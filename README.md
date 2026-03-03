@@ -26,8 +26,16 @@ when you hit limits.
 
 ## Install
 
+From source:
+
 ```sh
 cargo install --path .
+```
+
+From GitHub releases (prebuilt binaries for macOS and Linux):
+
+```sh
+# See https://github.com/emberian/tokeman/releases
 ```
 
 ## Setup
@@ -45,8 +53,8 @@ Tokens are stored in `~/.config/tokeman/tokens.toml`.
 
 ```sh
 tokeman                          # probe all tokens, print gauges, save snapshot
+tokeman --json                   # output probe results as JSON
 tokeman --watch                  # live TUI dashboard (auto-refreshes every 30s)
-tokeman tray                     # system tray app with glass UI
 tokeman launch [-- claude args]  # launch claude with the best token
 tokeman launch --auto [-- args]  # auto-rotate tokens on exhaustion
 tokeman list                     # show configured tokens
@@ -100,20 +108,43 @@ and waits:
 
 Set `TOKEMAN_CLAUDE_BIN` to override the claude binary path.
 
-### Tray mode
+### Tray app
 
-`tokeman tray` runs as a system tray application with a rich GUI window. Features:
+A menu bar / system tray app for at-a-glance token status and one-click launches.
 
-- **Glass UI** on macOS with native vibrancy/frosted glass effect
-- **Token gauges** with colored progress bars (green/amber/red)
-- **Click to launch**: each token has a Launch button that opens a terminal
-  with Claude Code using that token
-- **Launch Best**: one-click launch with the best available token
-- **Dangerous mode toggle**: prominent switch for `--dangerously-skip-permissions`
-- **Settings panel**: configure launch args, terminal preference, claude binary,
-  and probe interval — all saved to the config file
-- **Auto-refresh**: probes tokens in the background on a configurable interval
-- **Tray icon**: colored dot reflects overall token health (green/amber/red/gray)
+**macOS** — native SwiftUI app using `MenuBarExtra`, built separately:
+
+```sh
+cd macos/tray
+bash build.sh
+open Tokeman.app
+```
+
+Lives in the menu bar with a bolt icon colored by token health. Click to see all
+tokens with gauges, launch buttons, danger mode toggle, and a settings panel.
+Calls `tokeman --json` under the hood.
+
+**Linux** — egui-based tray app, built with the `tray` feature:
+
+```sh
+cargo install --path . --features tray
+tokeman tray
+```
+
+Same functionality: system tray icon, dark-themed window with token gauges,
+launch buttons, settings, and dangerous mode toggle. Uses `tray-icon` for the
+system tray and `eframe` for the UI. Supports terminal launching via
+`gnome-terminal`, `konsole`, `alacritty`, `kitty`, `wezterm`, and others.
+
+**Common features:**
+
+- Token gauges with colored progress bars (green/amber/red)
+- Click-to-launch: opens a terminal with Claude Code using that token
+- Launch Best: one-click launch with the best available token
+- Dangerous mode toggle for `--dangerously-skip-permissions`
+- Settings panel: launch args, terminal, claude binary, probe interval
+- Auto-refresh on a configurable interval
+- Tray icon color reflects overall token health
 
 Configure launch defaults in `~/.config/tokeman/tokens.toml`:
 
@@ -125,12 +156,6 @@ terminal = "iTerm2"
 probe_interval_secs = 30
 ```
 
-To build without tray support (CLI-only, smaller binary):
-
-```sh
-cargo install --path . --no-default-features
-```
-
 ### One-shot mode
 
 Run `tokeman` with no arguments. Probes every configured token concurrently,
@@ -139,6 +164,8 @@ displays colored gauge bars, and saves a snapshot to the local database.
 - Green: >50% remaining
 - Yellow: 20-50% remaining
 - Red: <20% remaining
+
+Use `--json` for machine-readable output (useful for scripting or the tray app).
 
 ### Watch mode
 
@@ -174,17 +201,33 @@ Each probe costs a fraction of a cent (one Haiku token).
 
 | Path | Contents |
 |------|----------|
-| `~/.config/tokeman/tokens.toml` | Token names and keys |
+| `~/.config/tokeman/tokens.toml` | Token names, keys, and settings |
 | `~/.local/share/tokeman/snapshots.db` | SQLite database of historical snapshots |
 
 Both paths respect `XDG_CONFIG_HOME` and `XDG_DATA_HOME`.
 
+## Releases
+
+Releases are built with [cargo-dist](https://opensource.axo.dev/cargo-dist/) and
+published to GitHub Releases with prebuilt binaries for:
+
+- macOS (ARM64, x86_64)
+- Linux (ARM64, x86_64)
+
+To cut a release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Roadmap
 
-- [x] System tray mode (`tokeman tray`) with glass UI and colored indicator
+- [x] System tray mode with native macOS SwiftUI and egui Linux support
+- [x] JSON output (`--json`) for scripting
+- [x] GitHub releases via cargo-dist
 - [ ] Notifications when weekly quota drops below threshold
 - [ ] Token refresh (auto-refresh expired OAuth tokens via refresh_token)
-- [ ] JSON output (`--json`) for scripting
 
 ## License
 
