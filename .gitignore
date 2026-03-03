@@ -1,0 +1,6 @@
+/target
+*.swp
+*.swo
+.DS_Store
+macos/tray/.build
+macos/tray/*.app
