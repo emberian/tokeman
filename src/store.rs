@@ -3,13 +3,15 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::probe::ProbeResult;
 
 pub struct Store {
     conn: Connection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)] // fields are populated from DB and available for queries
 pub struct Snapshot {
     pub token_name: String,
@@ -151,6 +153,21 @@ impl Store {
              FROM snapshots WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
         )?;
         let rows = stmt.query_map(params![token_name, since.to_rfc3339()], Self::map_row)?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(row?);
+        }
+        Ok(snapshots)
+    }
+
+    pub fn all_since(&self, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
+                    utilization_7d, reset_7d, representative_claim,
+                    overage_status, utilization_overage, reset_overage
+             FROM snapshots WHERE probed_at >= ?1 ORDER BY probed_at ASC",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339()], Self::map_row)?;
         let mut snapshots = Vec::new();
         for row in rows {
             snapshots.push(row?);

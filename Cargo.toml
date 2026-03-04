@@ -10,9 +10,6 @@ default = []
 tray = [
     "dep:tray-icon",
     "dep:eframe",
-    "dep:objc2",
-    "dep:objc2-app-kit",
-    "dep:objc2-foundation",
 ]
 
 [dependencies]
@@ -34,18 +31,6 @@ toml = "0.8"
 tray-icon = { version = "0.21", optional = true }
 eframe = { version = "0.33", optional = true, features = ["glow"] }
 
-# macOS native window management + vibrancy (feature-gated)
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", optional = true, features = [
-    "NSApplication",
-    "NSRunningApplication",
-    "NSWindow",
-    "NSView",
-    "NSVisualEffectView",
-    "NSResponder",
-] }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSGeometry"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

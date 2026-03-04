@@ -140,118 +140,6 @@ fn spawn_bg_thread(
     tx
 }
 
-// --- macOS vibrancy ---
-
-#[cfg(target_os = "macos")]
-fn apply_macos_vibrancy() {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{
-        NSApplication, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-        NSVisualEffectState, NSVisualEffectView,
-    };
-    use objc2_foundation::NSRect;
-
-    unsafe {
-        let mtm = MainThreadMarker::new_unchecked();
-        let app = NSApplication::sharedApplication(mtm);
-        let Some(window) = app.keyWindow() else {
-            return;
-        };
-
-        let Some(content_view) = window.contentView() else {
-            return;
-        };
-        let frame: NSRect = msg_send![&content_view, frame];
-
-        let effect_view: Retained<NSVisualEffectView> =
-            msg_send![NSVisualEffectView::alloc(mtm), initWithFrame: frame];
-
-        effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
-        effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-        effect_view.setState(NSVisualEffectState::Active);
-
-        let autoresizing: usize = (1 << 1) | (1 << 4); // width + height flexible
-        let _: () = msg_send![&effect_view, setAutoresizingMask: autoresizing];
-
-        // Insert behind all other subviews
-        let any_view: &AnyObject = &effect_view;
-        let _: () = msg_send![&content_view, addSubview: any_view, positioned: -1_isize, relativeTo: std::ptr::null::<AnyObject>()];
-    }
-}
-
-// --- macOS popover window behavior ---
-
-#[cfg(target_os = "macos")]
-fn setup_macos_popover_behavior() {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{msg_send, MainThreadMarker};
-    use objc2_app_kit::NSApplication;
-
-    unsafe {
-        let mtm = MainThreadMarker::new_unchecked();
-        let app = NSApplication::sharedApplication(mtm);
-
-        // Hide dock icon — this is a menu bar app
-        let _: bool = msg_send![&app, setActivationPolicy: 1_isize]; // Accessory
-
-        let windows: Retained<AnyObject> = msg_send![&app, windows];
-        let count: usize = msg_send![&windows, count];
-        if count > 0 {
-            let window: Retained<AnyObject> = msg_send![&windows, objectAtIndex: 0_usize];
-
-            // Float above other windows like a real popover
-            let _: () = msg_send![&window, setLevel: 3_isize]; // NSFloatingWindowLevel
-
-            // Auto-hide when user clicks elsewhere
-            let _: () = msg_send![&window, setHidesOnDeactivate: true];
-        }
-    }
-}
-
-// --- macOS native window management ---
-
-#[cfg(target_os = "macos")]
-fn macos_activate_and_show() {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{msg_send, MainThreadMarker};
-    use objc2_app_kit::NSApplication;
-
-    unsafe {
-        let mtm = MainThreadMarker::new_unchecked();
-        let app = NSApplication::sharedApplication(mtm);
-        let _: () = msg_send![&app, activateIgnoringOtherApps: true];
-        let windows: Retained<AnyObject> = msg_send![&app, windows];
-        let count: usize = msg_send![&windows, count];
-        if count > 0 {
-            let w: Retained<AnyObject> = msg_send![&windows, objectAtIndex: 0_usize];
-            let _: () = msg_send![&w, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_order_out() {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{msg_send, MainThreadMarker};
-    use objc2_app_kit::NSApplication;
-
-    unsafe {
-        let mtm = MainThreadMarker::new_unchecked();
-        let app = NSApplication::sharedApplication(mtm);
-        let windows: Retained<AnyObject> = msg_send![&app, windows];
-        let count: usize = msg_send![&windows, count];
-        if count > 0 {
-            let w: Retained<AnyObject> = msg_send![&windows, objectAtIndex: 0_usize];
-            let _: () = msg_send![&w, orderOut: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
 // --- egui App ---
 
 struct TokemaApp {
@@ -264,11 +152,10 @@ struct TokemaApp {
     menu_quit_id: Option<tray_icon::menu::MenuId>,
     settings_open: bool,
     settings_draft: LaunchSettings,
-    vibrancy_applied: bool,
+    first_frame: bool,
     last_icon_color: [u8; 3],
     quit_requested: bool,
     window_visible: bool,
-    last_shown: Instant,
 }
 
 impl TokemaApp {
@@ -277,20 +164,9 @@ impl TokemaApp {
         config: Config,
     ) -> Self {
         let mut visuals = egui::Visuals::dark();
-        #[cfg(target_os = "macos")]
-        {
-            // Semi-transparent for macOS vibrancy
-            visuals.window_fill = egui::Color32::from_black_alpha(190);
-            visuals.panel_fill = egui::Color32::from_black_alpha(190);
-            visuals.extreme_bg_color = egui::Color32::from_black_alpha(160);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Fully opaque dark theme for Linux
-            visuals.window_fill = egui::Color32::from_rgb(30, 30, 30);
-            visuals.panel_fill = egui::Color32::from_rgb(30, 30, 30);
-            visuals.extreme_bg_color = egui::Color32::from_rgb(20, 20, 20);
-        }
+        visuals.window_fill = egui::Color32::from_rgb(30, 30, 30);
+        visuals.panel_fill = egui::Color32::from_rgb(30, 30, 30);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(20, 20, 20);
         visuals.faint_bg_color = egui::Color32::from_white_alpha(8);
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_white_alpha(10);
         visuals.widgets.inactive.bg_fill = egui::Color32::from_white_alpha(15);
@@ -317,11 +193,10 @@ impl TokemaApp {
             menu_quit_id: None,
             settings_open: false,
             settings_draft,
-            vibrancy_applied: false,
+            first_frame: true,
             last_icon_color: [158, 158, 158],
             quit_requested: false,
             window_visible: true,
-            last_shown: Instant::now(),
         };
 
         // Create tray icon
@@ -362,28 +237,12 @@ impl TokemaApp {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         self.window_visible = true;
-        self.last_shown = Instant::now();
-        #[cfg(target_os = "macos")]
-        macos_activate_and_show();
-        #[cfg(not(target_os = "macos"))]
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        // Also send egui commands as fallback/supplement
-        #[cfg(target_os = "macos")]
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    #[allow(unused_variables)]
     fn hide_window(&mut self, ctx: &egui::Context) {
         self.window_visible = false;
-        #[cfg(target_os = "macos")]
-        macos_order_out();
-        #[cfg(not(target_os = "macos"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -716,22 +575,14 @@ impl TokemaApp {
 
 impl eframe::App for TokemaApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        #[cfg(target_os = "macos")]
-        { [0.0, 0.0, 0.0, 0.0] } // Transparent for vibrancy
-        #[cfg(not(target_os = "macos"))]
-        { [0.118, 0.118, 0.118, 1.0] } // Opaque dark (rgb 30,30,30)
+        [0.118, 0.118, 0.118, 1.0] // Opaque dark
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // First-frame setup: start hidden (tray-only), platform-specific init
-        if !self.vibrancy_applied {
-            #[cfg(target_os = "macos")]
-            {
-                apply_macos_vibrancy();
-                setup_macos_popover_behavior();
-            }
+        // First-frame setup: start hidden (tray-only)
+        if self.first_frame {
             self.hide_window(ctx);
-            self.vibrancy_applied = true;
+            self.first_frame = false;
         }
 
         // Handle tray icon left-click — position below icon and toggle
@@ -747,18 +598,6 @@ impl eframe::App for TokemaApp {
                     egui::pos2(x as f32, y as f32),
                 ));
                 self.show_window(ctx);
-            }
-        }
-
-        // macOS: detect auto-hide from hidesOnDeactivate
-        #[cfg(target_os = "macos")]
-        {
-            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            if !focused
-                && self.window_visible
-                && self.last_shown.elapsed() > std::time::Duration::from_millis(300)
-            {
-                self.window_visible = false;
             }
         }
 
@@ -926,15 +765,10 @@ impl eframe::App for TokemaApp {
 // --- Entry point ---
 
 pub fn run(config: Config) -> Result<()> {
-    let mut viewport = egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size([420.0, 520.0])
         .with_min_inner_size([360.0, 300.0])
         .with_title("Tokeman");
-
-    #[cfg(target_os = "macos")]
-    {
-        viewport = viewport.with_transparent(true).with_decorations(false);
-    }
 
     let options = eframe::NativeOptions {
         viewport,

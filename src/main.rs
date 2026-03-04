@@ -48,6 +48,15 @@ enum Command {
         /// Number of snapshots to show
         #[arg(long, default_value = "20")]
         last: usize,
+        /// Filter to a specific token name
+        #[arg(long)]
+        token: Option<String>,
+        /// Only show snapshots from the last N hours
+        #[arg(long)]
+        since: Option<f64>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show computed usage rates and statistics
     Stats,
@@ -98,10 +107,28 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::History { last }) => {
+        Some(Command::History {
+            last,
+            token,
+            since,
+            json,
+        }) => {
             let db = store::Store::open()?;
-            let snapshots = db.recent(None, last)?;
-            display::print_history(&snapshots);
+            let snapshots = if let Some(hours) = since {
+                let cutoff =
+                    Utc::now() - Duration::milliseconds((hours * 3_600_000.0) as i64);
+                match token.as_deref() {
+                    Some(name) => db.for_token_since(name, cutoff)?,
+                    None => db.all_since(cutoff)?,
+                }
+            } else {
+                db.recent(token.as_deref(), last)?
+            };
+            if json {
+                println!("{}", serde_json::to_string(&snapshots)?);
+            } else {
+                display::print_history(&snapshots);
+            }
         }
         Some(Command::Stats) => {
             let cfg = config::Config::load()?;

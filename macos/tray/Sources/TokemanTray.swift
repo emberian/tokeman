@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import Charts
 
 // MARK: - JSON models (matches `tokeman --json` output)
 
@@ -22,6 +23,45 @@ struct TokenResult: Codable, Identifiable {
         let utilization: Double
         let reset: Int64
     }
+}
+
+// MARK: - History model (matches `tokeman history --json` output)
+
+struct HistorySnapshot: Codable, Identifiable {
+    var id: String { "\(token_name)-\(probed_at)" }
+    let token_name: String
+    let probed_at: String
+    let unified_status: String?
+    let utilization_5h: Double?
+    let reset_5h: Int64?
+    let utilization_7d: Double?
+    let reset_7d: Int64?
+    let representative_claim: String?
+    let overage_status: String?
+    let utilization_overage: Double?
+    let reset_overage: Int64?
+
+    var probedDate: Date {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: probed_at) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: probed_at) ?? Date()
+    }
+
+    func remaining(for window: ChartWindowType) -> Double? {
+        switch window {
+        case .fiveHour: return utilization_5h.map { max(0, (1.0 - $0) * 100) }
+        case .sevenDay: return utilization_7d.map { max(0, (1.0 - $0) * 100) }
+        case .overage: return utilization_overage.map { max(0, (1.0 - $0) * 100) }
+        }
+    }
+}
+
+enum ChartWindowType: String, CaseIterable {
+    case fiveHour = "5h"
+    case sevenDay = "7d"
+    case overage = "$$"
 }
 
 // MARK: - Config reader/writer (~/.config/tokeman/tokens.toml)
@@ -161,6 +201,7 @@ class TokemanViewModel: ObservableObject {
     @Published var probeError: String?
     @Published var config = TokemanConfig.load()
     @Published var showSettings = false
+    @Published var history: [String: [HistorySnapshot]] = [:]
 
     private var timer: Timer?
 
@@ -190,6 +231,7 @@ class TokemanViewModel: ObservableObject {
 
     func startPolling() {
         probe()
+        loadHistory()
         timer?.invalidate()
         let interval = TimeInterval(config.settings.probeIntervalSecs)
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
@@ -211,10 +253,31 @@ class TokemanViewModel: ObservableObject {
                 tokens = decoded
                 lastProbe = Date()
                 probeError = nil
+                loadHistory()
             } else {
                 probeError = "Failed to parse tokeman output"
             }
             isProbing = false
+        }
+    }
+
+    func loadHistory() {
+        Task {
+            let bin = findTokenman()
+            let output = await shell(bin, args: ["history", "--json", "--since", "24"])
+            guard let data = output.data(using: .utf8),
+                  let snapshots = try? JSONDecoder().decode([HistorySnapshot].self, from: data) else {
+                return
+            }
+            var grouped: [String: [HistorySnapshot]] = [:]
+            for s in snapshots {
+                grouped[s.token_name, default: []].append(s)
+            }
+            // Sort each group by time
+            for key in grouped.keys {
+                grouped[key]?.sort { $0.probedDate < $1.probedDate }
+            }
+            history = grouped
         }
     }
 
@@ -402,9 +465,152 @@ struct GaugeRow: View {
     }
 }
 
+struct MiniUtilizationChart: View {
+    let snapshots: [HistorySnapshot]
+    let window: ChartWindowType = .sevenDay
+
+    private var chartColor: Color {
+        guard let last = snapshots.last,
+              let rem = last.remaining(for: window) else { return .green }
+        if rem > 50 { return .green }
+        if rem > 20 { return .orange }
+        return .red
+    }
+
+    var body: some View {
+        Chart {
+            ForEach(snapshots) { snap in
+                if let rem = snap.remaining(for: window) {
+                    AreaMark(
+                        x: .value("Time", snap.probedDate),
+                        y: .value("Remaining", rem)
+                    )
+                    .foregroundStyle(chartColor.opacity(0.15))
+
+                    LineMark(
+                        x: .value("Time", snap.probedDate),
+                        y: .value("Remaining", rem)
+                    )
+                    .foregroundStyle(chartColor)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                }
+            }
+        }
+        .chartYScale(domain: 0...100)
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .frame(height: 30)
+    }
+}
+
+struct TokenDetailChart: View {
+    let snapshots: [HistorySnapshot]
+    @State private var selectedWindow: ChartWindowType = .sevenDay
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Picker("Window", selection: $selectedWindow) {
+                ForEach(ChartWindowType.allCases, id: \.self) { w in
+                    Text(w.rawValue).tag(w)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            Chart {
+                // Threshold lines
+                RuleMark(y: .value("Warning", 20))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .foregroundStyle(.orange.opacity(0.5))
+                RuleMark(y: .value("Critical", 10))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .foregroundStyle(.red.opacity(0.5))
+
+                ForEach(snapshots) { snap in
+                    if let rem = snap.remaining(for: selectedWindow) {
+                        LineMark(
+                            x: .value("Time", snap.probedDate),
+                            y: .value("Remaining %", rem)
+                        )
+                        .foregroundStyle(.blue)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                        .interpolationMethod(.monotone)
+
+                        PointMark(
+                            x: .value("Time", snap.probedDate),
+                            y: .value("Remaining %", rem)
+                        )
+                        .foregroundStyle(.blue)
+                        .symbolSize(15)
+                    }
+                }
+            }
+            .chartYScale(domain: 0...100)
+            .chartYAxis {
+                AxisMarks(values: [0, 25, 50, 75, 100]) { val in
+                    AxisGridLine()
+                    AxisValueLabel {
+                        if let v = val.as(Int.self) { Text("\(v)%").font(.system(size: 9)) }
+                    }
+                }
+            }
+            .chartXAxis {
+                AxisMarks { val in
+                    AxisGridLine()
+                    AxisValueLabel(format: .dateTime.hour().minute())
+                }
+            }
+            .frame(height: 150)
+        }
+    }
+}
+
+struct ComparisonChart: View {
+    let history: [String: [HistorySnapshot]]
+
+    var body: some View {
+        Chart {
+            ForEach(Array(history.keys.sorted()), id: \.self) { name in
+                if let snaps = history[name] {
+                    ForEach(snaps) { snap in
+                        if let rem = snap.remaining(for: .sevenDay) {
+                            LineMark(
+                                x: .value("Time", snap.probedDate),
+                                y: .value("Remaining %", rem)
+                            )
+                            .foregroundStyle(by: .value("Token", name))
+                            .lineStyle(StrokeStyle(lineWidth: 1.5))
+                            .interpolationMethod(.monotone)
+                        }
+                    }
+                }
+            }
+        }
+        .chartYScale(domain: 0...100)
+        .chartYAxis {
+            AxisMarks(values: [0, 50, 100]) { val in
+                AxisGridLine()
+                AxisValueLabel {
+                    if let v = val.as(Int.self) { Text("\(v)%").font(.system(size: 9)) }
+                }
+            }
+        }
+        .chartXAxis {
+            AxisMarks { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.hour())
+            }
+        }
+        .chartLegend(.visible)
+        .frame(height: 100)
+    }
+}
+
 struct TokenCard: View {
     let token: TokenResult
+    let history: [HistorySnapshot]?
     let onLaunch: () -> Void
+    @State private var showDetail = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -428,16 +634,34 @@ struct TokenCard: View {
                 if let s = q.session { GaugeRow(label: "5h", window: s) }
                 if let w = q.weekly { GaugeRow(label: "7d", window: w) }
                 if let o = q.overage { GaugeRow(label: "$$", window: o) }
+
+                // Mini chart (7d trend)
+                if let snaps = history, snaps.count >= 2 {
+                    MiniUtilizationChart(snapshots: snaps)
+                        .padding(.top, 2)
+                }
             } else if let err = token.error {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
+
+            // Detail chart (tap to expand)
+            if showDetail, let snaps = history, snaps.count >= 2 {
+                TokenDetailChart(snapshots: snaps)
+                    .padding(.top, 4)
+            }
         }
         .padding(10)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if history != nil && (history?.count ?? 0) >= 2 {
+                withAnimation(.easeInOut(duration: 0.2)) { showDetail.toggle() }
+            }
+        }
     }
 
     private func statusColor(_ s: String) -> Color {
@@ -568,10 +792,22 @@ struct PopoverContent: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 120)
             } else {
+                // Comparison chart (all tokens overlaid)
+                if vm.history.values.contains(where: { $0.count >= 2 }) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("24h overview (7d remaining)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        ComparisonChart(history: vm.history)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+                }
+
                 // Token cards — no maxHeight, auto-expand for up to ~8 accounts
                 VStack(spacing: 6) {
                     ForEach(vm.tokens) { token in
-                        TokenCard(token: token) {
+                        TokenCard(token: token, history: vm.history[token.token_name]) {
                             vm.launchToken(token.token_name)
                         }
                     }
@@ -624,17 +860,20 @@ struct PopoverContent: View {
 
             Divider()
 
-            // Settings + Quit
-            HStack(alignment: .top) {
-                SettingsSection(vm: vm)
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            // Settings
+            SettingsSection(vm: vm)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+
+            Divider()
+
+            // Quit
+            Button("Quit Tokeman") { NSApplication.shared.terminate(nil) }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
         }
         .frame(width: 400)
         .onAppear { vm.startPolling() }
