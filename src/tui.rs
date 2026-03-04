@@ -519,7 +519,8 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
                 .style(Style::default().fg(Color::DarkGray))
                 .bounds([0.0, 100.0])
                 .labels(vec![Span::raw("0%"), Span::raw("50%"), Span::raw("100%")]),
-        );
+        )
+        .legend_position(Some(LegendPosition::BottomLeft));
 
     f.render_widget(chart, area);
 }
