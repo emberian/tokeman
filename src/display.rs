@@ -65,7 +65,8 @@ pub fn print_results(results: &[ProbeResult]) {
 
     println!();
     println!(
-        " \x1b[1mtokeman\x1b[0m — {ok}/{total} tokens probed"
+        " \x1b[1mtokeman\x1b[0m — {ok}/{total} tokens probed with {}",
+        crate::probe::PROBE_MODEL_LABEL
     );
     println!();
 
@@ -84,8 +85,34 @@ pub fn print_results(results: &[ProbeResult]) {
             println!("   \x1b[33mno unified quota headers (might be an API key, not OAuth)\x1b[0m");
             print_rate_limits(result);
         }
+        print_model_usage(result);
 
         println!();
+    }
+}
+
+fn print_model_usage(result: &ProbeResult) {
+    let Some(usage) = result.model_usage.as_ref() else {
+        let reason = if result.model_usage_error.is_some() {
+            "profile usage credential expired or unavailable"
+        } else {
+            "profile usage credential not captured"
+        };
+        println!("   Model   (7d) --  \x1b[90m{reason}\x1b[0m");
+        return;
+    };
+    let buckets = usage.buckets();
+    if buckets.is_empty() {
+        println!("   Model   (7d) --  \x1b[90mnot reported for this plan\x1b[0m");
+    }
+    for bucket in buckets {
+        println!(
+            "   {:<12} {}  resets {}  \x1b[90m{}\x1b[0m",
+            format!("{} (7d)", bucket.label),
+            render_bar(bucket.window.utilization),
+            format_reset(bucket.window.reset),
+            bucket.source.label(),
+        );
     }
 }
 
@@ -172,29 +199,68 @@ pub fn print_history(snapshots: &[crate::store::Snapshot]) {
 
     for s in snapshots {
         let local = s.probed_at.with_timezone(&Local);
-        let u5 = s.utilization_5h.map(|u| format!("{:.1}%", (1.0 - u) * 100.0)).unwrap_or_else(|| "--".into());
-        let u7 = s.utilization_7d.map(|u| format!("{:.1}%", (1.0 - u) * 100.0)).unwrap_or_else(|| "--".into());
+        let u5 = s
+            .utilization_5h
+            .map(|u| format!("{:.1}%", (1.0 - u) * 100.0))
+            .unwrap_or_else(|| "--".into());
+        let u7 = s
+            .utilization_7d
+            .map(|u| format!("{:.1}%", (1.0 - u) * 100.0))
+            .unwrap_or_else(|| "--".into());
         let status = s.unified_status.as_deref().unwrap_or("--");
-        let claim = s.representative_claim.as_deref().map(|c| match c {
-            "five_hour" => "session",
-            "seven_day" => "weekly",
-            "seven_day_opus" => "Opus",
-            "seven_day_sonnet" => "Sonnet",
-            "overage" => "extra",
-            other => other,
-        }).unwrap_or("--");
+        let claim = s
+            .representative_claim
+            .as_deref()
+            .map(|c| match c {
+                "five_hour" => "session",
+                "seven_day" => "weekly",
+                "seven_day_opus" => "Opus",
+                "seven_day_sonnet" => "Sonnet",
+                "overage" => "extra",
+                other => other,
+            })
+            .unwrap_or("--");
 
-        let overage = s.utilization_overage
+        let overage = s
+            .utilization_overage
             .map(|u| format!("  ov: {:>5.1}%", (1.0 - u) * 100.0))
             .unwrap_or_default();
+        let model_buckets = if s.model_usage_buckets.is_empty() {
+            [
+                s.utilization_opus_7d
+                    .map(|u| format!("Opus:{:.1}%", (1.0 - u) * 100.0)),
+                s.utilization_sonnet_7d
+                    .map(|u| format!("Sonnet:{:.1}%", (1.0 - u) * 100.0)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        } else {
+            s.model_usage_buckets
+                .iter()
+                .map(|bucket| {
+                    format!(
+                        "{}:{:.1}%",
+                        bucket.label,
+                        (1.0 - bucket.window.utilization) * 100.0
+                    )
+                })
+                .collect()
+        };
+        let models = if model_buckets.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", model_buckets.join(" "))
+        };
 
         println!(
-            "  {} \x1b[1m{:<16}\x1b[0m  5h: {:>6} left  7d: {:>6} left{}  [{} {}]",
+            "  {} \x1b[1m{:<16}\x1b[0m  5h: {:>6} left  7d: {:>6} left{}{}  [{} {}]",
             local.format("%Y-%m-%d %H:%M"),
             s.token_name,
             u5,
             u7,
             overage,
+            models,
             status,
             claim,
         );
@@ -238,7 +304,10 @@ pub fn print_stats(stats: &[crate::stats::TokenStats]) {
     println!();
 
     for s in stats {
-        println!(" \x1b[1m{}\x1b[0m ({} snapshots)", s.token_name, s.snapshot_count);
+        println!(
+            " \x1b[1m{}\x1b[0m ({} snapshots)",
+            s.token_name, s.snapshot_count
+        );
 
         if s.snapshot_count < 2 {
             println!("   Need at least 2 snapshots to compute rates.");

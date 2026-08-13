@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokeman</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+:root {
+  --bg: #0a0e14; --surface: #131820; --surface2: #1a2030; --border: #252d3a;
+  --text: #e6edf3; --text-dim: #6e7a8a; --text-mid: #9eaab8;
+  --green: #3fb950; --green-dim: #1a3a24;
+  --yellow: #d29922; --yellow-dim: #3a2e14;
+  --red: #f85149; --red-dim: #3a1a18;
+  --blue: #58a6ff; --blue-dim: #14283a;
+  --purple: #bc8cff; --cyan: #56d4dd; --orange: #f78166; --pink: #db61a2;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:"SF Mono","Fira Code","JetBrains Mono",monospace; font-size:13px; overflow-x:hidden; }
+
+/* Tabs */
+.tabs { display:flex; border-bottom:1px solid var(--border); background:var(--surface); }
+.tab { padding:12px 24px; cursor:pointer; color:var(--text-dim); font-size:13px; border-bottom:2px solid transparent; transition:all .15s; font-family:inherit; background:none; border-top:none; border-left:none; border-right:none; }
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--blue); border-bottom-color:var(--blue); }
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+
+/* Shared */
+header { padding:12px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:16px; flex-wrap:wrap; background:var(--surface); }
+header h1 { font-size:18px; font-weight:700; letter-spacing:-.5px; background:linear-gradient(135deg,var(--blue),var(--purple)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.controls { display:flex; gap:6px; align-items:center; }
+.controls label { color:var(--text-dim); font-size:10px; text-transform:uppercase; letter-spacing:1px; margin-right:4px; }
+.pill { display:flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.pill button { background:transparent; color:var(--text-dim); border:none; padding:5px 10px; cursor:pointer; font-size:11px; font-family:inherit; border-right:1px solid var(--border); transition:all .15s; }
+.pill button:last-child { border-right:none; }
+.pill button:hover { color:var(--text); background:var(--surface2); }
+.pill button.active { background:var(--blue); color:#fff; }
+.status-info { margin-left:auto; color:var(--text-dim); font-size:11px; }
+
+.panel { background:var(--bg); padding:20px 24px; border-bottom:1px solid var(--border); }
+.panel-title { font-size:10px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); margin-bottom:12px; }
+
+svg { overflow:visible; }
+.axis text { fill:var(--text-dim); font-size:10px; font-family:inherit; }
+.axis line,.axis path { stroke:var(--border); }
+.grid line { stroke:var(--border); stroke-opacity:.2; }
+.grid path { display:none; }
+.chart-line { fill:none; stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round; }
+.chart-area { opacity:.1; }
+.crosshair { stroke:var(--text-dim); stroke-width:1; stroke-dasharray:2 3; pointer-events:none; }
+.threshold { stroke-dasharray:4 4; stroke-width:.5; opacity:.5; pointer-events:none; }
+.zero-line { stroke:var(--border); stroke-width:1; }
+
+.tooltip { position:fixed; background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:12px 16px; pointer-events:none; font-size:11px; box-shadow:0 8px 32px rgba(0,0,0,.5); z-index:100; max-width:360px; display:none; }
+.tooltip .tt-time { color:var(--text-dim); margin-bottom:8px; font-size:10px; letter-spacing:.5px; }
+.tooltip .tt-entry { display:flex; align-items:center; gap:8px; margin:3px 0; justify-content:space-between; }
+.tooltip .tt-left { display:flex; align-items:center; gap:6px; }
+.tooltip .tt-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+.tooltip .tt-val { font-weight:700; font-variant-numeric:tabular-nums; }
+
+/* Token cards */
+.cards-row { display:flex; gap:1px; background:var(--border); overflow-x:auto; }
+.token-card { flex:1; min-width:150px; background:var(--bg); padding:12px 14px; cursor:pointer; transition:background .15s; }
+.token-card:hover { background:var(--surface); }
+.token-card.muted { opacity:.25; }
+.token-card .name { font-size:11px; font-weight:600; margin-bottom:4px; display:flex; align-items:center; gap:6px; }
+.token-card .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.token-card .metrics { display:flex; gap:12px; margin-top:6px; }
+.token-card .metric-col { text-align:center; }
+.token-card .metric-val { font-size:16px; font-weight:700; letter-spacing:-1px; }
+.token-card .metric-label { font-size:9px; color:var(--text-dim); text-transform:uppercase; }
+.token-card .spark { margin-top:6px; height:24px; }
+
+/* Insights */
+.insights { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:1px; background:var(--border); }
+.insight-card { background:var(--bg); padding:14px 18px; }
+.insight-card h3 { font-size:10px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); margin-bottom:8px; }
+.insight-metric { font-size:24px; font-weight:700; letter-spacing:-1px; margin-bottom:2px; }
+.insight-sub { font-size:11px; color:var(--text-dim); line-height:1.4; }
+.insight-bar { height:3px; background:var(--surface2); border-radius:2px; margin-top:8px; overflow:hidden; }
+.insight-bar-fill { height:100%; border-radius:2px; }
+
+/* Heatmap */
+.heatmap-row { display:flex; gap:1px; margin:2px 0; }
+.heatmap-cell { flex:1; height:14px; border-radius:1px; min-width:3px; }
+.heatmap-label { font-size:10px; color:var(--text-dim); width:80px; flex-shrink:0; text-align:right; padding-right:8px; line-height:14px; }
+
+/* Distribution */
+.dist-bar { display:flex; align-items:center; gap:8px; margin:2px 0; }
+.dist-label { width:50px; text-align:right; font-size:10px; color:var(--text-dim); }
+.dist-track { flex:1; height:10px; background:var(--surface2); border-radius:2px; overflow:hidden; }
+.dist-fill { height:100%; border-radius:2px; }
+.dist-count { width:40px; font-size:10px; color:var(--text-dim); }
+
+#loading { display:flex; align-items:center; justify-content:center; height:200px; color:var(--text-dim); }
+
+/* ── Session Timeline ── */
+.timeline-container { padding:24px; }
+.session-list { display:flex; flex-direction:column; gap:1px; background:var(--border); }
+.session-row { display:grid; grid-template-columns:100px 100px 1fr 80px 80px 60px; gap:12px; padding:10px 16px; background:var(--bg); align-items:center; cursor:pointer; transition:background .1s; font-size:12px; }
+.session-row:hover { background:var(--surface); }
+.session-row.expanded { background:var(--surface2); }
+.session-date { color:var(--text-dim); font-size:11px; }
+.session-project { color:var(--blue); font-weight:600; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.session-summary { color:var(--text-mid); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.session-stat { text-align:right; font-variant-numeric:tabular-nums; }
+.session-stat .val { font-weight:600; }
+.session-stat .unit { color:var(--text-dim); font-size:10px; }
+.outcome-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:4px; }
+.outcome-full { background:var(--green); }
+.outcome-mostly { background:var(--yellow); }
+.outcome-partial { background:var(--orange); }
+.outcome-not { background:var(--red); }
+.outcome-unknown { background:var(--text-dim); }
+
+.session-detail-panel { background:var(--surface); border-bottom:1px solid var(--border); padding:16px 24px; display:none; }
+.session-detail-panel.open { display:block; }
+.detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }
+.detail-section h4 { font-size:10px; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:6px; }
+.detail-section p { font-size:12px; line-height:1.5; color:var(--text-mid); }
+.tool-bar-row { display:flex; align-items:center; gap:6px; margin:2px 0; }
+.tool-bar-name { width:80px; text-align:right; font-size:10px; color:var(--text-dim); }
+.tool-bar-track { flex:1; max-width:200px; height:8px; background:var(--surface2); border-radius:2px; overflow:hidden; }
+.tool-bar-fill { height:100%; border-radius:2px; background:var(--blue); }
+.tool-bar-count { font-size:10px; color:var(--text-dim); width:30px; }
+
+/* Session timeline viz */
+.event-timeline { margin-top:12px; position:relative; }
+.event-lane { display:flex; align-items:center; gap:2px; margin:1px 0; flex-wrap:wrap; }
+.event-pip { width:6px; height:16px; border-radius:1px; flex-shrink:0; }
+.event-pip.user { background:var(--green); }
+.event-pip.assistant { background:var(--blue); }
+.event-pip.tool_use { background:var(--purple); }
+.event-pip.agent { background:var(--cyan); }
+.event-pip.system { background:var(--yellow); }
+
+/* Aggregate charts for sessions */
+.agg-chart-row { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--border); }
+.agg-chart { background:var(--bg); padding:16px 20px; }
+.agg-chart .panel-title { margin-bottom:8px; }
+
+/* Filter bar */
+.filter-bar { padding:12px 24px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+.filter-bar input { background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:6px 10px; color:var(--text); font-family:inherit; font-size:12px; width:200px; }
+.filter-bar input::placeholder { color:var(--text-dim); }
+.filter-bar select { background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:6px 10px; color:var(--text); font-family:inherit; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tokeman</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="quota">quota</button>
+    <button class="tab" data-tab="sessions">sessions</button>
+  </div>
+</header>
+
+<!-- ════════ QUOTA TAB ════════ -->
+<div class="tab-content active" id="tab-quota">
+  <div style="padding:8px 24px; border-bottom:1px solid var(--border); display:flex; gap:16px; align-items:center; flex-wrap:wrap; background:var(--surface);">
+    <div class="controls">
+      <label>range</label>
+      <div class="pill" id="range-btns">
+        <button data-range="6">6h</button>
+        <button class="active" data-range="24">24h</button>
+        <button data-range="72">3d</button>
+        <button data-range="168">7d</button>
+        <button data-range="720">30d</button>
+        <button data-range="all">all</button>
+      </div>
+    </div>
+    <div class="controls">
+      <label>view</label>
+      <div class="pill" id="overlap-btns">
+        <button class="active" data-overlap="overlay">overlay</button>
+        <button data-overlap="stack">stack</button>
+      </div>
+    </div>
+    <span class="status-info" id="status"></span>
+  </div>
+
+  <div class="cards-row" id="cards-row"></div>
+
+  <div class="panel">
+    <div class="panel-title" id="quota-chart-title">utilization — discovered quota buckets</div>
+    <div id="main-chart"><div id="loading">loading snapshots...</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">burn rate (derivative, %/hr)</div>
+    <div id="deriv-chart"></div>
+  </div>
+
+  <div class="insights" id="insights"></div>
+
+  <div class="panel">
+    <div class="panel-title">activity heatmap (avg utilization by hour)</div>
+    <div id="heatmap"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">utilization distribution (5h)</div>
+    <div id="distribution" style="max-width:600px"></div>
+  </div>
+</div>
+
+<!-- ════════ SESSIONS TAB ════════ -->
+<div class="tab-content" id="tab-sessions">
+  <div class="filter-bar">
+    <input type="text" id="session-search" placeholder="search projects, summaries...">
+    <select id="session-outcome-filter">
+      <option value="">all outcomes</option>
+      <option value="fully_achieved">fully achieved</option>
+      <option value="mostly_achieved">mostly achieved</option>
+      <option value="partially_achieved">partially achieved</option>
+      <option value="not_achieved">not achieved</option>
+    </select>
+    <span class="status-info" id="session-status"></span>
+  </div>
+
+  <div class="agg-chart-row">
+    <div class="agg-chart">
+      <div class="panel-title">sessions over time</div>
+      <div id="sessions-timeline-chart"></div>
+    </div>
+    <div class="agg-chart">
+      <div class="panel-title">tokens over time</div>
+      <div id="tokens-timeline-chart"></div>
+    </div>
+  </div>
+  <div class="agg-chart-row">
+    <div class="agg-chart">
+      <div class="panel-title">projects by session count</div>
+      <div id="projects-bar-chart"></div>
+    </div>
+    <div class="agg-chart">
+      <div class="panel-title">tool usage across all sessions</div>
+      <div id="tools-bar-chart"></div>
+    </div>
+  </div>
+
+  <div class="panel" style="padding:8px 24px;">
+    <div class="panel-title" id="sessions-list-title">sessions</div>
+  </div>
+  <div class="session-list" id="session-list"></div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+/* ── Shared state ── */
+const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#56d4dd","#f78166","#db61a2","#7ee787","#79c0ff"];
+const METRIC_COLORS = { "5h": "#58a6ff", "7d": "#bc8cff", "opus": "#f78166", "sonnet": "#d29922", "ovg": "#56d4dd" };
+const METRIC_FIELDS = { "5h": "utilization_5h", "7d": "utilization_7d", "opus": "utilization_opus_7d", "sonnet": "utilization_sonnet_7d", "ovg": "utilization_overage" };
+const GAP_MS = 600000; // 10 min — don't interpolate across gaps longer than this
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[ch]);
+}
+function splitAtGaps(pts, gapMs, field) {
+  if (pts.length < 2) return [pts];
+  const segs = []; let cur = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    const resetField = field === "utilization_5h" ? "reset_5h"
+      : field === "utilization_7d" ? "reset_7d"
+      : field === "utilization_opus_7d" ? "reset_opus_7d"
+      : field === "utilization_sonnet_7d" ? "reset_sonnet_7d"
+      : field === "utilization_overage" ? "reset_overage" : null;
+    const resetChanged = resetField && pts[i-1][resetField] != null
+      && pts[i][resetField] != null && pts[i-1][resetField] !== pts[i][resetField];
+    const utilizationReset = field && pts[i-1][field] != null
+      && pts[i][field] != null && pts[i][field] < pts[i-1][field];
+    if (pts[i].probed_at - pts[i-1].probed_at > gapMs || resetChanged || utilizationReset) {
+      segs.push(cur); cur = [];
+    }
+    cur.push(pts[i]);
+  }
+  if (cur.length) segs.push(cur);
+  return segs;
+}
+
+/* ── Tab switching ── */
+document.querySelectorAll(".tab").forEach(t => {
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach(x => x.classList.remove("active"));
+    t.classList.add("active");
+    document.getElementById("tab-" + t.dataset.tab).classList.add("active");
+    if (t.dataset.tab === "sessions" && !sessionsLoaded) loadSessions();
+  });
+});
+
+/* ══════════════════════════════════════
+   QUOTA TAB
+   ══════════════════════════════════════ */
+let rawData = [], range = "24", overlap = "overlay", mutedTokens = new Set(), loading = false;
+let modelMetrics = [];
+const rangeHours = { "6":6, "24":24, "72":72, "168":168, "720":720, "all":null };
+
+function wireButtons(id, setter, varName) {
+  document.querySelectorAll(`#${id} button`).forEach(b => {
+    b.addEventListener("click", () => {
+      document.querySelector(`#${id} .active`)?.classList.remove("active");
+      b.classList.add("active");
+      setter(b.dataset[varName]);
+    });
+  });
+}
+wireButtons("range-btns", v => { range = v; fetchAndRender(); }, "range");
+wireButtons("overlap-btns", v => { overlap = v; renderQuota(); }, "overlap");
+
+async function fetchAndRender() {
+  if (loading) return;
+  loading = true;
+  const hours = rangeHours[range];
+  const url = hours != null ? `/api/snapshots?since_hours=${hours}` : "/api/snapshots";
+  try {
+    const resp = await fetch(url);
+    const bucketLabels = new Map();
+    rawData = (await resp.json()).map(d => {
+      const row = { ...d, probed_at: new Date(d.probed_at) };
+      (d.model_usage_buckets || []).forEach(bucket => {
+        const field = `model_${bucket.key}`;
+        row[field] = bucket.window?.utilization;
+        bucketLabels.set(field, bucket.label);
+      });
+      return row;
+    });
+    modelMetrics = [...bucketLabels].map(([field,label], i) => ({
+      field, label, dash: `${2 + (i % 5) * 2} ${2 + (i % 3)}`
+    }));
+    if (rawData.some(d => d.utilization_opus_7d != null) &&
+        !modelMetrics.some(m => m.label.toLowerCase() === "opus")) {
+      modelMetrics.push({field:"utilization_opus_7d", label:"Opus", dash:"7 3"});
+    }
+    if (rawData.some(d => d.utilization_sonnet_7d != null) &&
+        !modelMetrics.some(m => m.label.toLowerCase() === "sonnet")) {
+      modelMetrics.push({field:"utilization_sonnet_7d", label:"Sonnet", dash:"2 2"});
+    }
+    document.getElementById("loading")?.remove();
+    renderQuota();
+  } finally { loading = false; }
+}
+fetchAndRender();
+
+function renderQuota() {
+  const allTokens = [...new Set(rawData.map(d => d.token_name))].sort();
+  const colorScale = d3.scaleOrdinal().domain(allTokens).range(COLORS);
+  renderCards(allTokens, colorScale);
+  renderMainChart(allTokens, colorScale);
+  renderDerivChart(allTokens, colorScale);
+  renderInsights(allTokens, colorScale);
+  renderHeatmap(allTokens, colorScale);
+  renderDistribution(allTokens, colorScale);
+  document.getElementById("status").textContent = `${rawData.length.toLocaleString()} pts | ${allTokens.length} tokens`;
+}
+
+/* ── Token cards ── */
+function renderCards(allTokens, colorScale) {
+  const el = document.getElementById("cards-row");
+  el.innerHTML = "";
+  allTokens.forEach(token => {
+    const pts = rawData.filter(d => d.token_name === token);
+    const card = document.createElement("div");
+    card.className = "token-card" + (mutedTokens.has(token) ? " muted" : "");
+    card.addEventListener("click", () => { mutedTokens.has(token) ? mutedTokens.delete(token) : mutedTokens.add(token); renderQuota(); });
+    const last = pts.length ? pts[pts.length-1] : null;
+    const v5 = last?.utilization_5h, v7 = last?.utilization_7d;
+    const vo = last?.utilization_overage;
+    const colorFor = v => v == null ? "var(--text-dim)" : v > .8 ? "var(--red)" : v > .5 ? "var(--yellow)" : "var(--green)";
+    const fmt = v => v == null ? "—" : (v*100).toFixed(0)+"%";
+    const scoped = modelMetrics.map(m => `
+        <div class="metric-col"><div class="metric-val" style="color:${colorFor(last?.[m.field])}">${fmt(last?.[m.field])}</div><div class="metric-label">${escapeHtml(m.label)}</div></div>`).join("");
+    card.innerHTML = `
+      <div class="name"><div class="dot" style="background:${colorScale(token)}"></div>${escapeHtml(token)}</div>
+      <div class="metrics">
+        <div class="metric-col"><div class="metric-val" style="color:${colorFor(v5)}">${fmt(v5)}</div><div class="metric-label">5h</div></div>
+        <div class="metric-col"><div class="metric-val" style="color:${colorFor(v7)}">${fmt(v7)}</div><div class="metric-label">7d</div></div>
+        ${scoped}
+        <div class="metric-col"><div class="metric-val" style="color:${colorFor(vo)}">${fmt(vo)}</div><div class="metric-label">ovg</div></div>
+      </div>
+      <div class="spark" id="spark-${escapeHtml(CSS.escape(token))}"></div>`;
+    el.appendChild(card);
+    // Sparkline showing every independently reported quota bucket.
+    if (pts.length > 1) {
+      const sw = 150, sh = 24;
+      const svg = d3.select(`#spark-${CSS.escape(token)}`).append("svg").attr("width",sw).attr("height",sh);
+      const sx = d3.scaleTime().domain(d3.extent(pts, d=>d.probed_at)).range([0,sw]);
+      const sy = d3.scaleLinear().domain([0,1]).range([sh-1,1]);
+      [["utilization_5h","#58a6ff"],["utilization_7d","#bc8cff"],["utilization_overage","#56d4dd"],
+       ...modelMetrics.map((m,i)=>[m.field, COLORS[(i+2)%COLORS.length]])].forEach(([f,c]) => {
+        const valid = pts.filter(d => d[f] != null);
+        if (valid.length < 2) return;
+        const line = d3.line().x(d=>sx(d.probed_at)).y(d=>sy(d[f])).curve(d3.curveMonotoneX);
+        splitAtGaps(valid, GAP_MS, f).forEach(seg => {
+          if (seg.length < 2) return;
+          svg.append("path").datum(seg).attr("d",line).attr("fill","none").attr("stroke",c).attr("stroke-width",1).attr("opacity",.7);
+        });
+      });
+    }
+  });
+}
+
+/* ── Main chart: ALL metrics on one plot ── */
+function renderMainChart(allTokens, colorScale) {
+  const container = document.getElementById("main-chart");
+  container.innerHTML = "";
+  const visibleTokens = allTokens.filter(t => !mutedTokens.has(t));
+  const visibleData = rawData.filter(d => visibleTokens.includes(d.token_name));
+  if (!visibleData.length) { container.innerHTML = '<div id="loading">no data</div>'; return; }
+
+  const margin = {top:16,right:80,bottom:30,left:48};
+  const width = container.clientWidth - margin.left - margin.right;
+  const height = 340 - margin.top - margin.bottom;
+  const svg = d3.select(container).append("svg").attr("width",width+margin.left+margin.right).attr("height",height+margin.top+margin.bottom);
+  const g = svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleTime().domain(d3.extent(visibleData, d=>d.probed_at)).range([0,width]);
+  const y = d3.scaleLinear().domain([0,1]).range([height,0]);
+
+  g.append("g").attr("class","grid").call(d3.axisLeft(y).ticks(5).tickSize(-width).tickFormat(""));
+  [.5,.8].forEach(t => {
+    g.append("line").attr("class","threshold").attr("x1",0).attr("x2",width).attr("y1",y(t)).attr("y2",y(t))
+      .attr("stroke", t===.8?"var(--red)":"var(--yellow)");
+  });
+  g.append("g").attr("class","axis").attr("transform",`translate(0,${height})`).call(d3.axisBottom(x).ticks(width>600?8:4));
+  g.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(5).tickFormat(d=>d3.format(".0%")(d)));
+
+  const grouped = d3.group(visibleData, d=>d.token_name);
+  const metricKeys = [
+    ["utilization_5h","5h",1.5,[]],
+    ["utilization_7d","7d",1.5,"4 3"],
+    ["utilization_overage","ovg",1,"1 3"],
+    ...modelMetrics.map(m => [m.field,m.label,1.5,m.dash])
+  ];
+  document.getElementById("quota-chart-title").textContent =
+    "utilization — " + metricKeys.map(m=>m[1]).join(" / ");
+
+  // Draw lines: per token × per metric, with different dash patterns
+  grouped.forEach((pts, token) => {
+    const c = colorScale(token);
+    metricKeys.forEach(([field, label, sw, dash]) => {
+      const valid = pts.filter(d => d[field] != null);
+      if (valid.length < 2) return;
+      const line = d3.line().x(d=>x(d.probed_at)).y(d=>y(d[field])).curve(d3.curveMonotoneX);
+      const segments = splitAtGaps(valid, GAP_MS, field);
+      segments.forEach(seg => {
+        if (seg.length < 2) return;
+        if (field === "utilization_5h") {
+          const area = d3.area().x(d=>x(d.probed_at)).y0(height).y1(d=>y(d[field])).curve(d3.curveMonotoneX);
+          g.append("path").datum(seg).attr("class","chart-area").attr("fill",c).attr("d",area);
+        }
+        const p = g.append("path").datum(seg).attr("class","chart-line").attr("stroke",c).attr("stroke-width",sw).attr("d",line);
+        if (dash) p.attr("stroke-dasharray",dash);
+      });
+    });
+  });
+
+  // Legend for line styles
+  const legend = g.append("g").attr("transform",`translate(${width+8},4)`);
+  metricKeys.forEach(([_,label,sw,dash],i) => {
+    const ly = i*18;
+    const l = legend.append("line").attr("x1",0).attr("x2",20).attr("y1",ly).attr("y2",ly)
+      .attr("stroke",METRIC_COLORS[label] || "#8b949e").attr("stroke-width",sw);
+    if (dash) l.attr("stroke-dasharray",dash);
+    legend.append("text").attr("x",24).attr("y",ly+3).attr("fill","var(--text-dim)").attr("font-size","10px").text(label);
+  });
+
+  // Crosshair tooltip
+  const crosshair = g.append("line").attr("class","crosshair").attr("y1",0).attr("y2",height).style("display","none");
+  const tooltip = d3.select("#tooltip");
+  const bisect = d3.bisector(d=>d.probed_at).left;
+
+  svg.append("rect").attr("transform",`translate(${margin.left},${margin.top})`).attr("width",width).attr("height",height)
+    .attr("fill","none").attr("pointer-events","all")
+    .on("mousemove", function(event) {
+      const [mx] = d3.pointer(event,this);
+      const t = x.invert(mx);
+      crosshair.attr("x1",mx).attr("x2",mx).style("display",null);
+      let entries = [];
+      grouped.forEach((pts,token) => {
+        const i = bisect(pts,t,1);
+        const d0=pts[i-1], d1=pts[i];
+        if(!d0) return;
+        const d = d1 && (t-d0.probed_at > d1.probed_at-t) ? d1 : d0;
+        metricKeys.forEach(([field,label]) => {
+          const v = d[field];
+          if (v != null) entries.push({token, label, value:v, color:colorScale(token)});
+        });
+      });
+      entries.sort((a,b)=>b.value-a.value);
+      tooltip.style("display","block")
+        .style("left",Math.min(event.clientX+16,window.innerWidth-320)+"px")
+        .style("top",(event.clientY-10)+"px")
+        .html(`<div class="tt-time">${d3.timeFormat("%a %b %d, %H:%M")(t)}</div>` +
+          entries.map(e=>`<div class="tt-entry"><span class="tt-left"><span class="tt-dot" style="background:${e.color}"></span>${escapeHtml(e.token)} <span style="color:${METRIC_COLORS[e.label] || "#8b949e"}">${escapeHtml(e.label)}</span></span><span class="tt-val">${d3.format(".1%")(e.value)}</span></div>`).join(""));
+    })
+    .on("mouseleave", () => { crosshair.style("display","none"); tooltip.style("display","none"); });
+}
+
+/* ── Derivative chart (5h metric) ── */
+function computeDerivatives(pts, field) {
+  const derivs = [];
+  for (let i=1; i<pts.length; i++) {
+    const dt = (pts[i].probed_at-pts[i-1].probed_at)/3600000;
+    const a=pts[i-1][field], b=pts[i][field];
+    const resetField = field === "utilization_5h" ? "reset_5h"
+      : field === "utilization_7d" ? "reset_7d"
+      : field === "utilization_opus_7d" ? "reset_opus_7d"
+      : field === "utilization_sonnet_7d" ? "reset_sonnet_7d"
+      : "reset_overage";
+    if (dt<=0||dt>2||a==null||b==null||b<a) continue;
+    if (pts[i-1][resetField]!=null && pts[i][resetField]!=null && pts[i-1][resetField]!==pts[i][resetField]) continue;
+    derivs.push({ probed_at:pts[i].probed_at, rate:(b-a)/dt, token_name:pts[i].token_name });
+  }
+  return derivs;
+}
+function smoothMA(pts,w) {
+  return pts.map((_,i) => {
+    const s=Math.max(0,i-Math.floor(w/2)), e=Math.min(pts.length,i+Math.ceil(w/2));
+    return { probed_at:pts[i].probed_at, token_name:pts[i].token_name, rate:d3.mean(pts.slice(s,e),d=>d.rate) };
+  });
+}
+
+function renderDerivChart(allTokens, colorScale) {
+  const container = document.getElementById("deriv-chart");
+  container.innerHTML = "";
+  const visibleTokens = allTokens.filter(t => !mutedTokens.has(t));
+  const grouped = d3.group(rawData.filter(d => visibleTokens.includes(d.token_name)), d=>d.token_name);
+  const derivGrouped = new Map();
+  const allDerivs = [];
+  grouped.forEach((pts,token) => { const d=computeDerivatives(pts,"utilization_5h"); derivGrouped.set(token,d); allDerivs.push(...d); });
+  if (!allDerivs.length) { container.innerHTML='<div style="height:100px"></div>'; return; }
+
+  const margin={top:8,right:80,bottom:30,left:48};
+  const width=container.clientWidth-margin.left-margin.right;
+  const height=140-margin.top-margin.bottom;
+  const svg=d3.select(container).append("svg").attr("width",width+margin.left+margin.right).attr("height",height+margin.top+margin.bottom);
+  const g=svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+  const x=d3.scaleTime().domain(d3.extent(allDerivs,d=>d.probed_at)).range([0,width]);
+  const maxR=d3.max(allDerivs,d=>Math.abs(d.rate))||.1;
+  const yE=Math.max(maxR*1.2,.01);
+  const y=d3.scaleLinear().domain([-yE,yE]).range([height,0]);
+  g.append("g").attr("class","grid").call(d3.axisLeft(y).ticks(4).tickSize(-width).tickFormat(""));
+  g.append("line").attr("class","zero-line").attr("x1",0).attr("x2",width).attr("y1",y(0)).attr("y2",y(0));
+  g.append("g").attr("class","axis").attr("transform",`translate(0,${height})`).call(d3.axisBottom(x).ticks(width>600?8:4));
+  g.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(4).tickFormat(d=>(d*100).toFixed(0)+"%"));
+
+  derivGrouped.forEach((pts,token) => {
+    if (pts.length<3) return;
+    const sm=smoothMA(pts,5);
+    const c=colorScale(token);
+    const areaPos=d3.area().x(d=>x(d.probed_at)).y0(y(0)).y1(d=>y(Math.max(0,d.rate))).curve(d3.curveMonotoneX);
+    const areaNeg=d3.area().x(d=>x(d.probed_at)).y0(y(0)).y1(d=>y(Math.min(0,d.rate))).curve(d3.curveMonotoneX);
+    g.append("path").datum(sm).attr("fill",c).attr("opacity",.12).attr("d",areaPos);
+    g.append("path").datum(sm).attr("fill",c).attr("opacity",.12).attr("d",areaNeg);
+    g.append("path").datum(sm).attr("class","chart-line").attr("stroke",c).attr("stroke-width",1)
+      .attr("d",d3.line().x(d=>x(d.probed_at)).y(d=>y(d.rate)).curve(d3.curveMonotoneX));
+  });
+}
+
+/* ── Insights ── */
+function renderInsights(allTokens, colorScale) {
+  const el = document.getElementById("insights"); el.innerHTML = "";
+  const visibleTokens = allTokens.filter(t => !mutedTokens.has(t));
+  const data = rawData.filter(d => visibleTokens.includes(d.token_name));
+  if (!data.length) return;
+  const latest = new Map(); data.forEach(d=>latest.set(d.token_name,d));
+  const vals5 = [...latest.values()].map(d=>d.utilization_5h).filter(v=>v!=null);
+  const avg = d3.mean(vals5)||0;
+  const atRisk = [...latest.entries()].filter(([_,d])=>(d.utilization_5h||0)>.7);
+  const grouped = d3.group(data,d=>d.token_name);
+  let soonest = null;
+  grouped.forEach((pts,token) => {
+    const d=computeDerivatives(pts,"utilization_5h").slice(-20);
+    const r=d3.mean(d,x=>x.rate);
+    if(r>.001){const rem=1-(pts[pts.length-1].utilization_5h||0);const h=rem/r;if(!soonest||h<soonest.hours)soonest={token,hours:h};}
+  });
+  const exhaust = soonest ? (soonest.hours<1?(soonest.hours*60).toFixed(0)+"m":soonest.hours<24?soonest.hours.toFixed(1)+"h":(soonest.hours/24).toFixed(1)+"d")+` (${soonest.token})` : "stable";
+  const timeSpan = (d3.max(data,d=>d.probed_at)-d3.min(data,d=>d.probed_at))/3600000;
+  const density = timeSpan>0?data.length/timeSpan:0;
+
+  [{t:"fleet util (5h)",v:(avg*100).toFixed(0)+"%",s:`${vals5.length} tokens, range ${(d3.min(vals5)*100).toFixed(0)}–${(d3.max(vals5)*100).toFixed(0)}%`,bar:avg,bc:avg>.8?"var(--red)":avg>.5?"var(--yellow)":"var(--green)"},
+   {t:"at risk",v:atRisk.length+"",s:atRisk.length?atRisk.map(([n,d])=>`${n} ${(d.utilization_5h*100).toFixed(0)}%`).join(", "):"all healthy",bar:atRisk.length/Math.max(visibleTokens.length,1),bc:atRisk.length?"var(--red)":"var(--green)"},
+   {t:"time to exhaustion",v:exhaust.split(" (")[0],s:exhaust.includes("(")?exhaust.split(" (")[1].replace(")",""):"at current burn"},
+   {t:"probe density",v:density.toFixed(1)+"/hr",s:`${data.length.toLocaleString()} pts over ${timeSpan<24?timeSpan.toFixed(1)+"h":(timeSpan/24).toFixed(1)+"d"}`},
+  ].forEach(c => {
+    const d=document.createElement("div"); d.className="insight-card";
+    d.innerHTML=`<h3>${escapeHtml(c.t)}</h3><div class="insight-metric">${escapeHtml(c.v)}</div><div class="insight-sub">${escapeHtml(c.s)}</div>${c.bar!=null?`<div class="insight-bar"><div class="insight-bar-fill" style="width:${Math.min(c.bar*100,100)}%;background:${c.bc}"></div></div>`:""}`;
+    el.appendChild(d);
+  });
+}
+
+/* ── Heatmap (5h) ── */
+function renderHeatmap(allTokens, colorScale) {
+  const el = document.getElementById("heatmap"); el.innerHTML = "";
+  const vis = allTokens.filter(t=>!mutedTokens.has(t));
+  const hm = rawData.filter(d=>d.utilization_5h!=null&&vis.includes(d.token_name));
+  if(!hm.length) return;
+  const buckets = new Map();
+  hm.forEach(d=>{const k=d.token_name+"|"+d.probed_at.getHours();if(!buckets.has(k))buckets.set(k,[]);buckets.get(k).push(d.utilization_5h);});
+  vis.forEach(token=>{
+    const row=document.createElement("div");row.className="heatmap-row";
+    row.innerHTML=`<span class="heatmap-label">${escapeHtml(token)}</span>`;
+    for(let h=0;h<24;h++){
+      const vals=buckets.get(token+"|"+h)||[];
+      const avg=vals.length?d3.mean(vals):null;
+      const cell=document.createElement("div");cell.className="heatmap-cell";
+      cell.title=`${token} @ ${h}:00 — ${avg!=null?(avg*100).toFixed(1)+"%":"n/a"} (${vals.length})`;
+      if(avg!=null){const int=Math.pow(avg,.7);cell.style.background=avg>.8?`rgba(248,81,73,${.2+int*.6})`:avg>.5?`rgba(210,153,34,${.2+int*.6})`:`rgba(63,185,80,${.2+int*.6})`;
+      }else{cell.style.background="var(--surface)";}
+      row.appendChild(cell);
+    }
+    el.appendChild(row);
+  });
+  const labels=document.createElement("div");labels.className="heatmap-row";labels.innerHTML='<span class="heatmap-label"></span>';
+  for(let h=0;h<24;h++){const l=document.createElement("div");l.className="heatmap-cell";l.style.cssText="background:none;font-size:9px;color:var(--text-dim);text-align:center;line-height:14px";l.textContent=h%3===0?h+"h":"";labels.appendChild(l);}
+  el.appendChild(labels);
+}
+
+/* ── Distribution (5h) ── */
+function renderDistribution(allTokens) {
+  const el = document.getElementById("distribution"); el.innerHTML = "";
+  const vis = rawData.filter(d=>!mutedTokens.has(d.token_name)&&d.utilization_5h!=null);
+  if(!vis.length) return;
+  const bkts=Array.from({length:10},(_,i)=>({min:i*.1,max:(i+1)*.1+(i===9?.01:0),label:`${i*10}–${(i+1)*10}%`}));
+  const counts=bkts.map(b=>({...b,count:vis.filter(d=>d.utilization_5h>=b.min&&d.utilization_5h<b.max).length}));
+  const mx=d3.max(counts,d=>d.count)||1;
+  counts.forEach(b=>{
+    const bc=b.min>=.8?"var(--red)":b.min>=.5?"var(--yellow)":"var(--green)";
+    const r=document.createElement("div");r.className="dist-bar";
+    r.innerHTML=`<span class="dist-label">${b.label}</span><div class="dist-track"><div class="dist-fill" style="width:${(b.count/mx*100).toFixed(1)}%;background:${bc}"></div></div><span class="dist-count">${(b.count/vis.length*100).toFixed(1)}%</span>`;
+    el.appendChild(r);
+  });
+}
+
+/* ══════════════════════════════════════
+   SESSIONS TAB
+   ══════════════════════════════════════ */
+let sessionsData = [], sessionsLoaded = false, expandedSession = null;
+
+async function loadSessions() {
+  sessionsLoaded = true;
+  const resp = await fetch("/api/sessions");
+  sessionsData = await resp.json();
+  renderSessions();
+}
+
+document.getElementById("session-search").addEventListener("input", renderSessions);
+document.getElementById("session-outcome-filter").addEventListener("change", renderSessions);
+
+function filteredSessions() {
+  const q = document.getElementById("session-search").value.toLowerCase();
+  const outcome = document.getElementById("session-outcome-filter").value;
+  return sessionsData.filter(s => {
+    if (q && !(s.project_short||"").toLowerCase().includes(q) && !(s.brief_summary||"").toLowerCase().includes(q) && !(s.first_prompt||"").toLowerCase().includes(q)) return false;
+    if (outcome && s.outcome !== outcome) return false;
+    return true;
+  });
+}
+
+function renderSessions() {
+  const sessions = filteredSessions();
+  document.getElementById("session-status").textContent = `${sessions.length} sessions`;
+  renderSessionsTimeline(sessions);
+  renderTokensTimeline(sessions);
+  renderProjectsBar(sessions);
+  renderToolsBar(sessions);
+  renderSessionList(sessions);
+}
+
+function renderSessionsTimeline(sessions) {
+  const el = document.getElementById("sessions-timeline-chart"); el.innerHTML = "";
+  if (!sessions.length) return;
+  // Group by day
+  const byDay = d3.rollup(sessions.filter(s=>s.start_time), v=>v.length, d=>d3.timeDay.floor(new Date(d.start_time)).toISOString());
+  const data = [...byDay.entries()].map(([k,v])=>({date:new Date(k),count:v})).sort((a,b)=>a.date-b.date);
+  const margin={top:4,right:8,bottom:20,left:30};
+  const w=el.clientWidth-margin.left-margin.right, h=80-margin.top-margin.bottom;
+  const svg=d3.select(el).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom);
+  const g=svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+  const x=d3.scaleTime().domain(d3.extent(data,d=>d.date)).range([0,w]);
+  const y=d3.scaleLinear().domain([0,d3.max(data,d=>d.count)]).nice().range([h,0]);
+  g.append("g").attr("class","axis").attr("transform",`translate(0,${h})`).call(d3.axisBottom(x).ticks(5));
+  g.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(3));
+  const bw=Math.max(2,w/data.length-1);
+  g.selectAll("rect").data(data).join("rect").attr("x",d=>x(d.date)-bw/2).attr("y",d=>y(d.count)).attr("width",bw).attr("height",d=>h-y(d.count)).attr("fill","var(--blue)").attr("rx",1);
+}
+
+function renderTokensTimeline(sessions) {
+  const el = document.getElementById("tokens-timeline-chart"); el.innerHTML = "";
+  if (!sessions.length) return;
+  const byDay = d3.rollup(sessions.filter(s=>s.start_time), v=>d3.sum(v,d=>(d.input_tokens||0)+(d.output_tokens||0)), d=>d3.timeDay.floor(new Date(d.start_time)).toISOString());
+  const data = [...byDay.entries()].map(([k,v])=>({date:new Date(k),tokens:v})).sort((a,b)=>a.date-b.date);
+  const margin={top:4,right:8,bottom:20,left:40};
+  const w=el.clientWidth-margin.left-margin.right, h=80-margin.top-margin.bottom;
+  const svg=d3.select(el).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom);
+  const g=svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+  const x=d3.scaleTime().domain(d3.extent(data,d=>d.date)).range([0,w]);
+  const y=d3.scaleLinear().domain([0,d3.max(data,d=>d.tokens)]).nice().range([h,0]);
+  g.append("g").attr("class","axis").attr("transform",`translate(0,${h})`).call(d3.axisBottom(x).ticks(5));
+  g.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(3).tickFormat(d=>d>=1e6?(d/1e6).toFixed(1)+"M":d>=1e3?(d/1e3).toFixed(0)+"k":d));
+  const area=d3.area().x(d=>x(d.date)).y0(h).y1(d=>y(d.tokens)).curve(d3.curveMonotoneX);
+  g.append("path").datum(data).attr("fill","var(--purple)").attr("opacity",.3).attr("d",area);
+  g.append("path").datum(data).attr("fill","none").attr("stroke","var(--purple)").attr("stroke-width",1.5)
+    .attr("d",d3.line().x(d=>x(d.date)).y(d=>y(d.tokens)).curve(d3.curveMonotoneX));
+}
+
+function renderProjectsBar(sessions) {
+  const el = document.getElementById("projects-bar-chart"); el.innerHTML = "";
+  const byProj = d3.rollup(sessions, v=>v.length, d=>d.project_short||"?");
+  const data = [...byProj.entries()].map(([k,v])=>({name:k,count:v})).sort((a,b)=>b.count-a.count).slice(0,12);
+  const margin={top:4,right:8,bottom:4,left:80};
+  const bh=16, gap=2;
+  const h=data.length*(bh+gap);
+  const w=el.clientWidth-margin.left-margin.right;
+  const svg=d3.select(el).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom);
+  const g=svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+  const x=d3.scaleLinear().domain([0,d3.max(data,d=>d.count)]).range([0,w]);
+  data.forEach((d,i)=>{
+    const y=i*(bh+gap);
+    g.append("rect").attr("x",0).attr("y",y).attr("width",x(d.count)).attr("height",bh).attr("fill","var(--blue)").attr("opacity",.6).attr("rx",2);
+    g.append("text").attr("x",-4).attr("y",y+bh/2+3).attr("text-anchor","end").attr("fill","var(--text-dim)").attr("font-size","10px").text(d.name);
+    g.append("text").attr("x",x(d.count)+4).attr("y",y+bh/2+3).attr("fill","var(--text-dim)").attr("font-size","10px").text(d.count);
+  });
+}
+
+function renderToolsBar(sessions) {
+  const el = document.getElementById("tools-bar-chart"); el.innerHTML = "";
+  const totals = {};
+  sessions.forEach(s=>{if(s.tool_counts)Object.entries(s.tool_counts).forEach(([k,v])=>{totals[k]=(totals[k]||0)+v;});});
+  const data=Object.entries(totals).map(([k,v])=>({name:k,count:v})).sort((a,b)=>b.count-a.count).slice(0,12);
+  if(!data.length) return;
+  const margin={top:4,right:8,bottom:4,left:80};
+  const bh=16,gap=2,h=data.length*(bh+gap);
+  const w=el.clientWidth-margin.left-margin.right;
+  const svg=d3.select(el).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom);
+  const g=svg.append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+  const x=d3.scaleLinear().domain([0,d3.max(data,d=>d.count)]).range([0,w]);
+  const tc=d3.scaleOrdinal().domain(data.map(d=>d.name)).range(COLORS);
+  data.forEach((d,i)=>{
+    const y=i*(bh+gap);
+    g.append("rect").attr("x",0).attr("y",y).attr("width",x(d.count)).attr("height",bh).attr("fill",tc(d.name)).attr("opacity",.6).attr("rx",2);
+    g.append("text").attr("x",-4).attr("y",y+bh/2+3).attr("text-anchor","end").attr("fill","var(--text-dim)").attr("font-size","10px").text(d.name);
+    g.append("text").attr("x",x(d.count)+4).attr("y",y+bh/2+3).attr("fill","var(--text-dim)").attr("font-size","10px").text(d.count.toLocaleString());
+  });
+}
+
+function renderSessionList(sessions) {
+  const el = document.getElementById("session-list"); el.innerHTML = "";
+  const sorted = [...sessions].sort((a,b)=>(b.start_time||"").localeCompare(a.start_time||""));
+  document.getElementById("sessions-list-title").textContent = `sessions (${sorted.length})`;
+
+  sorted.forEach(s => {
+    const row = document.createElement("div");
+    row.className = "session-row";
+    const date = s.start_time ? new Date(s.start_time) : null;
+    const dur = s.duration_minutes||0;
+    const tokens = ((s.input_tokens||0)+(s.output_tokens||0));
+    const outcomeClass = s.outcome === "fully_achieved" ? "outcome-full" : s.outcome === "mostly_achieved" ? "outcome-mostly" : s.outcome === "partially_achieved" ? "outcome-partial" : s.outcome === "not_achieved" ? "outcome-not" : "outcome-unknown";
+    const summary = s.brief_summary || s.first_prompt || "";
+
+    row.innerHTML = `
+      <span class="session-date">${date ? d3.timeFormat("%b %d %H:%M")(date) : "?"}</span>
+      <span class="session-project">${escapeHtml(s.project_short)}</span>
+      <span class="session-summary" title="${escapeHtml(summary)}"><span class="outcome-dot ${outcomeClass}"></span>${escapeHtml(summary.slice(0,80))}</span>
+      <span class="session-stat"><span class="val">${dur<60?dur.toFixed(0)+"m":(dur/60).toFixed(1)+"h"}</span></span>
+      <span class="session-stat"><span class="val">${tokens>=1e6?(tokens/1e6).toFixed(1)+"M":tokens>=1e3?(tokens/1e3).toFixed(0)+"k":tokens}</span> <span class="unit">tok</span></span>
+      <span class="session-stat"><span class="val">+${s.lines_added||0}</span> <span class="unit">ln</span></span>`;
+
+    const detail = document.createElement("div");
+    detail.className = "session-detail-panel";
+    detail.id = "detail-" + s.session_id;
+
+    row.addEventListener("click", async () => {
+      if (expandedSession === s.session_id) {
+        detail.classList.remove("open");
+        row.classList.remove("expanded");
+        expandedSession = null;
+        return;
+      }
+      // Collapse previous
+      document.querySelectorAll(".session-detail-panel.open").forEach(x=>x.classList.remove("open"));
+      document.querySelectorAll(".session-row.expanded").forEach(x=>x.classList.remove("expanded"));
+      expandedSession = s.session_id;
+      row.classList.add("expanded");
+      detail.classList.add("open");
+
+      // Populate detail
+      const toolBars = s.tool_counts ? Object.entries(s.tool_counts).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
+        const mx=Math.max(...Object.values(s.tool_counts));
+        return `<div class="tool-bar-row"><span class="tool-bar-name">${escapeHtml(k)}</span><div class="tool-bar-track"><div class="tool-bar-fill" style="width:${v/mx*100}%"></div></div><span class="tool-bar-count">${v}</span></div>`;
+      }).join("") : "";
+
+      detail.innerHTML = `
+        <div class="detail-grid">
+          <div class="detail-section">
+            <h4>summary</h4>
+            <p>${escapeHtml(s.brief_summary||"no summary available")}</p>
+            ${s.underlying_goal ? `<h4 style="margin-top:10px">goal</h4><p>${escapeHtml(s.underlying_goal)}</p>` : ""}
+            ${s.friction_detail ? `<h4 style="margin-top:10px">friction</h4><p style="color:var(--yellow)">${escapeHtml(s.friction_detail)}</p>` : ""}
+          </div>
+          <div class="detail-section">
+            <h4>tools</h4>
+            ${toolBars}
+            <div style="margin-top:10px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-dim)">
+              <span>outcome: <b style="color:var(--text)">${escapeHtml(s.outcome||"?")}</b></span>
+              <span>type: <b style="color:var(--text)">${escapeHtml(s.session_type||"?")}</b></span>
+              <span>helpfulness: <b style="color:var(--text)">${escapeHtml(s.claude_helpfulness||"?")}</b></span>
+              ${s.user_interruptions ? `<span>interruptions: <b style="color:var(--yellow)">${s.user_interruptions}</b></span>` : ""}
+              ${s.tool_errors ? `<span>errors: <b style="color:var(--red)">${s.tool_errors}</b></span>` : ""}
+            </div>
+          </div>
+        </div>
+        <div class="detail-section">
+          <h4>event timeline</h4>
+          <div class="event-timeline" id="events-${escapeHtml(s.session_id)}">loading events...</div>
+        </div>`;
+
+      // Load events
+      try {
+        const resp = await fetch(`/api/session-detail?session_id=${encodeURIComponent(s.session_id)}`);
+        const events = await resp.json();
+        renderEventTimeline(s.session_id, events);
+      } catch(e) {
+        document.getElementById("events-"+s.session_id).textContent = "failed to load events";
+      }
+    });
+
+    el.appendChild(row);
+    el.appendChild(detail);
+  });
+}
+
+function renderEventTimeline(sid, events) {
+  const el = document.getElementById("events-" + sid);
+  if (!events.length) { el.textContent = "no events"; return; }
+  el.innerHTML = "";
+
+  // Render as a dense pip strip
+  const container = document.createElement("div");
+  container.className = "event-lane";
+  container.title = `${events.length} events`;
+
+  // Deduplicate consecutive same-type events for density
+  let lastType = null, count = 0;
+  const condensed = [];
+  events.forEach(e => {
+    if (e.type === lastType) { count++; }
+    else { if (lastType) condensed.push({type:lastType,count}); lastType = e.type; count = 1; }
+  });
+  if (lastType) condensed.push({type:lastType, count});
+
+  condensed.forEach(e => {
+    const pip = document.createElement("div");
+    pip.className = "event-pip " + e.type;
+    pip.style.width = Math.min(Math.max(e.count * 2, 4), 40) + "px";
+    pip.title = `${e.type} x${e.count}`;
+    container.appendChild(pip);
+  });
+
+  el.appendChild(container);
+
+  // Legend
+  const legend = document.createElement("div");
+  legend.style.cssText = "display:flex; gap:12px; margin-top:6px; font-size:10px; color:var(--text-dim)";
+  ["user","assistant","tool_use","agent","system"].forEach(t => {
+    legend.innerHTML += `<span><span class="event-pip ${t}" style="display:inline-block;width:8px;height:8px;vertical-align:middle;margin-right:3px"></span>${t}</span>`;
+  });
+  el.appendChild(legend);
+}
+
+window.addEventListener("resize", () => {
+  if (document.getElementById("tab-quota").classList.contains("active")) renderQuota();
+  else if (sessionsLoaded) renderSessions();
+});
+</script>
+</body>
+</html>

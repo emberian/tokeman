@@ -9,6 +9,8 @@ struct TokenResult: Codable, Identifiable {
     let token_name: String
     let probed_at: String
     let quota: Quota?
+    let model_usage: ModelUsage?
+    let model_usage_error: String?
     let error: String?
 
     struct Quota: Codable {
@@ -23,6 +25,11 @@ struct TokenResult: Codable, Identifiable {
         let utilization: Double
         let reset: Int64
     }
+
+    struct ModelUsage: Codable {
+        let opus_weekly: Window?
+        let sonnet_weekly: Window?
+    }
 }
 
 // MARK: - History model (matches `tokeman history --json` output)
@@ -36,10 +43,16 @@ struct HistorySnapshot: Codable, Identifiable {
     let reset_5h: Int64?
     let utilization_7d: Double?
     let reset_7d: Int64?
+    let utilization_opus_7d: Double?
+    let reset_opus_7d: Int64?
+    let utilization_sonnet_7d: Double?
+    let reset_sonnet_7d: Int64?
     let representative_claim: String?
     let overage_status: String?
     let utilization_overage: Double?
     let reset_overage: Int64?
+    let error: String?
+    let model_usage_error: String?
 
     var probedDate: Date {
         let formatter = ISO8601DateFormatter()
@@ -53,6 +66,8 @@ struct HistorySnapshot: Codable, Identifiable {
         switch window {
         case .fiveHour: return utilization_5h.map { max(0, (1.0 - $0) * 100) }
         case .sevenDay: return utilization_7d.map { max(0, (1.0 - $0) * 100) }
+        case .opusWeekly: return utilization_opus_7d.map { max(0, (1.0 - $0) * 100) }
+        case .sonnetWeekly: return utilization_sonnet_7d.map { max(0, (1.0 - $0) * 100) }
         case .overage: return utilization_overage.map { max(0, (1.0 - $0) * 100) }
         }
     }
@@ -61,6 +76,8 @@ struct HistorySnapshot: Codable, Identifiable {
 enum ChartWindowType: String, CaseIterable {
     case fiveHour = "5h"
     case sevenDay = "7d"
+    case opusWeekly = "Opus"
+    case sonnetWeekly = "Sonnet"
     case overage = "$$"
 }
 
@@ -70,6 +87,7 @@ struct TokemanConfig {
     struct Token {
         let name: String
         let key: String
+        let usageKey: String?
     }
     struct Settings {
         var launchArgs: [String] = []
@@ -78,9 +96,18 @@ struct TokemanConfig {
         var claudeBin: String? = nil
         var probeIntervalSecs: Int = 30
     }
+    struct Rotation {
+        var normalMin5hRemaining = 0.10
+        var normalMin7dRemaining = 0.05
+        var sipMin5hRemaining = 0.02
+        var sipMin7dRemaining = 0.03
+        var normalProbeIntervalSecs = 120
+        var sipProbeIntervalSecs = 20
+    }
 
     var tokens: [Token] = []
     var settings: Settings = Settings()
+    var rotation: Rotation = Rotation()
 
     static var configPath: String {
         let configDir = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
@@ -97,6 +124,7 @@ struct TokemanConfig {
         var section = ""
         var curName: String?
         var curKey: String?
+        var curUsageKey: String?
 
         for line in content.components(separatedBy: "\n") {
             let t = line.trimmingCharacters(in: .whitespaces)
@@ -104,17 +132,24 @@ struct TokemanConfig {
 
             if t == "[[tokens]]" {
                 if let n = curName, let k = curKey {
-                    config.tokens.append(Token(name: n, key: k))
+                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
                 }
-                curName = nil; curKey = nil
+                curName = nil; curKey = nil; curUsageKey = nil
                 section = "tokens"; continue
             }
             if t == "[settings]" {
                 if let n = curName, let k = curKey {
-                    config.tokens.append(Token(name: n, key: k))
+                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
                 }
-                curName = nil; curKey = nil
+                curName = nil; curKey = nil; curUsageKey = nil
                 section = "settings"; continue
+            }
+            if t == "[rotation]" {
+                if let n = curName, let k = curKey {
+                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
+                }
+                curName = nil; curKey = nil; curUsageKey = nil
+                section = "rotation"; continue
             }
 
             guard let eq = t.firstIndex(of: "=") else { continue }
@@ -124,6 +159,7 @@ struct TokemanConfig {
             if section == "tokens" {
                 if key == "name" { curName = unquote(val) }
                 if key == "key" { curKey = unquote(val) }
+                if key == "usage_key" { curUsageKey = unquote(val) }
             } else if section == "settings" {
                 switch key {
                 case "dangerous_mode": config.settings.dangerousMode = val == "true"
@@ -133,10 +169,20 @@ struct TokemanConfig {
                 case "launch_args": config.settings.launchArgs = parseArray(val)
                 default: break
                 }
+            } else if section == "rotation" {
+                switch key {
+                case "normal_min_5h_remaining": config.rotation.normalMin5hRemaining = Double(val) ?? 0.10
+                case "normal_min_7d_remaining": config.rotation.normalMin7dRemaining = Double(val) ?? 0.05
+                case "sip_min_5h_remaining": config.rotation.sipMin5hRemaining = Double(val) ?? 0.02
+                case "sip_min_7d_remaining": config.rotation.sipMin7dRemaining = Double(val) ?? 0.03
+                case "normal_probe_interval_secs": config.rotation.normalProbeIntervalSecs = Int(val) ?? 120
+                case "sip_probe_interval_secs": config.rotation.sipProbeIntervalSecs = Int(val) ?? 20
+                default: break
+                }
             }
         }
         if let n = curName, let k = curKey {
-            config.tokens.append(Token(name: n, key: k))
+            config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
         }
         return config
     }
@@ -147,6 +193,9 @@ struct TokemanConfig {
             lines.append("[[tokens]]")
             lines.append("name = \"\(Self.escapeToml(token.name))\"")
             lines.append("key = \"\(Self.escapeToml(token.key))\"")
+            if let usageKey = token.usageKey {
+                lines.append("usage_key = \"\(Self.escapeToml(usageKey))\"")
+            }
             lines.append("")
         }
         lines.append("[settings]")
@@ -165,9 +214,32 @@ struct TokemanConfig {
         }
         lines.append("probe_interval_secs = \(settings.probeIntervalSecs)")
         lines.append("")
+        lines.append("[rotation]")
+        lines.append("normal_min_5h_remaining = \(rotation.normalMin5hRemaining)")
+        lines.append("normal_min_7d_remaining = \(rotation.normalMin7dRemaining)")
+        lines.append("sip_min_5h_remaining = \(rotation.sipMin5hRemaining)")
+        lines.append("sip_min_7d_remaining = \(rotation.sipMin7dRemaining)")
+        lines.append("normal_probe_interval_secs = \(rotation.normalProbeIntervalSecs)")
+        lines.append("sip_probe_interval_secs = \(rotation.sipProbeIntervalSecs)")
+        lines.append("")
 
         let content = lines.joined(separator: "\n")
-        try? content.write(toFile: Self.configPath, atomically: true, encoding: .utf8)
+        let url = URL(fileURLWithPath: Self.configPath)
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try content.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: Self.configPath
+            )
+        } catch {
+            fputs("tokeman tray: failed to save config: \(error)\n", stderr)
+        }
     }
 
     private static func escapeToml(_ s: String) -> String {
@@ -177,6 +249,10 @@ struct TokemanConfig {
 
     private static func unquote(_ s: String) -> String {
         if s.hasPrefix("\"") && s.hasSuffix("\"") && s.count >= 2 {
+            if let data = s.data(using: .utf8),
+               let value = try? JSONSerialization.jsonObject(with: data) as? String {
+                return value
+            }
             return String(s.dropFirst().dropLast())
         }
         return s
@@ -184,10 +260,31 @@ struct TokemanConfig {
 
     private static func parseArray(_ s: String) -> [String] {
         let inner = s.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return inner.components(separatedBy: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .map { unquote($0) }
-            .filter { !$0.isEmpty }
+        var values: [String] = []
+        var current = ""
+        var quoted = false
+        var escaped = false
+        for character in inner {
+            if escaped {
+                current.append(character)
+                escaped = false
+            } else if character == "\\" && quoted {
+                current.append(character)
+                escaped = true
+            } else if character == "\"" {
+                current.append(character)
+                quoted.toggle()
+            } else if character == "," && !quoted {
+                let value = unquote(current.trimmingCharacters(in: .whitespaces))
+                if !value.isEmpty { values.append(value) }
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        let value = unquote(current.trimmingCharacters(in: .whitespaces))
+        if !value.isEmpty { values.append(value) }
+        return values
     }
 }
 
@@ -224,16 +321,42 @@ class TokemanViewModel: ObservableObject {
     }
 
     var bestToken: TokenResult? {
-        tokens
-            .filter { $0.quota?.status == "allowed" || $0.quota?.status == "allowed_warning" }
-            .min(by: { ($0.quota?.weekly?.utilization ?? 1.0) < ($1.quota?.weekly?.utilization ?? 1.0) })
+        let allowed = tokens.filter {
+            ($0.quota?.status == "allowed" || $0.quota?.status == "allowed_warning")
+                && $0.error == nil
+        }
+        let normal = allowed.filter {
+            ($0.quota?.session.map { 1.0 - $0.utilization } ?? 0) > config.rotation.normalMin5hRemaining
+                && ($0.quota?.weekly.map { 1.0 - $0.utilization } ?? 0) > config.rotation.normalMin7dRemaining
+        }
+        if !normal.isEmpty {
+            return normal.min {
+                let lhs = ($0.quota?.weekly?.utilization ?? 1.0,
+                           $0.quota?.session?.utilization ?? 1.0)
+                let rhs = ($1.quota?.weekly?.utilization ?? 1.0,
+                           $1.quota?.session?.utilization ?? 1.0)
+                return lhs < rhs
+            }
+        }
+        // Sip-and-drain: once normal capacity is gone, sample/rotate against the
+        // 2% five-hour and 3% weekly floors and prefer immediate 5h headroom.
+        return allowed.filter {
+            ($0.quota?.session.map { 1.0 - $0.utilization } ?? 0) > config.rotation.sipMin5hRemaining
+                && ($0.quota?.weekly.map { 1.0 - $0.utilization } ?? 0) > config.rotation.sipMin7dRemaining
+        }.min {
+            let lhs = ($0.quota?.session?.utilization ?? 1.0,
+                       $0.quota?.weekly?.utilization ?? 1.0)
+            let rhs = ($1.quota?.session?.utilization ?? 1.0,
+                       $1.quota?.weekly?.utilization ?? 1.0)
+            return lhs < rhs
+        }
     }
 
     func startPolling() {
         probe()
         loadHistory()
         timer?.invalidate()
-        let interval = TimeInterval(config.settings.probeIntervalSecs)
+        let interval = TimeInterval(max(1, config.settings.probeIntervalSecs))
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.probe() }
         }
@@ -304,14 +427,22 @@ class TokemanViewModel: ObservableObject {
     }
 
     func launchToken(_ name: String) {
-        guard let tok = config.tokens.first(where: { $0.name == name }) else { return }
+        guard config.tokens.contains(where: { $0.name == name }) else { return }
         let bin = config.settings.claudeBin ?? "claude"
         var args = config.settings.launchArgs
         if config.settings.dangerousMode && !args.contains("--dangerously-skip-permissions") {
             args.append("--dangerously-skip-permissions")
         }
-        let cmd = ([bin] + args).joined(separator: " ")
-        launchTerminal(cmd: cmd, tokenKey: tok.key, terminal: config.settings.terminal)
+        let cmd = ([bin] + args).map(shellQuote).joined(separator: " ")
+        Task {
+            let tokeman = findTokenman()
+            let result = await shell(tokeman, args: ["rotate", "use", name])
+            guard !result.isEmpty else {
+                probeError = "Could not activate \(name) through tokeman"
+                return
+            }
+            launchTerminal(cmd: cmd, terminal: config.settings.terminal)
+        }
     }
 
     func launchBest() {
@@ -376,27 +507,39 @@ class TokemanViewModel: ObservableObject {
         }
     }
 
-    private func launchTerminal(cmd: String, tokenKey: String, terminal: String?) {
-        let escaped_key = tokenKey.replacingOccurrences(of: "'", with: "'\\''")
-        let escaped_cmd = cmd.replacingOccurrences(of: "'", with: "'\\''")
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func appleScriptQuote(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func launchTerminal(cmd: String, terminal: String?) {
         let app = terminal ?? "Terminal"
 
         let script: String
         switch app.lowercased() {
         case "iterm2", "iterm":
+            let badge = "printf '\\033]1337;SetBadgeFormat=dG9rZW1hbiDCtyBtYW5hZ2Vk\\007'; "
+            let escaped_cmd = appleScriptQuote(badge + cmd)
             script = """
             tell application "iTerm2"
+                activate
                 create window with default profile
                 tell current session of current window
-                    write text "export CLAUDE_CODE_OAUTH_TOKEN='\(escaped_key)'; \(escaped_cmd)"
+                    set name to "Claude · tokeman"
+                    write text "\(escaped_cmd)"
                 end tell
             end tell
             """
         default:
+            let escaped_cmd = appleScriptQuote(cmd)
             script = """
             tell application "Terminal"
                 activate
-                do script "export CLAUDE_CODE_OAUTH_TOKEN='\(escaped_key)'; \(escaped_cmd)"
+                do script "\(escaped_cmd)"
             end tell
             """
         }
@@ -437,7 +580,7 @@ struct GaugeRow: View {
                 Text(label)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: 22, alignment: .trailing)
+                    .frame(width: 34, alignment: .trailing)
 
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
@@ -456,7 +599,7 @@ struct GaugeRow: View {
             }
 
             HStack {
-                Spacer().frame(width: 28)
+                Spacer().frame(width: 40)
                 Text("resets \(resetText)")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
@@ -633,6 +776,16 @@ struct TokenCard: View {
             if let q = token.quota {
                 if let s = q.session { GaugeRow(label: "5h", window: s) }
                 if let w = q.weekly { GaugeRow(label: "7d", window: w) }
+                if let w = token.model_usage?.opus_weekly {
+                    GaugeRow(label: "Opus", window: w)
+                } else {
+                    UnavailableGaugeRow(label: "Opus")
+                }
+                if let w = token.model_usage?.sonnet_weekly {
+                    GaugeRow(label: "Son", window: w)
+                } else {
+                    UnavailableGaugeRow(label: "Son")
+                }
                 if let o = q.overage { GaugeRow(label: "$$", window: o) }
 
                 // Mini chart (7d trend)
@@ -670,6 +823,23 @@ struct TokenCard: View {
         case "allowed_warning": return .orange
         case "rejected": return .red
         default: return .secondary
+        }
+    }
+}
+
+struct UnavailableGaugeRow: View {
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .trailing)
+            Text("profile usage unavailable")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+            Spacer()
         }
     }
 }

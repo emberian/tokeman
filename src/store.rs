@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::probe::ProbeResult;
+use crate::probe::{ModelQuotaBucket, ProbeResult};
 
 pub struct Store {
     conn: Connection,
@@ -25,6 +26,13 @@ pub struct Snapshot {
     pub overage_status: Option<String>,
     pub utilization_overage: Option<f64>,
     pub reset_overage: Option<i64>,
+    pub error: Option<String>,
+    pub utilization_opus_7d: Option<f64>,
+    pub reset_opus_7d: Option<i64>,
+    pub utilization_sonnet_7d: Option<f64>,
+    pub reset_sonnet_7d: Option<i64>,
+    pub model_usage_error: Option<String>,
+    pub model_usage_buckets: Vec<ModelQuotaBucket>,
 }
 
 impl Store {
@@ -35,6 +43,10 @@ impl Store {
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        set_private_permissions(&path)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -66,11 +78,34 @@ impl Store {
                 representative_claim TEXT,
                 overage_status TEXT,
                 utilization_overage REAL,
-                reset_overage INTEGER
+                reset_overage INTEGER,
+                error TEXT,
+                utilization_opus_7d REAL,
+                reset_opus_7d INTEGER,
+                utilization_sonnet_7d REAL,
+                reset_sonnet_7d INTEGER,
+                model_usage_error TEXT,
+                model_usage_buckets TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time
                 ON snapshots(token_name, probed_at);",
         )?;
+        // Existing databases predate sanitized probe-error persistence.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE snapshots ADD COLUMN error TEXT", []);
+        for column in [
+            "utilization_opus_7d REAL",
+            "reset_opus_7d INTEGER",
+            "utilization_sonnet_7d REAL",
+            "reset_sonnet_7d INTEGER",
+            "model_usage_error TEXT",
+            "model_usage_buckets TEXT",
+        ] {
+            let _ = self
+                .conn
+                .execute(&format!("ALTER TABLE snapshots ADD COLUMN {column}"), []);
+        }
         Ok(())
     }
 
@@ -89,21 +124,59 @@ impl Store {
             ),
             None => (None, None, None, None, None, None, None, None, None),
         };
+        let (u_opus, r_opus, u_sonnet, r_sonnet) = result
+            .model_usage
+            .as_ref()
+            .map(|usage| {
+                (
+                    usage.opus_weekly.as_ref().map(|window| window.utilization),
+                    usage.opus_weekly.as_ref().map(|window| window.reset),
+                    usage
+                        .sonnet_weekly
+                        .as_ref()
+                        .map(|window| window.utilization),
+                    usage.sonnet_weekly.as_ref().map(|window| window.reset),
+                )
+            })
+            .unwrap_or((None, None, None, None));
+        let model_usage_buckets = result
+            .model_usage
+            .as_ref()
+            .map(|usage| serde_json::to_string(&usage.buckets()))
+            .transpose()?;
 
         self.conn.execute(
             "INSERT INTO snapshots (
                 token_name, probed_at,
                 unified_status, utilization_5h, reset_5h,
                 utilization_7d, reset_7d, representative_claim,
-                overage_status, utilization_overage, reset_overage
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                overage_status, utilization_overage, reset_overage, error,
+                utilization_opus_7d, reset_opus_7d,
+                utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                model_usage_buckets
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18
+            )",
             params![
                 result.token_name,
                 result.probed_at.to_rfc3339(),
                 unified_status,
-                u5h, r5h,
-                u7d, r7d, rep,
-                ov_status, u_ov, r_ov,
+                u5h,
+                r5h,
+                u7d,
+                r7d,
+                rep,
+                ov_status,
+                u_ov,
+                r_ov,
+                result.error.as_deref(),
+                u_opus,
+                r_opus,
+                u_sonnet,
+                r_sonnet,
+                result.model_usage_error.as_deref(),
+                model_usage_buckets,
             ],
         )?;
         Ok(())
@@ -114,14 +187,20 @@ impl Store {
             Some(_) => (
                 "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                         utilization_7d, reset_7d, representative_claim,
-                        overage_status, utilization_overage, reset_overage
+                        overage_status, utilization_overage, reset_overage, error,
+                        utilization_opus_7d, reset_opus_7d,
+                        utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                        model_usage_buckets
                  FROM snapshots WHERE token_name = ?1 ORDER BY probed_at DESC LIMIT ?2",
                 true,
             ),
             None => (
                 "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                         utilization_7d, reset_7d, representative_claim,
-                        overage_status, utilization_overage, reset_overage
+                        overage_status, utilization_overage, reset_overage, error,
+                        utilization_opus_7d, reset_opus_7d,
+                        utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                        model_usage_buckets
                  FROM snapshots ORDER BY probed_at DESC LIMIT ?1",
                 false,
             ),
@@ -141,18 +220,35 @@ impl Store {
         Ok(snapshots)
     }
 
-    pub fn for_token_since(
-        &self,
-        token_name: &str,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<Snapshot>> {
+    pub fn for_token_since(&self, token_name: &str, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
         let mut stmt = self.conn.prepare(
             "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                     utilization_7d, reset_7d, representative_claim,
-                    overage_status, utilization_overage, reset_overage
+                    overage_status, utilization_overage, reset_overage, error,
+                    utilization_opus_7d, reset_opus_7d,
+                    utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                    model_usage_buckets
              FROM snapshots WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
         )?;
         let rows = stmt.query_map(params![token_name, since.to_rfc3339()], Self::map_row)?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(row?);
+        }
+        Ok(snapshots)
+    }
+
+    pub fn all(&self) -> Result<Vec<Snapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
+                    utilization_7d, reset_7d, representative_claim,
+                    overage_status, utilization_overage, reset_overage, error,
+                    utilization_opus_7d, reset_opus_7d,
+                    utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                    model_usage_buckets
+             FROM snapshots ORDER BY probed_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::map_row)?;
         let mut snapshots = Vec::new();
         for row in rows {
             snapshots.push(row?);
@@ -164,7 +260,10 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                     utilization_7d, reset_7d, representative_claim,
-                    overage_status, utilization_overage, reset_overage
+                    overage_status, utilization_overage, reset_overage, error,
+                    utilization_opus_7d, reset_opus_7d,
+                    utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
+                    model_usage_buckets
              FROM snapshots WHERE probed_at >= ?1 ORDER BY probed_at ASC",
         )?;
         let rows = stmt.query_map(params![since.to_rfc3339()], Self::map_row)?;
@@ -177,13 +276,23 @@ impl Store {
 
     fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
         let probed_at_str: String = row.get(1)?;
+        let model_usage_buckets = row
+            .get::<_, Option<String>>(17)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
         let probed_at = DateTime::parse_from_rfc3339(&probed_at_str)
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| {
                 NaiveDateTime::parse_from_str(&probed_at_str, "%Y-%m-%dT%H:%M:%S%.f")
                     .map(|ndt| ndt.and_utc())
             })
-            .unwrap_or_default();
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
 
         Ok(Snapshot {
             token_name: row.get(0)?,
@@ -197,6 +306,25 @@ impl Store {
             overage_status: row.get(8)?,
             utilization_overage: row.get(9)?,
             reset_overage: row.get(10)?,
+            error: row.get(11)?,
+            utilization_opus_7d: row.get(12)?,
+            reset_opus_7d: row.get(13)?,
+            utilization_sonnet_7d: row.get(14)?,
+            reset_sonnet_7d: row.get(15)?,
+            model_usage_error: row.get(16)?,
+            model_usage_buckets,
         })
     }
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }

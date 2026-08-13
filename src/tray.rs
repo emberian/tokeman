@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -6,10 +6,11 @@ use eframe::egui;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use crate::admission;
 use crate::config::{Config, LaunchSettings};
 use crate::display::format_reset_compact;
-use crate::launch::select_best;
 use crate::probe::{self, ProbeResult, Window};
+use crate::rotation;
 use crate::store::Store;
 use crate::terminal;
 
@@ -59,8 +60,13 @@ fn make_icon(color: [u8; 3]) -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, size, size).expect("failed to create icon")
 }
 
-fn status_color(results: &[ProbeResult]) -> [u8; 3] {
-    let best = select_best(results);
+fn select_best<'a>(results: &'a [ProbeResult], config: &Config) -> Option<&'a ProbeResult> {
+    let mode = rotation::mode_for(results, &config.rotation);
+    rotation::choose_best(results, mode, &config.rotation)
+}
+
+fn status_color(results: &[ProbeResult], config: &Config) -> [u8; 3] {
+    let best = select_best(results, config);
     match best {
         Some(r) => {
             let remaining = r
@@ -98,7 +104,9 @@ fn spawn_bg_thread(
 
             loop {
                 // Probe all tokens
-                let results = probe::probe_all(&config.tokens).await;
+                let _ = admission::scan_transcripts(&config.tokens);
+                let mut results = probe::probe_all(&config.tokens).await;
+                admission::apply_observed_limits(&mut results);
                 if let Some(ref s) = store {
                     for r in &results {
                         let _ = s.insert(r);
@@ -114,15 +122,18 @@ fn spawn_bg_thread(
                 ctx.request_repaint();
 
                 // Wait for interval or command
-                let interval_ms = config.settings.probe_interval_secs * 1000;
-                let deadline = Instant::now()
-                    + std::time::Duration::from_millis(interval_ms);
+                let interval_ms = config.settings.probe_interval_secs.max(1) * 1000;
+                let mut deadline = Instant::now() + std::time::Duration::from_millis(interval_ms);
 
                 loop {
                     match rx.try_recv() {
                         Ok(BgCmd::ForceRefresh) => break,
                         Ok(BgCmd::UpdateConfig(new_cfg)) => {
                             config = new_cfg;
+                            deadline = Instant::now()
+                                + std::time::Duration::from_secs(
+                                    config.settings.probe_interval_secs.max(1),
+                                );
                         }
                         Ok(BgCmd::Shutdown) => return,
                         Err(mpsc::TryRecvError::Disconnected) => return,
@@ -159,10 +170,7 @@ struct TokemaApp {
 }
 
 impl TokemaApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        config: Config,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.window_fill = egui::Color32::from_rgb(30, 30, 30);
         visuals.panel_fill = egui::Color32::from_rgb(30, 30, 30);
@@ -247,7 +255,7 @@ impl TokemaApp {
     }
 
     fn update_tray_icon(&mut self, results: &[ProbeResult]) {
-        let color = status_color(results);
+        let color = status_color(results, &self.config);
         if color != self.last_icon_color {
             if let Some(ref ti) = self.tray_icon {
                 let _ = ti.set_icon(Some(make_icon(color)));
@@ -257,16 +265,10 @@ impl TokemaApp {
     }
 
     fn launch_token(&self, token_name: &str) {
-        let token_key = self
-            .config
-            .tokens
-            .iter()
-            .find(|t| t.name == token_name)
-            .map(|t| t.key.as_str());
-
-        let Some(key) = token_key else {
+        if let Err(error) = rotation::activate_token(&self.config, token_name) {
+            eprintln!("Failed to activate token: {error:#}");
             return;
-        };
+        }
 
         let env_bin = std::env::var("TOKEMAN_CLAUDE_BIN").ok();
         let claude_bin = self
@@ -287,7 +289,6 @@ impl TokemaApp {
         if let Err(e) = terminal::launch_in_terminal(
             claude_bin,
             &args,
-            key,
             self.config.settings.terminal.as_deref(),
         ) {
             eprintln!("Failed to launch terminal: {e}");
@@ -357,7 +358,10 @@ impl TokemaApp {
     fn draw_token_card(&self, ui: &mut egui::Ui, result: &ProbeResult) {
         let frame = egui::Frame::NONE
             .fill(egui::Color32::from_black_alpha(140))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_white_alpha(30),
+            ))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(10));
 
@@ -366,11 +370,7 @@ impl TokemaApp {
 
             // Header: name + status + launch button
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&result.token_name)
-                        .strong()
-                        .size(14.0),
-                );
+                ui.label(egui::RichText::new(&result.token_name).strong().size(14.0));
 
                 let (status_text, status_color) =
                     match result.quota.as_ref().map(|q| q.status.as_str()) {
@@ -388,7 +388,11 @@ impl TokemaApp {
                             }
                         }
                     };
-                ui.label(egui::RichText::new(status_text).color(status_color).size(11.0));
+                ui.label(
+                    egui::RichText::new(status_text)
+                        .color(status_color)
+                        .size(11.0),
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -409,6 +413,34 @@ impl TokemaApp {
                 }
                 if let Some(ref w) = q.weekly {
                     Self::draw_gauge(ui, "7d", w);
+                }
+                if let Some(w) = result
+                    .model_usage
+                    .as_ref()
+                    .and_then(|usage| usage.opus_weekly.as_ref())
+                {
+                    Self::draw_gauge(ui, "Opus", w);
+                } else {
+                    ui.label(
+                        egui::RichText::new("Opus  profile usage unavailable")
+                            .monospace()
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(110)),
+                    );
+                }
+                if let Some(w) = result
+                    .model_usage
+                    .as_ref()
+                    .and_then(|usage| usage.sonnet_weekly.as_ref())
+                {
+                    Self::draw_gauge(ui, "Son", w);
+                } else {
+                    ui.label(
+                        egui::RichText::new("Son   profile usage unavailable")
+                            .monospace()
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(110)),
+                    );
                 }
                 if let Some(ref w) = q.overage {
                     Self::draw_gauge(ui, "$$", w);
@@ -594,9 +626,9 @@ impl eframe::App for TokemaApp {
                 let window_width = 420.0_f64;
                 let x = rect.position.x + rect.size.width as f64 / 2.0 - window_width / 2.0;
                 let y = rect.position.y + rect.size.height as f64 + 4.0;
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                    egui::pos2(x as f32, y as f32),
-                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    x as f32, y as f32,
+                )));
                 self.show_window(ctx);
             }
         }
@@ -636,24 +668,23 @@ impl eframe::App for TokemaApp {
         // Bottom panel: actions (always visible, pinned to bottom)
         if !results.is_empty() {
             egui::TopBottomPanel::bottom("actions")
-                .frame(
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin {
-                            left: 16,
-                            right: 16,
-                            top: 4,
-                            bottom: 12,
-                        }),
-                )
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 16,
+                    right: 16,
+                    top: 4,
+                    bottom: 12,
+                }))
                 .show(ctx, |ui| {
                     ui.separator();
                     ui.add_space(4.0);
 
                     // Launch Best button
-                    let best = select_best(&results);
+                    let best = select_best(&results, &self.config);
                     ui.horizontal(|ui| {
                         let btn = egui::Button::new(
-                            egui::RichText::new("\u{1F680} Launch Best").strong().size(13.0),
+                            egui::RichText::new("\u{1F680} Launch Best")
+                                .strong()
+                                .size(13.0),
                         )
                         .min_size(egui::vec2(120.0, 28.0));
                         let enabled = best.is_some();

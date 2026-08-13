@@ -45,13 +45,19 @@ pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
             continue;
         }
 
-        if let (Some(u0), Some(u1)) = (pair[0].utilization_7d, pair[1].utilization_7d) {
+        if pair[0].reset_7d == pair[1].reset_7d
+            && let (Some(u0), Some(u1)) = (pair[0].utilization_7d, pair[1].utilization_7d)
+            && u1 >= u0
+        {
             let rate = (u1 - u0) / dt_hours;
             if rate.is_finite() {
                 burn_rates_7d.push(rate);
             }
         }
-        if let (Some(u0), Some(u1)) = (pair[0].utilization_5h, pair[1].utilization_5h) {
+        if pair[0].reset_5h == pair[1].reset_5h
+            && let (Some(u0), Some(u1)) = (pair[0].utilization_5h, pair[1].utilization_5h)
+            && u1 >= u0
+        {
             let rate = (u1 - u0) / dt_hours;
             if rate.is_finite() {
                 burn_rates_5h.push(rate);
@@ -69,8 +75,11 @@ pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
     };
 
     let stddev_burn_7d = mean_burn_7d.map(|mean| {
-        let variance =
-            burn_rates_7d.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / burn_rates_7d.len() as f64;
+        let variance = burn_rates_7d
+            .iter()
+            .map(|r| (r - mean).powi(2))
+            .sum::<f64>()
+            / burn_rates_7d.len() as f64;
         variance.sqrt()
     });
 
@@ -80,15 +89,11 @@ pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
 
     let hours_to_depletion_5h = latest_burn_5h
         .filter(|&r| r > 0.0)
-        .and_then(|rate| {
-            last.utilization_5h.map(|u| (1.0 - u) / rate)
-        });
+        .and_then(|rate| last.utilization_5h.map(|u| (1.0 - u) / rate));
 
     let hours_to_depletion_7d = latest_burn_7d
         .filter(|&r| r > 0.0)
-        .and_then(|rate| {
-            last.utilization_7d.map(|u| (1.0 - u) / rate)
-        });
+        .and_then(|rate| last.utilization_7d.map(|u| (1.0 - u) / rate));
 
     TokenStats {
         token_name: token_name.to_string(),
