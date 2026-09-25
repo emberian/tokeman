@@ -781,7 +781,8 @@ async fn login_accounts(name: Option<String>, more: bool) -> anyhow::Result<()> 
     let mut lines = stdin.lock().lines();
     let mut done = 0usize;
     for (index, account) in targets.iter().enumerate() {
-        let pkce = claude_login::begin()?;
+        // Account names are usually the account's email; hint only then.
+        let pkce = claude_login::begin(account.contains('@').then_some(account.as_str()))?;
         println!();
         println!("[{}/{}] {account}", index + 1, total);
         if !cfg.tokens.iter().any(|token| &token.name == account) {

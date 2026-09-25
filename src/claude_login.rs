@@ -21,9 +21,12 @@ pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
-/// `offline_access` is what earns a refresh token; without it the credential
-/// dies in an hour and the daemon cannot renew it.
-pub const SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:file_upload user:mcp_servers offline_access";
+/// The scopes Claude Code's own claude.ai login requests (2.1.282), minus
+/// `org:create_api_key`, which tokeman has no use for. The refresh token
+/// comes with the grant; there is no `offline_access` scope, and asking for
+/// one makes the consent page refuse the request.
+pub const SCOPES: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 pub struct Pkce {
     pub verifier: String,
@@ -60,17 +63,23 @@ fn random_b64() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-pub fn begin() -> Result<Pkce> {
+/// Start a login. `login_hint` (an email) pre-fills the account on the
+/// consent page, which is what keeps a round from being completed as the
+/// wrong account.
+pub fn begin(login_hint: Option<&str>) -> Result<Pkce> {
     let verifier = random_b64()?;
     let state = random_b64()?;
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let url = format!(
+    let mut url = format!(
         "{AUTHORIZE_URL}?code=true&client_id={CLIENT_ID}&response_type=code\
          &redirect_uri={redirect}&scope={scope}&code_challenge={challenge}\
          &code_challenge_method=S256&state={state}",
         redirect = urlencode(REDIRECT_URI),
         scope = urlencode(SCOPES),
     );
+    if let Some(hint) = login_hint {
+        url.push_str(&format!("&login_hint={}", urlencode(hint)));
+    }
     Ok(Pkce {
         verifier,
         state,
@@ -219,9 +228,12 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_profile_scope_and_a_challenge() {
-        let pkce = begin().expect("pkce");
+        let pkce = begin(None).expect("pkce");
         assert!(pkce.url.contains("user%3Aprofile"));
-        assert!(pkce.url.contains("offline_access"));
+        assert!(!pkce.url.contains("offline_access"));
+        assert!(!pkce.url.contains("login_hint"));
+        let hinted = begin(Some("me@example.com")).expect("pkce");
+        assert!(hinted.url.ends_with("&login_hint=me%40example.com"));
         assert!(pkce.url.contains("code_challenge_method=S256"));
         assert!(pkce.url.contains(CLIENT_ID));
         assert_ne!(pkce.verifier, pkce.state);
@@ -229,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_code_from_another_attempt_is_refused() {
-        let pkce = begin().expect("pkce");
+        let pkce = begin(None).expect("pkce");
         let error = exchange("somecode#not-our-state", &pkce)
             .await
             .expect_err("state mismatch must be rejected before any network call");
@@ -263,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_paste_is_refused() {
-        let pkce = begin().expect("pkce");
+        let pkce = begin(None).expect("pkce");
         assert!(exchange("   ", &pkce).await.is_err());
     }
 }
