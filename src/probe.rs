@@ -421,12 +421,20 @@ pub fn client_user_agent() -> &'static str {
     })
 }
 
+/// The system prompt Claude Code opens every request with.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// Error reported for an account with neither a live login nor a setup token.
 /// Rotation treats it like a refused credential: it is an answer, not a
 /// network hiccup worth retrying on the fast cadence.
 pub const NO_CREDENTIAL: &str = "no usable credential";
 
-pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult {
+/// Probe one token with a 1-token request to `model`.
+///
+/// Rate-limit headers vary by the model a request used: some windows (the
+/// Fable limit) only appear on requests to that family, which is what an
+/// occasional target-model sample is for.
+pub async fn probe_token(client: &reqwest::Client, token: &Token, model: &str) -> ProbeResult {
     let probed_at = Utc::now();
     let Some(credential) = token.credential(probed_at.timestamp_millis()) else {
         return ProbeResult {
@@ -443,9 +451,14 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
         };
     };
 
+    // Subscription OAuth tokens are only admitted to premium models (Fable)
+    // for requests that identify as Claude Code; without it the API answers a
+    // bare 429 with no quota headers. Haiku happens to be lenient, but every
+    // probe identifies the same way so all of them measure the same thing.
     let body = json!({
-        "model": PROBE_MODEL,
+        "model": model,
         "max_tokens": 1,
+        "system": [{"type": "text", "text": CLAUDE_CODE_IDENTITY}],
         "messages": [{"role": "user", "content": "quota"}]
     });
 
@@ -458,7 +471,8 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
     if credential.value.starts_with("sk-ant-oat01-") {
         req = req
             .header("Authorization", format!("Bearer {}", credential.value))
-            .header("anthropic-beta", "oauth-2025-04-20");
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("user-agent", client_user_agent());
     } else {
         req = req.header("x-api-key", credential.value);
     }
@@ -474,7 +488,9 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
             let quota = parse_unified_quota(&headers);
             let rate_limits = parse_rate_limits(&headers);
 
-            let error = if !status.is_success() && status.as_u16() != 429 {
+            // A 429 still carries the quota headers that explain it; one
+            // without them is a refusal like any other status.
+            let error = if !status.is_success() && (status.as_u16() != 429 || quota.is_none()) {
                 let body_text = resp.text().await.unwrap_or_default();
                 Some(format!("HTTP {status}: {body_text}"))
             } else {
@@ -514,7 +530,7 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
 /// unless the profile endpoint already reported one. Rotation, history, charts
 /// and every dashboard then treat it like any other model bucket, including on
 /// accounts whose credential cannot read the profile endpoint.
-fn attach_header_buckets(probe: &mut ProbeResult) {
+pub fn attach_header_buckets(probe: &mut ProbeResult) {
     let Some(window) = probe.quota.as_ref().and_then(|quota| quota.fable.clone()) else {
         return;
     };
@@ -542,6 +558,15 @@ pub async fn probe_all_with_timeout(
     tokens: &[Token],
     timeout: std::time::Duration,
 ) -> Vec<ProbeResult> {
+    probe_all_with_model(tokens, timeout, PROBE_MODEL).await
+}
+
+/// Probe every token concurrently with `model`.
+pub async fn probe_all_with_model(
+    tokens: &[Token],
+    timeout: std::time::Duration,
+    model: &str,
+) -> Vec<ProbeResult> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(8).min(timeout))
         .timeout(timeout)
@@ -549,7 +574,7 @@ pub async fn probe_all_with_timeout(
         .unwrap_or_else(|_| reqwest::Client::new());
     let futures: Vec<_> = tokens
         .iter()
-        .map(|token| probe_token(&client, token))
+        .map(|token| probe_token(&client, token, model))
         .collect();
     futures::future::join_all(futures).await
 }

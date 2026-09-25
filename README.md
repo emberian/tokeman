@@ -234,9 +234,22 @@ separate Opus 4.8 and Opus 5 buckets. Tokeman reads them from two places:
   ones and ones with no reset yet; the server's `is_active` flag only marks
   its headline row and is not a filter.
 - **The `7d_oi` rate-limit headers** ("seven day, overage included"), which
-  carry the Fable limit on any credential, setup tokens included, when the
-  probe response includes them. They are recorded as a "Fable" bucket unless
-  the profile endpoint already reported one.
+  carry the Fable limit on any credential, setup tokens included. They are
+  recorded as a "Fable" bucket unless the profile endpoint already reported
+  one.
+
+Headers only describe the model a request used, so the cheap Haiku probe never
+sees the Fable limit. When the startup model is a Fable model, tokeman
+subsamples: each account without profile reads gets one probe with that model
+every `target_model_sample_secs` (default 1800), and every Haiku probe in
+between carries the last reading forward until its window resets. `tokeman
+rotate status` shows when each account was last sampled. Set the interval to 0
+to never spend a Fable request on probing:
+
+```toml
+[rotation]
+target_model_sample_secs = 1800
+```
 
 A bucket's identity is a canonical key (`opus48`, `opus5`, `fable`) shared by
 profile rows and observed rejections, so `claude-opus-4-8` in a rejection and

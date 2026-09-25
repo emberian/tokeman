@@ -215,6 +215,8 @@ pub struct RotationStatus {
     pub min_5h_remaining: f64,
     pub min_7d_remaining: f64,
     pub premium_admission: String,
+    /// Whether and how header-only limits are being sampled.
+    pub header_sampling: String,
     pub live_sessions: Vec<ClaudeSessionStatus>,
     pub abandoned_drains: Vec<AbandonedDrain>,
     pub tokens: Vec<RotationTokenStatus>,
@@ -261,6 +263,21 @@ struct CadenceState {
     probe_interval_secs: Option<u64>,
     #[serde(default)]
     consecutive_degraded_probes: u32,
+    /// Latest target-model sample per account (see `target_model_sample_secs`).
+    #[serde(default)]
+    header_samples: BTreeMap<String, HeaderSample>,
+}
+
+/// What an occasional target-model probe saw of the limits only that model's
+/// responses carry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeaderSample {
+    sampled_at: f64,
+    /// Whether the sample got a quota answer at all.
+    #[serde(default)]
+    answered: bool,
+    /// The Fable (`7d_oi`) window; `None` when the response carried none.
+    window: Option<crate::probe::Window>,
 }
 
 impl Default for CadenceState {
@@ -272,6 +289,7 @@ impl Default for CadenceState {
             mode: Some(RotationMode::Normal),
             probe_interval_secs: None,
             consecutive_degraded_probes: 0,
+            header_samples: BTreeMap::new(),
         }
     }
 }
@@ -1290,56 +1308,6 @@ fn describe(result: Option<&ProbeResult>) -> String {
     }
 }
 
-/// Probe only the accounts that are due, carrying skipped ones forward.
-///
-/// A skipped account is reported with the error that put it in backoff, so the
-/// batch stays the same size and shape: `probe_is_complete`, the sticky-hold
-/// logic and viability all behave exactly as if it had been asked and refused.
-/// The point is to stop sending the request, not to pretend the account works.
-async fn probe_due_and_store(
-    config: &Config,
-    backoff: &BTreeMap<String, AuthBackoff>,
-    now: f64,
-    force: bool,
-) -> Vec<ProbeResult> {
-    let (due, skipped): (Vec<_>, Vec<_>) = config.tokens.iter().cloned().partition(|token| {
-        force
-            || backoff
-                .get(&token.name)
-                .is_none_or(|entry| now >= entry.next_attempt_epoch)
-    });
-    if skipped.is_empty() {
-        return probe_and_store(config).await;
-    }
-    let mut results = probe::probe_all_with_timeout(&due, std::time::Duration::from_secs(45)).await;
-    if let Ok(store) = Store::open() {
-        for result in &results {
-            let _ = store.insert(result);
-        }
-    }
-    // Synthesized rows are not written to the snapshot store: they are a
-    // restatement of a known refusal, not a fresh observation, and recording
-    // them would inflate the history the burn-rate maths reads from.
-    let probed_at = Utc::now();
-    for token in skipped {
-        let error = backoff
-            .get(&token.name)
-            .map(|entry| entry.last_error.clone())
-            .unwrap_or_else(|| "authentication previously refused".to_string());
-        results.push(ProbeResult {
-            token_name: token.name,
-            probed_at,
-            quota: None,
-            model_usage: None,
-            model_usage_error: None,
-            rate_limits: Default::default(),
-            error: Some(error),
-        });
-    }
-    admission::apply_observed_limits(&mut results);
-    results
-}
-
 /// Fold this cycle's outcomes into the recheck schedule.
 fn update_auth_backoff(
     backoff: &mut BTreeMap<String, AuthBackoff>,
@@ -1376,18 +1344,212 @@ fn update_auth_backoff(
     newly_parked
 }
 
-async fn probe_and_store(config: &Config) -> Vec<ProbeResult> {
+/// Model families with a weekly limit that only appears in rate-limit headers
+/// on requests to that family: the Fable limit (`7d_oi`).
+const HEADER_ONLY_FAMILIES: &[&str] = &["fable"];
+
+/// The model to sample with, when the startup model's family has a
+/// header-only limit. `[1m]` is a Claude Code context option, not part of the
+/// API id; bare aliases (`fable`) name no API model, so they are not sampled.
+fn sample_model(target_model: Option<&str>) -> Option<&str> {
+    let base = target_model?.split('[').next()?.trim();
+    let family = family_version(base)?.family;
+    (base.starts_with("claude-") && HEADER_ONLY_FAMILIES.contains(&family.as_str())).then_some(base)
+}
+
+fn due_for_sample(
+    token: &Token,
+    samples: &BTreeMap<String, HeaderSample>,
+    policy: &RotationSettings,
+    now: f64,
+) -> bool {
+    let interval = policy.target_model_sample_secs as f64;
+    // An account with profile reads already gets the limit as a model row.
+    interval > 0.0
+        && token.usage_credential((now * 1000.0) as i64).is_none()
+        && samples
+            .get(&token.name)
+            .is_none_or(|sample| now - sample.sampled_at >= interval)
+}
+
+fn describe_header_sampling(
+    config: &Config,
+    cadence: &CadenceState,
+    target_model: Option<&str>,
+    now: f64,
+) -> String {
+    let Some(model) = sample_model(target_model) else {
+        return "none for the startup model".into();
+    };
+    let interval = config.rotation.target_model_sample_secs;
+    if interval == 0 {
+        return format!("{model} has one, but sampling is off (target_model_sample_secs = 0)");
+    }
+    let eligible: Vec<&Token> = config
+        .tokens
+        .iter()
+        .filter(|token| token.usage_credential((now * 1000.0) as i64).is_none())
+        .filter(|token| {
+            cadence
+                .auth_backoff
+                .get(&token.name)
+                .is_none_or(|entry| now >= entry.next_attempt_epoch)
+        })
+        .collect();
+    if eligible.is_empty() {
+        return format!("{model}: no account needs sampling");
+    }
+    let ages: Vec<f64> = eligible
+        .iter()
+        .filter_map(|token| cadence.header_samples.get(&token.name))
+        .map(|sample| ((now - sample.sampled_at) / 60.0).max(0.0))
+        .collect();
+    let sampled = match ages.iter().copied().reduce(f64::max) {
+        Some(oldest) => format!("{} sampled, oldest {:.0}m ago", ages.len(), oldest),
+        None => "none sampled yet".into(),
+    };
+    format!(
+        "{model} probe every {}m on {} account(s) without profile reads ({sampled})",
+        interval / 60,
+        eligible.len(),
+    )
+}
+
+/// Record every sample attempt, answered or not, so an account whose sample
+/// keeps failing is still only asked once per interval.
+fn record_header_samples(
+    samples: &[ProbeResult],
+    cache: &mut BTreeMap<String, HeaderSample>,
+    now: f64,
+) {
+    for sample in samples {
+        let answered = sample.quota.is_some();
+        if !answered
+            && cache
+                .get(&sample.token_name)
+                .is_none_or(|previous| previous.answered)
+        {
+            append_log(&format!(
+                "target-model sample for {} got no quota headers ({}); next try in one interval",
+                sample.token_name,
+                failure_reason(sample.error.as_deref())
+            ));
+        }
+        cache.insert(
+            sample.token_name.clone(),
+            HeaderSample {
+                sampled_at: now,
+                answered,
+                window: sample.quota.as_ref().and_then(|quota| quota.fable.clone()),
+            },
+        );
+    }
+}
+
+/// Carry each account's latest sampled window onto its probe result, until
+/// the window resets, as an ordinary per-model bucket.
+fn apply_header_samples(
+    results: &mut [ProbeResult],
+    cache: &BTreeMap<String, HeaderSample>,
+    now: f64,
+) {
+    for result in results {
+        let Some(quota) = result.quota.as_mut() else {
+            continue;
+        };
+        if quota.fable.is_some() {
+            continue;
+        }
+        let carried = cache
+            .get(&result.token_name)
+            .and_then(|sample| sample.window.clone())
+            .filter(|window| window.reset == 0 || window.reset as f64 > now);
+        if carried.is_some() {
+            quota.fable = carried;
+            probe::attach_header_buckets(result);
+        }
+    }
+}
+
+/// Probe every account that is not in authentication backoff, record the
+/// snapshots, and restate the refusals of the ones that are.
+///
+/// When `sample` is set and the startup model has a header-only limit, the
+/// accounts due for a sample are probed with that model instead of Haiku.
+/// Skipped accounts keep the batch the same size and shape, so completeness,
+/// sticky holds and viability behave as if they had been asked and refused;
+/// their synthesized rows are not stored, being a restatement rather than an
+/// observation.
+async fn probe_and_store(
+    config: &Config,
+    cadence: &mut CadenceState,
+    target_model: Option<&str>,
+    now: f64,
+    force: bool,
+    sample: bool,
+) -> Vec<ProbeResult> {
+    let (due, skipped): (Vec<_>, Vec<_>) = config.tokens.iter().cloned().partition(|token| {
+        force
+            || cadence
+                .auth_backoff
+                .get(&token.name)
+                .is_none_or(|entry| now >= entry.next_attempt_epoch)
+    });
+    let sample_with = sample.then(|| sample_model(target_model)).flatten();
+    let to_sample: Vec<Token> = match sample_with {
+        Some(_) => due
+            .iter()
+            .filter(|token| due_for_sample(token, &cadence.header_samples, &config.rotation, now))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
     // Match the dashboard's timeout. All token requests are concurrent, and a
-    // slow-but-valid 20-40s response is safer than treating a partial 15s batch
-    // as fleet truth. The scheduler skips missed ticks.
-    let mut results =
-        probe::probe_all_with_timeout(&config.tokens, std::time::Duration::from_secs(45)).await;
+    // slow-but-valid 20-40s response is safer than treating a partial 15s
+    // batch as fleet truth. The scheduler skips missed ticks. A sample is an
+    // extra request next to the Haiku probe, never a replacement: whatever it
+    // answers, the cycle keeps its quota reading.
+    let timeout = std::time::Duration::from_secs(45);
+    let (mut results, samples) = futures::join!(
+        probe::probe_all_with_timeout(&due, timeout),
+        probe::probe_all_with_model(
+            &to_sample,
+            timeout,
+            sample_with.unwrap_or(probe::PROBE_MODEL)
+        ),
+    );
+    record_header_samples(&samples, &mut cadence.header_samples, now);
+    apply_header_samples(&mut results, &cadence.header_samples, now);
     admission::apply_observed_limits(&mut results);
     if let Ok(store) = Store::open() {
         for result in &results {
             let _ = store.insert(result);
         }
     }
+    let probed_at = Utc::now();
+    for token in skipped {
+        let error = cadence
+            .auth_backoff
+            .get(&token.name)
+            .map(|entry| entry.last_error.clone())
+            .unwrap_or_else(|| "authentication previously refused".to_string());
+        results.push(ProbeResult {
+            token_name: token.name,
+            probed_at,
+            quota: None,
+            model_usage: None,
+            model_usage_error: None,
+            rate_limits: Default::default(),
+            error: Some(error),
+        });
+    }
+    // Configured order, as every consumer displays it.
+    results.sort_by_key(|result| {
+        config
+            .tokens
+            .iter()
+            .position(|token| token.name == result.token_name)
+    });
     results
 }
 
@@ -1486,8 +1648,16 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         })
         .map(|token| token.name.clone())
         .collect();
-    let results =
-        probe_due_and_store(config, &cadence.auth_backoff, probe_now, options.force).await;
+    // A dry run must not spend target-model requests.
+    let results = probe_and_store(
+        config,
+        &mut cadence,
+        target_model.as_deref(),
+        probe_now,
+        options.force,
+        !options.dry_run,
+    )
+    .await;
     for account in update_auth_backoff(&mut cadence.auth_backoff, &results, &probed, probe_now) {
         append_log(&format!(
             "{account} refused authentication; rechecking on a backoff instead of every cycle"
@@ -1898,8 +2068,18 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
     let current_value = configured_token(&settings);
     let current_name = token_name_for_value(&config.tokens, current_value).map(str::to_owned);
     let _ = admission::scan_transcripts(&config.tokens);
-    let results = probe_and_store(config).await;
-    let previous_mode = load_cadence().mode.unwrap_or(RotationMode::Normal);
+    // Status carries earlier target-model samples forward but takes none.
+    let mut cadence = load_cadence();
+    let results = probe_and_store(
+        config,
+        &mut cadence,
+        target_model.as_deref(),
+        now_epoch(),
+        true,
+        false,
+    )
+    .await;
+    let previous_mode = cadence.mode.unwrap_or(RotationMode::Normal);
     let mode = safe_mode_for(
         &results,
         config.tokens.len(),
@@ -2004,6 +2184,8 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
         target_model.as_deref(),
     );
 
+    let header_sampling =
+        describe_header_sampling(config, &cadence, target_model.as_deref(), now_epoch());
     Ok(RotationStatus {
         monitor: if paused { "paused" } else { "running" }.into(),
         service_installed: launch_agent_path().is_ok_and(|path| path.exists()),
@@ -2022,6 +2204,7 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
             config.tokens.len(),
             active_admission_limits.len()
         ),
+        header_sampling,
         live_sessions,
         abandoned_drains: drains,
         tokens,
@@ -2048,6 +2231,7 @@ pub fn print_status(status: &RotationStatus) {
         probe::PROBE_MODEL_LABEL
     );
     println!("premium admission: {}", status.premium_admission);
+    println!("header-only limits: {}", status.header_sampling);
     println!(
         "default for newly started Claude processes: {}",
         status.default_token.as_deref().unwrap_or("/login")
@@ -3565,5 +3749,101 @@ mod tests {
             summary,
             "1/5 quota readings; unavailable [401 revoked: r1, r2; 403 org disallows OAuth: org; network: net]"
         );
+    }
+
+    #[test]
+    fn only_full_ids_of_header_only_families_are_sampled() {
+        assert_eq!(
+            sample_model(Some("claude-fable-5-1[1m]")),
+            Some("claude-fable-5-1")
+        );
+        assert_eq!(
+            sample_model(Some("fable")),
+            None,
+            "an alias names no API model"
+        );
+        assert_eq!(sample_model(Some("claude-opus-5")), None);
+        assert_eq!(sample_model(None), None);
+    }
+
+    #[test]
+    fn sampling_skips_profile_readers_and_respects_the_interval() {
+        let policy = RotationSettings::default();
+        let interval = policy.target_model_sample_secs as f64;
+        let setup_only = Token {
+            name: "a".into(),
+            key: "sk-ant-oat01-setup".into(),
+            ..Token::default()
+        };
+        let mut samples = BTreeMap::new();
+        assert!(due_for_sample(&setup_only, &samples, &policy, 1_000.0));
+        samples.insert(
+            "a".into(),
+            HeaderSample {
+                sampled_at: 1_000.0,
+                answered: true,
+                window: None,
+            },
+        );
+        assert!(!due_for_sample(
+            &setup_only,
+            &samples,
+            &policy,
+            1_000.0 + interval - 1.0
+        ));
+        assert!(due_for_sample(
+            &setup_only,
+            &samples,
+            &policy,
+            1_000.0 + interval
+        ));
+
+        let profile_reader = login_account("b");
+        assert!(!due_for_sample(
+            &profile_reader,
+            &BTreeMap::new(),
+            &policy,
+            1_000.0
+        ));
+
+        let mut off = policy.clone();
+        off.target_model_sample_secs = 0;
+        assert!(!due_for_sample(
+            &setup_only,
+            &BTreeMap::new(),
+            &off,
+            1_000.0
+        ));
+    }
+
+    #[test]
+    fn samples_are_recorded_then_carried_until_reset() {
+        let mut sample = result("a", 0.1, 0.1);
+        sample.quota.as_mut().unwrap().fable = Some(Window {
+            utilization: 0.7,
+            reset: 5_000,
+        });
+        let mut refused = result("b", 0.0, 0.0);
+        refused.quota = None;
+        refused.error = Some("HTTP 429 Too Many Requests: {}".into());
+        let mut cache = BTreeMap::new();
+        record_header_samples(&[sample, refused], &mut cache, 1_000.0);
+        assert_eq!(cache["a"].window.as_ref().unwrap().utilization, 0.7);
+        // An unanswered sample is still an attempt: it waits an interval.
+        assert!(!cache["b"].answered);
+        assert_eq!(cache["b"].sampled_at, 1_000.0);
+
+        // A later Haiku probe carries no 7d_oi; the sample fills it in and
+        // becomes a Fable bucket.
+        let mut later = [result("a", 0.1, 0.1)];
+        apply_header_samples(&mut later, &cache, 2_000.0);
+        let usage = later[0].model_usage.as_ref().unwrap();
+        assert_eq!(usage.scoped_weekly[0].key, "fable");
+        assert_eq!(usage.scoped_weekly[0].source, ModelUsageSource::Headers);
+
+        // After the window resets, the old reading is no longer claimed.
+        let mut reset = [result("a", 0.1, 0.1)];
+        apply_header_samples(&mut reset, &cache, 6_000.0);
+        assert!(reset[0].quota.as_ref().unwrap().fable.is_none());
     }
 }

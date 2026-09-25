@@ -249,6 +249,12 @@ fn default_per_session_reserve() -> f64 {
     0.02
 }
 
+/// Half an hour: a weekly limit moves slowly, and a Fable request is far
+/// dearer than a Haiku one.
+fn default_target_model_sample() -> u64 {
+    1800
+}
+
 fn default_sip_rotation_interval() -> u64 {
     20
 }
@@ -274,6 +280,11 @@ pub struct RotationSettings {
     pub sip_probe_interval_secs: u64,
     #[serde(default = "default_per_session_reserve")]
     pub per_session_reserve: f64,
+    /// How often, per account, to spend one probe on the startup model instead
+    /// of Haiku, to read limits that only its responses carry (the Fable
+    /// limit). Only accounts without profile reads are sampled. 0 disables.
+    #[serde(default = "default_target_model_sample")]
+    pub target_model_sample_secs: u64,
 }
 
 impl Default for RotationSettings {
@@ -286,6 +297,7 @@ impl Default for RotationSettings {
             normal_probe_interval_secs: default_normal_rotation_interval(),
             sip_probe_interval_secs: default_sip_rotation_interval(),
             per_session_reserve: default_per_session_reserve(),
+            target_model_sample_secs: default_target_model_sample(),
         }
     }
 }
