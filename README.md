@@ -53,6 +53,7 @@ Log each account in through the browser:
 tokeman login "my-account"       # one account (added if it is new)
 tokeman login --more             # every configured account that still needs it
 tokeman refresh [<name>]         # renew grants now (the daemon does this before expiry)
+tokeman resets [use <name>]      # show or use usage-limit resets
 ```
 
 Each round prints a claude.com URL; sign in as that account and paste the code
@@ -267,6 +268,31 @@ labeled signal (`!`), not as profile telemetry.
 copies the access token of the account currently `/login`ed in Claude Code
 (reading the Keychain, which may prompt). It cannot be refreshed and expires
 within hours; prefer `tokeman login`.
+
+### Usage-limit resets
+
+Anthropic offers some accounts resets that refill their limits on request,
+for example a launch promotion's "one usage-limit reset for Pro and Max". Two
+programs exist:
+
+- **Limit resets** (grants): each grant carries a number of resets, a
+  use-by date, and the windows it refills (5h, 7d, the Fable limit). Some can
+  be used any time, others only at a limit. The weekly reset day does not
+  move.
+- **Session resets**: refill the 5-hour limit, out of the weekly limit, and
+  are offered only once you are at the session limit.
+
+```sh
+tokeman resets                    # every logged-in account's offers
+tokeman resets use <name>         # use the next grant; shows it and asks first
+tokeman resets use <name> --session
+```
+
+`tokeman rotate status` lists grants on offer. Resets are scarce and
+irreversible, so tokeman never uses one on its own. Reading and using them
+needs a `tokeman login` account. Neither program is documented; tokeman
+follows Claude Code's client, including its user agent, because the server
+decides eligibility by the client it believes it is talking to.
 
 ### Launch mode
 

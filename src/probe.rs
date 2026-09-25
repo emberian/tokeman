@@ -397,8 +397,10 @@ pub async fn validate_usage_key(usage_key: &str) -> Result<ModelUsage, String> {
     usage.ok_or_else(|| error.unwrap_or_else(|| "usage data unavailable".into()))
 }
 
-/// The `claude-code/<version>` user agent of the installed Claude Code, so
-/// requests look like the client whose endpoints they call. Read once per
+/// The user agent Claude Code's API client sends,
+/// `claude-cli/<version> (external, cli)`, for the installed version. The
+/// server derives the requesting surface from it: under any other agent the
+/// usage-reset programs answer `ineligible_reason: "surface"`. Read once per
 /// process; falls back to a recent version if `claude` cannot be run.
 pub fn client_user_agent() -> &'static str {
     static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -417,7 +419,10 @@ pub fn client_user_agent() -> &'static str {
                 .filter(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
                 .map(str::to_owned)
         });
-        format!("claude-code/{}", version.as_deref().unwrap_or("2.1.282"))
+        format!(
+            "claude-cli/{} (external, cli)",
+            version.as_deref().unwrap_or("2.1.282")
+        )
     })
 }
 

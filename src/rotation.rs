@@ -217,6 +217,8 @@ pub struct RotationStatus {
     pub premium_admission: String,
     /// Whether and how header-only limits are being sampled.
     pub header_sampling: String,
+    /// Usage-limit resets on offer to logged-in accounts, one line each.
+    pub resets_on_offer: Vec<String>,
     pub live_sessions: Vec<ClaudeSessionStatus>,
     pub abandoned_drains: Vec<AbandonedDrain>,
     pub tokens: Vec<RotationTokenStatus>,
@@ -1372,6 +1374,35 @@ fn due_for_sample(
             .is_none_or(|sample| now - sample.sampled_at >= interval)
 }
 
+/// Usable limit resets across logged-in accounts. Best-effort: an account
+/// whose status cannot be read is left out rather than failing `status`.
+async fn resets_on_offer(config: &Config) -> Vec<String> {
+    let now_ms = Utc::now().timestamp_millis();
+    let accounts: Vec<&Token> = config
+        .tokens
+        .iter()
+        .filter(|token| token.usage_credential(now_ms).is_some())
+        .collect();
+    let statuses =
+        futures::future::join_all(accounts.iter().map(|token| crate::resets::status(token))).await;
+    let mut offers = Vec::new();
+    for (token, status) in accounts.iter().zip(statuses) {
+        let Some(program) = status.ok().and_then(|status| status.cedar_ember) else {
+            continue;
+        };
+        for grant in program.grants() {
+            if grant.resets_left > 0 && !grant.paused {
+                offers.push(format!(
+                    "{}: {}",
+                    token.name,
+                    crate::resets::describe_grant(&grant)
+                ));
+            }
+        }
+    }
+    offers
+}
+
 fn describe_header_sampling(
     config: &Config,
     cadence: &CadenceState,
@@ -2186,6 +2217,7 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
 
     let header_sampling =
         describe_header_sampling(config, &cadence, target_model.as_deref(), now_epoch());
+    let resets_on_offer = resets_on_offer(config).await;
     Ok(RotationStatus {
         monitor: if paused { "paused" } else { "running" }.into(),
         service_installed: launch_agent_path().is_ok_and(|path| path.exists()),
@@ -2204,6 +2236,7 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
             config.tokens.len(),
             active_admission_limits.len()
         ),
+        resets_on_offer,
         header_sampling,
         live_sessions,
         abandoned_drains: drains,
@@ -2232,6 +2265,9 @@ pub fn print_status(status: &RotationStatus) {
     );
     println!("premium admission: {}", status.premium_admission);
     println!("header-only limits: {}", status.header_sampling);
+    for offer in &status.resets_on_offer {
+        println!("reset on offer: {offer} (`tokeman resets use`)");
+    }
     println!(
         "default for newly started Claude processes: {}",
         status.default_token.as_deref().unwrap_or("/login")

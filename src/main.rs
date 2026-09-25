@@ -13,6 +13,7 @@ mod launch;
 mod openai;
 mod private_fs;
 mod probe;
+mod resets;
 mod rotation;
 mod stats;
 mod store;
@@ -24,7 +25,7 @@ mod tray;
 mod tui;
 mod web;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -143,6 +144,11 @@ enum Command {
         #[arg(long)]
         more: bool,
     },
+    /// Show or use usage-limit resets (needs a `tokeman login` account)
+    Resets {
+        #[command(subcommand)]
+        action: Option<ResetAction>,
+    },
     /// Renew login grants now instead of waiting for the daemon
     Refresh {
         /// Account to refresh (default: every account with a login)
@@ -151,6 +157,29 @@ enum Command {
     /// Run as a system tray application
     #[cfg(feature = "tray")]
     Tray,
+}
+
+#[derive(Subcommand)]
+enum ResetAction {
+    /// List each logged-in account's reset grants and session reset
+    List {
+        /// Limit to one account
+        name: Option<String>,
+    },
+    /// Use a reset on one account (asks before claiming)
+    Use {
+        /// Configured account name
+        name: String,
+        /// Grant to use (default: the one the server offers next)
+        #[arg(long)]
+        grant: Option<String>,
+        /// Use the session (5-hour) reset instead of a grant
+        #[arg(long, conflicts_with = "grant")]
+        session: bool,
+        /// Do not ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -435,6 +464,17 @@ async fn main() -> Result<()> {
         Some(Command::Login { name, more }) => {
             login_accounts(name, more).await?;
         }
+        Some(Command::Resets { action }) => {
+            match action.unwrap_or(ResetAction::List { name: None }) {
+                ResetAction::List { name } => list_resets(name.as_deref()).await?,
+                ResetAction::Use {
+                    name,
+                    grant,
+                    session,
+                    yes,
+                } => use_reset(&name, grant, session, yes).await?,
+            }
+        }
         Some(Command::Refresh { name }) => {
             let refreshed = rotation::force_refresh(name.as_deref()).await?;
             let now_ms = Utc::now().timestamp_millis();
@@ -686,7 +726,6 @@ async fn main() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn read_claude_usage_key() -> Result<String> {
-    use anyhow::Context;
     let output = std::process::Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
@@ -855,6 +894,194 @@ async fn login_accounts(name: Option<String>, more: bool) -> anyhow::Result<()> 
         println!(
             "the rotation service installs these on its next cycle; `tokeman rotate status` shows which credential each account uses."
         );
+    }
+    Ok(())
+}
+
+/// Every logged-in account's reset offers. Accounts without a profile
+/// credential are listed as such rather than skipped silently.
+async fn list_resets(only: Option<&str>) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let now_ms = Utc::now().timestamp_millis();
+    for token in cfg
+        .tokens
+        .iter()
+        .filter(|token| only.is_none_or(|name| token.name == name))
+    {
+        if token.usage_credential(now_ms).is_none() {
+            if only.is_some() {
+                println!(
+                    "{}: no login; run `tokeman login {}`",
+                    token.name, token.name
+                );
+            }
+            continue;
+        }
+        println!("{}", token.name);
+        match resets::status(token).await {
+            Ok(status) => print_reset_status(&status),
+            Err(error) => println!("  unavailable: {error:#}"),
+        }
+    }
+    Ok(())
+}
+
+fn print_reset_status(status: &resets::ResetStatus) {
+    match &status.cedar_ember {
+        Some(program) if program.eligible => {
+            let grants = program.grants();
+            if grants.is_empty() {
+                println!("  limit resets: none on offer");
+            }
+            for grant in grants {
+                let next = program.next_grant_id.as_deref() == Some(grant.id.as_str());
+                println!(
+                    "  {} {}",
+                    if next { "*" } else { " " },
+                    resets::describe_grant(&grant)
+                );
+            }
+            if let Some(until) = &program.cooldown_until {
+                println!("    cooling down until {until}");
+            }
+        }
+        Some(program) => println!(
+            "  limit resets: not eligible ({})",
+            program
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
+        ),
+        None => println!("  limit resets: not offered"),
+    }
+    match &status.juniper_tide {
+        Some(session) if session.available => println!(
+            "  session reset: available ({} per week)",
+            session.resets_per_week.unwrap_or(1)
+        ),
+        Some(session) => println!(
+            "  session reset: not available ({}{})",
+            session
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("not offered"),
+            session
+                .next_available_at
+                .as_deref()
+                .map(|at| format!("; next {at}"))
+                .unwrap_or_default()
+        ),
+        None => println!("  session reset: not offered"),
+    }
+}
+
+/// Claim a reset after showing what it would clear. Resets are scarce and
+/// cannot be taken back, so this asks unless `--yes` is given.
+async fn use_reset(
+    name: &str,
+    grant: Option<String>,
+    session: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let cfg = config::Config::load()?;
+    let token = cfg
+        .tokens
+        .iter()
+        .find(|token| token.name == name)
+        .with_context(|| format!("no configured account named {name}"))?;
+    let status = resets::status(token).await?;
+    let grant_id = if session {
+        let session = status
+            .juniper_tide
+            .as_ref()
+            .context("the session reset is not offered to this account")?;
+        if !session.available {
+            bail!(
+                "the session reset is not available ({})",
+                session
+                    .ineligible_reason
+                    .as_deref()
+                    .unwrap_or("not offered")
+            );
+        }
+        println!("{name}: session reset (refills the 5-hour limit, paid from the weekly limit)");
+        None
+    } else {
+        let program = status
+            .cedar_ember
+            .as_ref()
+            .context("limit resets are not offered to this account")?;
+        if !program.eligible {
+            bail!(
+                "not eligible for limit resets ({})",
+                program
+                    .ineligible_reason
+                    .as_deref()
+                    .unwrap_or("no reason given")
+            );
+        }
+        let wanted = grant.or_else(|| program.next_grant_id.clone());
+        let chosen = program
+            .grants()
+            .into_iter()
+            .find(|candidate| Some(&candidate.id) == wanted.as_ref())
+            .context("no such grant on offer; see `tokeman resets list`")?;
+        if !chosen.usable_now {
+            bail!(
+                "that grant is not usable right now{}",
+                if chosen.use_requires_limit {
+                    " (it only works at a usage limit)"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!("{name}: {}", resets::describe_grant(&chosen));
+        Some(chosen.id)
+    };
+
+    if !yes {
+        print!("use it now? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("kept.");
+            return Ok(());
+        }
+    }
+    let outcome = resets::claim(token, grant_id.as_deref()).await?;
+    let cleared = outcome
+        .cleared
+        .iter()
+        .map(|window| resets::window_label(window))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match outcome.result.as_str() {
+        "reset" => println!(
+            "reset: cleared {}{}",
+            if cleared.is_empty() { "-" } else { &cleared },
+            outcome
+                .resets_left
+                .map(|left| format!("; {left} left"))
+                .unwrap_or_default()
+        ),
+        other => println!(
+            "not reset: {other}{}",
+            outcome
+                .reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        ),
+    }
+    if let Some(weekly) = &outcome.weekly_resets_at {
+        println!("your weekly reset day stays {weekly}");
+    }
+    if let Some(until) = &outcome.cooldown_until {
+        println!("cooling down until {until}");
     }
     Ok(())
 }
