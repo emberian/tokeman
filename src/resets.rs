@@ -21,8 +21,6 @@ use crate::config::Token;
 use crate::probe::client_user_agent;
 
 const API: &str = "https://api.anthropic.com";
-/// The read Claude Code makes at a limit: usage plus both programs' blocks.
-const STATUS_PATH: &str = "/api/oauth/usage?at_wall=1&skip_spend=1";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Grant {
@@ -151,8 +149,16 @@ async fn get_json<T: serde::de::DeserializeOwned>(bearer: &str, path: &str) -> R
     serde_json::from_str(&body).with_context(|| format!("unreadable {path} response"))
 }
 
-pub async fn status(token: &Token) -> Result<ResetStatus> {
-    get_json(profile_token(token)?, STATUS_PATH).await
+/// Reset offers, from the shared profile-read cache unless `fresh`.
+pub async fn status(token: &Token, fresh: bool) -> Result<ResetStatus> {
+    let body = crate::profile_reads::read(
+        &token.name,
+        profile_token(token)?,
+        crate::profile_reads::Read::AtWall,
+        fresh,
+    )
+    .await?;
+    serde_json::from_value(body).context("unreadable reset status")
 }
 
 async fn organization_uuid(bearer: &str) -> Result<String> {

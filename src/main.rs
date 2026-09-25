@@ -13,6 +13,7 @@ mod launch;
 mod openai;
 mod private_fs;
 mod probe;
+mod profile_reads;
 mod resets;
 mod rotation;
 mod stats;
@@ -918,7 +919,7 @@ async fn list_resets(only: Option<&str>) -> anyhow::Result<()> {
             continue;
         }
         println!("{}", token.name);
-        match resets::status(token).await {
+        match resets::status(token, false).await {
             Ok(status) => print_reset_status(&status),
             Err(error) => println!("  unavailable: {error:#}"),
         }
@@ -991,7 +992,8 @@ async fn use_reset(
         .iter()
         .find(|token| token.name == name)
         .with_context(|| format!("no configured account named {name}"))?;
-    let status = resets::status(token).await?;
+    // A claim needs the current offer, not a cached one.
+    let status = resets::status(token, true).await?;
     let grant_id = if session {
         let session = status
             .juniper_tide

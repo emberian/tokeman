@@ -1383,8 +1383,12 @@ async fn resets_on_offer(config: &Config) -> Vec<String> {
         .iter()
         .filter(|token| token.usage_credential(now_ms).is_some())
         .collect();
-    let statuses =
-        futures::future::join_all(accounts.iter().map(|token| crate::resets::status(token))).await;
+    let statuses = futures::future::join_all(
+        accounts
+            .iter()
+            .map(|token| crate::resets::status(token, false)),
+    )
+    .await;
     let mut offers = Vec::new();
     for (token, status) in accounts.iter().zip(statuses) {
         let Some(program) = status.ok().and_then(|status| status.cedar_ember) else {

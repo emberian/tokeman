@@ -352,49 +352,39 @@ fn parse_model_usage(usage: UsageResponse) -> ModelUsage {
     }
 }
 
-async fn probe_model_usage(
-    client: &reqwest::Client,
-    token: &Token,
-) -> (Option<ModelUsage>, Option<String>) {
+async fn probe_model_usage(token: &Token) -> (Option<ModelUsage>, Option<String>) {
     let Some(usage_key) = token.usage_credential(Utc::now().timestamp_millis()) else {
         return (None, None);
     };
-    let response = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {usage_key}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", client_user_agent())
-        .send()
-        .await;
-    match response {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<UsageResponse>().await {
-                Ok(usage) => (Some(parse_model_usage(usage)), None),
-                Err(error) => (None, Some(format!("usage response parse failed: {error}"))),
-            }
-        }
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            (None, Some(format!("usage HTTP {status}: {body}")))
-        }
-        Err(error) => (None, Some(format!("usage request failed: {error}"))),
+    match crate::profile_reads::read(
+        &token.name,
+        usage_key,
+        crate::profile_reads::Read::Usage,
+        false,
+    )
+    .await
+    {
+        Ok(body) => match serde_json::from_value::<UsageResponse>(body) {
+            Ok(usage) => (Some(parse_model_usage(usage)), None),
+            Err(error) => (None, Some(format!("usage response parse failed: {error}"))),
+        },
+        Err(error) => (None, Some(format!("usage {error:#}"))),
     }
 }
 
+/// Check a freshly captured token: always asks the endpoint, never the cache.
 pub async fn validate_usage_key(usage_key: &str) -> Result<ModelUsage, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let token = Token {
-        name: "validation".into(),
-        access_token: Some(usage_key.into()),
-        ..Token::default()
-    };
-    let (usage, error) = probe_model_usage(&client, &token).await;
-    usage.ok_or_else(|| error.unwrap_or_else(|| "usage data unavailable".into()))
+    let body = crate::profile_reads::read(
+        "validation",
+        usage_key,
+        crate::profile_reads::Read::Usage,
+        true,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+    serde_json::from_value::<UsageResponse>(body)
+        .map(parse_model_usage)
+        .map_err(|error| format!("usage response parse failed: {error}"))
 }
 
 /// The user agent Claude Code's API client sends,
@@ -524,7 +514,7 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token, model: &str) -
             error: Some(e.to_string()),
         },
     };
-    let (model_usage, model_usage_error) = probe_model_usage(client, token).await;
+    let (model_usage, model_usage_error) = probe_model_usage(token).await;
     probe.model_usage = model_usage;
     probe.model_usage_error = model_usage_error;
     attach_header_buckets(&mut probe);
