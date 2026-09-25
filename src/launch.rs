@@ -30,20 +30,7 @@ pub async fn run(config: Config, auto: bool, claude_args: Vec<String>) -> Result
     .await?;
     eprintln!(" \x1b[1mtokeman:\x1b[0m {}", outcome.message);
 
-    let claude_bin = std::env::var("TOKEMAN_CLAUDE_BIN")
-        .ok()
-        .or_else(|| config.settings.claude_bin.clone())
-        .unwrap_or_else(|| "claude".into());
-
-    let mut args = config.settings.launch_args.clone();
-    args.extend(claude_args);
-    if config.settings.dangerous_mode
-        && !args
-            .iter()
-            .any(|arg| arg == "--dangerously-skip-permissions")
-    {
-        args.push("--dangerously-skip-permissions".into());
-    }
+    let (claude_bin, args) = config.settings.command(claude_args);
 
     eprintln!(
         " \x1b[1mtokeman:\x1b[0m launching {}{}{}",

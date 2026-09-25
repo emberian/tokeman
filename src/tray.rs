@@ -280,24 +280,9 @@ impl TokemaApp {
             return;
         }
 
-        let env_bin = std::env::var("TOKEMAN_CLAUDE_BIN").ok();
-        let claude_bin = self
-            .config
-            .settings
-            .claude_bin
-            .as_deref()
-            .or(env_bin.as_deref())
-            .unwrap_or("claude");
-
-        let mut args = self.config.settings.launch_args.clone();
-        if self.config.settings.dangerous_mode
-            && !args.iter().any(|a| a == "--dangerously-skip-permissions")
-        {
-            args.push("--dangerously-skip-permissions".into());
-        }
-
+        let (claude_bin, args) = self.config.settings.command([]);
         if let Err(e) = terminal::launch_in_terminal(
-            claude_bin,
+            &claude_bin,
             &args,
             self.config.settings.terminal.as_deref(),
         ) {

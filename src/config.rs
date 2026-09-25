@@ -337,6 +337,24 @@ pub struct LaunchSettings {
     pub probe_interval_secs: u64,
 }
 
+impl LaunchSettings {
+    /// The Claude binary and arguments to launch with. `TOKEMAN_CLAUDE_BIN`
+    /// overrides the configured binary, which overrides `claude` on PATH.
+    pub fn command(&self, extra_args: impl IntoIterator<Item = String>) -> (String, Vec<String>) {
+        let binary = std::env::var("TOKEMAN_CLAUDE_BIN")
+            .ok()
+            .or_else(|| self.claude_bin.clone())
+            .unwrap_or_else(|| "claude".into());
+        let mut args = self.launch_args.clone();
+        args.extend(extra_args);
+        const SKIP: &str = "--dangerously-skip-permissions";
+        if self.dangerous_mode && !args.iter().any(|arg| arg == SKIP) {
+            args.push(SKIP.into());
+        }
+        (binary, args)
+    }
+}
+
 impl Default for LaunchSettings {
     fn default() -> Self {
         Self {
