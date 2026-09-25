@@ -143,6 +143,11 @@ enum Command {
         #[arg(long)]
         more: bool,
     },
+    /// Renew login grants now instead of waiting for the daemon
+    Refresh {
+        /// Account to refresh (default: every account with a login)
+        name: Option<String>,
+    },
     /// Run as a system tray application
     #[cfg(feature = "tray")]
     Tray,
@@ -429,6 +434,19 @@ async fn main() -> Result<()> {
         }
         Some(Command::Login { name, more }) => {
             login_accounts(name, more).await?;
+        }
+        Some(Command::Refresh { name }) => {
+            let refreshed = rotation::force_refresh(name.as_deref()).await?;
+            let now_ms = Utc::now().timestamp_millis();
+            for token in config::Config::load()?
+                .tokens
+                .iter()
+                .filter(|token| name.as_ref().is_none_or(|name| &token.name == name))
+                .filter(|token| token.refresh_token.is_some())
+            {
+                println!("  {} — {}", token.name, describe_login(token, now_ms));
+            }
+            println!("{refreshed} grant(s) refreshed.");
         }
         Some(Command::Rotate { action }) => {
             let cfg = config::Config::load()?;

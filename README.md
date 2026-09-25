@@ -52,6 +52,7 @@ Log each account in through the browser:
 ```sh
 tokeman login "my-account"       # one account (added if it is new)
 tokeman login --more             # every configured account that still needs it
+tokeman refresh [<name>]         # renew grants now (the daemon does this before expiry)
 ```
 
 Each round prints a claude.com URL; sign in as that account and paste the code
@@ -127,11 +128,12 @@ refuses it. Only then does it re-read the environment. So:
 
 - A process on a **setup token** keeps its launch account for its whole life.
   Rotating the default only moves new or restarted processes.
-- A process on a **login token** keeps its account until that token expires.
+- A process on a **login token** keeps its account until that token expires
+  (8 hours) or is refreshed: a refresh revokes the access token it replaces.
   Its next request is refused, it waits (up to the 401 wait above) for settings
   to offer a live token, and continues on whatever the default is by then. No
-  restart is needed, and an account rotated away from stops being drained
-  within one token lifetime.
+  restart is needed, and an account rotated away from stops being drained by
+  its next refresh at the latest.
 
 The daemon refreshes each login 30 minutes before expiry and rewrites settings
 when the default's token changes, so that retry is normally immediate. If a

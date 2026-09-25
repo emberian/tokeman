@@ -2394,12 +2394,28 @@ impl RefreshBackoff {
 /// fresh token and skip it. The new grant is saved before anything else
 /// happens, because losing it would lose the account.
 pub async fn refresh_logins(backoff: &mut RefreshBackoff) -> Result<usize> {
+    refresh_logins_where(backoff, |token, now_ms| token.needs_refresh(now_ms)).await
+}
+
+/// `tokeman refresh`: renew the named account (or every refreshable one)
+/// now, through the same locked path the daemon uses.
+pub async fn force_refresh(account: Option<&str>) -> Result<usize> {
+    refresh_logins_where(&mut RefreshBackoff::default(), |token, _| {
+        token.is_refreshable() && account.is_none_or(|name| token.name == name)
+    })
+    .await
+}
+
+async fn refresh_logins_where(
+    backoff: &mut RefreshBackoff,
+    due_now: impl Fn(&Token, i64) -> bool,
+) -> Result<usize> {
     let now = now_epoch();
     let now_ms = Utc::now().timestamp_millis();
     let due: Vec<String> = Config::load()?
         .tokens
         .iter()
-        .filter(|token| token.needs_refresh(now_ms))
+        .filter(|token| due_now(token, now_ms))
         .filter(|token| backoff.allows(&token.name, now))
         .map(|token| token.name.clone())
         .collect();
@@ -2414,7 +2430,7 @@ pub async fn refresh_logins(backoff: &mut RefreshBackoff) -> Result<usize> {
         let Some(token) = config.tokens.iter_mut().find(|token| token.name == account) else {
             continue;
         };
-        if !token.needs_refresh(Utc::now().timestamp_millis()) {
+        if !due_now(token, Utc::now().timestamp_millis()) {
             continue;
         }
         let Some(refresh_token) = token.refresh_token.clone() else {
@@ -2423,10 +2439,29 @@ pub async fn refresh_logins(backoff: &mut RefreshBackoff) -> Result<usize> {
         let scopes = token.scopes.clone().unwrap_or_default();
         match crate::claude_login::refresh(&refresh_token, &scopes).await {
             Ok(bundle) => {
+                // Refreshing revokes the access token it replaces, so any
+                // session still holding it is refused from now on.
+                let replaced = token
+                    .access_token
+                    .as_deref()
+                    .map(credential_history::fingerprint);
                 token.apply_login(bundle, Utc::now().timestamp_millis());
                 config.save(&config_lock)?;
                 backoff.clear(&account);
                 changed += 1;
+                if let Some(fingerprint) = replaced
+                    && let Err(error) = credential_history::append(&CredentialEvent {
+                        at: Utc::now().timestamp(),
+                        account: Some(account.clone()),
+                        fingerprint: Some(fingerprint),
+                        expires_at: None,
+                        kind: credential_history::REVOKE.into(),
+                    })
+                {
+                    append_log(&format!(
+                        "ERROR could not record credential history: {error:#}"
+                    ));
+                }
             }
             Err(error) if crate::claude_login::is_permanent_refresh_failure(&error) => {
                 let fallback = if token.setup_key().is_some() {

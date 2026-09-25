@@ -38,7 +38,10 @@ pub struct CredentialEvent {
     /// practice (setup tokens), or for legacy events of unknown kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
-    /// `switch`, `activate`, `refresh`, `upgrade`, `pause`, or `legacy`.
+    /// `switch`, `activate`, `refresh`, `upgrade`, `pause`, `legacy`, or
+    /// `revoke`. A `revoke` event is not an offer: it records that the token
+    /// with this fingerprint stopped working at `at` (a refresh revokes the
+    /// access token it replaces).
     pub kind: String,
 }
 
@@ -108,6 +111,8 @@ pub fn account_for_fingerprint(events: &[CredentialEvent], fingerprint: &str) ->
         .and_then(|event| event.account.clone())
 }
 
+pub const REVOKE: &str = "revoke";
+
 /// Combine recorded events with default changes reconstructed from the
 /// rotation log, for the period before this file existed. Legacy entries
 /// carry no expiry, which reproduces the old semantics exactly: a process
@@ -143,23 +148,41 @@ pub fn with_legacy(
 /// settings offer at that moment. If settings still offer the same expired
 /// token (tokeman was asleep), it keeps retrying until a newer one appears.
 pub fn account_at(events: &[CredentialEvent], started_at: i64, at: i64) -> Option<Option<String>> {
-    let mut index = events.iter().rposition(|event| event.at <= started_at)?;
+    // A token stops working at its expiry or its revocation, whichever is
+    // first; revocations are not offers.
+    let revoked_at = |fingerprint: Option<&str>| {
+        events
+            .iter()
+            .filter(|event| event.kind == REVOKE && event.fingerprint.as_deref() == fingerprint)
+            .map(|event| event.at)
+            .min()
+    };
+    let offers: Vec<&CredentialEvent> =
+        events.iter().filter(|event| event.kind != REVOKE).collect();
+    let mut index = offers.iter().rposition(|event| event.at <= started_at)?;
     loop {
-        let current = &events[index];
-        let Some(expired_at) = current.expires_at.filter(|expiry| *expiry <= at) else {
+        let current = offers[index];
+        let ends_at = match (
+            current.expires_at,
+            revoked_at(current.fingerprint.as_deref()),
+        ) {
+            (Some(expiry), Some(revoked)) => Some(expiry.min(revoked)),
+            (expiry, revoked) => expiry.or(revoked),
+        };
+        let Some(expired_at) = ends_at.filter(|end| *end <= at) else {
             return Some(current.account.clone());
         };
-        let offered = events
+        let offered = offers
             .iter()
             .rposition(|event| event.at <= expired_at)
             .unwrap_or(index)
             .max(index);
-        let next = if events[offered].fingerprint != current.fingerprint {
+        let next = if offers[offered].fingerprint != current.fingerprint {
             offered
         } else {
             // Settings still offered the refused token: the first later
             // installation is what the retrying process picks up.
-            match events[offered + 1..]
+            match offers[offered + 1..]
                 .iter()
                 .position(|event| event.fingerprint != current.fingerprint)
             {
@@ -167,7 +190,7 @@ pub fn account_at(events: &[CredentialEvent], started_at: i64, at: i64) -> Optio
                 None => return Some(current.account.clone()),
             }
         };
-        if events[next].at > at {
+        if offers[next].at > at {
             // The replacement arrived after the moment asked about.
             return Some(current.account.clone());
         }
@@ -261,5 +284,24 @@ mod tests {
         assert_eq!(fingerprint("abc"), fingerprint("abc"));
         assert_ne!(fingerprint("abc"), fingerprint("abd"));
         assert_eq!(fingerprint("abc").len(), 16);
+    }
+
+    #[test]
+    fn a_refresh_elsewhere_moves_sessions_at_revocation_not_expiry() {
+        let revoke = CredentialEvent {
+            at: 400,
+            account: Some("a".into()),
+            fingerprint: Some("a0".into()),
+            expires_at: None,
+            kind: REVOKE.into(),
+        };
+        let events = vec![
+            event(0, "a", "a0", Some(10_000)),
+            event(200, "b", "b0", Some(10_000)),
+            revoke,
+        ];
+        assert_eq!(account_at(&events, 10, 300), Some(Some("a".into())));
+        // a0 was revoked at 400 when `a` refreshed; the process adopted b.
+        assert_eq!(account_at(&events, 10, 500), Some(Some("b".into())));
     }
 }
