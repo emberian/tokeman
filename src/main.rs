@@ -1,3 +1,8 @@
+// The rotation service (launchd) and Claude login handling (Keychain) are
+// macOS-only, so much of that layer is unreachable elsewhere. Dead code is
+// still reported on macOS, where the whole crate is live.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 mod admission;
 mod chart;
 mod claude_login;
@@ -19,7 +24,7 @@ mod tray;
 mod tui;
 mod web;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -663,6 +668,7 @@ async fn main() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn read_claude_usage_key() -> Result<String> {
+    use anyhow::Context;
     let output = std::process::Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
