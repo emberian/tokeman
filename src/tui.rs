@@ -612,15 +612,8 @@ fn level_color(level: Level) -> Color {
 }
 
 fn compact_bucket_label(label: &str, rejected: bool) -> String {
-    let mut compact = label
-        .split_whitespace()
-        .map(|part| part.chars().next().unwrap_or('?'))
-        .collect::<String>();
-    if compact.len() < 2 {
-        compact = label.chars().take(3).collect();
-    }
-    compact.truncate(3);
-    format!("{compact}{}", if rejected { "!" } else { "7" })
+    let short = crate::display::short_bucket_label(label);
+    format!("{short}{}", if rejected { "!" } else { "" })
 }
 
 fn make_gauge_line<'a>(label: &str, window: &Window) -> Line<'a> {

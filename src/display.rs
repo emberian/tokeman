@@ -350,3 +350,35 @@ pub fn print_stats(stats: &[crate::stats::TokenStats]) {
         println!();
     }
 }
+
+/// A three-character name for a per-model bucket, for narrow gauge rows:
+/// the family's initial plus its version ("Opus 4.8" -> "O48", "Opus 5" ->
+/// "O5"), or the first three letters when there is no version ("Fable" ->
+/// "Fab").
+pub fn short_bucket_label(label: &str) -> String {
+    let mut words = label.split_whitespace();
+    let name = words.next().unwrap_or("?");
+    let version: String = words
+        .flat_map(str::chars)
+        .filter(char::is_ascii_digit)
+        .collect();
+    let short = if version.is_empty() {
+        name.chars().take(3).collect::<String>()
+    } else {
+        format!("{}{version}", name.chars().next().unwrap_or('?'))
+    };
+    short.chars().take(3).collect()
+}
+
+#[cfg(test)]
+mod bucket_label_tests {
+    use super::short_bucket_label;
+
+    #[test]
+    fn short_labels_keep_family_and_version() {
+        assert_eq!(short_bucket_label("Opus 4.8"), "O48");
+        assert_eq!(short_bucket_label("Opus 5"), "O5");
+        assert_eq!(short_bucket_label("Fable"), "Fab");
+        assert_eq!(short_bucket_label("Sonnet"), "Son");
+    }
+}

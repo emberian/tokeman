@@ -266,10 +266,15 @@ impl Store {
 
     fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
         let probed_at_str: String = row.get(1)?;
-        let model_usage_buckets = row
+        let mut model_usage_buckets: Vec<ModelQuotaBucket> = row
             .get::<_, Option<String>>(17)?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
+        // Rows written before keys were canonicalized say `claudeopus48`
+        // where newer ones say `opus48`; one key keeps one history line.
+        for bucket in &mut model_usage_buckets {
+            bucket.key = crate::probe::model_key(&bucket.key);
+        }
         let probed_at = DateTime::parse_from_rfc3339(&probed_at_str)
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| {

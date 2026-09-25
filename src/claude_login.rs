@@ -194,7 +194,7 @@ async fn post_token(body: serde_json::Value) -> Result<Bundle> {
         .post(TOKEN_URL)
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", "claude-code/2.1.247")
+        .header("user-agent", crate::probe::client_user_agent())
         .json(&body)
         .send()
         .await

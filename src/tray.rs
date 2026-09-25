@@ -389,33 +389,25 @@ impl TokemaApp {
                 if let Some(ref w) = q.weekly {
                     Self::draw_gauge(ui, "7d", w);
                 }
-                if let Some(w) = result
+                let buckets = result
                     .model_usage
                     .as_ref()
-                    .and_then(|usage| usage.opus_weekly.as_ref())
-                {
-                    Self::draw_gauge(ui, "Opus", w);
-                } else {
+                    .map(|usage| usage.buckets())
+                    .unwrap_or_default();
+                if buckets.is_empty() {
                     ui.label(
-                        egui::RichText::new("Opus  profile usage unavailable")
+                        egui::RichText::new("per-model limits unavailable")
                             .monospace()
                             .size(10.0)
                             .color(egui::Color32::from_gray(110)),
                     );
                 }
-                if let Some(w) = result
-                    .model_usage
-                    .as_ref()
-                    .and_then(|usage| usage.sonnet_weekly.as_ref())
-                {
-                    Self::draw_gauge(ui, "Son", w);
-                } else {
-                    ui.label(
-                        egui::RichText::new("Son   profile usage unavailable")
-                            .monospace()
-                            .size(10.0)
-                            .color(egui::Color32::from_gray(110)),
-                    );
+                for bucket in &buckets {
+                    let mut label = crate::display::short_bucket_label(&bucket.label);
+                    if bucket.source == crate::probe::ModelUsageSource::ObservedRejection {
+                        label.push('!');
+                    }
+                    Self::draw_gauge(ui, &label, &bucket.window);
                 }
                 if let Some(ref w) = q.overage {
                     Self::draw_gauge(ui, "$$", w);

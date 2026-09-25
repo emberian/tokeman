@@ -859,13 +859,7 @@ fn family_version(value: &str) -> Option<ModelDescriptor> {
         .unwrap_or(value)
         .to_ascii_lowercase();
     let normalized = normalized_model(&base);
-    if normalized == "fable" || normalized.contains("fable") {
-        return Some(ModelDescriptor {
-            family: "opus".into(),
-            version: Some("48".into()),
-        });
-    }
-    for family in ["opus", "sonnet"] {
+    for family in ["opus", "sonnet", "fable"] {
         let Some(normalized_start) = normalized.find(family) else {
             continue;
         };
@@ -905,7 +899,12 @@ fn bucket_matches_model(bucket: &ModelQuotaBucket, target_model: &str) -> bool {
     let bucket_descriptor = family_version(&bucket.key).or_else(|| family_version(&bucket.label));
     match (target, bucket_descriptor) {
         (Some(target), Some(bucket)) if target.family == bucket.family => {
-            bucket.version.is_none() || target.version == bucket.version
+            match (target.version.as_deref(), bucket.version.as_deref()) {
+                (_, None) => true,
+                // A major-only bucket ("Fable 5") covers its point releases.
+                (Some(target), Some(bucket)) if bucket.len() == 1 => target.starts_with(bucket),
+                (target, bucket) => target == bucket,
+            }
         }
         (Some(_), Some(_)) => false,
         _ => {
@@ -924,15 +923,16 @@ fn relevant_model_windows<'a>(
     let Some(target_model) = target_model else {
         return Vec::new();
     };
-    let Some(usage) = result.model_usage.as_ref() else {
-        return Vec::new();
-    };
-    let descriptor = family_version(target_model);
+    let family = family_version(target_model).map(|descriptor| descriptor.family);
     let mut windows = Vec::new();
-    match descriptor
-        .as_ref()
-        .map(|descriptor| descriptor.family.as_str())
-    {
+    if family.as_deref() == Some("fable") {
+        // The header form of the Fable limit, when the probe carried it.
+        windows.extend(result.quota.as_ref().and_then(|quota| quota.fable.as_ref()));
+    }
+    let Some(usage) = result.model_usage.as_ref() else {
+        return windows;
+    };
+    match family.as_deref() {
         Some("opus") => windows.extend(usage.opus_weekly.as_ref()),
         Some("sonnet") => windows.extend(usage.sonnet_weekly.as_ref()),
         _ => {}
@@ -2746,6 +2746,8 @@ mod tests {
                 overage_status: None,
                 overage: None,
                 overage_disabled_reason: None,
+                fable: None,
+                overage_in_use: false,
             }),
             model_usage: None,
             model_usage_error: None,
@@ -2859,19 +2861,34 @@ mod tests {
     #[test]
     fn exhausted_opus_48_bucket_does_not_poison_opus_5() {
         let policy = RotationSettings::default();
-        let result = result_with_scoped_bucket("separate-models", "claudeopus48", "Opus 4.8", 1.0);
-        assert!(is_viable(
-            &result,
-            RotationMode::Normal,
-            &policy,
-            Some("opus")
-        ));
-        assert!(!is_viable(
-            &result,
-            RotationMode::Normal,
-            &policy,
-            Some("fable")
-        ));
+        let result = result_with_scoped_bucket("separate-models", "opus48", "Opus 4.8", 1.0);
+        let viable = |model| is_viable(&result, RotationMode::Normal, &policy, Some(model));
+        assert!(viable("opus"));
+        assert!(!viable("claude-opus-4-8"));
+        // Fable is its own family with its own limit, not Opus 4.8.
+        assert!(viable("claude-fable-5-1"));
+    }
+
+    #[test]
+    fn the_fable_limit_gates_fable_sessions_only() {
+        let policy = RotationSettings::default();
+        let viable = |result: &ProbeResult, model| {
+            is_viable(result, RotationMode::Normal, &policy, Some(model))
+        };
+        // Profile row: a major-less "Fable" bucket covers every Fable release.
+        let profile = result_with_scoped_bucket("profile", "fable", "Fable", 1.0);
+        assert!(!viable(&profile, "claude-fable-5-1"));
+        assert!(!viable(&profile, "fable"));
+        assert!(viable(&profile, "opus"));
+
+        // Header form (`7d_oi`) on an account without profile usage.
+        let mut headers = result("headers", 0.1, 0.1);
+        headers.quota.as_mut().unwrap().fable = Some(Window {
+            utilization: 1.0,
+            reset: 0,
+        });
+        assert!(!viable(&headers, "claude-fable-5-1"));
+        assert!(viable(&headers, "claude-opus-5"));
     }
 
     #[test]

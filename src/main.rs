@@ -99,8 +99,9 @@ enum Command {
         /// How many hours of history to display
         #[arg(long, default_value = "24")]
         hours: f64,
-        /// Capacity window to chart
-        #[arg(long, value_enum, default_value = "five-hour")]
+        /// Window to chart: five-hour, seven-day, overage, or a model's
+        /// weekly bucket by name (fable, opus-5, "Opus 4.8", ...)
+        #[arg(long, default_value = "five-hour")]
         metric: chart::ChartMetric,
         /// Also save the PNG at this path
         #[arg(long)]

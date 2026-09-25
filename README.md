@@ -92,8 +92,8 @@ tokeman rotate quarantine <name> --model opus --window weekly \
 tokeman rotate clear-quarantine <name>
 tokeman chart                     # inline history chart in iTerm2
 tokeman chart --metric seven-day # chart another quota window
-tokeman chart --metric opus-weekly # chart the separate Opus weekly bucket
-tokeman chart --metric sonnet-weekly
+tokeman chart --metric fable      # chart any per-model weekly bucket by name
+tokeman chart --metric "Opus 4.8"
 tokeman usage capture <name>       # capture current /login profile usage access
 tokeman browse                    # local interactive history/session dashboard
 tokeman login [<name>|--more]    # browser login: full scope, refreshable
@@ -223,24 +223,35 @@ admission than a cheap probe.
 
 ### Model-specific weekly buckets
 
-The long-lived setup tokens used for message probes generally do not have the
-`user:profile` scope needed by Claude's profile-usage endpoint. To attach the
-currently logged-in Claude account's read-only usage view to a configured token:
+Besides the general 5-hour and weekly windows, an account can have weekly
+limits that apply to one model: for example a "Fable limit" (the share of the
+weekly allowance Fable models may use before they need usage credits), or
+separate Opus 4.8 and Opus 5 buckets. Tokeman reads them from two places:
 
-```sh
-# In Claude Code, /login to the account represented by this tokeman name.
-tokeman usage capture ember@lunar.town
-```
+- **The profile-usage endpoint** (`/api/oauth/usage`, needs a `tokeman login`
+  credential). Its `limits` list holds one `weekly_scoped` row per model,
+  named by the model's display name. Every such row is shown, including idle
+  ones and ones with no reset yet; the server's `is_active` flag only marks
+  its headline row and is not a filter.
+- **The `7d_oi` rate-limit headers** ("seven day, overage included"), which
+  carry the Fable limit on any credential, setup tokens included, when the
+  probe response includes them. They are recorded as a "Fable" bucket unless
+  the profile endpoint already reported one.
 
-Capture reads the macOS Keychain and may cause one explicit prompt. It also
-reconciles the `/login` record after capture so managed fleet auth remains
-authoritative. The background rotator, session observer, `--watch`, tray,
-browser, and normal probes never read Keychain. A captured profile access token
-can expire; if the model-scoped rows change to
-“unavailable,” repeat `/login` and the capture command for that account. Tokeman
-displays missing model data as unknown and never substitutes the general 7-day
-value. An observed Claude rejection is rendered as a separate, labeled signal,
-not misrepresented as profile telemetry.
+A bucket's identity is a canonical key (`opus48`, `opus5`, `fable`) shared by
+profile rows and observed rejections, so `claude-opus-4-8` in a rejection and
+"Opus 4.8" in a profile row are the same bucket. Only buckets matching the
+startup model participate in rotation: an exhausted Opus 4.8 bucket does not
+block Opus 5 sessions, and Fable is its own family.
+
+Tokeman displays missing model data as unknown and never substitutes the
+general 7-day value. An observed Claude rejection is rendered as a separate,
+labeled signal (`!`), not as profile telemetry.
+
+`tokeman usage capture <name>` is the older way to get profile reads: it
+copies the access token of the account currently `/login`ed in Claude Code
+(reading the Keychain, which may prompt). It cannot be refreshed and expires
+within hours; prefer `tokeman login`.
 
 ### Launch mode
 
@@ -279,8 +290,12 @@ headroom for each account. The PNG is also saved under
 ```sh
 tokeman chart --hours 24 --metric five-hour
 tokeman chart --hours 168 --metric seven-day --output weekly.png
-tokeman chart --hours 168 --metric opus-weekly --output opus-weekly.png
+tokeman chart --hours 168 --metric fable --output fable.png
 ```
+
+`--metric` accepts `five-hour`, `seven-day`, `overage`, or a model name in any
+spelling (`fable`, `opus-5`, `"Opus 4.8"`). An unknown model lists the buckets
+that do have history.
 
 ### Tray app
 
@@ -380,8 +395,15 @@ the `anthropic-ratelimit-unified-*` response headers. These headers report:
 |--------|---------------|
 | `5h` | Rolling 5-hour session quota |
 | `7d` | General weekly quota reported by the Haiku probe |
-| `<model> 7d` | Dynamically discovered model-scoped quota from the profile-usage endpoint |
+| `7d_oi` | The Fable weekly limit, when the response carries it |
+| `<model> 7d` | Per-model weekly buckets from the profile-usage endpoint |
 | `overage` | Extra usage / pay-as-you-go credits |
+
+`representative-claim` names the window currently deciding admission:
+`five_hour`, `seven_day`, `seven_day_overage_included` (Fable),
+`seven_day_opus`, `seven_day_sonnet`, or `overage`. Neither the headers nor the
+profile endpoint is publicly documented; tokeman follows how Claude Code's own
+client reads them, and requests identify as the installed Claude Code version.
 
 OAuth tokens require the `anthropic-beta: oauth-2025-04-20` header.
 

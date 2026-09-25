@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::config::Token;
 use crate::private_fs::{FileLock, state_dir, write_atomic};
 use crate::probe::{
-    ModelQuotaBucket, ModelUsage, ModelUsageSource, ProbeResult, Window, normalized_bucket_key,
+    ModelQuotaBucket, ModelUsage, ModelUsageSource, ProbeResult, Window, model_key,
 };
 
 pub const ACCOUNT_ENV: &str = "TOKEMAN_ACCOUNT";
@@ -581,7 +581,7 @@ fn apply_limit(result: &mut ProbeResult, limit: &ObservedLimit) {
     if limit.window == LimitWindow::Weekly
         && let Some(model_id) = limit.model_id.as_deref()
     {
-        let key = normalized_bucket_key(model_id);
+        let key = model_key(model_id);
         if key.is_empty() {
             return;
         }
@@ -819,6 +819,8 @@ mod tests {
                 overage_status: None,
                 overage: None,
                 overage_disabled_reason: None,
+                fable: None,
+                overage_in_use: false,
             }),
             model_usage: None,
             model_usage_error: None,
@@ -943,7 +945,7 @@ mod tests {
         let usage = result.model_usage.unwrap();
         assert!(usage.opus_weekly.is_none());
         assert_eq!(usage.scoped_weekly.len(), 1);
-        assert_eq!(usage.scoped_weekly[0].key, "claudeopus48");
+        assert_eq!(usage.scoped_weekly[0].key, "opus48");
         assert_eq!(usage.scoped_weekly[0].window.utilization, 1.0);
         assert_eq!(
             usage.scoped_weekly[0].source,

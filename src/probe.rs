@@ -46,17 +46,26 @@ pub struct UnifiedQuota {
     /// "allowed", "allowed_warning", or "rejected"
     pub status: String,
     pub reset: i64,
-    /// Which claim is authoritative: "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage"
+    /// Which claim is authoritative: "five_hour", "seven_day",
+    /// "seven_day_overage_included" (the Fable limit), "seven_day_opus",
+    /// "seven_day_sonnet", or "overage"
     pub representative_claim: String,
     /// "available" if fallback exists
     pub fallback: Option<String>,
     /// Per-window utilization
     pub session: Option<Window>, // 5h
     pub weekly: Option<Window>, // 7d
+    /// The Fable weekly limit (`7d_oi`, "seven day, overage included"): the
+    /// share of the weekly allowance Fable models may use before they need
+    /// usage credits. Headers vary by the model a request used, so a probe on
+    /// another model may not carry it; the profile endpoint's per-model rows do.
+    pub fable: Option<Window>,
     /// Overage / extra usage
     pub overage_status: Option<String>,
     pub overage: Option<Window>,
     pub overage_disabled_reason: Option<String>,
+    /// Requests are currently being paid for with usage credits.
+    pub overage_in_use: bool,
 }
 
 impl UnifiedQuota {
@@ -99,6 +108,8 @@ pub struct ProbeResult {
 pub enum ModelUsageSource {
     Profile,
     ObservedRejection,
+    /// A rate-limit header window, e.g. the `7d_oi` Fable limit.
+    Headers,
 }
 
 impl ModelUsageSource {
@@ -106,6 +117,7 @@ impl ModelUsageSource {
         match self {
             Self::Profile => "profile",
             Self::ObservedRejection => "observed Claude rejection",
+            Self::Headers => "rate-limit headers",
         }
     }
 
@@ -113,6 +125,7 @@ impl ModelUsageSource {
         match self {
             Self::Profile => "profile",
             Self::ObservedRejection => "observed!",
+            Self::Headers => "headers",
         }
     }
 }
@@ -168,6 +181,10 @@ impl ModelUsage {
     }
 }
 
+// The `/api/oauth/usage` response, as Claude Code's own client reads it.
+// Every window is `{utilization: percent 0-100 | null, resets_at: ISO 8601 |
+// null}`. `limits` is the server's list of meters, meant to be rendered
+// verbatim; it is null from older servers.
 #[derive(Debug, Deserialize)]
 struct UsageWindowResponse {
     utilization: Option<f64>,
@@ -178,31 +195,28 @@ struct UsageWindowResponse {
 struct UsageResponse {
     seven_day_opus: Option<UsageWindowResponse>,
     seven_day_sonnet: Option<UsageWindowResponse>,
-    #[serde(default)]
-    limits: Vec<UsageLimitResponse>,
+    /// Kept as raw values so one unexpected row cannot fail the whole parse.
+    limits: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsageLimitResponse {
-    kind: Option<String>,
-    group: Option<String>,
-    percent: Option<f64>,
+    /// Classify rows on this: "session", "weekly_all", "weekly_scoped", ...
+    kind: String,
+    /// 0-100.
+    percent: f64,
     resets_at: Option<String>,
-    is_active: Option<bool>,
     scope: Option<UsageScopeResponse>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsageScopeResponse {
-    model: Option<UsageModelResponse>,
-    surface: Option<String>,
+    model: Option<DisplayName>,
 }
 
 #[derive(Debug, Deserialize)]
-struct UsageModelResponse {
-    display_name: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
+struct DisplayName {
+    display_name: String,
 }
 
 fn header_str(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -241,12 +255,15 @@ fn parse_unified_quota(headers: &HeaderMap) -> Option<UnifiedQuota> {
         fallback: header_str(headers, "anthropic-ratelimit-unified-fallback"),
         session: parse_window(headers, "anthropic-ratelimit-unified-5h"),
         weekly: parse_window(headers, "anthropic-ratelimit-unified-7d"),
+        fable: parse_window(headers, "anthropic-ratelimit-unified-7d_oi"),
         overage_status: header_str(headers, "anthropic-ratelimit-unified-overage-status"),
         overage: parse_window(headers, "anthropic-ratelimit-unified-overage"),
         overage_disabled_reason: header_str(
             headers,
             "anthropic-ratelimit-unified-overage-disabled-reason",
         ),
+        overage_in_use: header_str(headers, "anthropic-ratelimit-unified-overage-in-use")
+            .is_some_and(|value| value == "true"),
     })
 }
 
@@ -262,59 +279,53 @@ fn parse_rate_limits(headers: &HeaderMap) -> RateLimits {
 }
 
 fn usage_window(window: UsageWindowResponse) -> Option<Window> {
-    let utilization = window.utilization?;
-    let reset = DateTime::parse_from_rfc3339(window.resets_at.as_deref()?)
-        .ok()?
-        .timestamp();
     Some(Window {
         // The profile endpoint reports percentages; message headers report a
         // 0..1 fraction. Normalize once at the boundary.
-        utilization: (utilization / 100.0).clamp(0.0, 1.0),
-        reset,
+        utilization: (window.utilization? / 100.0).clamp(0.0, 1.0),
+        reset: parse_reset(window.resets_at.as_deref()),
     })
 }
 
-pub(crate) fn normalized_bucket_key(value: &str) -> String {
-    value
+/// Canonical identity for a model or a per-model bucket, so a profile row
+/// labeled "Opus 4.8" and a rejection naming `claude-opus-4-8` land on the
+/// same key: lowercase alphanumerics, without the `claude` prefix.
+pub(crate) fn model_key(value: &str) -> String {
+    let key: String = value
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
+        .collect();
+    match key.strip_prefix("claude") {
+        Some(rest) if !rest.is_empty() => rest.to_owned(),
+        _ => key,
+    }
 }
 
-fn dynamic_usage_bucket(limit: UsageLimitResponse) -> Option<ModelQuotaBucket> {
-    if limit.kind.as_deref() != Some("weekly_scoped")
-        && !(limit.group.as_deref() == Some("weekly") && limit.scope.is_some())
-    {
+fn parse_reset(resets_at: Option<&str>) -> i64 {
+    // An unused bucket may have no reset yet; 0 renders as "--".
+    resets_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map_or(0, |time| time.timestamp())
+}
+
+/// A per-model weekly row, identified the way Claude Code identifies it: a
+/// `weekly_scoped` meter whose scope names a model. Surface-scoped rows are
+/// not models. Every such row counts, including idle ones; `is_active` only
+/// marks the server's headline row.
+fn scoped_model_bucket(row: serde_json::Value) -> Option<ModelQuotaBucket> {
+    let row: UsageLimitResponse = serde_json::from_value(row).ok()?;
+    if row.kind != "weekly_scoped" {
         return None;
     }
-    let percent = limit.percent?;
-    if percent == 0.0 && limit.is_active == Some(false) {
-        return None;
-    }
-    let reset = DateTime::parse_from_rfc3339(limit.resets_at.as_deref()?)
-        .ok()?
-        .timestamp();
-    let scope = limit.scope?;
-    let model = scope.model;
-    let label = model
-        .as_ref()
-        .and_then(|model| model.display_name.clone())
-        .or_else(|| scope.surface.clone())
-        .or_else(|| model.as_ref().and_then(|model| model.name.clone()))
-        .or_else(|| model.as_ref().and_then(|model| model.id.clone()))
-        .unwrap_or_else(|| "Scoped model".into());
-    let identity = model
-        .as_ref()
-        .and_then(|model| model.id.as_deref().or(model.name.as_deref()))
-        .unwrap_or(&label);
-    let key = normalized_bucket_key(identity);
-    (!key.is_empty()).then_some(ModelQuotaBucket {
+    let label = row.scope?.model?.display_name;
+    let key = model_key(&label);
+    (!key.is_empty()).then(|| ModelQuotaBucket {
         key,
         label,
         window: Window {
-            utilization: (percent / 100.0).clamp(0.0, 1.0),
-            reset,
+            utilization: (row.percent / 100.0).clamp(0.0, 1.0),
+            reset: parse_reset(row.resets_at.as_deref()),
         },
         source: ModelUsageSource::Profile,
     })
@@ -325,11 +336,13 @@ fn parse_model_usage(usage: UsageResponse) -> ModelUsage {
     let sonnet_weekly = usage.seven_day_sonnet.and_then(usage_window);
     let mut scoped_weekly = usage
         .limits
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(dynamic_usage_bucket)
+        .filter_map(scoped_model_bucket)
         .collect::<Vec<_>>();
-    scoped_weekly.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.key.cmp(&b.key)));
+    scoped_weekly.sort_by(|a, b| a.key.cmp(&b.key));
     scoped_weekly.dedup_by(|a, b| a.key == b.key);
+    scoped_weekly.sort_by(|a, b| a.label.cmp(&b.label));
     ModelUsage {
         opus_source: opus_weekly.as_ref().map(|_| ModelUsageSource::Profile),
         sonnet_source: sonnet_weekly.as_ref().map(|_| ModelUsageSource::Profile),
@@ -350,7 +363,7 @@ async fn probe_model_usage(
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {usage_key}"))
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", "claude-code/2.1.220")
+        .header("user-agent", client_user_agent())
         .send()
         .await;
     match response {
@@ -382,6 +395,30 @@ pub async fn validate_usage_key(usage_key: &str) -> Result<ModelUsage, String> {
     };
     let (usage, error) = probe_model_usage(&client, &token).await;
     usage.ok_or_else(|| error.unwrap_or_else(|| "usage data unavailable".into()))
+}
+
+/// The `claude-code/<version>` user agent of the installed Claude Code, so
+/// requests look like the client whose endpoints they call. Read once per
+/// process; falls back to a recent version if `claude` cannot be run.
+pub fn client_user_agent() -> &'static str {
+    static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let version = std::process::Command::new(
+            std::env::var("TOKEMAN_CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+        )
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .filter(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                .map(str::to_owned)
+        });
+        format!("claude-code/{}", version.as_deref().unwrap_or("2.1.282"))
+    })
 }
 
 /// Error reported for an account with neither a live login nor a setup token.
@@ -469,7 +506,32 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
     let (model_usage, model_usage_error) = probe_model_usage(client, token).await;
     probe.model_usage = model_usage;
     probe.model_usage_error = model_usage_error;
+    attach_header_buckets(&mut probe);
     probe
+}
+
+/// Record the header form of the Fable limit as an ordinary per-model bucket,
+/// unless the profile endpoint already reported one. Rotation, history, charts
+/// and every dashboard then treat it like any other model bucket, including on
+/// accounts whose credential cannot read the profile endpoint.
+fn attach_header_buckets(probe: &mut ProbeResult) {
+    let Some(window) = probe.quota.as_ref().and_then(|quota| quota.fable.clone()) else {
+        return;
+    };
+    let usage = probe.model_usage.get_or_insert_with(ModelUsage::default);
+    if usage
+        .scoped_weekly
+        .iter()
+        .any(|bucket| bucket.key.starts_with("fable"))
+    {
+        return;
+    }
+    usage.scoped_weekly.push(ModelQuotaBucket {
+        key: "fable".into(),
+        label: "Fable".into(),
+        window,
+        source: ModelUsageSource::Headers,
+    });
 }
 
 pub async fn probe_all(tokens: &[Token]) -> Vec<ProbeResult> {
@@ -494,7 +556,7 @@ pub async fn probe_all_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageResponse, UsageWindowResponse, parse_model_usage, usage_window};
+    use super::{UsageResponse, UsageWindowResponse, model_key, parse_model_usage, usage_window};
 
     #[test]
     fn profile_usage_percent_is_normalized_to_fraction() {
@@ -574,7 +636,7 @@ mod tests {
                         "percent": 0.0,
                         "resets_at": "2026-08-03T12:00:00Z",
                         "is_active": false,
-                        "scope": {"surface": "dormant"}
+                        "scope": {"surface": {"display_name": "Cowork"}}
                     }
                 ]
             }"#,
@@ -582,12 +644,46 @@ mod tests {
         .expect("dynamic usage response");
 
         let usage = parse_model_usage(usage);
+        // The surface-scoped row is a meter, but not a model.
         assert_eq!(usage.scoped_weekly.len(), 2);
-        assert_eq!(usage.scoped_weekly[0].key, "claudeopus48");
+        assert_eq!(usage.scoped_weekly[0].key, "opus48");
         assert_eq!(usage.scoped_weekly[0].label, "Opus 4.8");
         assert_eq!(usage.scoped_weekly[0].window.utilization, 1.0);
-        assert_eq!(usage.scoped_weekly[1].key, "claudeopus5");
+        assert_eq!(usage.scoped_weekly[1].key, "opus5");
         assert_eq!(usage.scoped_weekly[1].window.utilization, 0.2);
+    }
+
+    #[test]
+    fn idle_null_reset_and_odd_rows_do_not_hide_model_buckets() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{
+                "seven_day_opus": {"utilization": 0.0, "resets_at": null},
+                "limits": [
+                    {"kind": "weekly_scoped", "group": "weekly", "percent": 0.0,
+                     "resets_at": null, "severity": "normal", "is_active": false,
+                     "scope": {"model": {"display_name": "Fable"}}},
+                    {"kind": "weekly_scoped", "percent": "not a number",
+                     "scope": {"model": {"display_name": "Broken"}}},
+                    {"kind": "some_future_kind", "percent": 5.0, "surprise": [1, 2]}
+                ]
+            }"#,
+        )
+        .expect("a malformed row must not fail the whole response");
+        let usage = parse_model_usage(usage);
+        assert_eq!(usage.scoped_weekly.len(), 1);
+        assert_eq!(usage.scoped_weekly[0].key, "fable");
+        assert_eq!(usage.scoped_weekly[0].window.reset, 0);
+        assert_eq!(usage.opus_weekly.as_ref().map(|w| w.reset), Some(0));
+
+        let older: UsageResponse = serde_json::from_str(r#"{"limits": null}"#).unwrap();
+        assert!(parse_model_usage(older).scoped_weekly.is_empty());
+    }
+
+    #[test]
+    fn model_keys_agree_between_ids_and_display_names() {
+        assert_eq!(model_key("claude-opus-4-8"), model_key("Opus 4.8"));
+        assert_eq!(model_key("claude-fable-5-1"), "fable51");
+        assert_eq!(model_key("Claude"), "claude");
     }
 
     #[test]

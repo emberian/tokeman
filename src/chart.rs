@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use chrono::{Duration, Utc};
-use clap::ValueEnum;
 
 use crate::config::Config;
 use crate::rotation::{self, RotationMode};
@@ -24,46 +23,74 @@ const COLORS: [[u8; 4]; 10] = [
     [200, 214, 229, 255],
 ];
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+/// What to chart: a general window, or one per-model weekly bucket.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChartMetric {
     FiveHour,
     SevenDay,
-    OpusWeekly,
-    SonnetWeekly,
     Overage,
+    /// A per-model bucket by canonical key (`opus5`, `fable`, ...).
+    Model(String),
+}
+
+impl std::str::FromStr for ChartMetric {
+    type Err = String;
+
+    /// `five-hour`, `seven-day`, `overage`, or any model name: `fable`,
+    /// `opus-5`, `"Opus 4.8"`. `opus-weekly`/`sonnet-weekly` still work.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "five-hour" | "5h" => Self::FiveHour,
+            "seven-day" | "7d" => Self::SevenDay,
+            "overage" => Self::Overage,
+            "opus-weekly" => Self::Model("opus".into()),
+            "sonnet-weekly" => Self::Model("sonnet".into()),
+            other => {
+                let key = crate::probe::model_key(other);
+                if key.is_empty() {
+                    return Err(format!("unknown metric {other:?}"));
+                }
+                Self::Model(key)
+            }
+        })
+    }
 }
 
 impl ChartMetric {
-    fn label(self) -> &'static str {
+    fn label(&self, snapshots: &[Snapshot]) -> String {
         match self {
-            Self::FiveHour => "5-HOUR CAPACITY REMAINING",
-            Self::SevenDay => "7-DAY CAPACITY REMAINING",
-            Self::OpusWeekly => "OPUS 7-DAY CAPACITY REMAINING",
-            Self::SonnetWeekly => "SONNET 7-DAY CAPACITY REMAINING",
-            Self::Overage => "OVERAGE CAPACITY REMAINING",
+            Self::FiveHour => "5-HOUR CAPACITY REMAINING".into(),
+            Self::SevenDay => "7-DAY CAPACITY REMAINING".into(),
+            Self::Overage => "OVERAGE CAPACITY REMAINING".into(),
+            Self::Model(key) => {
+                let label = snapshots
+                    .iter()
+                    .rev()
+                    .flat_map(Snapshot::model_buckets)
+                    .find(|bucket| &bucket.key == key)
+                    .map_or_else(|| key.clone(), |bucket| bucket.label);
+                format!("{} 7-DAY CAPACITY REMAINING", label.to_uppercase())
+            }
         }
     }
 
-    fn signal_label(self) -> &'static str {
+    fn signal_label(&self) -> &'static str {
         match self {
-            Self::OpusWeekly | Self::SonnetWeekly => {
-                "PROFILE USAGE SIGNAL · COLD-REQUEST ADMISSION CAN BE STRICTER"
-            }
+            Self::Model(_) => "PER-MODEL WEEKLY LIMIT · COLD-REQUEST ADMISSION CAN BE STRICTER",
             Self::FiveHour | Self::SevenDay | Self::Overage => {
                 "HAIKU 4.5 QUOTA SIGNAL · PREMIUM ADMISSION UNMEASURED"
             }
         }
     }
 
-    /// (utilization, reset); the Opus/Sonnet metrics read the legacy columns.
-    fn window(self, s: &Snapshot) -> Option<(f64, Option<i64>)> {
-        match self {
-            Self::FiveHour => s.window(Series::FiveHour),
-            Self::SevenDay => s.window(Series::SevenDay),
-            Self::OpusWeekly => Some((s.utilization_opus_7d?, s.reset_opus_7d)),
-            Self::SonnetWeekly => Some((s.utilization_sonnet_7d?, s.reset_sonnet_7d)),
-            Self::Overage => s.window(Series::Overage),
-        }
+    /// (utilization, reset) for this metric in one snapshot.
+    fn window(&self, s: &Snapshot) -> Option<(f64, Option<i64>)> {
+        s.window(match self {
+            Self::FiveHour => Series::FiveHour,
+            Self::SevenDay => Series::SevenDay,
+            Self::Overage => Series::Overage,
+            Self::Model(key) => Series::Model(key),
+        })
     }
 }
 
@@ -109,7 +136,7 @@ pub fn run(config: &Config, options: ChartOptions) -> Result<PathBuf> {
     let png = render_png(
         config,
         &snapshots,
-        options.metric,
+        &options.metric,
         options.hours,
         options.width,
         options.height,
@@ -158,7 +185,7 @@ fn print_iterm_image(png: &[u8]) {
 fn render_png(
     config: &Config,
     snapshots: &[Snapshot],
-    metric: ChartMetric,
+    metric: &ChartMetric,
     hours: f64,
     width: u32,
     height: u32,
@@ -181,6 +208,23 @@ fn render_png(
             });
     }
     if series.values().all(Vec::is_empty) {
+        if let ChartMetric::Model(key) = metric {
+            let mut known: Vec<String> = snapshots
+                .iter()
+                .flat_map(Snapshot::model_buckets)
+                .map(|bucket| bucket.key)
+                .collect();
+            known.sort();
+            known.dedup();
+            bail!(
+                "no history for model bucket {key:?} in this range; recorded buckets: {}",
+                if known.is_empty() {
+                    "none".into()
+                } else {
+                    known.join(", ")
+                }
+            );
+        }
         bail!("no chartable history in this range; run `tokeman` to collect a snapshot first");
     }
 
@@ -194,7 +238,7 @@ fn render_png(
         bail!("chart dimensions are too small");
     }
 
-    canvas.text(24, 22, metric.label(), 3, [229, 235, 244, 255]);
+    canvas.text(24, 22, &metric.label(snapshots), 3, [229, 235, 244, 255]);
     canvas.text(
         24,
         52,
@@ -246,7 +290,7 @@ fn render_png(
     let (normal_floor, sip_floor) = match metric {
         ChartMetric::FiveHour => (normal.0, sip.0),
         ChartMetric::SevenDay => (normal.1, sip.1),
-        ChartMetric::OpusWeekly | ChartMetric::SonnetWeekly | ChartMetric::Overage => (0.0, 0.0),
+        ChartMetric::Model(_) | ChartMetric::Overage => (0.0, 0.0),
     };
     if normal_floor > 0.0 {
         let y = map_y(normal_floor, top, bottom);
