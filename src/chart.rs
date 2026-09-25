@@ -8,7 +8,8 @@ use chrono::{Duration, Utc};
 use clap::ValueEnum;
 
 use crate::config::Config;
-use crate::store::{Snapshot, Store};
+use crate::rotation::{self, RotationMode};
+use crate::store::{Series, Snapshot, Store};
 
 const COLORS: [[u8; 4]; 10] = [
     [91, 192, 235, 255],
@@ -54,23 +55,14 @@ impl ChartMetric {
         }
     }
 
-    fn utilization(self, snapshot: &Snapshot) -> Option<f64> {
+    /// (utilization, reset); the Opus/Sonnet metrics read the legacy columns.
+    fn window(self, s: &Snapshot) -> Option<(f64, Option<i64>)> {
         match self {
-            Self::FiveHour => snapshot.utilization_5h,
-            Self::SevenDay => snapshot.utilization_7d,
-            Self::OpusWeekly => snapshot.utilization_opus_7d,
-            Self::SonnetWeekly => snapshot.utilization_sonnet_7d,
-            Self::Overage => snapshot.utilization_overage,
-        }
-    }
-
-    fn reset(self, snapshot: &Snapshot) -> Option<i64> {
-        match self {
-            Self::FiveHour => snapshot.reset_5h,
-            Self::SevenDay => snapshot.reset_7d,
-            Self::OpusWeekly => snapshot.reset_opus_7d,
-            Self::SonnetWeekly => snapshot.reset_sonnet_7d,
-            Self::Overage => snapshot.reset_overage,
+            Self::FiveHour => s.window(Series::FiveHour),
+            Self::SevenDay => s.window(Series::SevenDay),
+            Self::OpusWeekly => Some((s.utilization_opus_7d?, s.reset_opus_7d)),
+            Self::SonnetWeekly => Some((s.utilization_sonnet_7d?, s.reset_sonnet_7d)),
+            Self::Overage => s.window(Series::Overage),
         }
     }
 }
@@ -85,10 +77,20 @@ pub struct ChartOptions {
 }
 
 #[derive(Clone, Copy)]
-struct Point {
-    timestamp: i64,
-    remaining: f64,
-    reset: Option<i64>,
+pub(crate) struct Point {
+    pub(crate) timestamp: i64,
+    /// Remaining capacity as a fraction.
+    pub(crate) remaining: f64,
+    pub(crate) reset: Option<i64>,
+}
+
+/// Whether a line from `prev` to `cur` would mislead: a time gap, a reset
+/// change (both known), or capacity rising by more than 2.5 points.
+pub(crate) fn breaks_segment(prev: &Point, cur: &Point, gap_secs: i64) -> bool {
+    let reset_changed = prev.reset.is_some() && cur.reset.is_some() && prev.reset != cur.reset;
+    cur.timestamp - prev.timestamp > gap_secs
+        || reset_changed
+        || cur.remaining > prev.remaining + 0.025
 }
 
 pub fn run(config: &Config, options: ChartOptions) -> Result<PathBuf> {
@@ -163,7 +165,7 @@ fn render_png(
 ) -> Result<Vec<u8>> {
     let mut series: BTreeMap<String, Vec<Point>> = BTreeMap::new();
     for snapshot in snapshots {
-        let Some(utilization) = metric.utilization(snapshot) else {
+        let Some((utilization, reset)) = metric.window(snapshot) else {
             continue;
         };
         if !utilization.is_finite() {
@@ -175,7 +177,7 @@ fn render_png(
             .push(Point {
                 timestamp: snapshot.probed_at.timestamp(),
                 remaining: (1.0 - utilization).clamp(0.0, 1.0),
-                reset: metric.reset(snapshot),
+                reset,
             });
     }
     if series.values().all(Vec::is_empty) {
@@ -239,17 +241,12 @@ fn render_png(
         );
     }
 
+    let normal = rotation::floors(RotationMode::Normal, &config.rotation);
+    let sip = rotation::floors(RotationMode::SipAndDrain, &config.rotation);
     let (normal_floor, sip_floor) = match metric {
-        ChartMetric::FiveHour => (
-            config.rotation.normal_min_5h_remaining,
-            config.rotation.sip_min_5h_remaining,
-        ),
-        ChartMetric::SevenDay => (
-            config.rotation.normal_min_7d_remaining,
-            config.rotation.sip_min_7d_remaining,
-        ),
-        ChartMetric::OpusWeekly | ChartMetric::SonnetWeekly => (0.0, 0.0),
-        ChartMetric::Overage => (0.0, 0.0),
+        ChartMetric::FiveHour => (normal.0, sip.0),
+        ChartMetric::SevenDay => (normal.1, sip.1),
+        ChartMetric::OpusWeekly | ChartMetric::SonnetWeekly | ChartMetric::Overage => (0.0, 0.0),
     };
     if normal_floor > 0.0 {
         let y = map_y(normal_floor, top, bottom);
@@ -282,22 +279,16 @@ fn render_png(
         for point in points {
             let x = map_x(point.timestamp, start, now, left, right);
             let y = map_y(point.remaining, top, bottom);
-            if let Some(prev) = previous {
-                let reset_changed =
-                    prev.reset.is_some() && point.reset.is_some() && prev.reset != point.reset;
-                let capacity_jumped = point.remaining > prev.remaining + 0.025;
-                if point.timestamp - prev.timestamp <= gap_limit
-                    && !reset_changed
-                    && !capacity_jumped
-                {
-                    canvas.thick_line(
-                        map_x(prev.timestamp, start, now, left, right),
-                        map_y(prev.remaining, top, bottom),
-                        x,
-                        y,
-                        color,
-                    );
-                }
+            if let Some(prev) = previous
+                && !breaks_segment(&prev, point, gap_limit)
+            {
+                canvas.thick_line(
+                    map_x(prev.timestamp, start, now, left, right),
+                    map_y(prev.remaining, top, bottom),
+                    x,
+                    y,
+                    color,
+                );
             }
             canvas.circle(x, y, 2, color);
             previous = Some(*point);
@@ -337,7 +328,7 @@ fn render_png(
     Ok(png_bytes)
 }
 
-fn format_duration_hours(hours: f64) -> String {
+pub(crate) fn format_duration_hours(hours: f64) -> String {
     if hours >= 24.0 && (hours / 24.0).fract().abs() < 0.01 {
         format!("{:.0}d", hours / 24.0)
     } else if hours >= 1.0 {

@@ -65,9 +65,6 @@ pub async fn run(config: Config, auto: bool, claude_args: Vec<String>) -> Result
     let mut child = tokio::process::Command::new(&claude_bin)
         .args(&args)
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to launch {claude_bin}"))?;
 

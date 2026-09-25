@@ -8,8 +8,8 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::admission;
 use crate::config::{Config, LaunchSettings};
-use crate::display::format_reset_compact;
-use crate::probe::{self, ProbeResult, Window};
+use crate::display::{format_reset_compact, status_badge, truncate_chars};
+use crate::probe::{self, Level, ProbeResult, Window, level};
 use crate::rotation;
 use crate::store::Store;
 use crate::terminal;
@@ -25,7 +25,7 @@ enum BgCmd {
 // --- Shared state between bg thread and UI ---
 
 struct SharedState {
-    results: Vec<ProbeResult>,
+    results: Arc<Vec<ProbeResult>>,
     last_probe: Option<Instant>,
 }
 
@@ -61,28 +61,32 @@ fn make_icon(color: [u8; 3]) -> tray_icon::Icon {
 }
 
 fn select_best<'a>(results: &'a [ProbeResult], config: &Config) -> Option<&'a ProbeResult> {
-    let mode = rotation::mode_for(results, &config.rotation);
-    rotation::choose_best(results, mode, &config.rotation)
+    let target_model = rotation::target_model_name().ok().flatten();
+    let mode = rotation::mode_for(results, &config.rotation, target_model.as_deref());
+    rotation::choose_best(results, mode, &config.rotation, target_model.as_deref())
+}
+
+fn level_rgb(level: Level) -> [u8; 3] {
+    match level {
+        Level::Ok => [76, 175, 80],       // green
+        Level::Low => [255, 193, 7],      // amber
+        Level::Critical => [244, 67, 54], // red
+    }
+}
+
+fn level_color(level: Level) -> egui::Color32 {
+    let [r, g, b] = level_rgb(level);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 fn status_color(results: &[ProbeResult], config: &Config) -> [u8; 3] {
-    let best = select_best(results, config);
-    match best {
-        Some(r) => {
-            let remaining = r
-                .quota
+    match select_best(results, config) {
+        Some(r) => level_rgb(level(
+            r.quota
                 .as_ref()
                 .and_then(|q| q.weekly.as_ref())
-                .map(|w| 1.0 - w.utilization)
-                .unwrap_or(0.0);
-            if remaining > 0.50 {
-                [76, 175, 80] // green
-            } else if remaining > 0.20 {
-                [255, 193, 7] // amber
-            } else {
-                [244, 67, 54] // red
-            }
-        }
+                .map_or(0.0, Window::remaining),
+        )),
         None => [158, 158, 158], // gray
     }
 }
@@ -116,7 +120,7 @@ fn spawn_bg_thread(
                 // Update shared state
                 {
                     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    state.results = results;
+                    state.results = Arc::new(results);
                     state.last_probe = Some(Instant::now());
                 }
                 ctx.request_repaint();
@@ -126,8 +130,8 @@ fn spawn_bg_thread(
                 let mut deadline = Instant::now() + std::time::Duration::from_millis(interval_ms);
 
                 loop {
-                    match rx.try_recv() {
-                        Ok(BgCmd::ForceRefresh) => break,
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(BgCmd::ForceRefresh) | Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Ok(BgCmd::UpdateConfig(new_cfg)) => {
                             config = new_cfg;
                             deadline = Instant::now()
@@ -135,14 +139,8 @@ fn spawn_bg_thread(
                                     config.settings.probe_interval_secs.max(1),
                                 );
                         }
-                        Ok(BgCmd::Shutdown) => return,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                        Err(mpsc::TryRecvError::Empty) => {}
+                        Ok(BgCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         });
@@ -184,7 +182,7 @@ impl TokemaApp {
         cc.egui_ctx.set_visuals(visuals);
 
         let shared = Arc::new(Mutex::new(SharedState {
-            results: Vec::new(),
+            results: Arc::default(),
             last_probe: None,
         }));
 
@@ -254,6 +252,18 @@ impl TokemaApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
+    /// Hide if visible; otherwise move to `position` (when given) and show.
+    fn toggle_window(&mut self, ctx: &egui::Context, position: Option<egui::Pos2>) {
+        if self.window_visible {
+            self.hide_window(ctx);
+        } else {
+            if let Some(position) = position {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+            }
+            self.show_window(ctx);
+        }
+    }
+
     fn update_tray_icon(&mut self, results: &[ProbeResult]) {
         let color = status_color(results, &self.config);
         if color != self.last_icon_color {
@@ -296,16 +306,10 @@ impl TokemaApp {
     }
 
     fn draw_gauge(ui: &mut egui::Ui, label: &str, window: &Window) {
-        let remaining = (1.0 - window.utilization).clamp(0.0, 1.0) as f32;
+        let remaining = window.remaining().clamp(0.0, 1.0);
+        let color = level_color(level(remaining));
+        let remaining = remaining as f32;
         let pct = (remaining * 100.0).round() as u32;
-
-        let color = if remaining > 0.50 {
-            egui::Color32::from_rgb(76, 175, 80)
-        } else if remaining > 0.20 {
-            egui::Color32::from_rgb(255, 193, 7)
-        } else {
-            egui::Color32::from_rgb(244, 67, 54)
-        };
 
         let bar_bg = egui::Color32::from_white_alpha(30);
 
@@ -372,22 +376,8 @@ impl TokemaApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&result.token_name).strong().size(14.0));
 
-                let (status_text, status_color) =
-                    match result.quota.as_ref().map(|q| q.status.as_str()) {
-                        Some("allowed") => ("allowed", egui::Color32::from_rgb(76, 175, 80)),
-                        Some("allowed_warning") => {
-                            ("warning", egui::Color32::from_rgb(255, 193, 7))
-                        }
-                        Some("rejected") => ("REJECTED", egui::Color32::from_rgb(244, 67, 54)),
-                        Some(s) => (s, egui::Color32::from_rgb(255, 193, 7)),
-                        None => {
-                            if result.error.is_some() {
-                                ("error", egui::Color32::from_rgb(244, 67, 54))
-                            } else {
-                                ("unknown", egui::Color32::from_gray(120))
-                            }
-                        }
-                    };
+                let (status_text, status_level) = status_badge(result, "unknown");
+                let status_color = status_level.map_or(egui::Color32::from_gray(120), level_color);
                 ui.label(
                     egui::RichText::new(status_text)
                         .color(status_color)
@@ -446,12 +436,8 @@ impl TokemaApp {
                     Self::draw_gauge(ui, "$$", w);
                 }
             } else if let Some(ref err) = result.error {
-                let truncated: &str = match err.char_indices().nth(60) {
-                    Some((idx, _)) => &err[..idx],
-                    None => err,
-                };
                 ui.label(
-                    egui::RichText::new(truncated)
+                    egui::RichText::new(truncate_chars(err, 60))
                         .color(egui::Color32::from_rgb(244, 67, 54))
                         .size(11.0),
                 );
@@ -468,8 +454,14 @@ impl TokemaApp {
             let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
 
             if response.clicked() {
-                self.config.settings.dangerous_mode = !is_on;
-                let _ = self.config.save();
+                // Update only the setting, against the file as it is now: this
+                // window's copy of the credentials may be hours stale.
+                if let Ok((fresh, ())) = Config::update(|config| {
+                    config.settings.dangerous_mode = !is_on;
+                    Ok(())
+                }) {
+                    self.config = fresh;
+                }
                 let _ = self.bg_tx.send(BgCmd::UpdateConfig(self.config.clone()));
             }
 
@@ -481,18 +473,15 @@ impl TokemaApp {
             } else {
                 egui::Color32::from_gray(80)
             };
-            painter.rect_filled(rect, rounding, track_color);
-
-            // Glow when on
+            // Glow when on, under the track
             if is_on {
                 painter.rect_filled(
                     rect.expand(2.0),
                     egui::CornerRadius::same(11),
                     egui::Color32::from_rgba_unmultiplied(244, 67, 54, 40),
                 );
-                // Redraw track on top of glow
-                painter.rect_filled(rect, rounding, track_color);
             }
+            painter.rect_filled(rect, rounding, track_color);
 
             // Knob
             let knob_radius = 7.0;
@@ -525,11 +514,7 @@ impl TokemaApp {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Launch args:")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
+            settings_label(ui, "Launch args:");
             let mut args_str = self.settings_draft.launch_args.join(" ");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut args_str)
@@ -541,47 +526,20 @@ impl TokemaApp {
                     args_str.split_whitespace().map(String::from).collect();
             }
         });
-
+        optional_text_row(
+            ui,
+            "Terminal:",
+            &mut self.settings_draft.terminal,
+            "auto-detect",
+        );
+        optional_text_row(
+            ui,
+            "Claude binary:",
+            &mut self.settings_draft.claude_bin,
+            "claude",
+        );
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Terminal:")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
-            let mut term = self.settings_draft.terminal.clone().unwrap_or_default();
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut term)
-                    .desired_width(150.0)
-                    .hint_text("auto-detect"),
-            );
-            if resp.changed() {
-                self.settings_draft.terminal = if term.is_empty() { None } else { Some(term) };
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Claude binary:")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
-            let mut bin = self.settings_draft.claude_bin.clone().unwrap_or_default();
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut bin)
-                    .desired_width(150.0)
-                    .hint_text("claude"),
-            );
-            if resp.changed() {
-                self.settings_draft.claude_bin = if bin.is_empty() { None } else { Some(bin) };
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Probe interval:")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
+            settings_label(ui, "Probe interval:");
             ui.add(
                 egui::DragValue::new(&mut self.settings_draft.probe_interval_secs)
                     .range(10..=300)
@@ -592,8 +550,13 @@ impl TokemaApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("Apply").clicked() {
-                self.config.settings = self.settings_draft.clone();
-                let _ = self.config.save();
+                let draft = self.settings_draft.clone();
+                if let Ok((fresh, ())) = Config::update(|config| {
+                    config.settings = draft;
+                    Ok(())
+                }) {
+                    self.config = fresh;
+                }
                 let _ = self.bg_tx.send(BgCmd::UpdateConfig(self.config.clone()));
                 self.settings_open = false;
             }
@@ -603,6 +566,30 @@ impl TokemaApp {
             }
         });
     }
+}
+
+fn settings_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.0)
+            .color(egui::Color32::from_gray(160)),
+    );
+}
+
+/// Label + single-line edit where an empty string means "unset".
+fn optional_text_row(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, hint: &str) {
+    ui.horizontal(|ui| {
+        settings_label(ui, label);
+        let mut text = value.clone().unwrap_or_default();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(150.0)
+                .hint_text(hint),
+        );
+        if resp.changed() {
+            *value = if text.is_empty() { None } else { Some(text) };
+        }
+    });
 }
 
 impl eframe::App for TokemaApp {
@@ -619,28 +606,17 @@ impl eframe::App for TokemaApp {
 
         // Handle tray icon left-click — position below icon and toggle
         if let Ok(TrayIconEvent::Click { rect, .. }) = TrayIconEvent::receiver().try_recv() {
-            if self.window_visible {
-                self.hide_window(ctx);
-            } else {
-                // Position window centered below the tray icon
-                let window_width = 420.0_f64;
-                let x = rect.position.x + rect.size.width as f64 / 2.0 - window_width / 2.0;
-                let y = rect.position.y + rect.size.height as f64 + 4.0;
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    x as f32, y as f32,
-                )));
-                self.show_window(ctx);
-            }
+            // Position window centered below the tray icon
+            let window_width = 420.0_f64;
+            let x = rect.position.x + rect.size.width as f64 / 2.0 - window_width / 2.0;
+            let y = rect.position.y + rect.size.height as f64 + 4.0;
+            self.toggle_window(ctx, Some(egui::pos2(x as f32, y as f32)));
         }
 
         // Handle menu events (right-click menu)
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if Some(&event.id) == self.menu_show_id.as_ref() {
-                if self.window_visible {
-                    self.hide_window(ctx);
-                } else {
-                    self.show_window(ctx);
-                }
+                self.toggle_window(ctx, None);
             } else if Some(&event.id) == self.menu_refresh_id.as_ref() {
                 let _ = self.bg_tx.send(BgCmd::ForceRefresh);
             } else if Some(&event.id) == self.menu_quit_id.as_ref() {
@@ -653,7 +629,7 @@ impl eframe::App for TokemaApp {
         // Get current state
         let (results, last_probe) = {
             let state = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            (state.results.clone(), state.last_probe)
+            (Arc::clone(&state.results), state.last_probe)
         };
 
         // Update tray icon color
@@ -699,7 +675,7 @@ impl eframe::App for TokemaApp {
                                 .quota
                                 .as_ref()
                                 .and_then(|q| q.weekly.as_ref())
-                                .map(|w| ((1.0 - w.utilization) * 100.0) as u32)
+                                .map(|w| (w.remaining() * 100.0) as u32)
                                 .unwrap_or(0);
                             ui.label(
                                 egui::RichText::new(format!("{} ({}%)", r.token_name, pct))
@@ -780,7 +756,7 @@ impl eframe::App for TokemaApp {
                 } else {
                     // Token cards (scrollable)
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for result in &results {
+                        for result in results.iter() {
                             self.draw_token_card(ui, result);
                             ui.add_space(6.0);
                         }

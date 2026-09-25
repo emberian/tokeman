@@ -259,15 +259,15 @@ function escapeHtml(value) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[ch]);
 }
+// utilization_X -> reset_X; other fields (e.g. model_*) carry no reset column.
+function resetFieldFor(field) {
+  return field?.startsWith("utilization_") ? field.replace("utilization_", "reset_") : null;
+}
 function splitAtGaps(pts, gapMs, field) {
   if (pts.length < 2) return [pts];
   const segs = []; let cur = [pts[0]];
+  const resetField = resetFieldFor(field);
   for (let i = 1; i < pts.length; i++) {
-    const resetField = field === "utilization_5h" ? "reset_5h"
-      : field === "utilization_7d" ? "reset_7d"
-      : field === "utilization_opus_7d" ? "reset_opus_7d"
-      : field === "utilization_sonnet_7d" ? "reset_sonnet_7d"
-      : field === "utilization_overage" ? "reset_overage" : null;
     const resetChanged = resetField && pts[i-1][resetField] != null
       && pts[i][resetField] != null && pts[i-1][resetField] !== pts[i][resetField];
     const utilizationReset = field && pts[i-1][field] != null
@@ -503,14 +503,10 @@ function renderMainChart(allTokens, colorScale) {
 /* ── Derivative chart (5h metric) ── */
 function computeDerivatives(pts, field) {
   const derivs = [];
+  const resetField = resetFieldFor(field);
   for (let i=1; i<pts.length; i++) {
     const dt = (pts[i].probed_at-pts[i-1].probed_at)/3600000;
     const a=pts[i-1][field], b=pts[i][field];
-    const resetField = field === "utilization_5h" ? "reset_5h"
-      : field === "utilization_7d" ? "reset_7d"
-      : field === "utilization_opus_7d" ? "reset_opus_7d"
-      : field === "utilization_sonnet_7d" ? "reset_sonnet_7d"
-      : "reset_overage";
     if (dt<=0||dt>2||a==null||b==null||b<a) continue;
     if (pts[i-1][resetField]!=null && pts[i][resetField]!=null && pts[i-1][resetField]!==pts[i][resetField]) continue;
     derivs.push({ probed_at:pts[i].probed_at, rate:(b-a)/dt, token_name:pts[i].token_name });

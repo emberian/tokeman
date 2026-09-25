@@ -13,11 +13,12 @@ use ratatui::symbols;
 use ratatui::widgets::*;
 
 use crate::admission;
+use crate::chart::{Point, breaks_segment, format_duration_hours};
 use crate::config::Config;
-use crate::display::format_reset_compact;
-use crate::probe::{self, ProbeResult, Window};
-use crate::rotation;
-use crate::store::{Snapshot, Store};
+use crate::display::{claim_label, format_reset_compact, status_badge, truncate_chars};
+use crate::probe::{self, Level, ModelQuotaBucket, ProbeResult, Window, level};
+use crate::rotation::{self, RotationMode};
+use crate::store::{Series, Snapshot, Store};
 
 #[derive(Clone, PartialEq, Eq)]
 enum ChartWindow {
@@ -36,63 +37,19 @@ impl ChartWindow {
             ChartWindow::Overage => "$$",
         }
     }
-}
 
-#[derive(Clone, Copy, PartialEq)]
-enum ChartRange {
-    D1,
-    D3,
-    D5,
-    D7,
-    D14,
-    D30,
-}
-
-impl ChartRange {
-    fn days(self) -> i64 {
+    fn series(&self) -> Series<'_> {
         match self {
-            ChartRange::D1 => 1,
-            ChartRange::D3 => 3,
-            ChartRange::D5 => 5,
-            ChartRange::D7 => 7,
-            ChartRange::D14 => 14,
-            ChartRange::D30 => 30,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            ChartRange::D1 => "1d",
-            ChartRange::D3 => "3d",
-            ChartRange::D5 => "5d",
-            ChartRange::D7 => "7d",
-            ChartRange::D14 => "14d",
-            ChartRange::D30 => "30d",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            ChartRange::D1 => ChartRange::D3,
-            ChartRange::D3 => ChartRange::D5,
-            ChartRange::D5 => ChartRange::D7,
-            ChartRange::D7 => ChartRange::D14,
-            ChartRange::D14 => ChartRange::D30,
-            ChartRange::D30 => ChartRange::D1,
-        }
-    }
-
-    fn prev(self) -> Self {
-        match self {
-            ChartRange::D1 => ChartRange::D30,
-            ChartRange::D3 => ChartRange::D1,
-            ChartRange::D5 => ChartRange::D3,
-            ChartRange::D7 => ChartRange::D5,
-            ChartRange::D14 => ChartRange::D7,
-            ChartRange::D30 => ChartRange::D14,
+            ChartWindow::FiveHour => Series::FiveHour,
+            ChartWindow::SevenDay => Series::SevenDay,
+            ChartWindow::Model { key, .. } => Series::Model(key),
+            ChartWindow::Overage => Series::Overage,
         }
     }
 }
+
+/// Chart ranges in days, cycled with `[` / `]`.
+const RANGE_DAYS: [i64; 6] = [1, 3, 5, 7, 14, 30];
 
 struct App {
     results: Vec<ProbeResult>,
@@ -104,7 +61,8 @@ struct App {
     show_chart: bool,
     chart_fullscreen: bool,
     chart_window: ChartWindow,
-    chart_range: ChartRange,
+    /// Index into `RANGE_DAYS`.
+    chart_range: usize,
     history: HashMap<String, Vec<Snapshot>>,
     refresh_interval: Duration,
     default_token: Option<String>,
@@ -129,7 +87,7 @@ impl App {
             show_chart: false,
             chart_fullscreen: false,
             chart_window: ChartWindow::SevenDay,
-            chart_range: ChartRange::D1,
+            chart_range: 0,
             history: HashMap::new(),
             refresh_interval,
             default_token,
@@ -173,13 +131,27 @@ impl App {
     }
 
     fn load_history(&mut self) {
-        let since = Utc::now() - chrono::Duration::days(self.chart_range.days());
+        let since = Utc::now() - chrono::Duration::days(self.range_days());
         self.history.clear();
         for token in &self.config.tokens {
             if let Ok(snaps) = self.store.for_token_since(&token.name, since) {
                 self.history.insert(token.name.clone(), snaps);
             }
         }
+    }
+
+    fn range_days(&self) -> i64 {
+        RANGE_DAYS[self.chart_range]
+    }
+
+    fn range_label(&self) -> String {
+        format!("{}d", self.range_days())
+    }
+
+    fn spawn_probe(&mut self) -> tokio::task::JoinHandle<Vec<ProbeResult>> {
+        self.status_msg = "Probing...".into();
+        let tokens = self.config.tokens.clone();
+        tokio::spawn(async move { probe::probe_all(&tokens).await })
     }
 
     fn available_chart_windows(&self) -> Vec<ChartWindow> {
@@ -194,22 +166,8 @@ impl App {
             }
         }
         for snapshot in self.history.values().flatten() {
-            for bucket in &snapshot.model_usage_buckets {
-                model_buckets
-                    .entry(bucket.key.clone())
-                    .or_insert_with(|| bucket.label.clone());
-            }
-            // Preserve access to history written before dynamic buckets were
-            // added to the snapshot schema.
-            if snapshot.utilization_opus_7d.is_some() {
-                model_buckets
-                    .entry("opus".into())
-                    .or_insert_with(|| "Opus".into());
-            }
-            if snapshot.utilization_sonnet_7d.is_some() {
-                model_buckets
-                    .entry("sonnet".into())
-                    .or_insert_with(|| "Sonnet".into());
+            for bucket in snapshot.model_buckets() {
+                model_buckets.entry(bucket.key).or_insert(bucket.label);
             }
         }
         let mut windows = vec![ChartWindow::SevenDay, ChartWindow::FiveHour];
@@ -290,9 +248,7 @@ pub async fn run(config: Config) -> Result<()> {
             app.apply_probe_results(results);
         }
         if app.last_probe.elapsed() >= app.refresh_interval && active_probe.is_none() {
-            app.status_msg = "Probing...".into();
-            let tokens = app.config.tokens.clone();
-            active_probe = Some(tokio::spawn(async move { probe::probe_all(&tokens).await }));
+            active_probe = Some(app.spawn_probe());
         }
 
         terminal.draw(|f| draw(f, &app))?;
@@ -307,10 +263,7 @@ pub async fn run(config: Config) -> Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('r') => {
                     if active_probe.is_none() {
-                        app.status_msg = "Probing...".into();
-                        let tokens = app.config.tokens.clone();
-                        active_probe =
-                            Some(tokio::spawn(async move { probe::probe_all(&tokens).await }));
+                        active_probe = Some(app.spawn_probe());
                     }
                 }
                 KeyCode::Char('c') => {
@@ -330,11 +283,11 @@ pub async fn run(config: Config) -> Result<()> {
                     app.cycle_chart_window();
                 }
                 KeyCode::Char('[') => {
-                    app.chart_range = app.chart_range.prev();
+                    app.chart_range = (app.chart_range + RANGE_DAYS.len() - 1) % RANGE_DAYS.len();
                     app.load_history();
                 }
                 KeyCode::Char(']') => {
-                    app.chart_range = app.chart_range.next();
+                    app.chart_range = (app.chart_range + 1) % RANGE_DAYS.len();
                     app.load_history();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -434,7 +387,7 @@ fn draw(f: &mut Frame, app: &App) {
         format!(
             " q: quit  r: refresh  c: split  C: full-screen  Tab: window [{}]  [/]: range [{}]",
             app.chart_window.label(),
-            app.chart_range.label()
+            app.range_label()
         )
     } else {
         format!(
@@ -448,6 +401,16 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(footer, chunks[2]);
 }
 
+/// Lines in a token card: name, quota gauges (or error), model gauges,
+/// optional sparkline, spacer.
+fn card_rows(result: &ProbeResult, model_rows: usize, show_spark: bool) -> u16 {
+    let quota_rows = result
+        .quota
+        .as_ref()
+        .map_or(1, |q| q.windows(["", "", ""]).count() as u16);
+    2 + quota_rows + model_rows.max(1) as u16 + show_spark as u16
+}
+
 fn draw_tokens(
     f: &mut Frame,
     area: Rect,
@@ -456,26 +419,24 @@ fn draw_tokens(
     history: &HashMap<String, Vec<Snapshot>>,
     default_token: Option<&str>,
 ) {
-    // Each token: name + gauges + optional sparkline for selected + spacer
+    let model_buckets: Vec<Vec<ModelQuotaBucket>> = results
+        .iter()
+        .map(|r| {
+            r.model_usage
+                .as_ref()
+                .map(|u| u.buckets())
+                .unwrap_or_default()
+        })
+        .collect();
+    let spark_history = |i: usize, r: &ProbeResult| {
+        history
+            .get(&r.token_name)
+            .filter(|h| i == selected && h.len() >= 2)
+    };
     let heights: Vec<u16> = results
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            let gauge_lines = r.quota.as_ref().map_or(1, |q| {
-                q.session.is_some() as u16 + q.weekly.is_some() as u16 + q.overage.is_some() as u16
-            }) + r
-                .model_usage
-                .as_ref()
-                .map(|usage| usage.buckets().len().max(1) as u16)
-                .unwrap_or(1);
-            let sparkline =
-                if i == selected && history.get(&r.token_name).is_some_and(|h| h.len() >= 2) {
-                    1
-                } else {
-                    0
-                };
-            2 + gauge_lines + sparkline
-        })
+        .map(|(i, r)| card_rows(r, model_buckets[i].len(), spark_history(i, r).is_some()))
         .collect();
 
     // Keep the selected card visible when the fleet is taller than the terminal.
@@ -506,64 +467,33 @@ fn draw_tokens(
 
     for (visible_index, result) in results[start..end].iter().enumerate() {
         let result_index = start + visible_index;
-        let snaps = if result_index == selected {
-            history.get(&result.token_name)
-        } else {
-            None
-        };
         draw_single_token(
             f,
             token_chunks[visible_index],
             result,
+            &model_buckets[result_index],
+            heights[result_index],
             result_index == selected,
             default_token == Some(result.token_name.as_str()),
-            snaps,
+            spark_history(result_index, result),
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_single_token(
     f: &mut Frame,
     area: Rect,
     result: &ProbeResult,
+    model_buckets: &[ModelQuotaBucket],
+    row_count: u16,
     selected: bool,
     is_default: bool,
-    history: Option<&Vec<Snapshot>>,
+    spark_history: Option<&Vec<Snapshot>>,
 ) {
-    let mut row_constraints = vec![Constraint::Length(1)]; // name line
-
-    if let Some(ref q) = result.quota {
-        if q.session.is_some() {
-            row_constraints.push(Constraint::Length(1));
-        }
-        if q.weekly.is_some() {
-            row_constraints.push(Constraint::Length(1));
-        }
-        if q.overage.is_some() {
-            row_constraints.push(Constraint::Length(1));
-        }
-    } else {
-        row_constraints.push(Constraint::Length(1)); // error line
-    }
-    let model_buckets = result
-        .model_usage
-        .as_ref()
-        .map(|usage| usage.buckets())
-        .unwrap_or_default();
-    let model_row_count = model_buckets.len().max(1);
-    row_constraints.extend((0..model_row_count).map(|_| Constraint::Length(1)));
-
-    // Sparkline row for selected token
-    let show_spark = selected && history.is_some_and(|h| h.len() >= 2);
-    if show_spark {
-        row_constraints.push(Constraint::Length(1));
-    }
-
-    row_constraints.push(Constraint::Length(1)); // spacer
-
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(row_constraints)
+        .constraints(vec![Constraint::Length(1); row_count as usize])
         .split(area);
 
     // Name line
@@ -573,32 +503,13 @@ fn draw_single_token(
         (false, true) => " D",
         (false, false) => "  ",
     };
-    let (status_str, status_color) = match result.quota.as_ref().map(|q| q.status.as_str()) {
-        Some("allowed") => ("allowed", Color::Green),
-        Some("allowed_warning") => ("warning", Color::Yellow),
-        Some("rejected") => ("REJECTED", Color::Red),
-        Some(s) => (s, Color::Yellow),
-        None => {
-            if result.error.is_some() {
-                ("error", Color::Red)
-            } else {
-                ("no quota", Color::DarkGray)
-            }
-        }
-    };
-
+    let (status_str, status_level) = status_badge(result, "no quota");
+    let status_color = status_level.map_or(Color::DarkGray, level_color);
     let claim_str = result
         .quota
         .as_ref()
-        .map(|q| match q.representative_claim.as_str() {
-            "five_hour" => " session",
-            "seven_day" => " weekly",
-            "seven_day_opus" => " Opus",
-            "seven_day_sonnet" => " Sonnet",
-            "overage" => " extra",
-            _ => "",
-        })
-        .unwrap_or("");
+        .and_then(|q| claim_label(&q.representative_claim))
+        .map_or(String::new(), |(_, short)| format!(" {short}"));
 
     let name_line = Line::from(vec![
         Span::styled(
@@ -621,28 +532,13 @@ fn draw_single_token(
 
     let mut row_idx = 1;
     if let Some(ref q) = result.quota {
-        if let Some(ref w) = q.session {
-            let gauge = make_gauge_line("5h", w);
-            f.render_widget(Paragraph::new(gauge), rows[row_idx]);
-            row_idx += 1;
-        }
-        if let Some(ref w) = q.weekly {
-            let gauge = make_gauge_line("7d", w);
-            f.render_widget(Paragraph::new(gauge), rows[row_idx]);
-            row_idx += 1;
-        }
-        if let Some(ref w) = q.overage {
-            let gauge = make_gauge_line("$$", w);
-            f.render_widget(Paragraph::new(gauge), rows[row_idx]);
+        for (label, w) in q.windows(["5h", "7d", "$$"]) {
+            f.render_widget(Paragraph::new(make_gauge_line(label, w)), rows[row_idx]);
             row_idx += 1;
         }
     } else if let Some(ref err) = result.error {
-        let truncated: &str = match err.char_indices().nth(80) {
-            Some((idx, _)) => &err[..idx],
-            None => err,
-        };
         let err_line = Line::from(Span::styled(
-            format!("   error: {truncated}"),
+            format!("   error: {}", truncate_chars(err, 80)),
             Style::default().fg(Color::Red),
         ));
         f.render_widget(Paragraph::new(err_line), rows[row_idx]);
@@ -661,7 +557,7 @@ fn draw_single_token(
         f.render_widget(Paragraph::new(line), rows[row_idx]);
         row_idx += 1;
     } else {
-        for bucket in &model_buckets {
+        for bucket in model_buckets {
             let label = compact_bucket_label(
                 &bucket.label,
                 bucket.source == crate::probe::ModelUsageSource::ObservedRejection,
@@ -675,14 +571,14 @@ fn draw_single_token(
     }
 
     // Sparkline for the selected token's 7d utilization
-    if show_spark && let Some(snaps) = history {
+    if let Some(snaps) = spark_history {
         let spark_data: Vec<u64> = snaps
             .iter()
             .filter_map(|s| s.utilization_7d)
             .map(|u| ((1.0 - u) * 100.0).round() as u64)
             .collect();
         if !spark_data.is_empty() {
-            let label = "   7d ".to_string();
+            let label = "   7d ";
             let spark_area = Rect {
                 x: area.x + label.len() as u16,
                 y: rows[row_idx].y,
@@ -691,7 +587,7 @@ fn draw_single_token(
             };
             // Label
             f.render_widget(
-                Paragraph::new(Span::styled(&label, Style::default().fg(Color::DarkGray))),
+                Paragraph::new(Span::styled(label, Style::default().fg(Color::DarkGray))),
                 Rect {
                     x: area.x,
                     y: rows[row_idx].y,
@@ -704,6 +600,14 @@ fn draw_single_token(
                 .style(Style::default().fg(Color::Cyan));
             f.render_widget(sparkline, spark_area);
         }
+    }
+}
+
+fn level_color(level: Level) -> Color {
+    match level {
+        Level::Ok => Color::Green,
+        Level::Low => Color::Yellow,
+        Level::Critical => Color::Red,
     }
 }
 
@@ -720,19 +624,12 @@ fn compact_bucket_label(label: &str, rejected: bool) -> String {
 }
 
 fn make_gauge_line<'a>(label: &str, window: &Window) -> Line<'a> {
-    let remaining = (1.0 - window.utilization).clamp(0.0, 1.0);
+    let remaining = window.remaining().clamp(0.0, 1.0);
     let bar_width = 30usize;
     let filled = (remaining * bar_width as f64).round() as usize;
     let empty = bar_width - filled;
     let pct = (remaining * 100.0).round() as u8;
-
-    let color = if remaining > 0.50 {
-        Color::Green
-    } else if remaining > 0.20 {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
+    let color = level_color(level(remaining));
 
     let reset = format_reset_compact(window.reset);
 
@@ -781,59 +678,33 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
 
     for (idx, (name, snaps)) in sorted_history.iter().enumerate() {
         let color = colors[idx % colors.len()];
-        // Collect points with original timestamps for gap detection
-        let points_with_ts: Vec<(i64, f64, f64, Option<i64>)> = snaps
+        let series = app.chart_window.series();
+        let points: Vec<Point> = snaps
             .iter()
             .filter_map(|s| {
-                let (util, reset) = match &app.chart_window {
-                    ChartWindow::FiveHour => (s.utilization_5h?, s.reset_5h),
-                    ChartWindow::SevenDay => (s.utilization_7d?, s.reset_7d),
-                    ChartWindow::Model { key, .. } => {
-                        if let Some(bucket) = s
-                            .model_usage_buckets
-                            .iter()
-                            .find(|bucket| bucket.key == *key)
-                        {
-                            (bucket.window.utilization, Some(bucket.window.reset))
-                        } else {
-                            match key.as_str() {
-                                "opus" => (s.utilization_opus_7d?, s.reset_opus_7d),
-                                "sonnet" => (s.utilization_sonnet_7d?, s.reset_sonnet_7d),
-                                _ => return None,
-                            }
-                        }
-                    }
-                    ChartWindow::Overage => (s.utilization_overage?, s.reset_overage),
-                };
-                let ts = s.probed_at.timestamp();
-                let hours_ago = (ts as f64 - now) / 3600.0;
-                let remaining = (1.0 - util) * 100.0;
-                Some((ts, hours_ago, remaining, reset))
+                let (util, reset) = s.window(series)?;
+                Some(Point {
+                    timestamp: s.probed_at.timestamp(),
+                    remaining: 1.0 - util,
+                    reset,
+                })
             })
             .collect();
-
-        if points_with_ts.is_empty() {
+        if points.is_empty() {
             continue;
         }
 
-        // Split into contiguous segments at gaps > threshold
-        let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
-        let mut cur: Vec<(f64, f64)> = vec![(points_with_ts[0].1, points_with_ts[0].2)];
-        for i in 1..points_with_ts.len() {
-            let reset_changed = points_with_ts[i - 1].3.is_some()
-                && points_with_ts[i].3.is_some()
-                && points_with_ts[i - 1].3 != points_with_ts[i].3;
-            let capacity_jumped = points_with_ts[i].2 > points_with_ts[i - 1].2 + 2.5;
-            if points_with_ts[i].0 - points_with_ts[i - 1].0 > GAP_THRESHOLD_SECS
-                || reset_changed
-                || capacity_jumped
-            {
-                segments.push(std::mem::take(&mut cur));
+        // Split into contiguous segments at gaps, resets and capacity jumps.
+        let mut segments: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
+        for (i, point) in points.iter().enumerate() {
+            if i > 0 && breaks_segment(&points[i - 1], point, GAP_THRESHOLD_SECS) {
+                segments.push(Vec::new());
             }
-            cur.push((points_with_ts[i].1, points_with_ts[i].2));
-        }
-        if !cur.is_empty() {
-            segments.push(cur);
+            let hours_ago = (point.timestamp as f64 - now) / 3600.0;
+            segments
+                .last_mut()
+                .expect("segments starts non-empty")
+                .push((hours_ago, point.remaining * 100.0));
         }
 
         entries.push(ChartEntry {
@@ -847,16 +718,12 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         });
     }
 
-    let range_hours = (app.chart_range.days() * 24) as f64;
+    let range_hours = (app.range_days() * 24) as f64;
+    let normal = rotation::floors(RotationMode::Normal, &app.config.rotation);
+    let sip = rotation::floors(RotationMode::SipAndDrain, &app.config.rotation);
     let policy_floors = match &app.chart_window {
-        ChartWindow::FiveHour => Some((
-            app.config.rotation.normal_min_5h_remaining * 100.0,
-            app.config.rotation.sip_min_5h_remaining * 100.0,
-        )),
-        ChartWindow::SevenDay => Some((
-            app.config.rotation.normal_min_7d_remaining * 100.0,
-            app.config.rotation.sip_min_7d_remaining * 100.0,
-        )),
+        ChartWindow::FiveHour => Some((normal.0 * 100.0, sip.0 * 100.0)),
+        ChartWindow::SevenDay => Some((normal.1 * 100.0, sip.1 * 100.0)),
         ChartWindow::Model { .. } | ChartWindow::Overage => None,
     };
     let normal_floor_data =
@@ -900,8 +767,8 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
 
     let half = range_hours / 2.0;
     let x_labels = vec![
-        Span::raw(format!("-{}", app.chart_range.label())),
-        Span::raw(format_axis_offset(half)),
+        Span::raw(format!("-{}", app.range_label())),
+        Span::raw(format!("-{}", format_duration_hours(half))),
         Span::raw("now"),
     ];
 
@@ -917,7 +784,7 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
                 .title(format!(
                     " {} remaining ({}) · {} mode · {} ",
                     app.chart_window.label(),
-                    app.chart_range.label(),
+                    app.range_label(),
                     mode.label(),
                     signal_label,
                 ))
@@ -941,12 +808,4 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         .legend_position(Some(LegendPosition::BottomLeft));
 
     f.render_widget(chart, area);
-}
-
-fn format_axis_offset(hours: f64) -> String {
-    if hours >= 24.0 && (hours / 24.0).fract().abs() < f64::EPSILON {
-        format!("-{:.0}d", hours / 24.0)
-    } else {
-        format!("-{hours:.0}h")
-    }
 }

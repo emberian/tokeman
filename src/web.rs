@@ -8,9 +8,11 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::display::truncate_chars;
 use crate::store::{Snapshot, Store};
 
 async fn index() -> impl IntoResponse {
@@ -99,6 +101,22 @@ struct SessionInfo {
     first_prompt: Option<String>,
 }
 
+fn str_field(v: &Value, k: &str) -> Option<String> {
+    v.get(k).and_then(Value::as_str).map(str::to_string)
+}
+
+fn u64_field(v: &Value, k: &str) -> Option<u64> {
+    v.get(k).and_then(Value::as_u64)
+}
+
+fn u64_map(v: &Value, k: &str) -> Option<HashMap<String, u64>> {
+    v.get(k).and_then(Value::as_object).map(|obj| {
+        obj.iter()
+            .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+            .collect()
+    })
+}
+
 async fn api_sessions() -> Json<Vec<SessionInfo>> {
     let Some(base) = claude_dir() else {
         return Json(vec![]);
@@ -127,7 +145,7 @@ async fn api_sessions() -> Json<Vec<SessionInfo>> {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) else {
+        let Ok(meta) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
 
@@ -142,75 +160,40 @@ async fn api_sessions() -> Json<Vec<SessionInfo>> {
             .get("first_prompt")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let first_prompt = first_prompt_raw.chars().take(200).collect::<String>();
+        let first_prompt = truncate_chars(first_prompt_raw, 200).to_string();
 
         // Load facets if available
         let facets = std::fs::read_to_string(facets_dir.join(format!("{sid}.json")))
             .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
-
-        let f = |v: &serde_json::Value, k: &str| -> Option<String> {
-            v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string())
-        };
-        let fu64 =
-            |v: &serde_json::Value, k: &str| -> Option<u64> { v.get(k).and_then(|x| x.as_u64()) };
-        let ff64 =
-            |v: &serde_json::Value, k: &str| -> Option<f64> { v.get(k).and_then(|x| x.as_f64()) };
-        let fbool =
-            |v: &serde_json::Value, k: &str| -> Option<bool> { v.get(k).and_then(|x| x.as_bool()) };
-
-        let tool_counts: Option<HashMap<String, u64>> = meta
-            .get("tool_counts")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
-                    .collect()
-            });
-
-        let languages: Option<HashMap<String, u64>> = meta
-            .get("languages")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
-                    .collect()
-            });
+            .and_then(|c| serde_json::from_str::<Value>(&c).ok());
+        let facet = |k: &str| facets.as_ref().and_then(|v| str_field(v, k));
 
         sessions.push(SessionInfo {
             session_id: sid,
-            project: project.clone(),
+            project,
             project_short,
-            start_time: f(&meta, "start_time"),
-            duration_minutes: ff64(&meta, "duration_minutes"),
-            input_tokens: fu64(&meta, "input_tokens"),
-            output_tokens: fu64(&meta, "output_tokens"),
-            lines_added: fu64(&meta, "lines_added"),
-            lines_removed: fu64(&meta, "lines_removed"),
-            files_modified: fu64(&meta, "files_modified"),
-            git_commits: fu64(&meta, "git_commits"),
-            assistant_message_count: fu64(&meta, "assistant_message_count"),
-            user_message_count: fu64(&meta, "user_message_count"),
-            tool_counts,
-            tool_errors: fu64(&meta, "tool_errors"),
-            user_interruptions: fu64(&meta, "user_interruptions"),
-            uses_task_agent: fbool(&meta, "uses_task_agent"),
-            languages,
-            brief_summary: facets.as_ref().and_then(|f_val| f(f_val, "brief_summary")),
-            underlying_goal: facets
-                .as_ref()
-                .and_then(|f_val| f(f_val, "underlying_goal")),
-            outcome: facets.as_ref().and_then(|f_val| f(f_val, "outcome")),
-            session_type: facets.as_ref().and_then(|f_val| f(f_val, "session_type")),
-            claude_helpfulness: facets
-                .as_ref()
-                .and_then(|f_val| f(f_val, "claude_helpfulness")),
-            primary_success: facets
-                .as_ref()
-                .and_then(|f_val| f(f_val, "primary_success")),
-            friction_detail: facets
-                .as_ref()
-                .and_then(|f_val| f(f_val, "friction_detail")),
+            start_time: str_field(&meta, "start_time"),
+            duration_minutes: meta.get("duration_minutes").and_then(Value::as_f64),
+            input_tokens: u64_field(&meta, "input_tokens"),
+            output_tokens: u64_field(&meta, "output_tokens"),
+            lines_added: u64_field(&meta, "lines_added"),
+            lines_removed: u64_field(&meta, "lines_removed"),
+            files_modified: u64_field(&meta, "files_modified"),
+            git_commits: u64_field(&meta, "git_commits"),
+            assistant_message_count: u64_field(&meta, "assistant_message_count"),
+            user_message_count: u64_field(&meta, "user_message_count"),
+            tool_counts: u64_map(&meta, "tool_counts"),
+            tool_errors: u64_field(&meta, "tool_errors"),
+            user_interruptions: u64_field(&meta, "user_interruptions"),
+            uses_task_agent: meta.get("uses_task_agent").and_then(Value::as_bool),
+            languages: u64_map(&meta, "languages"),
+            brief_summary: facet("brief_summary"),
+            underlying_goal: facet("underlying_goal"),
+            outcome: facet("outcome"),
+            session_type: facet("session_type"),
+            claude_helpfulness: facet("claude_helpfulness"),
+            primary_success: facet("primary_success"),
+            friction_detail: facet("friction_detail"),
             first_prompt: Some(first_prompt),
         });
     }
@@ -226,7 +209,7 @@ struct SessionDetailQuery {
     session_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct SessionEvent {
     timestamp: String,
     #[serde(rename = "type")]
@@ -279,18 +262,14 @@ async fn api_session_detail(
     let mut events = Vec::new();
 
     for line in content.lines() {
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue;
         };
 
-        let msg_type = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let msg_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
         let timestamp = obj
             .get("timestamp")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
 
@@ -298,52 +277,36 @@ async fn api_session_detail(
             continue;
         }
 
-        match msg_type.as_str() {
+        match msg_type {
             "user" => {
-                let text = extract_text_preview(&obj);
                 events.push(SessionEvent {
                     timestamp,
                     event_type: "user".into(),
                     role: Some("user".into()),
-                    text_preview: Some(text),
-                    tool_name: None,
-                    agent_id: None,
-                    agent_prompt: None,
-                    subtype: None,
-                    duration_ms: None,
+                    text_preview: Some(extract_text_preview(&obj)),
+                    ..Default::default()
                 });
             }
             "assistant" => {
-                let msg = obj.get("message").cloned().unwrap_or_default();
-                let content = msg.get("content").and_then(|c| c.as_array());
+                let content = obj.pointer("/message/content").and_then(Value::as_array);
 
                 if let Some(blocks) = content {
                     // Emit text blocks
                     let mut text_parts = Vec::new();
                     for block in blocks {
-                        let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        match bt {
+                        match block.get("type").and_then(Value::as_str).unwrap_or("") {
                             "text" => {
-                                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                                    text_parts.push(t.chars().take(200).collect::<String>());
+                                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                    text_parts.push(truncate_chars(t, 200));
                                 }
                             }
                             "tool_use" => {
-                                let name = block
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?")
-                                    .to_string();
+                                let name = block.get("name").and_then(Value::as_str).unwrap_or("?");
                                 events.push(SessionEvent {
                                     timestamp: timestamp.clone(),
                                     event_type: "tool_use".into(),
-                                    role: None,
-                                    text_preview: None,
-                                    tool_name: Some(name),
-                                    agent_id: None,
-                                    agent_prompt: None,
-                                    subtype: None,
-                                    duration_ms: None,
+                                    tool_name: Some(name.to_string()),
+                                    ..Default::default()
                                 });
                             }
                             _ => {}
@@ -351,62 +314,40 @@ async fn api_session_detail(
                     }
                     if !text_parts.is_empty() {
                         events.push(SessionEvent {
-                            timestamp: timestamp.clone(),
+                            timestamp,
                             event_type: "assistant".into(),
                             role: Some("assistant".into()),
-                            text_preview: Some(text_parts.join(" ").chars().take(300).collect()),
-                            tool_name: None,
-                            agent_id: None,
-                            agent_prompt: None,
-                            subtype: None,
-                            duration_ms: None,
+                            text_preview: Some(truncate_chars(&text_parts.join(" "), 300).into()),
+                            ..Default::default()
                         });
                     }
                 }
             }
             "progress" => {
-                let data = obj.get("data").cloned().unwrap_or_default();
-                let dt = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if dt == "agent_progress" {
-                    let agent_id = data
-                        .get("agentId")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let prompt = data
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.chars().take(200).collect());
+                if let Some(data) = obj
+                    .get("data")
+                    .filter(|d| d.get("type").and_then(Value::as_str) == Some("agent_progress"))
+                {
                     events.push(SessionEvent {
                         timestamp,
                         event_type: "agent".into(),
-                        role: None,
-                        text_preview: None,
-                        tool_name: None,
-                        agent_id,
-                        agent_prompt: prompt,
-                        subtype: None,
-                        duration_ms: None,
+                        agent_id: str_field(data, "agentId"),
+                        agent_prompt: data
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .map(|s| truncate_chars(s, 200).to_string()),
+                        ..Default::default()
                     });
                 }
                 // Skip bash_progress / hook_progress (too noisy)
             }
             "system" => {
-                let subtype = obj
-                    .get("subtype")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let dur = obj.get("durationMs").and_then(|v| v.as_u64());
                 events.push(SessionEvent {
                     timestamp,
                     event_type: "system".into(),
-                    role: None,
-                    text_preview: None,
-                    tool_name: None,
-                    agent_id: None,
-                    agent_prompt: None,
-                    subtype: Some(subtype),
-                    duration_ms: dur,
+                    subtype: Some(str_field(&obj, "subtype").unwrap_or_default()),
+                    duration_ms: u64_field(&obj, "durationMs"),
+                    ..Default::default()
                 });
             }
             _ => {}
@@ -424,21 +365,19 @@ fn valid_session_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn extract_text_preview(obj: &serde_json::Value) -> String {
-    let msg = obj.get("message").cloned().unwrap_or_default();
-    let content = msg.get("content");
-    match content {
-        Some(serde_json::Value::String(s)) => s.chars().take(200).collect(),
-        Some(serde_json::Value::Array(arr)) => {
+fn extract_text_preview(obj: &Value) -> String {
+    match obj.pointer("/message/content") {
+        Some(Value::String(s)) => truncate_chars(s, 200).to_string(),
+        Some(Value::Array(arr)) => {
             for block in arr {
-                if block.get("type").and_then(|v| v.as_str()) == Some("text")
-                    && let Some(t) = block.get("text").and_then(|v| v.as_str())
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(t) = block.get("text").and_then(Value::as_str)
                 {
-                    return t.chars().take(200).collect();
+                    return truncate_chars(t, 200).to_string();
                 }
                 // tool_result content
-                if let Some(c) = block.get("content").and_then(|v| v.as_str()) {
-                    return c.chars().take(200).collect();
+                if let Some(c) = block.get("content").and_then(Value::as_str) {
+                    return truncate_chars(c, 200).to_string();
                 }
             }
             String::new()

@@ -22,9 +22,6 @@ pub fn launch_in_terminal(
 }
 
 fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".into();
-    }
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -74,36 +71,30 @@ fn apple_script_escape(value: &str) -> String {
 fn launch_platform(command: &str, terminal_pref: Option<&str>) -> Result<()> {
     let shell_command = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
 
-    let terminals: Vec<String> = if let Some(pref) = terminal_pref {
-        vec![pref.to_string()]
-    } else {
-        vec![
-            "x-terminal-emulator".into(),
-            "gnome-terminal".into(),
-            "konsole".into(),
-            "xfce4-terminal".into(),
-            "alacritty".into(),
-            "kitty".into(),
-            "wezterm".into(),
-            "xterm".into(),
-        ]
+    let preferred = terminal_pref.map(|pref| [pref]);
+    let terminals: &[&str] = match &preferred {
+        Some(pref) => pref,
+        None => &[
+            "x-terminal-emulator",
+            "gnome-terminal",
+            "konsole",
+            "xfce4-terminal",
+            "alacritty",
+            "kitty",
+            "wezterm",
+            "xterm",
+        ],
     };
 
-    for terminal in &terminals {
-        let result = match terminal.as_str() {
-            "gnome-terminal" => Command::new(terminal)
-                .arg("--")
-                .arg("bash")
-                .arg("-c")
-                .arg(&shell_command)
-                .spawn(),
-            _ => Command::new(terminal)
-                .arg("-e")
-                .arg("bash")
-                .arg("-c")
-                .arg(&shell_command)
-                .spawn(),
+    for &terminal in terminals {
+        let exec_flag = if terminal == "gnome-terminal" {
+            "--"
+        } else {
+            "-e"
         };
+        let result = Command::new(terminal)
+            .args([exec_flag, "bash", "-c", shell_command.as_str()])
+            .spawn();
         if result.is_ok() {
             return Ok(());
         }
@@ -132,5 +123,6 @@ mod tests {
     fn shell_quote_preserves_spaces_and_single_quotes() {
         assert_eq!(shell_quote("hello world"), "'hello world'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 }

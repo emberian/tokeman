@@ -22,48 +22,24 @@ pub struct TokenStats {
 }
 
 pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
-    if snapshots.len() < 2 {
-        return TokenStats {
-            token_name: token_name.to_string(),
-            burn_rate_5h: None,
-            burn_rate_7d: None,
-            mean_burn_7d: None,
-            stddev_burn_7d: None,
-            peak_burn_7d: None,
-            hours_to_depletion_5h: None,
-            hours_to_depletion_7d: None,
-            snapshot_count: snapshots.len(),
-        };
-    }
-
-    let mut burn_rates_7d: Vec<f64> = Vec::new();
-    let mut burn_rates_5h: Vec<f64> = Vec::new();
-
-    for pair in snapshots.windows(2) {
-        let dt_hours = (pair[1].probed_at - pair[0].probed_at).num_seconds() as f64 / 3600.0;
-        if dt_hours <= 0.0 {
-            continue;
-        }
-
-        if pair[0].reset_7d == pair[1].reset_7d
-            && let (Some(u0), Some(u1)) = (pair[0].utilization_7d, pair[1].utilization_7d)
-            && u1 >= u0
-        {
-            let rate = (u1 - u0) / dt_hours;
-            if rate.is_finite() {
-                burn_rates_7d.push(rate);
-            }
-        }
-        if pair[0].reset_5h == pair[1].reset_5h
-            && let (Some(u0), Some(u1)) = (pair[0].utilization_5h, pair[1].utilization_5h)
-            && u1 >= u0
-        {
-            let rate = (u1 - u0) / dt_hours;
-            if rate.is_finite() {
-                burn_rates_5h.push(rate);
-            }
-        }
-    }
+    // Burn rates between consecutive snapshots within the same reset window.
+    let burn_rates = |series: fn(&Snapshot) -> (Option<f64>, Option<i64>)| -> Vec<f64> {
+        snapshots
+            .windows(2)
+            .filter_map(|pair| {
+                let dt_hours =
+                    (pair[1].probed_at - pair[0].probed_at).num_seconds() as f64 / 3600.0;
+                let ((u0, r0), (u1, r1)) = (series(&pair[0]), series(&pair[1]));
+                let (u0, u1) = (u0?, u1?);
+                let rate = (u1 - u0) / dt_hours;
+                (dt_hours > 0.0 && r0 == r1 && u1 >= u0 && rate.is_finite()).then_some(rate)
+            })
+            .collect()
+    };
+    let series_5h = |s: &Snapshot| (s.utilization_5h, s.reset_5h);
+    let series_7d = |s: &Snapshot| (s.utilization_7d, s.reset_7d);
+    let burn_rates_5h = burn_rates(series_5h);
+    let burn_rates_7d = burn_rates(series_7d);
 
     let latest_burn_5h = burn_rates_5h.last().copied();
     let latest_burn_7d = burn_rates_7d.last().copied();
@@ -85,15 +61,11 @@ pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
 
     let peak_burn_7d = burn_rates_7d.iter().copied().reduce(f64::max);
 
-    let last = snapshots.last().unwrap();
-
-    let hours_to_depletion_5h = latest_burn_5h
-        .filter(|&r| r > 0.0)
-        .and_then(|rate| last.utilization_5h.map(|u| (1.0 - u) / rate));
-
-    let hours_to_depletion_7d = latest_burn_7d
-        .filter(|&r| r > 0.0)
-        .and_then(|rate| last.utilization_7d.map(|u| (1.0 - u) / rate));
+    let depletion = |latest: Option<f64>, series: fn(&Snapshot) -> (Option<f64>, Option<i64>)| {
+        let rate = latest.filter(|&r| r > 0.0)?;
+        let u = series(snapshots.last()?).0?;
+        Some((1.0 - u) / rate)
+    };
 
     TokenStats {
         token_name: token_name.to_string(),
@@ -102,8 +74,8 @@ pub fn compute_stats(token_name: &str, snapshots: &[Snapshot]) -> TokenStats {
         mean_burn_7d,
         stddev_burn_7d,
         peak_burn_7d,
-        hours_to_depletion_5h,
-        hours_to_depletion_7d,
+        hours_to_depletion_5h: depletion(latest_burn_5h, series_5h),
+        hours_to_depletion_7d: depletion(latest_burn_7d, series_7d),
         snapshot_count: snapshots.len(),
     }
 }

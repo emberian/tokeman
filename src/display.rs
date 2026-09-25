@@ -1,22 +1,29 @@
 use chrono::{DateTime, Local, Utc};
 
-use crate::probe::{ProbeResult, UnifiedQuota};
+use crate::probe::{Level, ProbeResult, UnifiedQuota, level};
 
 const BAR_WIDTH: usize = 40;
 
-fn format_reset(ts: i64) -> String {
+/// Reset time and time left until it, or the literal to print instead
+/// ("--" for an unknown reset, "now" when it already passed).
+fn until(ts: i64) -> Result<(DateTime<Utc>, chrono::Duration), &'static str> {
     if ts == 0 {
-        return "--".to_string();
+        return Err("--");
     }
     let reset = DateTime::from_timestamp(ts, 0).unwrap_or_default();
-    let local = reset.with_timezone(&Local);
-    let now = Utc::now();
-    let diff = reset - now;
-
+    let diff = reset - Utc::now();
     if diff.num_seconds() < 0 {
-        return "now".to_string();
+        return Err("now");
     }
+    Ok((reset, diff))
+}
 
+fn format_reset(ts: i64) -> String {
+    let (reset, diff) = match until(ts) {
+        Ok(until) => until,
+        Err(text) => return text.to_string(),
+    };
+    let local = reset.with_timezone(&Local);
     let hours = diff.num_hours();
     let mins = diff.num_minutes() % 60;
 
@@ -31,13 +38,34 @@ fn format_reset(ts: i64) -> String {
     }
 }
 
-fn utilization_color(remaining_frac: f64) -> &'static str {
-    if remaining_frac > 0.50 {
-        "\x1b[32m" // green
-    } else if remaining_frac > 0.20 {
-        "\x1b[33m" // yellow
-    } else {
-        "\x1b[31m" // red
+/// The first `max_chars` characters of `s`, without an ellipsis.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .map_or(s, |(idx, _)| &s[..idx])
+}
+
+/// Long and short display labels for a representative claim.
+pub fn claim_label(claim: &str) -> Option<(&'static str, &'static str)> {
+    Some(match claim {
+        "five_hour" => ("session", "session"),
+        "seven_day" => ("weekly", "weekly"),
+        "seven_day_opus" => ("Opus weekly", "Opus"),
+        "seven_day_sonnet" => ("Sonnet weekly", "Sonnet"),
+        "overage" => ("extra usage", "extra"),
+        _ => return None,
+    })
+}
+
+/// Status badge text and health level (None = neutral) for a probe result.
+pub fn status_badge<'a>(result: &'a ProbeResult, no_quota: &'a str) -> (&'a str, Option<Level>) {
+    match result.quota.as_ref().map(|q| q.status.as_str()) {
+        Some("allowed") => ("allowed", Some(Level::Ok)),
+        Some("allowed_warning") => ("warning", Some(Level::Low)),
+        Some("rejected") => ("REJECTED", Some(Level::Critical)),
+        Some(s) => (s, Some(Level::Low)),
+        None if result.error.is_some() => ("error", Some(Level::Critical)),
+        None => (no_quota, None),
     }
 }
 
@@ -48,7 +76,11 @@ fn render_bar(utilization: f64) -> String {
     let empty = BAR_WIDTH - filled;
     let pct = (remaining * 100.0).round() as u8;
 
-    let color = utilization_color(remaining);
+    let color = match level(remaining) {
+        Level::Ok => "\x1b[32m",
+        Level::Low => "\x1b[33m",
+        Level::Critical => "\x1b[31m",
+    };
     let reset = "\x1b[0m";
 
     format!(
@@ -126,7 +158,7 @@ fn print_quota(q: &UnifiedQuota) {
     }
 
     if let Some(ref w) = q.weekly {
-        let remaining = 1.0 - w.utilization;
+        let remaining = w.remaining();
         let warning = if remaining < 0.10 {
             "  \x1b[31m!! critical\x1b[0m"
         } else if remaining < 0.20 {
@@ -162,28 +194,30 @@ fn print_quota(q: &UnifiedQuota) {
         _ => format!("\x1b[31m{}\x1b[0m", q.status),
     };
 
-    let claim = match q.representative_claim.as_str() {
-        "five_hour" => "session",
-        "seven_day" => "weekly",
-        "seven_day_opus" => "Opus weekly",
-        "seven_day_sonnet" => "Sonnet weekly",
-        "overage" => "extra usage",
-        other => other,
-    };
+    let claim =
+        claim_label(&q.representative_claim).map_or(q.representative_claim.as_str(), |l| l.0);
 
     println!("   Status: {status_str}  (limit: {claim})");
 }
 
 fn print_rate_limits(result: &ProbeResult) {
     let rl = &result.rate_limits;
-    if let (Some(lim), Some(rem)) = (rl.requests_limit, rl.requests_remaining) {
-        println!("   RPM: {rem}/{lim}");
-    }
-    if let (Some(lim), Some(rem)) = (rl.input_tokens_limit, rl.input_tokens_remaining) {
-        println!("   Input TPM: {rem}/{lim}");
-    }
-    if let (Some(lim), Some(rem)) = (rl.output_tokens_limit, rl.output_tokens_remaining) {
-        println!("   Output TPM: {rem}/{lim}");
+    for (label, limit, remaining) in [
+        ("RPM", rl.requests_limit, rl.requests_remaining),
+        (
+            "Input TPM",
+            rl.input_tokens_limit,
+            rl.input_tokens_remaining,
+        ),
+        (
+            "Output TPM",
+            rl.output_tokens_limit,
+            rl.output_tokens_remaining,
+        ),
+    ] {
+        if let (Some(lim), Some(rem)) = (limit, remaining) {
+            println!("   {label}: {rem}/{lim}");
+        }
     }
 }
 
@@ -197,56 +231,39 @@ pub fn print_history(snapshots: &[crate::store::Snapshot]) {
     println!(" \x1b[1mtokeman\x1b[0m — {} snapshots", snapshots.len());
     println!();
 
+    let left_pct = |u: f64| (1.0 - u) * 100.0;
     for s in snapshots {
         let local = s.probed_at.with_timezone(&Local);
         let u5 = s
             .utilization_5h
-            .map(|u| format!("{:.1}%", (1.0 - u) * 100.0))
+            .map(|u| format!("{:.1}%", left_pct(u)))
             .unwrap_or_else(|| "--".into());
         let u7 = s
             .utilization_7d
-            .map(|u| format!("{:.1}%", (1.0 - u) * 100.0))
+            .map(|u| format!("{:.1}%", left_pct(u)))
             .unwrap_or_else(|| "--".into());
         let status = s.unified_status.as_deref().unwrap_or("--");
         let claim = s
             .representative_claim
             .as_deref()
-            .map(|c| match c {
-                "five_hour" => "session",
-                "seven_day" => "weekly",
-                "seven_day_opus" => "Opus",
-                "seven_day_sonnet" => "Sonnet",
-                "overage" => "extra",
-                other => other,
-            })
+            .map(|c| claim_label(c).map_or(c, |l| l.1))
             .unwrap_or("--");
 
         let overage = s
             .utilization_overage
-            .map(|u| format!("  ov: {:>5.1}%", (1.0 - u) * 100.0))
+            .map(|u| format!("  ov: {:>5.1}%", left_pct(u)))
             .unwrap_or_default();
-        let model_buckets = if s.model_usage_buckets.is_empty() {
-            [
-                s.utilization_opus_7d
-                    .map(|u| format!("Opus:{:.1}%", (1.0 - u) * 100.0)),
-                s.utilization_sonnet_7d
-                    .map(|u| format!("Sonnet:{:.1}%", (1.0 - u) * 100.0)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-        } else {
-            s.model_usage_buckets
-                .iter()
-                .map(|bucket| {
-                    format!(
-                        "{}:{:.1}%",
-                        bucket.label,
-                        (1.0 - bucket.window.utilization) * 100.0
-                    )
-                })
-                .collect()
-        };
+        let model_buckets: Vec<_> = s
+            .model_buckets()
+            .iter()
+            .map(|bucket| {
+                format!(
+                    "{}:{:.1}%",
+                    bucket.label,
+                    left_pct(bucket.window.utilization)
+                )
+            })
+            .collect();
         let models = if model_buckets.is_empty() {
             String::new()
         } else {
@@ -269,17 +286,10 @@ pub fn print_history(snapshots: &[crate::store::Snapshot]) {
 }
 
 pub fn format_reset_compact(ts: i64) -> String {
-    if ts == 0 {
-        return "--".to_string();
-    }
-    let reset = DateTime::from_timestamp(ts, 0).unwrap_or_default();
-    let now = Utc::now();
-    let diff = reset - now;
-
-    if diff.num_seconds() < 0 {
-        return "now".to_string();
-    }
-
+    let (reset, diff) = match until(ts) {
+        Ok(until) => until,
+        Err(text) => return text.to_string(),
+    };
     let hours = diff.num_hours();
     let mins = diff.num_minutes() % 60;
 

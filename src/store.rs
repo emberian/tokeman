@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::probe::{ModelQuotaBucket, ProbeResult};
+use crate::probe::{ModelQuotaBucket, ModelUsageSource, ProbeResult, Window};
 
 pub struct Store {
     conn: Connection,
@@ -35,6 +35,66 @@ pub struct Snapshot {
     pub model_usage_buckets: Vec<ModelQuotaBucket>,
 }
 
+/// A plottable utilization series stored on a snapshot.
+#[derive(Clone, Copy)]
+pub enum Series<'a> {
+    FiveHour,
+    SevenDay,
+    Overage,
+    Model(&'a str),
+}
+
+impl Snapshot {
+    /// Model buckets, with legacy Opus/Sonnet columns folded in by the same
+    /// rule as `ModelUsage::buckets` (only when no bucket already has the key).
+    pub fn model_buckets(&self) -> Vec<ModelQuotaBucket> {
+        let mut buckets = self.model_usage_buckets.clone();
+        for (key, label, utilization, reset) in [
+            ("opus", "Opus", self.utilization_opus_7d, self.reset_opus_7d),
+            (
+                "sonnet",
+                "Sonnet",
+                self.utilization_sonnet_7d,
+                self.reset_sonnet_7d,
+            ),
+        ] {
+            if let Some(utilization) = utilization
+                && !buckets.iter().any(|bucket| bucket.key == key)
+            {
+                buckets.push(ModelQuotaBucket {
+                    key: key.into(),
+                    label: label.into(),
+                    window: Window {
+                        utilization,
+                        reset: reset.unwrap_or(0),
+                    },
+                    source: ModelUsageSource::Profile,
+                });
+            }
+        }
+        buckets
+    }
+
+    /// (utilization, reset) for one series, if this snapshot recorded it.
+    pub fn window(&self, series: Series) -> Option<(f64, Option<i64>)> {
+        match series {
+            Series::FiveHour => Some((self.utilization_5h?, self.reset_5h)),
+            Series::SevenDay => Some((self.utilization_7d?, self.reset_7d)),
+            Series::Overage => Some((self.utilization_overage?, self.reset_overage)),
+            Series::Model(key) => {
+                if let Some(bucket) = self.model_usage_buckets.iter().find(|b| b.key == key) {
+                    return Some((bucket.window.utilization, Some(bucket.window.reset)));
+                }
+                match key {
+                    "opus" => Some((self.utilization_opus_7d?, self.reset_opus_7d)),
+                    "sonnet" => Some((self.utilization_sonnet_7d?, self.reset_sonnet_7d)),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 impl Store {
     pub fn open() -> Result<Self> {
         let path = Self::db_path()?;
@@ -46,7 +106,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        set_private_permissions(&path)?;
+        crate::private_fs::set_mode(&path, 0o600)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -90,11 +150,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time
                 ON snapshots(token_name, probed_at);",
         )?;
-        // Existing databases predate sanitized probe-error persistence.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE snapshots ADD COLUMN error TEXT", []);
+        // Existing databases predate these columns; ALTER fails harmlessly when present.
         for column in [
+            "error TEXT",
             "utilization_opus_7d REAL",
             "reset_opus_7d INTEGER",
             "utilization_sonnet_7d REAL",
@@ -110,38 +168,17 @@ impl Store {
     }
 
     pub fn insert(&self, result: &ProbeResult) -> Result<()> {
-        let (unified_status, u5h, r5h, u7d, r7d, rep, ov_status, u_ov, r_ov) = match &result.quota {
-            Some(q) => (
-                Some(q.status.as_str()),
-                q.session.as_ref().map(|w| w.utilization),
-                q.session.as_ref().map(|w| w.reset),
-                q.weekly.as_ref().map(|w| w.utilization),
-                q.weekly.as_ref().map(|w| w.reset),
-                Some(q.representative_claim.as_str()),
-                q.overage_status.as_deref(),
-                q.overage.as_ref().map(|w| w.utilization),
-                q.overage.as_ref().map(|w| w.reset),
-            ),
-            None => (None, None, None, None, None, None, None, None, None),
-        };
-        let (u_opus, r_opus, u_sonnet, r_sonnet) = result
-            .model_usage
-            .as_ref()
-            .map(|usage| {
-                (
-                    usage.opus_weekly.as_ref().map(|window| window.utilization),
-                    usage.opus_weekly.as_ref().map(|window| window.reset),
-                    usage
-                        .sonnet_weekly
-                        .as_ref()
-                        .map(|window| window.utilization),
-                    usage.sonnet_weekly.as_ref().map(|window| window.reset),
-                )
-            })
-            .unwrap_or((None, None, None, None));
-        let model_usage_buckets = result
-            .model_usage
-            .as_ref()
+        fn split(window: Option<&Window>) -> (Option<f64>, Option<i64>) {
+            (window.map(|w| w.utilization), window.map(|w| w.reset))
+        }
+        let quota = result.quota.as_ref();
+        let (u5h, r5h) = split(quota.and_then(|q| q.session.as_ref()));
+        let (u7d, r7d) = split(quota.and_then(|q| q.weekly.as_ref()));
+        let (u_ov, r_ov) = split(quota.and_then(|q| q.overage.as_ref()));
+        let usage = result.model_usage.as_ref();
+        let (u_opus, r_opus) = split(usage.and_then(|u| u.opus_weekly.as_ref()));
+        let (u_sonnet, r_sonnet) = split(usage.and_then(|u| u.sonnet_weekly.as_ref()));
+        let model_usage_buckets = usage
             .map(|usage| serde_json::to_string(&usage.buckets()))
             .transpose()?;
 
@@ -161,13 +198,13 @@ impl Store {
             params![
                 result.token_name,
                 result.probed_at.to_rfc3339(),
-                unified_status,
+                quota.map(|q| q.status.as_str()),
                 u5h,
                 r5h,
                 u7d,
                 r7d,
-                rep,
-                ov_status,
+                quota.map(|q| q.representative_claim.as_str()),
+                quota.and_then(|q| q.overage_status.as_deref()),
                 u_ov,
                 r_ov,
                 result.error.as_deref(),
@@ -183,94 +220,47 @@ impl Store {
     }
 
     pub fn recent(&self, token_name: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
-        let (sql, has_filter) = match token_name {
-            Some(_) => (
-                "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
-                        utilization_7d, reset_7d, representative_claim,
-                        overage_status, utilization_overage, reset_overage, error,
-                        utilization_opus_7d, reset_opus_7d,
-                        utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                        model_usage_buckets
-                 FROM snapshots WHERE token_name = ?1 ORDER BY probed_at DESC LIMIT ?2",
-                true,
+        let limit = limit as i64;
+        match token_name {
+            Some(name) => self.query(
+                "WHERE token_name = ?1 ORDER BY probed_at DESC LIMIT ?2",
+                params![name, limit],
             ),
-            None => (
-                "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
-                        utilization_7d, reset_7d, representative_claim,
-                        overage_status, utilization_overage, reset_overage, error,
-                        utilization_opus_7d, reset_opus_7d,
-                        utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                        model_usage_buckets
-                 FROM snapshots ORDER BY probed_at DESC LIMIT ?1",
-                false,
-            ),
-        };
-
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = if has_filter {
-            stmt.query_map(params![token_name.unwrap(), limit as i64], Self::map_row)?
-        } else {
-            stmt.query_map(params![limit as i64], Self::map_row)?
-        };
-
-        let mut snapshots = Vec::new();
-        for row in rows {
-            snapshots.push(row?);
+            None => self.query("ORDER BY probed_at DESC LIMIT ?1", params![limit]),
         }
-        Ok(snapshots)
     }
 
     pub fn for_token_since(&self, token_name: &str, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
-                    utilization_7d, reset_7d, representative_claim,
-                    overage_status, utilization_overage, reset_overage, error,
-                    utilization_opus_7d, reset_opus_7d,
-                    utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                    model_usage_buckets
-             FROM snapshots WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
-        )?;
-        let rows = stmt.query_map(params![token_name, since.to_rfc3339()], Self::map_row)?;
-        let mut snapshots = Vec::new();
-        for row in rows {
-            snapshots.push(row?);
-        }
-        Ok(snapshots)
+        self.query(
+            "WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
+            params![token_name, since.to_rfc3339()],
+        )
     }
 
     pub fn all(&self) -> Result<Vec<Snapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
-                    utilization_7d, reset_7d, representative_claim,
-                    overage_status, utilization_overage, reset_overage, error,
-                    utilization_opus_7d, reset_opus_7d,
-                    utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                    model_usage_buckets
-             FROM snapshots ORDER BY probed_at ASC",
-        )?;
-        let rows = stmt.query_map([], Self::map_row)?;
-        let mut snapshots = Vec::new();
-        for row in rows {
-            snapshots.push(row?);
-        }
-        Ok(snapshots)
+        self.query("ORDER BY probed_at ASC", [])
     }
 
     pub fn all_since(&self, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
-        let mut stmt = self.conn.prepare(
+        self.query(
+            "WHERE probed_at >= ?1 ORDER BY probed_at ASC",
+            params![since.to_rfc3339()],
+        )
+    }
+
+    fn query(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Snapshot>> {
+        const SELECT_COLS: &str =
             "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                     utilization_7d, reset_7d, representative_claim,
                     overage_status, utilization_overage, reset_overage, error,
                     utilization_opus_7d, reset_opus_7d,
                     utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
                     model_usage_buckets
-             FROM snapshots WHERE probed_at >= ?1 ORDER BY probed_at ASC",
-        )?;
-        let rows = stmt.query_map(params![since.to_rfc3339()], Self::map_row)?;
-        let mut snapshots = Vec::new();
-        for row in rows {
-            snapshots.push(row?);
-        }
+             FROM snapshots";
+        let mut stmt = self.conn.prepare(&format!("{SELECT_COLS} {tail}"))?;
+        let snapshots = stmt
+            .query_map(params, Self::map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(snapshots)
     }
 
@@ -317,14 +307,54 @@ impl Store {
     }
 }
 
-#[cfg(unix)]
-fn set_private_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+    #[test]
+    fn legacy_model_columns_fold_in_only_when_bucket_missing() {
+        let bucket = |key: &str, utilization: f64| ModelQuotaBucket {
+            key: key.into(),
+            label: key.into(),
+            window: Window {
+                utilization,
+                reset: 7,
+            },
+            source: ModelUsageSource::ObservedRejection,
+        };
+        let snapshot = Snapshot {
+            token_name: "t".into(),
+            probed_at: Utc::now(),
+            unified_status: None,
+            utilization_5h: Some(0.1),
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            representative_claim: None,
+            overage_status: None,
+            utilization_overage: None,
+            reset_overage: None,
+            error: None,
+            utilization_opus_7d: Some(0.2),
+            reset_opus_7d: Some(1),
+            utilization_sonnet_7d: Some(0.3),
+            reset_sonnet_7d: Some(2),
+            model_usage_error: None,
+            model_usage_buckets: vec![bucket("opus", 0.9)],
+        };
+        let keys: Vec<_> = snapshot
+            .model_buckets()
+            .into_iter()
+            .map(|b| (b.key, b.window.utilization))
+            .collect();
+        assert_eq!(keys, [("opus".into(), 0.9), ("sonnet".into(), 0.3)]);
+        assert_eq!(snapshot.window(Series::Model("opus")), Some((0.9, Some(7))));
+        assert_eq!(
+            snapshot.window(Series::Model("sonnet")),
+            Some((0.3, Some(2)))
+        );
+        assert_eq!(snapshot.window(Series::Model("fable")), None);
+        assert_eq!(snapshot.window(Series::FiveHour), Some((0.1, None)));
+        assert_eq!(snapshot.window(Series::SevenDay), None);
+    }
 }
