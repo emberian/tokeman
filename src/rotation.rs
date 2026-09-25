@@ -2420,7 +2420,8 @@ pub async fn refresh_logins(backoff: &mut RefreshBackoff) -> Result<usize> {
         let Some(refresh_token) = token.refresh_token.clone() else {
             continue;
         };
-        match crate::claude_login::refresh(&refresh_token).await {
+        let scopes = token.scopes.clone().unwrap_or_default();
+        match crate::claude_login::refresh(&refresh_token, &scopes).await {
             Ok(bundle) => {
                 token.apply_login(bundle, Utc::now().timestamp_millis());
                 config.save(&config_lock)?;

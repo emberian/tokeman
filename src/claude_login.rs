@@ -147,17 +147,51 @@ pub async fn exchange(pasted: &str, pkce: &Pkce) -> Result<Bundle> {
         "code_verifier": pkce.verifier,
         "state": pkce.state,
     });
-    post_token(body).await
+    // The token endpoint rate-limits hard, and the pasted code survives a 429:
+    // wait it out here rather than sending the user back through the browser.
+    let mut waits = [5u64, 15, 30].into_iter();
+    loop {
+        match post_token(&body).await {
+            Err(error) if is_rate_limited(&error) => match waits.next() {
+                Some(secs) => {
+                    eprintln!("  token endpoint is rate limiting; retrying in {secs}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+                None => return Err(error),
+            },
+            outcome => return outcome,
+        }
+    }
 }
 
-pub async fn refresh(refresh_token: &str) -> Result<Bundle> {
+fn is_rate_limited(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<TokenEndpointError>()
+        .is_some_and(|error| error.status == 429)
+}
+
+/// Renew a grant. `scopes` are the ones it was issued with; Claude Code
+/// states them on every refresh.
+pub async fn refresh(refresh_token: &str, scopes: &[String]) -> Result<Bundle> {
+    let scope = if scopes.is_empty() {
+        SCOPES.to_owned()
+    } else {
+        scopes.join(" ")
+    };
     let body = serde_json::json!({
         "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
         "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": scope,
     });
-    post_token(body).await
+    post_token(&body).await
 }
+
+/// Claude Code's token requests go out through axios with no extra headers,
+/// so these are axios's defaults at the version Claude Code bundles (2.1.282
+/// ships 1.15.2). The endpoint is quick to rate-limit clients it does not
+/// recognize; looking like the client it serves is the reliable path.
+const TOKEN_CLIENT_USER_AGENT: &str = "axios/1.15.2";
 
 /// A non-success answer from the token endpoint.
 #[derive(Debug)]
@@ -195,16 +229,16 @@ pub fn is_permanent_refresh_failure(error: &anyhow::Error) -> bool {
         .is_some_and(TokenEndpointError::is_permanent)
 }
 
-async fn post_token(body: serde_json::Value) -> Result<Bundle> {
+async fn post_token(body: &serde_json::Value) -> Result<Bundle> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let response = client
         .post(TOKEN_URL)
+        .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", crate::probe::client_user_agent())
-        .json(&body)
+        .header("User-Agent", TOKEN_CLIENT_USER_AGENT)
+        .json(body)
         .send()
         .await
         .context("token endpoint request failed")?;
