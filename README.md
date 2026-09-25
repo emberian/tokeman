@@ -47,14 +47,32 @@ From GitHub releases (prebuilt binaries for macOS and Linux):
 
 ## Setup
 
-Add your OAuth tokens (the `sk-ant-oat01-...` keys from Claude Code / Claude Max):
+Log each account in through the browser:
 
 ```sh
-tokeman add "my-account" "sk-ant-oat01-..."
+tokeman login "my-account"       # one account (added if it is new)
+tokeman login --more             # every configured account that still needs it
+```
+
+Each round prints a claude.com URL; sign in as that account and paste the code
+the page shows. This grants the same full scope set Claude Code's own `/login`
+does, including `user:profile`, with a refresh token the rotation service
+renews in the background.
+
+You can also add long-lived `claude setup-token` keys:
+
+```sh
 tokeman add "work" "sk-ant-oat01-..."
 ```
 
-Tokens are stored in `~/.config/tokeman/tokens.toml` with mode `0600`.
+A setup token is **inference-only**. A Claude session running on one cannot
+send `/feedback`, use Remote Control, or read profile usage, and every quota
+probe has to spend a Haiku request. When an account has both, the login is
+used and the setup token is kept as a fallback in case the login is refused.
+
+Credentials are stored in `~/.config/tokeman/tokens.toml` with mode `0600`.
+Every write to that file is a locked read-modify-write, because refresh tokens
+are single-use and a save from a stale copy would lose the account.
 
 ## Usage
 
@@ -78,7 +96,8 @@ tokeman chart --metric opus-weekly # chart the separate Opus weekly bucket
 tokeman chart --metric sonnet-weekly
 tokeman usage capture <name>       # capture current /login profile usage access
 tokeman browse                    # local interactive history/session dashboard
-tokeman list                     # show configured tokens
+tokeman login [<name>|--more]    # browser login: full scope, refreshable
+tokeman list                     # show configured tokens and their login state
 tokeman add <name> <key>         # add a token
 tokeman remove <name>            # remove a token
 tokeman history [--last N]       # show recent snapshots
@@ -87,13 +106,41 @@ tokeman stats                    # burn rates and usage statistics
 
 ### Startup-default rotation
 
-`tokeman rotate install` installs a per-user macOS LaunchAgent. It updates
-`~/.claude/settings.json` at `.env.CLAUDE_CODE_OAUTH_TOKEN`. New Claude Code
-processes load that default at startup. Existing processes may notice settings
-changes, but Tokeman does not rely on auth hot-reload: restart/resume is the
-guaranteed credential boundary. Tokeman deliberately does **not** use
-`apiKeyHelper`: Claude treats that hook as an external API-key credential, while
-tokeman stores Claude.ai OAuth bearer tokens.
+`tokeman rotate install` installs a per-user macOS LaunchAgent. It writes the
+default account's credential to `~/.claude/settings.json` under `.env`:
+
+| Key | Value |
+|-----|-------|
+| `CLAUDE_CODE_OAUTH_TOKEN` | the account's login access token, or its setup token |
+| `CLAUDE_CODE_OAUTH_SCOPES` | the login's granted scopes (omitted for setup tokens) |
+| `CLAUDE_CODE_OAUTH_401_WAIT_MS` | `120000` |
+| `TOKEMAN_ACCOUNT` | the account name |
+
+Claude assumes an env token is inference-only unless `CLAUDE_CODE_OAUTH_SCOPES`
+says otherwise, so the scope list is what turns `/feedback` and Remote Control
+back on.
+
+How running Claude processes see these values matters for everything below.
+Claude copies settings `env` into its process environment whenever the file
+changes, but its API client keeps the token it cached at startup until the API
+refuses it. Only then does it re-read the environment. So:
+
+- A process on a **setup token** keeps its launch account for its whole life.
+  Rotating the default only moves new or restarted processes.
+- A process on a **login token** keeps its account until that token expires.
+  Its next request is refused, it waits (up to the 401 wait above) for settings
+  to offer a live token, and continues on whatever the default is by then. No
+  restart is needed, and an account rotated away from stops being drained
+  within one token lifetime.
+
+The daemon refreshes each login 30 minutes before expiry and rewrites settings
+when the default's token changes, so that retry is normally immediate. If a
+refresh is refused for good (revoked grant), the account falls back to its setup
+token and the log says to run `tokeman login` again.
+
+Tokeman deliberately does **not** use `apiKeyHelper`: Claude treats that hook as
+an external API-key credential, while tokeman stores Claude.ai OAuth bearer
+tokens.
 
 Default selection is sticky: a healthy account remains the startup default so
 the fleet preserves prompt-cache locality. When a floor is genuinely crossed,
@@ -101,8 +148,10 @@ tokeman chooses the viable account with the largest balanced headroom so new or
 restarted sessions can absorb cold prompt-cache creation. If two candidates
 offer the same landing room, the limiting window that replenishes soonest wins.
 
-Interactive Claude gives the short-lived OAuth record created by `/login`
-precedence over this managed default. During explicit foreground enrollment
+A `/login` record left in the Keychain would undermine that recovery: when
+Claude's token is refused and the stored login has a refresh token, Claude
+refreshes the Keychain login instead of waiting for settings to offer a new
+env token. So during explicit foreground enrollment
 (`tokeman add`, `tokeman usage capture`) and installation, Tokeman privately
 backs up that Claude login field and suppresses it while preserving MCP and
 unknown Keychain fields. `rotate pause` and `rotate uninstall` restore the saved
@@ -111,17 +160,20 @@ never access Keychain, so an unattended swarm cannot deadlock on a permission
 dialog. After a later manual `/login`, finish enrollment with `tokeman add` or
 `tokeman usage capture` before leaving the managed fleet unattended.
 
-Installation also adds a small `SessionStart` hook that receives only a
-non-secret account name, session id, process id, and transcript path. That
-creates an exact launch-account binding for new/resumed Claude processes; older
-processes remain explicitly marked as startup estimates. The dashboard's `D`
-marker means “default for new processes,” not a claim that every running process
-has reloaded it.
+Every credential tokeman installs is recorded, by fingerprint only, in a
+credential history. Replaying it from a process's start time through each token
+expiry gives the account that process is actually spending, which is what
+session listings, drain warnings and admission feedback use. (Neither the
+`TOKEMAN_ACCOUNT` a hook sees nor the token in `ps eww` can answer this: both
+show what settings offer, not what the process has cached.) Installation also
+adds a small `SessionStart` hook that records session id, process id and
+transcript path, so rejections in a transcript can be attributed. The
+dashboard's `D` marker means “default for new processes.”
 
 The default policy has two stages:
 
 1. **Normal:** probe every 120 seconds and rotate at 10% five-hour remaining or
-   5% seven-day remaining.
+   10% seven-day remaining.
 2. **Sip-and-drain:** when no token remains above both normal floors, probe
    every 20 seconds and drain the reserve pool to 2% five-hour / 3% seven-day.
 
@@ -132,7 +184,7 @@ cadences are configurable:
 ```toml
 [rotation]
 normal_min_5h_remaining = 0.10
-normal_min_7d_remaining = 0.05
+normal_min_7d_remaining = 0.10
 sip_min_5h_remaining = 0.02
 sip_min_7d_remaining = 0.03
 normal_probe_interval_secs = 120
@@ -143,7 +195,10 @@ The service wakes every 20 seconds, but skips the network probe until the
 current mode's cadence is due. Rotation is serialized with a file lock, settings
 writes are atomic, and token values are never written to logs. A partial probe
 batch is never used to select a replacement: tokeman keeps the current default
-and retries at the fast cadence.
+and retries at the fast cadence. An account whose credential is refused
+(revoked, expired) is rechecked on a backoff of 5 to 30 minutes instead of every
+cycle, and the log groups unavailable accounts by cause rather than repeating
+each response body. The log is moved aside to `claude-rotate.log.old` past 4 MB.
 
 Quota snapshots use a one-token Haiku 4.5 request. They are a cheap shared
 capacity signal, not proof that an unusually large Opus/1M turn will be
@@ -336,11 +391,13 @@ Each probe costs a fraction of a cent (one Haiku token).
 
 | Path | Contents |
 |------|----------|
-| `~/.config/tokeman/tokens.toml` | Token names, keys, and settings |
+| `~/.config/tokeman/tokens.toml` | Accounts, setup tokens, login grants, and settings |
+| `~/.config/tokeman/tokens.lock` | Serializes every write to `tokens.toml` |
+| `~/.config/tokeman/claude-credential-history.jsonl` | Which credential settings offered when (fingerprints and expiries only) |
 | `~/.config/tokeman/claude-rotate-state.json` | Adaptive monitor cadence/mode |
 | `~/.config/tokeman/claude-rotate.log` | Rotation events (names/headroom only) |
 | `~/.config/tokeman/claude-login-keychain-backup.json` | Private `/login` backup and managed-mode suppression marker |
-| `~/.config/tokeman/claude-admission-state.json` | Exact session bindings and reset-bounded rejection quarantines |
+| `~/.config/tokeman/claude-admission-state.json` | Session bindings and reset-bounded rejection quarantines |
 | `~/.local/share/tokeman/snapshots.db` | SQLite database of historical snapshots |
 
 Both paths respect `XDG_CONFIG_HOME` and `XDG_DATA_HOME`.
@@ -370,7 +427,7 @@ git push origin v0.1.0
 - [x] Local D3 history/session dashboard
 - [x] GitHub releases via cargo-dist
 - [ ] Notifications when weekly quota drops below threshold
-- [ ] Token refresh (auto-refresh expired OAuth tokens via refresh_token)
+- [x] Browser login with background refresh (full-scope, refreshable credentials)
 
 ## License
 

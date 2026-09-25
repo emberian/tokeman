@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,17 +9,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDateTime, TimeZone, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::admission;
-use crate::config::{Config, RotationSettings, Token};
+use crate::config::{Config, CredentialKind, RotationSettings, Token};
+use crate::credential_history::{self, CredentialEvent};
+use crate::private_fs::{FileLock, ensure_private_parent, set_mode, state_dir, write_atomic};
 use crate::probe::{self, ModelQuotaBucket, ModelUsage, ModelUsageSource, ProbeResult};
 use crate::store::Store;
 
 const SERVICE_LABEL: &str = "com.ember.tokeman-claude-rotate";
 const OAUTH_SETTING: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// Claude assumes an env token is inference-only unless told otherwise, and
+/// gates /feedback, Remote Control and profile reads on that assumption.
+const SCOPES_SETTING: &str = "CLAUDE_CODE_OAUTH_SCOPES";
+/// How long a refused Claude request waits for `settings.json` to offer a
+/// replacement token. Claude's local default is zero, which turns an expired
+/// access token into a failed request instead of a pause; two minutes covers
+/// the daemon's 20s wake plus a slow refresh.
+const WAIT_SETTING: &str = "CLAUDE_CODE_OAUTH_401_WAIT_MS";
+const WAIT_MS: &str = "120000";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const LOGIN_BACKUP_VERSION: u32 = 1;
@@ -69,6 +78,27 @@ pub struct RotationOutcome {
     pub message: String,
 }
 
+impl RotationOutcome {
+    /// An outcome that left the default where it was.
+    fn held(
+        action: &str,
+        mode: RotationMode,
+        active: Option<String>,
+        probed: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            mode,
+            active_before: active.clone(),
+            active_after: active,
+            changed: false,
+            probed,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RotationTokenStatus {
     pub name: String,
@@ -83,6 +113,8 @@ pub struct RotationTokenStatus {
     pub viable: bool,
     pub is_default: bool,
     pub error: Option<String>,
+    /// Which credential this account offers Claude, without secrets.
+    pub credential: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +139,70 @@ pub struct ClaudeSessionStatus {
     pub credential_source: String,
 }
 
+/// An account that is no longer the default, still has live sessions bound to
+/// it, and has fallen below a rotation floor.
+///
+/// Rotating the default protects only *new* processes. Nothing previously
+/// noticed when the account tokeman had just stepped away from kept being
+/// drained past its floor by the sessions left on it, so the fleet could
+/// exhaust an account the policy believed it had already rescued.
+#[derive(Debug, Clone, Serialize)]
+pub struct AbandonedDrain {
+    pub account: String,
+    pub bound_sessions: usize,
+    pub remaining_5h: Option<f64>,
+    pub remaining_7d: Option<f64>,
+}
+
+impl AbandonedDrain {
+    pub fn summary(&self) -> String {
+        let pct = |value: Option<f64>| match value {
+            Some(value) => format!("{:.0}%", value * 100.0),
+            None => "n/a".to_string(),
+        };
+        format!(
+            "{} is below floor (5h {} left, 7d {} left) with {} live session(s) still bound to it",
+            self.account,
+            pct(self.remaining_5h),
+            pct(self.remaining_7d),
+            self.bound_sessions
+        )
+    }
+}
+
+/// Accounts being drained past their floor by sessions the daemon can no
+/// longer move. Restarting or resuming those sessions is the only way to
+/// release them, so the point of this is to say so out loud.
+pub fn abandoned_drains(
+    results: &[ProbeResult],
+    default: Option<&str>,
+    bound: &BTreeMap<String, usize>,
+    mode: RotationMode,
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+) -> Vec<AbandonedDrain> {
+    let mut drains: Vec<_> = results
+        .iter()
+        .filter(|result| Some(result.token_name.as_str()) != default)
+        .filter(|result| has_quota_reading(result))
+        .filter(|result| !is_viable(result, mode, policy, target_model))
+        .filter_map(|result| {
+            let sessions = bound.get(&result.token_name).copied().unwrap_or(0);
+            (sessions > 0).then(|| {
+                let (remaining_5h, remaining_7d) = remaining(result);
+                AbandonedDrain {
+                    account: result.token_name.clone(),
+                    bound_sessions: sessions,
+                    remaining_5h,
+                    remaining_7d,
+                }
+            })
+        })
+        .collect();
+    drains.sort_by(|a, b| a.account.cmp(&b.account));
+    drains
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RotationStatus {
     pub monitor: String,
@@ -120,13 +216,43 @@ pub struct RotationStatus {
     pub min_7d_remaining: f64,
     pub premium_admission: String,
     pub live_sessions: Vec<ClaudeSessionStatus>,
+    pub abandoned_drains: Vec<AbandonedDrain>,
     pub tokens: Vec<RotationTokenStatus>,
+}
+
+/// Recheck schedule for an account the API is actively refusing.
+///
+/// A 401 or 403 is a decision, not a hiccup: a revoked token stays revoked
+/// until someone logs in again. Measured over seven days, seven accounts failed
+/// 24,390 of 24,390 probes -- 54% of all probe traffic spent re-asking a
+/// question already answered. Transient failures (timeouts, connection resets)
+/// are deliberately excluded: those we do want to retry immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthBackoff {
+    failures: u32,
+    next_attempt_epoch: f64,
+    last_error: String,
+}
+
+/// 5m, 10m, 20m, then every 30m. Long enough to stop the bleeding, short
+/// enough that a fresh login is picked up within one sip-and-drain window.
+fn auth_backoff_secs(failures: u32) -> f64 {
+    const CAP: f64 = 1800.0;
+    let step = 300.0 * 2f64.powi(failures.saturating_sub(1).min(8) as i32);
+    step.min(CAP)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CadenceState {
     #[serde(default)]
     last_probe_epoch: f64,
+    /// Accounts already reported as drained-while-abandoned, so a standing
+    /// condition is logged on the transition instead of every probe cycle.
+    #[serde(default)]
+    drained_accounts: Vec<String>,
+    /// Per-account recheck schedule for hard authentication failures.
+    #[serde(default)]
+    auth_backoff: BTreeMap<String, AuthBackoff>,
     #[serde(default)]
     mode: Option<RotationMode>,
     /// The next scheduled interval. This can be faster than the mode default
@@ -141,6 +267,8 @@ impl Default for CadenceState {
     fn default() -> Self {
         Self {
             last_probe_epoch: 0.0,
+            drained_accounts: Vec::new(),
+            auth_backoff: BTreeMap::new(),
             mode: Some(RotationMode::Normal),
             probe_interval_secs: None,
             consecutive_degraded_probes: 0,
@@ -148,34 +276,13 @@ impl Default for CadenceState {
     }
 }
 
-struct RotationLock {
-    _file: File,
-}
+/// Serializes every change to Claude's settings and to rotation state.
+struct RotationLock;
 
 impl RotationLock {
-    fn acquire() -> Result<Self> {
-        let path = lock_path()?;
-        ensure_private_parent(&path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open rotation lock {}", path.display()))?;
-        set_permissions(&path, 0o600)?;
-        FileExt::lock_exclusive(&file)
-            .with_context(|| format!("failed to lock {}", path.display()))?;
-        Ok(Self { _file: file })
+    fn acquire() -> Result<FileLock> {
+        FileLock::acquire(&lock_path()?)
     }
-}
-
-fn state_dir() -> Result<PathBuf> {
-    let config_path = Config::path()?;
-    config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .context("tokeman config path has no parent")
 }
 
 fn lock_path() -> Result<PathBuf> {
@@ -220,42 +327,6 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("could not find home directory")?
         .join(".claude/settings.json"))
-}
-
-fn ensure_private_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        set_permissions(parent, 0o700)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_permissions(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    ensure_private_parent(path)?;
-    let parent = path.parent().context("output path has no parent")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    set_permissions(temp.path(), mode)?;
-    temp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    set_permissions(path, mode)?;
-    Ok(())
 }
 
 fn split_claude_login(document: &mut Value) -> Result<Option<Value>> {
@@ -421,18 +492,28 @@ pub fn reconcile_keychain_after_login() -> Result<()> {
     Ok(())
 }
 
+/// Past this size the log is moved aside to `.old`, replacing any previous
+/// one, so it cannot grow without bound.
+const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn previous_log_path(path: &Path) -> PathBuf {
+    path.with_extension("log.old")
+}
+
 fn append_log(message: &str) {
+    // Unit tests exercise code paths that log; they must never write into the
+    // user's real rotation log (which `default_events` also parses).
+    if cfg!(test) {
+        return;
+    }
     let Ok(path) = log_path() else {
         return;
     };
-    if ensure_private_parent(&path).is_err() {
-        return;
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LOG_ROTATE_BYTES) {
+        let _ = std::fs::rename(&path, previous_log_path(&path));
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = set_permissions(&path, 0o600);
-        let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let _ = writeln!(file, "{stamp} {message}");
-    }
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let _ = crate::private_fs::append_line(&path, &format!("{stamp} {message}"));
 }
 
 fn now_epoch() -> f64 {
@@ -506,22 +587,17 @@ fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-fn configured_token(settings: &Map<String, Value>) -> Option<&str> {
+/// A non-empty string from Claude settings' `env` block.
+fn configured_env<'a>(settings: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     settings
-        .get("env")
-        .and_then(Value::as_object)
-        .and_then(|env| env.get(OAUTH_SETTING))
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
+        .get("env")?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
 }
 
-fn configured_account_marker(settings: &Map<String, Value>) -> Option<&str> {
-    settings
-        .get("env")
-        .and_then(Value::as_object)
-        .and_then(|env| env.get(admission::ACCOUNT_ENV))
-        .and_then(Value::as_str)
-        .filter(|account| !account.is_empty())
+fn configured_token(settings: &Map<String, Value>) -> Option<&str> {
+    configured_env(settings, OAUTH_SETTING)
 }
 
 fn configured_target_model(settings: &Map<String, Value>) -> Option<&str> {
@@ -531,7 +607,25 @@ fn configured_target_model(settings: &Map<String, Value>) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
-fn set_configured_token(settings: &mut Map<String, Value>, token: &str, account: &str) {
+/// Point `settings.json` at an account's current credential.
+///
+/// Returns the history event to record once the settings are saved. Claude
+/// copies settings `env` into its process environment on every change, so
+/// running sessions see this immediately, but each keeps using its cached
+/// token until the API refuses it; the event is what lets tokeman reconstruct
+/// which account every process is actually spending.
+fn install_credential(
+    settings: &mut Map<String, Value>,
+    token: &Token,
+    kind: &str,
+) -> Result<CredentialEvent> {
+    let now_ms = Utc::now().timestamp_millis();
+    let credential = token.credential(now_ms).with_context(|| {
+        format!(
+            "{} has no usable credential; run `tokeman login {}`",
+            token.name, token.name
+        )
+    })?;
     if !settings.get("env").is_some_and(Value::is_object) {
         settings.insert("env".into(), Value::Object(Map::new()));
     }
@@ -539,27 +633,121 @@ fn set_configured_token(settings: &mut Map<String, Value>, token: &str, account:
         .get_mut("env")
         .and_then(Value::as_object_mut)
         .expect("env was just initialized");
-    env.insert(OAUTH_SETTING.into(), Value::String(token.into()));
-    env.insert(admission::ACCOUNT_ENV.into(), Value::String(account.into()));
+    env.insert(OAUTH_SETTING.into(), Value::String(credential.value.into()));
+    env.insert(
+        admission::ACCOUNT_ENV.into(),
+        Value::String(token.name.clone()),
+    );
+    env.insert(WAIT_SETTING.into(), Value::String(WAIT_MS.into()));
+    match credential.kind {
+        CredentialKind::Login if !credential.scopes.is_empty() => {
+            env.insert(
+                SCOPES_SETTING.into(),
+                Value::String(credential.scopes.join(" ")),
+            );
+        }
+        _ => {
+            env.remove(SCOPES_SETTING);
+        }
+    }
+    Ok(CredentialEvent {
+        at: now_ms / 1000,
+        account: Some(token.name.clone()),
+        fingerprint: Some(credential_history::fingerprint(credential.value)),
+        expires_at: credential.expires_at.map(|ms| ms / 1000),
+        kind: kind.into(),
+    })
+}
+
+/// Save settings, then record what they now offer. History is best-effort:
+/// failing to write it degrades attribution, not the credential itself.
+fn commit_settings(settings: &Map<String, Value>, event: Option<CredentialEvent>) -> Result<()> {
+    save_claude_settings(settings)?;
+    if let Some(event) = event
+        && let Err(error) = credential_history::append(&event)
+    {
+        append_log(&format!(
+            "ERROR could not record credential history: {error:#}"
+        ));
+    }
+    Ok(())
 }
 
 fn clear_configured_token(settings: &mut Map<String, Value>) -> bool {
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return false;
     };
-    let changed =
-        env.remove(OAUTH_SETTING).is_some() | env.remove(admission::ACCOUNT_ENV).is_some();
+    let mut changed = false;
+    for key in [
+        OAUTH_SETTING,
+        admission::ACCOUNT_ENV,
+        SCOPES_SETTING,
+        WAIT_SETTING,
+    ] {
+        changed |= env.remove(key).is_some();
+    }
     if env.is_empty() {
         settings.remove("env");
     }
     changed
 }
 
+/// Why the settings entry for the default account needs rewriting, if it does.
+fn reinstall_reason(settings: &Map<String, Value>, token: &Token) -> Option<&'static str> {
+    let credential = token.credential(Utc::now().timestamp_millis())?;
+    let installed = configured_token(settings);
+    if installed != Some(credential.value) {
+        return Some(match credential.kind {
+            CredentialKind::Login if installed == token.setup_key() => "upgrade",
+            CredentialKind::Login => "refresh",
+            CredentialKind::Setup => "fallback",
+        });
+    }
+    let scopes = configured_env(settings, SCOPES_SETTING);
+    let scopes_ok = match credential.kind {
+        CredentialKind::Login if !credential.scopes.is_empty() => {
+            scopes == Some(credential.scopes.join(" ").as_str())
+        }
+        _ => scopes.is_none(),
+    };
+    let marker_ok = configured_env(settings, admission::ACCOUNT_ENV) == Some(token.name.as_str());
+    let wait_ok = configured_env(settings, WAIT_SETTING) == Some(WAIT_MS);
+    (!(scopes_ok && marker_ok && wait_ok)).then_some("repair")
+}
+
+/// Which credential an account currently offers, without secrets.
+fn describe_credential(token: &Token) -> String {
+    let now_ms = Utc::now().timestamp_millis();
+    match token.credential(now_ms) {
+        Some(credential) if credential.kind == CredentialKind::Login => match credential.expires_at
+        {
+            Some(expires_at) => format!(
+                "a full-scope login token (valid {}m)",
+                (expires_at - now_ms).max(0) / 60_000
+            ),
+            None => "a full-scope login token".into(),
+        },
+        Some(_) if token.login_error.is_some() => {
+            "its inference-only setup token (login refused; run `tokeman login`)".into()
+        }
+        Some(_) => "its inference-only setup token".into(),
+        None => "no usable credential".into(),
+    }
+}
+
 fn token_name_for_value<'a>(tokens: &'a [Token], value: Option<&str>) -> Option<&'a str> {
     let value = value?;
+    if let Some(token) = tokens.iter().find(|token| token.holds(value)) {
+        return Some(token.name.as_str());
+    }
+    // An access token tokeman installed and has since refreshed past.
+    let account = credential_history::account_for_fingerprint(
+        &credential_history::load(),
+        &credential_history::fingerprint(value),
+    )?;
     tokens
         .iter()
-        .find(|token| token.key.as_bytes() == value.as_bytes())
+        .find(|token| token.name == account)
         .map(|token| token.name.as_str())
 }
 
@@ -591,10 +779,11 @@ fn has_quota_reading(result: &ProbeResult) -> bool {
 }
 
 fn is_hard_auth_failure(result: &ProbeResult) -> bool {
-    result
-        .error
-        .as_deref()
-        .is_some_and(|error| error.starts_with("HTTP 401") || error.starts_with("HTTP 403"))
+    result.error.as_deref().is_some_and(|error| {
+        error.starts_with("HTTP 401")
+            || error.starts_with("HTTP 403")
+            || error.starts_with(probe::NO_CREDENTIAL)
+    })
 }
 
 fn probe_is_complete(results: &[ProbeResult], expected: usize) -> bool {
@@ -838,15 +1027,42 @@ fn active_probe_is_degraded(
 }
 
 fn compact_error(error: &str) -> String {
-    let single_line = error.split_whitespace().collect::<Vec<_>>().join(" ");
-    const MAX_CHARS: usize = 160;
-    if single_line.chars().count() <= MAX_CHARS {
-        single_line
+    crate::text::one_line(error, 160)
+}
+
+/// A few words for why a probe produced no quota, so a summary line groups
+/// accounts by cause instead of repeating every response body. The full error
+/// is still available in `tokeman rotate status` and the snapshot store.
+fn failure_reason(error: Option<&str>) -> String {
+    let Some(error) = error else {
+        return "no quota headers".into();
+    };
+    let lower = error.to_ascii_lowercase();
+    let status = error
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|code| code.chars().all(|c| c.is_ascii_digit()));
+    let cause = if lower.contains("revoked") {
+        "revoked"
+    } else if lower.contains("has expired") {
+        "expired"
+    } else if lower.contains("not allowed for this organization") {
+        "org disallows OAuth"
+    } else if lower.contains("overloaded") {
+        "overloaded"
+    } else if error.starts_with(probe::NO_CREDENTIAL) {
+        return probe::NO_CREDENTIAL.into();
+    } else if lower.contains("error sending request") || lower.contains("timed out") {
+        return "network".into();
     } else {
-        format!(
-            "{}…",
-            single_line.chars().take(MAX_CHARS).collect::<String>()
-        )
+        return match status {
+            Some(code) => format!("HTTP {code}"),
+            None => compact_error(error).chars().take(60).collect(),
+        };
+    };
+    match status {
+        Some(code) => format!("{code} {cause}"),
+        None => cause.into(),
     }
 }
 
@@ -855,36 +1071,67 @@ fn degraded_probe_summary(results: &[ProbeResult], expected: usize) -> String {
         .iter()
         .filter(|result| has_quota_reading(result))
         .count();
-    let unavailable = results
-        .iter()
-        .filter(|result| !has_quota_reading(result))
-        .map(|result| {
-            format!(
-                "{}: {}",
-                result.token_name,
-                result
-                    .error
-                    .as_deref()
-                    .map(compact_error)
-                    .unwrap_or_else(|| "quota headers unavailable".into())
-            )
-        })
-        .collect::<Vec<_>>();
-    if unavailable.is_empty() {
-        format!("{available}/{expected} quota readings")
-    } else {
-        format!(
-            "{available}/{expected} quota readings; unavailable [{}]",
-            unavailable.join("; ")
-        )
+    let mut by_reason = BTreeMap::<String, Vec<&str>>::new();
+    for result in results.iter().filter(|result| !has_quota_reading(result)) {
+        by_reason
+            .entry(failure_reason(result.error.as_deref()))
+            .or_default()
+            .push(&result.token_name);
     }
+    if by_reason.is_empty() {
+        return format!("{available}/{expected} quota readings");
+    }
+    let groups = by_reason
+        .into_iter()
+        .map(|(reason, accounts)| format!("{reason}: {}", accounts.join(", ")))
+        .collect::<Vec<_>>();
+    format!(
+        "{available}/{expected} quota readings; unavailable [{}]",
+        groups.join("; ")
+    )
 }
 
+/// Live Claude sessions still bound to each account.
+///
+/// A Claude process resolves its credential once at startup, so an account the
+/// daemon has rotated away from keeps burning until those processes exit.
+/// Measured across 70 switches: the outgoing account burns a further 1% of its
+/// weekly quota at the median, but up to 28% when several sessions are bound to
+/// it. That tail is how an account tokeman had already decided to protect still
+/// reached 96% used, hours after it stopped being the default.
+pub fn bound_session_counts(config: &Config) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for session in claude_sessions(config) {
+        if let Some(account) = session.account {
+            *counts.entry(account).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Compatibility wrapper: load-blind selection, used by the tray and by tests
+/// that assert the floors in isolation.
+#[allow(dead_code)]
 pub fn choose_best<'a>(
     results: &'a [ProbeResult],
     mode: RotationMode,
     policy: &RotationSettings,
     target_model: Option<&str>,
+) -> Option<&'a ProbeResult> {
+    choose_best_with_load(results, mode, policy, target_model, &BTreeMap::new())
+}
+
+/// Pick a landing zone, discounting candidates that live sessions are already
+/// draining. Bound sessions are committed burn the probe has not seen yet, so
+/// an account carrying three of them is a worse destination than its raw
+/// headroom suggests. This only reorders candidates that are already viable --
+/// it never rescues nor rejects one, so the floors keep their exact meaning.
+pub fn choose_best_with_load<'a>(
+    results: &'a [ProbeResult],
+    mode: RotationMode,
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+    bound: &BTreeMap<String, usize>,
 ) -> Option<&'a ProbeResult> {
     let mut viable: Vec<_> = results
         .iter()
@@ -900,8 +1147,8 @@ pub fn choose_best<'a>(
         // Once two candidates offer equal landing room, consume the one whose
         // limiting window replenishes sooner.
         compare_f64(
-            dwell_score(b, mode, policy, target_model),
-            dwell_score(a, mode, policy, target_model),
+            loaded_dwell_score(b, mode, policy, target_model, bound),
+            loaded_dwell_score(a, mode, policy, target_model, bound),
         )
         .then_with(|| {
             compare_optional_delay(
@@ -914,6 +1161,24 @@ pub fn choose_best<'a>(
         .then_with(|| a.token_name.cmp(&b.token_name))
     });
     viable.into_iter().next()
+}
+
+/// `dwell_score` minus the headroom already spoken for by sessions bound to
+/// this account. Clamped at the raw score so a heavily loaded account can be
+/// deprioritized but never scored below an account with no room at all.
+fn loaded_dwell_score(
+    result: &ProbeResult,
+    mode: RotationMode,
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+    bound: &BTreeMap<String, usize>,
+) -> f64 {
+    let raw = dwell_score(result, mode, policy, target_model);
+    if !raw.is_finite() {
+        return raw;
+    }
+    let sessions = bound.get(&result.token_name).copied().unwrap_or(0);
+    raw - (sessions as f64) * policy.per_session_reserve
 }
 
 fn dwell_score(
@@ -1025,6 +1290,92 @@ fn describe(result: Option<&ProbeResult>) -> String {
     }
 }
 
+/// Probe only the accounts that are due, carrying skipped ones forward.
+///
+/// A skipped account is reported with the error that put it in backoff, so the
+/// batch stays the same size and shape: `probe_is_complete`, the sticky-hold
+/// logic and viability all behave exactly as if it had been asked and refused.
+/// The point is to stop sending the request, not to pretend the account works.
+async fn probe_due_and_store(
+    config: &Config,
+    backoff: &BTreeMap<String, AuthBackoff>,
+    now: f64,
+    force: bool,
+) -> Vec<ProbeResult> {
+    let (due, skipped): (Vec<_>, Vec<_>) = config.tokens.iter().cloned().partition(|token| {
+        force
+            || backoff
+                .get(&token.name)
+                .is_none_or(|entry| now >= entry.next_attempt_epoch)
+    });
+    if skipped.is_empty() {
+        return probe_and_store(config).await;
+    }
+    let mut results = probe::probe_all_with_timeout(&due, std::time::Duration::from_secs(45)).await;
+    if let Ok(store) = Store::open() {
+        for result in &results {
+            let _ = store.insert(result);
+        }
+    }
+    // Synthesized rows are not written to the snapshot store: they are a
+    // restatement of a known refusal, not a fresh observation, and recording
+    // them would inflate the history the burn-rate maths reads from.
+    let probed_at = Utc::now();
+    for token in skipped {
+        let error = backoff
+            .get(&token.name)
+            .map(|entry| entry.last_error.clone())
+            .unwrap_or_else(|| "authentication previously refused".to_string());
+        results.push(ProbeResult {
+            token_name: token.name,
+            probed_at,
+            quota: None,
+            model_usage: None,
+            model_usage_error: None,
+            rate_limits: Default::default(),
+            error: Some(error),
+        });
+    }
+    admission::apply_observed_limits(&mut results);
+    results
+}
+
+/// Fold this cycle's outcomes into the recheck schedule.
+fn update_auth_backoff(
+    backoff: &mut BTreeMap<String, AuthBackoff>,
+    results: &[ProbeResult],
+    probed: &std::collections::HashSet<String>,
+    now: f64,
+) -> Vec<String> {
+    let mut newly_parked = Vec::new();
+    for result in results {
+        if !probed.contains(&result.token_name) {
+            continue;
+        }
+        if is_hard_auth_failure(result) {
+            let entry = backoff
+                .entry(result.token_name.clone())
+                .or_insert(AuthBackoff {
+                    failures: 0,
+                    next_attempt_epoch: 0.0,
+                    last_error: String::new(),
+                });
+            entry.failures = entry.failures.saturating_add(1);
+            entry.last_error = result.error.clone().unwrap_or_default();
+            entry.next_attempt_epoch = now + auth_backoff_secs(entry.failures);
+            if entry.failures == 1 {
+                newly_parked.push(result.token_name.clone());
+            }
+        } else if backoff.remove(&result.token_name).is_some() {
+            append_log(&format!(
+                "{} answered again; clearing authentication backoff",
+                result.token_name
+            ));
+        }
+    }
+    newly_parked
+}
+
 async fn probe_and_store(config: &Config) -> Vec<ProbeResult> {
     // Match the dashboard's timeout. All token requests are concurrent, and a
     // slow-but-valid 20-40s response is safer than treating a partial 15s batch
@@ -1048,15 +1399,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     let _lock = RotationLock::acquire()?;
 
     if pause_path()?.exists() {
-        return Ok(RotationOutcome {
-            action: "paused".into(),
-            mode: load_cadence().mode.unwrap_or(RotationMode::Normal),
-            active_before: None,
-            active_after: None,
-            changed: false,
-            probed: false,
-            message: "rotation is paused".into(),
-        });
+        return Ok(RotationOutcome::held(
+            "paused",
+            load_cadence().mode.unwrap_or(RotationMode::Normal),
+            None,
+            false,
+            "rotation is paused",
+        ));
     }
     if !options.scheduled && suppress_login_shadow(false)? {
         append_log("suppressed short-lived /login Keychain auth before managed rotation");
@@ -1086,15 +1435,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             .unwrap_or_else(|| interval_secs(previous_mode, &config.rotation))
             as f64;
         if probe_started_epoch - cadence.last_probe_epoch < interval {
-            return Ok(RotationOutcome {
-                action: "cadence-skip".into(),
-                mode: previous_mode,
-                active_before: None,
-                active_after: None,
-                changed: false,
-                probed: false,
-                message: format!("next probe is not due ({interval:.0}s cadence)"),
-            });
+            return Ok(RotationOutcome::held(
+                "cadence-skip",
+                previous_mode,
+                None,
+                false,
+                format!("next probe is not due ({interval:.0}s cadence)"),
+            ));
         }
         // Track probe starts, not completions. Otherwise request latency is
         // silently added to the configured cadence (20s + a 15s timeout).
@@ -1108,17 +1455,44 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     let current_name =
         token_name_for_value(&config.tokens, current_value.as_deref()).map(str::to_owned);
     if let Some(account) = current_name.as_deref()
-        && configured_account_marker(&settings) != Some(account)
+        && !options.dry_run
     {
         let token = config
             .tokens
             .iter()
             .find(|token| token.name == account)
             .context("managed Claude OAuth token disappeared from configuration")?;
-        set_configured_token(&mut settings, &token.key, account);
-        save_claude_settings(&settings)?;
+        if let Some(kind) = reinstall_reason(&settings, token) {
+            let event = install_credential(&mut settings, token, kind)?;
+            commit_settings(&settings, Some(event))?;
+            if kind != "repair" {
+                append_log(&format!(
+                    "{kind}: {account} now offers {}",
+                    describe_credential(token)
+                ));
+            }
+        }
     }
-    let results = probe_and_store(config).await;
+    let probe_now = now_epoch();
+    let probed: std::collections::HashSet<String> = config
+        .tokens
+        .iter()
+        .filter(|token| {
+            options.force
+                || cadence
+                    .auth_backoff
+                    .get(&token.name)
+                    .is_none_or(|entry| probe_now >= entry.next_attempt_epoch)
+        })
+        .map(|token| token.name.clone())
+        .collect();
+    let results =
+        probe_due_and_store(config, &cadence.auth_backoff, probe_now, options.force).await;
+    for account in update_auth_backoff(&mut cadence.auth_backoff, &results, &probed, probe_now) {
+        append_log(&format!(
+            "{account} refused authentication; rechecking on a backoff instead of every cycle"
+        ));
+    }
     let probe_has_quota = results.iter().any(has_quota_reading);
     let complete_probe = probe_is_complete(&results, config.tokens.len());
     let mode = safe_mode_for(
@@ -1131,6 +1505,45 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     let current_result = current_name
         .as_deref()
         .and_then(|name| results.iter().find(|result| result.token_name == name));
+    // What to call the default in messages: a configured account, or a token
+    // tokeman does not manage.
+    let active_label = current_name.clone().or_else(|| {
+        current_value
+            .as_ref()
+            .map(|_| "unmanaged OAuth token".to_string())
+    });
+
+    // Sessions bound to an account are burn the daemon cannot redirect: a
+    // Claude process keeps the credential it resolved at startup. Read them
+    // once per cycle so both the landing-zone choice and the drain watch below
+    // work from the same picture.
+    let bound = bound_session_counts(config);
+    let drains = abandoned_drains(
+        &results,
+        current_name.as_deref(),
+        &bound,
+        mode,
+        &config.rotation,
+        target_model.as_deref(),
+    );
+    let drained_now: Vec<String> = drains.iter().map(|d| d.account.clone()).collect();
+    if drained_now != cadence.drained_accounts {
+        for drain in &drains {
+            if !cadence.drained_accounts.contains(&drain.account) {
+                append_log(&format!(
+                    "WARNING abandoned drain: {}; rotating the default cannot move them -- restart or resume those sessions to release it",
+                    drain.summary()
+                ));
+            }
+        }
+        for account in &cadence.drained_accounts {
+            if !drained_now.contains(account) {
+                append_log(&format!("abandoned drain cleared for {account}"));
+            }
+        }
+        cadence.drained_accounts = drained_now;
+    }
+
     let next_interval =
         next_probe_interval_secs(mode, current_result, complete_probe, &config.rotation);
     cadence.last_probe_epoch = probe_started_epoch;
@@ -1144,11 +1557,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     save_cadence(&cadence)?;
 
     if !probe_has_quota {
-        let active = current_name.clone().or_else(|| {
-            current_value
-                .as_ref()
-                .map(|_| "unmanaged OAuth token".into())
-        });
+        let active = active_label.clone();
         let message = format!(
             "probe failed for every token; kept {}; retrying in {}s ({})",
             active.as_deref().unwrap_or("/login"),
@@ -1156,15 +1565,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             degraded_probe_summary(&results, config.tokens.len())
         );
         append_log(&message);
-        return Ok(RotationOutcome {
-            action: "probe-failed".into(),
+        return Ok(RotationOutcome::held(
+            "probe-failed",
             mode,
-            active_before: active.clone(),
-            active_after: active,
-            changed: false,
-            probed: true,
+            active,
+            true,
             message,
-        });
+        ));
     }
 
     if mode != previous_mode {
@@ -1183,11 +1590,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     // roomy landing zone. Retry on the fast cadence instead of rotating from
     // whichever subset happened to answer.
     if !complete_probe && !options.force {
-        let default = current_name.clone().or_else(|| {
-            current_value
-                .as_ref()
-                .map(|_| "unmanaged OAuth token".into())
-        });
+        let default = active_label.clone();
         let message = format!(
             "partial probe; kept default {}; retrying in {}s ({})",
             default.as_deref().unwrap_or("/login"),
@@ -1195,15 +1598,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             degraded_probe_summary(&results, config.tokens.len())
         );
         append_log(&message);
-        return Ok(RotationOutcome {
-            action: "partial-probe-hold".into(),
+        return Ok(RotationOutcome::held(
+            "partial-probe-hold",
             mode,
-            active_before: default.clone(),
-            active_after: default,
-            changed: false,
-            probed: true,
+            default,
+            true,
             message,
-        });
+        ));
     }
 
     // Missing quota is not evidence that the default token crossed a floor.
@@ -1218,15 +1619,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             degraded_probe_summary(&results, config.tokens.len())
         );
         append_log(&message);
-        return Ok(RotationOutcome {
-            action: "default-probe-degraded".into(),
+        return Ok(RotationOutcome::held(
+            "default-probe-degraded",
             mode,
-            active_before: current_name.clone(),
-            active_after: current_name,
-            changed: false,
-            probed: true,
+            current_name,
+            true,
             message,
-        });
+        ));
     }
 
     let current_healthy = current_result
@@ -1237,37 +1636,35 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             current_name.as_deref().unwrap_or("default token"),
             describe(current_result)
         );
-        return Ok(RotationOutcome {
-            action: "kept".into(),
+        return Ok(RotationOutcome::held(
+            "kept",
             mode,
-            active_before: current_name.clone(),
-            active_after: current_name,
-            changed: false,
-            probed: true,
+            current_name,
+            true,
             message,
-        });
+        ));
     }
 
-    let Some(best) = choose_best(&results, mode, &config.rotation, target_model.as_deref()) else {
-        let active = current_name.clone().or_else(|| {
-            current_value
-                .as_ref()
-                .map(|_| "unmanaged OAuth token".into())
-        });
+    let Some(best) = choose_best_with_load(
+        &results,
+        mode,
+        &config.rotation,
+        target_model.as_deref(),
+        &bound,
+    ) else {
+        let active = active_label.clone();
         let message = format!(
             "no viable token; kept {}",
             active.as_deref().unwrap_or("/login")
         );
         append_log(&message);
-        return Ok(RotationOutcome {
-            action: "no-viable-token".into(),
+        return Ok(RotationOutcome::held(
+            "no-viable-token",
             mode,
-            active_before: active.clone(),
-            active_after: active,
-            changed: false,
-            probed: true,
+            active,
+            true,
             message,
-        });
+        ));
     };
 
     let best_token = config
@@ -1277,15 +1674,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         .context("probe returned a token absent from configuration")?;
     if current_name.as_deref() == Some(best.token_name.as_str()) {
         let message = format!("kept {} ({})", best.token_name, describe(Some(best)));
-        return Ok(RotationOutcome {
-            action: "kept".into(),
+        return Ok(RotationOutcome::held(
+            "kept",
             mode,
-            active_before: current_name.clone(),
-            active_after: current_name,
-            changed: false,
-            probed: true,
+            current_name,
+            true,
             message,
-        });
+        ));
     }
 
     let trigger = match current_result {
@@ -1328,8 +1723,8 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     if !options.scheduled && suppress_login_shadow(false)? {
         append_log("suppressed short-lived /login Keychain auth before credential switch");
     }
-    set_configured_token(&mut settings, &best_token.key, &best_token.name);
-    save_claude_settings(&settings)?;
+    let event = install_credential(&mut settings, best_token, "switch")?;
+    commit_settings(&settings, Some(event))?;
     append_log(&message);
     Ok(RotationOutcome {
         action: "switched".into(),
@@ -1352,15 +1747,29 @@ fn default_events() -> Vec<DefaultEvent> {
     let Ok(path) = log_path() else {
         return Vec::new();
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut events = contents
-        .lines()
-        .filter_map(parse_default_event)
+    let mut events = [previous_log_path(&path), path]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .filter_map(parse_default_event)
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     events.sort_by_key(|event| event.at);
     events
+}
+
+/// Every credential `settings.json` has offered, oldest first: the recorded
+/// history, preceded by default changes reconstructed from the rotation log.
+pub fn credential_timeline() -> Vec<CredentialEvent> {
+    credential_history::with_legacy(
+        credential_history::load(),
+        default_events()
+            .into_iter()
+            .map(|event| (event.at, event.account)),
+    )
 }
 
 fn parse_default_event(line: &str) -> Option<DefaultEvent> {
@@ -1405,25 +1814,14 @@ fn parse_ps_session(line: &str) -> Option<(u32, Option<String>, chrono::DateTime
     Some((pid, tty, started_at))
 }
 
-fn process_oauth_token(pid: u32) -> Option<String> {
-    let output = Command::new("/bin/ps")
-        .args(["eww", "-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("CLAUDE_CODE_OAUTH_TOKEN="))
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-/// Inspect live Claude processes without exposing credentials. Process-local
-/// OAuth variables and SessionStart launch bindings are exact; older sessions
-/// are inferred from the default event preceding process startup.
-pub fn claude_sessions(config: &Config) -> Vec<ClaudeSessionStatus> {
+/// Inspect live Claude processes without exposing credentials.
+///
+/// The account is derived from the credential timeline: the token settings
+/// offered when the process started, followed through every expiry at which
+/// Claude would have adopted a newer one. Neither the SessionStart hook's
+/// environment nor `ps eww` can say this: both show what settings offer now or
+/// at exec time, not the token the process has cached.
+pub fn claude_sessions(_config: &Config) -> Vec<ClaudeSessionStatus> {
     let Ok(output) = Command::new("/bin/ps")
         .args(["-axo", "pid=,tty=,lstart=,comm="])
         .output()
@@ -1433,47 +1831,30 @@ pub fn claude_sessions(config: &Config) -> Vec<ClaudeSessionStatus> {
     if !output.status.success() {
         return Vec::new();
     }
-    let events = default_events();
+    let timeline = credential_timeline();
+    let now = Utc::now().timestamp();
     let mut sessions = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_ps_session)
         .map(|(pid, tty, started_at)| {
             let binding = admission::binding_for_pid(pid, started_at.timestamp());
-            let inherited = process_oauth_token(pid);
-            let exact_account =
-                token_name_for_value(&config.tokens, inherited.as_deref()).map(str::to_owned);
-            let (account, credential_source, session_id) = if inherited.is_some() {
-                (
-                    exact_account.or_else(|| Some("unmanaged OAuth token".into())),
-                    "process environment (exact)".into(),
-                    binding.as_ref().map(|binding| binding.session_id.clone()),
-                )
-            } else if let Some(binding) = binding {
-                (
-                    Some(binding.account),
-                    "SessionStart launch binding (exact)".into(),
-                    Some(binding.session_id),
-                )
-            } else {
-                let estimated = events
-                    .iter()
-                    .rev()
-                    .find(|event| event.at <= started_at.timestamp())
-                    .and_then(|event| event.account.clone());
-                match estimated {
-                    Some(account) => (
-                        Some(account),
-                        "default at process start (estimated)".into(),
-                        None,
-                    ),
-                    None => (None, "unknown (predates recorded default)".into(), None),
-                }
-            };
+            let (account, credential_source) =
+                match credential_history::account_at(&timeline, started_at.timestamp(), now) {
+                    Some(Some(account)) => (Some(account), "credential timeline".to_string()),
+                    Some(None) => (None, "no managed credential (/login)".to_string()),
+                    None => match &binding {
+                        Some(binding) => (
+                            Some(binding.account.clone()),
+                            "SessionStart binding".to_string(),
+                        ),
+                        None => (None, "unknown (predates recorded default)".to_string()),
+                    },
+                };
             ClaudeSessionStatus {
                 pid,
                 tty,
                 started_at,
-                session_id,
+                session_id: binding.map(|binding| binding.session_id),
                 account,
                 credential_source,
             }
@@ -1489,7 +1870,7 @@ pub fn session_summary(sessions: &[ClaudeSessionStatus]) -> String {
     }
     let mut counts = BTreeMap::<String, usize>::new();
     for session in sessions {
-        let prefix = if session.credential_source.contains("(exact)") {
+        let prefix = if session.credential_source == "credential timeline" {
             ""
         } else {
             "~"
@@ -1574,6 +1955,12 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
                 })
                 .collect();
             RotationTokenStatus {
+                credential: config
+                    .tokens
+                    .iter()
+                    .find(|token| token.name == result.token_name)
+                    .map(describe_credential)
+                    .unwrap_or_default(),
                 name: result.token_name.clone(),
                 remaining_5h,
                 remaining_7d,
@@ -1600,6 +1987,22 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
         })
         .collect();
     let live_sessions = claude_sessions(config);
+    let bound = live_sessions
+        .iter()
+        .fold(BTreeMap::new(), |mut acc, session| {
+            if let Some(account) = session.account.clone() {
+                *acc.entry(account).or_insert(0usize) += 1;
+            }
+            acc
+        });
+    let drains = abandoned_drains(
+        &results,
+        current_name.as_deref(),
+        &bound,
+        mode,
+        &config.rotation,
+        target_model.as_deref(),
+    );
 
     Ok(RotationStatus {
         monitor: if paused { "paused" } else { "running" }.into(),
@@ -1620,6 +2023,7 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
             active_admission_limits.len()
         ),
         live_sessions,
+        abandoned_drains: drains,
         tokens,
     })
 }
@@ -1653,10 +2057,17 @@ pub fn print_status(status: &RotationStatus) {
         status.target_model.as_deref().unwrap_or("unknown")
     );
     println!(
-        "live Claude processes: {} ({}; ~=startup estimate, unmarked=exact launch binding)",
+        "live Claude processes: {} ({}; ~=startup estimate, unmarked=derived from credential history)",
         status.live_sessions.len(),
         session_summary(&status.live_sessions)
     );
+    for drain in &status.abandoned_drains {
+        println!("  ! ABANDONED DRAIN: {}", drain.summary());
+        println!(
+            "    {:<22} rotating the default cannot move these; restart or resume them",
+            ""
+        );
+    }
     println!(
         "default thresholds: change at 5h <= {:.0}% left or 7d <= {:.0}% left",
         status.min_5h_remaining * 100.0,
@@ -1675,9 +2086,10 @@ pub fn print_status(status: &RotationStatus) {
             _ => println!(
                 " {marker} {:<24} {}",
                 token.name,
-                token.error.as_deref().unwrap_or("quota unavailable")
+                failure_reason(token.error.as_deref())
             ),
         }
+        println!("   {:<24} offers {}", "", token.credential);
         if token.model_buckets.is_empty() {
             println!("   {:<24} model-scoped 7d: unavailable", "");
         }
@@ -1717,10 +2129,19 @@ pub async fn pause() -> Result<()> {
     let path = pause_path()?;
     ensure_private_parent(&path)?;
     OpenOptions::new().create(true).append(true).open(&path)?;
-    set_permissions(&path, 0o600)?;
+    set_mode(&path, 0o600)?;
     let mut settings = load_claude_settings()?;
     if clear_configured_token(&mut settings) {
-        save_claude_settings(&settings)?;
+        commit_settings(
+            &settings,
+            Some(CredentialEvent {
+                at: Utc::now().timestamp(),
+                account: None,
+                fingerprint: None,
+                expires_at: None,
+                kind: "pause".into(),
+            }),
+        )?;
     }
     let restored = restore_login_shadow()?;
     append_log(if restored {
@@ -1753,6 +2174,123 @@ pub async fn resume(config: &Config) -> Result<RotationOutcome> {
     .await
 }
 
+/// Per-account retry schedule for refreshes that failed transiently. Held in
+/// the daemon's memory: a restart retrying at once is the right behavior.
+#[derive(Debug, Default)]
+pub struct RefreshBackoff {
+    accounts: BTreeMap<String, (u32, f64)>,
+}
+
+impl RefreshBackoff {
+    fn allows(&self, account: &str, now: f64) -> bool {
+        self.accounts
+            .get(account)
+            .is_none_or(|(_, next_attempt)| now >= *next_attempt)
+    }
+
+    /// Record a failure; returns true for the first in a streak.
+    fn fail(&mut self, account: &str, now: f64) -> bool {
+        let entry = self.accounts.entry(account.to_owned()).or_insert((0, 0.0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now + (60.0 * 2f64.powi(entry.0.min(4) as i32 - 1)).min(600.0);
+        entry.0 == 1
+    }
+
+    fn clear(&mut self, account: &str) {
+        self.accounts.remove(account);
+    }
+}
+
+/// Renew every login grant that is close to expiry, then make sure the
+/// default account's settings entry offers its newest access token.
+///
+/// Refresh tokens are single-use, so this runs under the rotation lock and
+/// re-reads each account under the config lock immediately before redeeming:
+/// whichever tokeman process gets there first wins, and the others see a
+/// fresh token and skip it. The new grant is saved before anything else
+/// happens, because losing it would lose the account.
+pub async fn refresh_logins(backoff: &mut RefreshBackoff) -> Result<usize> {
+    let now = now_epoch();
+    let now_ms = Utc::now().timestamp_millis();
+    let due: Vec<String> = Config::load()?
+        .tokens
+        .iter()
+        .filter(|token| token.needs_refresh(now_ms))
+        .filter(|token| backoff.allows(&token.name, now))
+        .map(|token| token.name.clone())
+        .collect();
+    if due.is_empty() {
+        return Ok(0);
+    }
+
+    let _lock = RotationLock::acquire()?;
+    let mut changed = 0;
+    for account in due {
+        let (mut config, config_lock) = Config::load_locked()?;
+        let Some(token) = config.tokens.iter_mut().find(|token| token.name == account) else {
+            continue;
+        };
+        if !token.needs_refresh(Utc::now().timestamp_millis()) {
+            continue;
+        }
+        let Some(refresh_token) = token.refresh_token.clone() else {
+            continue;
+        };
+        match crate::claude_login::refresh(&refresh_token).await {
+            Ok(bundle) => {
+                token.apply_login(bundle, Utc::now().timestamp_millis());
+                config.save(&config_lock)?;
+                backoff.clear(&account);
+                changed += 1;
+            }
+            Err(error) if crate::claude_login::is_permanent_refresh_failure(&error) => {
+                let fallback = if token.setup_key().is_some() {
+                    "its setup token"
+                } else {
+                    "nothing"
+                };
+                token.login_error = Some(compact_error(&format!("{error:#}")));
+                config.save(&config_lock)?;
+                changed += 1;
+                append_log(&format!(
+                    "ERROR login for {account} was refused permanently ({}); it falls back to {fallback} until `tokeman login {account}`",
+                    compact_error(&format!("{error:#}")),
+                ));
+            }
+            Err(error) => {
+                if backoff.fail(&account, now) {
+                    append_log(&format!(
+                        "login refresh for {account} failed; retrying with backoff ({})",
+                        compact_error(&format!("{error:#}"))
+                    ));
+                }
+            }
+        }
+    }
+
+    if changed > 0 {
+        let config = Config::load()?;
+        let mut settings = load_claude_settings()?;
+        let default = configured_token(&settings)
+            .and_then(|value| token_name_for_value(&config.tokens, Some(value)))
+            .and_then(|account| config.tokens.iter().find(|token| token.name == account));
+        if let Some(token) = default
+            && let Some(kind) = reinstall_reason(&settings, token)
+        {
+            let event = install_credential(&mut settings, token, kind)?;
+            commit_settings(&settings, Some(event))?;
+            if kind != "refresh" && kind != "repair" {
+                append_log(&format!(
+                    "{kind}: {} now offers {}",
+                    token.name,
+                    describe_credential(token)
+                ));
+            }
+        }
+    }
+    Ok(changed)
+}
+
 /// Persistent service loop. launchd supervises this one process instead of
 /// spawning a fresh helper every 20 seconds (which can be delayed by xpcproxy).
 /// Configuration is reloaded on every wake so policy/token edits take effect
@@ -1761,6 +2299,9 @@ pub async fn daemon() -> Result<()> {
     let startup_executable = executable_identity();
     let mut wake = tokio::time::interval(std::time::Duration::from_secs(20));
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_codex_sweep = std::time::Instant::now();
+    let mut refresh_backoff = RefreshBackoff::default();
+    let mut codex_needs_login = std::collections::BTreeSet::new();
     loop {
         wake.tick().await;
         if startup_executable.is_some()
@@ -1769,29 +2310,110 @@ pub async fn daemon() -> Result<()> {
             append_log("daemon executable was replaced; exiting so launchd loads the new binary");
             return Ok(());
         }
-        match Config::load() {
-            Ok(config) => match rotate(
-                &config,
-                RotateOptions {
-                    scheduled: true,
-                    ..RotateOptions::default()
-                },
-            )
-            .await
-            {
-                Ok(outcome) if outcome.changed || outcome.action == "no-viable-token" => {
-                    println!("{}", outcome.message);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    append_log(&format!("ERROR rotation cycle failed: {error:#}"));
-                    eprintln!("tokeman rotation cycle failed: {error:#}");
-                }
-            },
+        if !pause_path().is_ok_and(|path| path.exists())
+            && let Err(error) = refresh_logins(&mut refresh_backoff).await
+        {
+            append_log(&format!("ERROR login refresh sweep failed: {error:#}"));
+        }
+        let config = match Config::load() {
+            Ok(config) => config,
             Err(error) => {
                 append_log(&format!("ERROR config reload failed: {error:#}"));
                 eprintln!("tokeman config reload failed: {error:#}");
+                continue;
             }
+        };
+        let scheduled = RotateOptions {
+            scheduled: true,
+            ..RotateOptions::default()
+        };
+        match rotate(&config, scheduled).await {
+            Ok(outcome) if outcome.changed || outcome.action == "no-viable-token" => {
+                println!("{}", outcome.message);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                append_log(&format!("ERROR rotation cycle failed: {error:#}"));
+                eprintln!("tokeman rotation cycle failed: {error:#}");
+            }
+        }
+
+        if std::time::Instant::now() >= next_codex_sweep {
+            next_codex_sweep = std::time::Instant::now() + CODEX_SWEEP_INTERVAL;
+            codex_maintenance(&config, &mut codex_needs_login).await;
+        }
+    }
+}
+
+/// Codex accounts only need attention on the order of days, so sweeping every
+/// half hour is ample and keeps the request rate far below anything the edge
+/// would treat as abusive.
+const CODEX_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Keep every configured Codex profile refreshed.
+///
+/// This exists because a parked profile rots: once its refresh token ages out
+/// the account is dead and needs an interactive re-login, and the failure is
+/// silent — `codex login status` still says "Logged in using ChatGPT" for a
+/// profile the backend rejects. Refreshing on a schedule is what keeps a
+/// standby account actually available when rotation reaches for it.
+///
+/// Never propagates errors: Codex upkeep must not be able to take down the
+/// Claude rotation loop this daemon primarily exists to run.
+async fn codex_maintenance(config: &Config, needs_login: &mut std::collections::BTreeSet<String>) {
+    use crate::openai::refresh;
+    if config.codex_accounts.is_empty() {
+        return;
+    }
+
+    // Age alone is not a sufficient trigger. A session revoked elsewhere — the
+    // user signing out on another device — leaves `last_refresh` looking recent
+    // while the backend already rejects the token, so we ask the backend rather
+    // than trusting the clock.
+    let probes = crate::openai::probe::probe_all(&config.codex_accounts).await;
+    let rejected: std::collections::HashSet<&str> = probes
+        .iter()
+        .filter(|result| result.unauthorized)
+        .map(|result| result.account_name.as_str())
+        .collect();
+
+    for account in &config.codex_accounts {
+        // An access-token-only account has no refresh material; attempting a
+        // refresh would just fail noisily. It dies when its token expires and
+        // that is expected, not a fault to log every half hour.
+        if account.access_only {
+            continue;
+        }
+        let home = account.home();
+        let force = rejected.contains(account.name.as_str());
+        let outcome = refresh::refresh(&home, force, refresh::DEFAULT_MAX_AGE_DAYS).await;
+        // A permanent failure is a standing condition: say it once when it
+        // starts and once when it clears, not every half hour until then.
+        let permanent = outcome
+            .as_ref()
+            .err()
+            .and_then(refresh::failure_kind)
+            .filter(|failure| failure.is_permanent());
+        if permanent.is_none() && needs_login.remove(&account.name) {
+            append_log(&format!("codex: {} is usable again", account.name));
+        }
+        match (outcome, permanent) {
+            (Ok(Some(_)), _) => append_log(&format!("codex: refreshed {}", account.name)),
+            (Ok(None), _) => {}
+            (Err(_), Some(failure)) => {
+                if needs_login.insert(account.name.clone()) {
+                    append_log(&format!(
+                        "codex: {} needs an interactive `CODEX_HOME={} codex login` ({})",
+                        account.name,
+                        home.path().display(),
+                        failure.label(),
+                    ));
+                }
+            }
+            (Err(error), None) => append_log(&format!(
+                "codex: refresh failed for {}: {error:#}",
+                account.name
+            )),
         }
     }
 }
@@ -1811,8 +2433,8 @@ pub fn activate_token(config: &Config, token_name: &str) -> Result<()> {
         append_log("suppressed short-lived /login Keychain auth before explicit activation");
     }
     let mut settings = load_claude_settings()?;
-    set_configured_token(&mut settings, &token.key, &token.name);
-    save_claude_settings(&settings)?;
+    let event = install_credential(&mut settings, token, "activate")?;
+    commit_settings(&settings, Some(event))?;
     append_log(&format!("explicitly activated {token_name}"));
     Ok(())
 }
@@ -1919,14 +2541,17 @@ exec "$binary" rotate daemon
             append_log("suppressed short-lived /login Keychain auth during service install");
         }
         let mut settings = load_claude_settings()?;
-        if let Some(value) = configured_token(&settings).map(str::to_owned)
-            && let Some(account) =
-                token_name_for_value(&config.tokens, Some(&value)).map(str::to_owned)
-        {
-            set_configured_token(&mut settings, &value, &account);
-        }
+        let managed = configured_token(&settings)
+            .and_then(|value| token_name_for_value(&config.tokens, Some(value)))
+            .and_then(|account| config.tokens.iter().find(|token| token.name == account));
+        let event = match managed {
+            Some(token) if token.credential(Utc::now().timestamp_millis()).is_some() => {
+                Some(install_credential(&mut settings, token, "install")?)
+            }
+            _ => None,
+        };
         install_observer_hook(&mut settings, &binary);
-        save_claude_settings(&settings)?;
+        commit_settings(&settings, event)?;
 
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2214,14 +2839,17 @@ mod tests {
     #[test]
     fn known_opus_floor_is_part_of_shared_default_viability() {
         let policy = RotationSettings::default();
+        // Derive the boundary from the policy rather than pinning it to a
+        // literal, so this keeps testing the boundary when the floor moves.
+        let floor = policy.normal_min_7d_remaining;
         assert!(!is_viable(
-            &result_with_opus("opus-wall", 0.0, 0.0, 0.95),
+            &result_with_opus("opus-wall", 0.0, 0.0, 1.0 - floor),
             RotationMode::Normal,
             &policy,
             Some("opus")
         ));
         assert!(is_viable(
-            &result_with_opus("opus-room", 0.0, 0.0, 0.94),
+            &result_with_opus("opus-room", 0.0, 0.0, 1.0 - floor - 0.01),
             RotationMode::Normal,
             &policy,
             Some("opus")
@@ -2589,5 +3217,336 @@ mod tests {
             .and_then(Value::as_array)
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    fn load(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect()
+    }
+
+    #[test]
+    fn bound_sessions_break_a_tie_between_equally_roomy_accounts() {
+        let policy = RotationSettings::default();
+        let results = vec![result("busy", 0.10, 0.10), result("idle", 0.10, 0.10)];
+        // Load-blind, the tie falls to the first name alphabetically.
+        assert_eq!(
+            choose_best(&results, RotationMode::Normal, &policy, None)
+                .unwrap()
+                .token_name,
+            "busy"
+        );
+        // Three sessions are already draining `busy`, so `idle` is the better
+        // landing zone even though the probe shows identical headroom.
+        assert_eq!(
+            choose_best_with_load(
+                &results,
+                RotationMode::Normal,
+                &policy,
+                None,
+                &load(&[("busy", 3)]),
+            )
+            .unwrap()
+            .token_name,
+            "idle"
+        );
+    }
+
+    #[test]
+    fn the_reserve_never_rescues_or_rejects_a_candidate() {
+        let policy = RotationSettings::default();
+        // `full` is past the 7d floor; no amount of idleness makes it viable.
+        let results = vec![result("full", 0.10, 0.99), result("open", 0.10, 0.10)];
+        assert_eq!(
+            choose_best_with_load(
+                &results,
+                RotationMode::Normal,
+                &policy,
+                None,
+                &load(&[("open", 40)]),
+            )
+            .unwrap()
+            .token_name,
+            "open"
+        );
+        // And a lone viable account stays chosen no matter how loaded it is.
+        let only = vec![result("open", 0.10, 0.10)];
+        assert_eq!(
+            choose_best_with_load(
+                &only,
+                RotationMode::Normal,
+                &policy,
+                None,
+                &load(&[("open", 99)]),
+            )
+            .unwrap()
+            .token_name,
+            "open"
+        );
+    }
+
+    #[test]
+    fn a_reserve_of_zero_reproduces_load_blind_selection() {
+        let mut policy = RotationSettings::default();
+        policy.per_session_reserve = 0.0;
+        let results = vec![result("busy", 0.10, 0.10), result("idle", 0.10, 0.10)];
+        assert_eq!(
+            choose_best_with_load(
+                &results,
+                RotationMode::Normal,
+                &policy,
+                None,
+                &load(&[("busy", 5)]),
+            )
+            .unwrap()
+            .token_name,
+            "busy"
+        );
+    }
+
+    #[test]
+    fn abandoned_drain_reports_only_bound_non_default_accounts_below_floor() {
+        let policy = RotationSettings::default();
+        let results = vec![
+            result("default", 0.99, 0.99),
+            result("drained", 0.99, 0.99),
+            result("spare", 0.99, 0.99),
+            result("healthy", 0.10, 0.10),
+        ];
+        let drains = abandoned_drains(
+            &results,
+            Some("default"),
+            &load(&[("default", 2), ("drained", 3), ("healthy", 4)]),
+            RotationMode::Normal,
+            &policy,
+            None,
+        );
+        // `default` is excluded (rotation handles it), `spare` has no bound
+        // sessions, `healthy` is above the floor. Only `drained` qualifies.
+        assert_eq!(drains.len(), 1);
+        assert_eq!(drains[0].account, "drained");
+        assert_eq!(drains[0].bound_sessions, 3);
+        assert!(drains[0].summary().contains("3 live session(s)"));
+    }
+
+    #[test]
+    fn abandoned_drain_ignores_accounts_with_no_quota_reading() {
+        let policy = RotationSettings::default();
+        let mut broken = result("broken", 0.99, 0.99);
+        broken.quota = None;
+        broken.error = Some("HTTP 401 Unauthorized".into());
+        let drains = abandoned_drains(
+            &results_of(vec![broken]),
+            Some("default"),
+            &load(&[("broken", 2)]),
+            RotationMode::Normal,
+            &policy,
+            None,
+        );
+        assert!(drains.is_empty());
+    }
+
+    fn results_of(results: Vec<ProbeResult>) -> Vec<ProbeResult> {
+        results
+    }
+
+    fn auth_failure(name: &str, code: &str) -> ProbeResult {
+        let mut r = result(name, 0.0, 0.0);
+        r.quota = None;
+        r.error = Some(format!("HTTP {code} Forbidden"));
+        r
+    }
+
+    #[test]
+    fn hard_auth_failures_back_off_and_successes_clear() {
+        let mut backoff = BTreeMap::new();
+        let probed: std::collections::HashSet<String> = ["dead".to_string(), "live".to_string()]
+            .into_iter()
+            .collect();
+        let results = vec![auth_failure("dead", "401"), result("live", 0.1, 0.1)];
+
+        let parked = update_auth_backoff(&mut backoff, &results, &probed, 1_000.0);
+        assert_eq!(parked, vec!["dead".to_string()]);
+        let entry = backoff.get("dead").expect("parked");
+        assert_eq!(entry.failures, 1);
+        assert_eq!(entry.next_attempt_epoch, 1_000.0 + 300.0);
+        assert!(!backoff.contains_key("live"));
+
+        // Repeated refusals lengthen the wait, and only the first is announced.
+        let parked = update_auth_backoff(&mut backoff, &results, &probed, 2_000.0);
+        assert!(parked.is_empty());
+        assert_eq!(backoff["dead"].failures, 2);
+        assert_eq!(backoff["dead"].next_attempt_epoch, 2_000.0 + 600.0);
+
+        // A later success releases it immediately.
+        update_auth_backoff(&mut backoff, &[result("dead", 0.1, 0.1)], &probed, 3_000.0);
+        assert!(backoff.is_empty());
+    }
+
+    #[test]
+    fn transient_failures_never_back_off() {
+        let mut backoff = BTreeMap::new();
+        let probed: std::collections::HashSet<String> = ["flaky".to_string()].into_iter().collect();
+        let mut timeout = result("flaky", 0.0, 0.0);
+        timeout.quota = None;
+        timeout.error = Some("error sending request for url (https://api.anthropic.com)".into());
+        update_auth_backoff(&mut backoff, &[timeout], &probed, 1_000.0);
+        assert!(
+            backoff.is_empty(),
+            "a network error is a hiccup, not a refusal -- retry it immediately"
+        );
+    }
+
+    #[test]
+    fn a_skipped_account_is_not_credited_with_a_failure() {
+        let mut backoff = BTreeMap::new();
+        backoff.insert(
+            "dead".to_string(),
+            AuthBackoff {
+                failures: 4,
+                next_attempt_epoch: 9_999.0,
+                last_error: "HTTP 401 Unauthorized".into(),
+            },
+        );
+        // Not in `probed`: this cycle carried it forward without asking.
+        let probed: std::collections::HashSet<String> = ["live".to_string()].into_iter().collect();
+        let carried = auth_failure("dead", "401");
+        update_auth_backoff(&mut backoff, &[carried], &probed, 5_000.0);
+        assert_eq!(
+            backoff["dead"].failures, 4,
+            "carried-forward rows must not escalate"
+        );
+        assert_eq!(backoff["dead"].next_attempt_epoch, 9_999.0);
+    }
+
+    #[test]
+    fn backoff_schedule_climbs_then_caps_at_thirty_minutes() {
+        assert_eq!(auth_backoff_secs(1), 300.0);
+        assert_eq!(auth_backoff_secs(2), 600.0);
+        assert_eq!(auth_backoff_secs(3), 1200.0);
+        assert_eq!(auth_backoff_secs(4), 1800.0);
+        assert_eq!(auth_backoff_secs(50), 1800.0);
+    }
+
+    fn login_account(name: &str) -> Token {
+        let now = Utc::now().timestamp_millis();
+        Token {
+            name: name.into(),
+            key: format!("sk-ant-oat01-setup-{name}"),
+            access_token: Some(format!("sk-ant-oat01-access-{name}")),
+            refresh_token: Some("sk-ant-ort01-refresh".into()),
+            expires_at: Some(now + 8 * 3_600_000),
+            obtained_at: Some(now),
+            scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+            login_error: None,
+        }
+    }
+
+    #[test]
+    fn installing_a_login_declares_its_scopes_and_a_401_wait() {
+        let token = login_account("a");
+        let mut settings = Map::new();
+        let event = install_credential(&mut settings, &token, "switch").unwrap();
+        let env = settings["env"].as_object().unwrap();
+        assert_eq!(env[OAUTH_SETTING], "sk-ant-oat01-access-a");
+        assert_eq!(env[SCOPES_SETTING], "user:inference user:profile");
+        assert_eq!(env[WAIT_SETTING], WAIT_MS);
+        assert_eq!(env[admission::ACCOUNT_ENV], "a");
+        assert_eq!(event.account.as_deref(), Some("a"));
+        assert_eq!(
+            event.fingerprint.as_deref(),
+            Some(credential_history::fingerprint("sk-ant-oat01-access-a").as_str())
+        );
+        assert!(event.expires_at.is_some());
+        assert_eq!(reinstall_reason(&settings, &token), None);
+    }
+
+    #[test]
+    fn falling_back_to_a_setup_token_withdraws_the_scope_claim() {
+        let mut token = login_account("a");
+        let mut settings = Map::new();
+        install_credential(&mut settings, &token, "switch").unwrap();
+        token.login_error = Some("invalid_grant".into());
+        assert_eq!(reinstall_reason(&settings, &token), Some("fallback"));
+        let event = install_credential(&mut settings, &token, "fallback").unwrap();
+        let env = settings["env"].as_object().unwrap();
+        assert_eq!(env[OAUTH_SETTING], "sk-ant-oat01-setup-a");
+        assert!(!env.contains_key(SCOPES_SETTING));
+        assert_eq!(event.expires_at, None);
+    }
+
+    #[test]
+    fn reinstall_reasons_distinguish_upgrade_refresh_and_repair() {
+        let mut token = login_account("a");
+        let mut settings = Map::new();
+        // Settings still hold the setup token from before `tokeman login`.
+        let setup_only = Token {
+            access_token: None,
+            refresh_token: None,
+            ..token.clone()
+        };
+        install_credential(&mut settings, &setup_only, "switch").unwrap();
+        assert_eq!(reinstall_reason(&settings, &token), Some("upgrade"));
+
+        install_credential(&mut settings, &token, "upgrade").unwrap();
+        token.access_token = Some("sk-ant-oat01-access-a-2".into());
+        assert_eq!(reinstall_reason(&settings, &token), Some("refresh"));
+
+        install_credential(&mut settings, &token, "refresh").unwrap();
+        settings
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove(WAIT_SETTING);
+        assert_eq!(reinstall_reason(&settings, &token), Some("repair"));
+    }
+
+    #[test]
+    fn clearing_removes_every_managed_key() {
+        let mut settings = Map::new();
+        install_credential(&mut settings, &login_account("a"), "switch").unwrap();
+        settings
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("UNRELATED".into(), Value::String("kept".into()));
+        assert!(clear_configured_token(&mut settings));
+        let env = settings["env"].as_object().unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env["UNRELATED"], "kept");
+    }
+
+    #[test]
+    fn degraded_summaries_group_accounts_by_cause() {
+        let mut results = vec![result("ok", 0.1, 0.1)];
+        for (name, error) in [
+            (
+                "r1",
+                "HTTP 401 Unauthorized: {\"type\":\"error\",\"error\":{\"message\":\"OAuth access token has been revoked.\"}}",
+            ),
+            (
+                "r2",
+                "HTTP 401 Unauthorized: {\"error\":{\"message\":\"OAuth access token has been revoked.\"}}",
+            ),
+            (
+                "org",
+                "HTTP 403 Forbidden: {\"error\":{\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}",
+            ),
+            (
+                "net",
+                "error sending request for url (https://api.anthropic.com/v1/messages)",
+            ),
+        ] {
+            let mut failed = result(name, 0.0, 0.0);
+            failed.quota = None;
+            failed.error = Some(error.into());
+            results.push(failed);
+        }
+        let summary = degraded_probe_summary(&results, 5);
+        assert_eq!(
+            summary,
+            "1/5 quota readings; unavailable [401 revoked: r1, r2; 403 org disallows OAuth: org; network: net]"
+        );
     }
 }

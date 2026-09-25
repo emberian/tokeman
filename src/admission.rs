@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,11 +8,11 @@ use anyhow::{Context, Result, bail};
 use chrono::{
     DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Config, Token};
+use crate::config::Token;
+use crate::private_fs::{FileLock, state_dir, write_atomic};
 use crate::probe::{
     ModelQuotaBucket, ModelUsage, ModelUsageSource, ProbeResult, Window, normalized_bucket_key,
 };
@@ -145,77 +145,12 @@ struct SessionStartInput {
     source: Option<String>,
 }
 
-struct StateLock {
-    _file: File,
-}
-
-impl StateLock {
-    fn acquire() -> Result<Self> {
-        let path = lock_path()?;
-        ensure_private_parent(&path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open admission lock {}", path.display()))?;
-        set_permissions(&path, 0o600)?;
-        FileExt::lock_exclusive(&file)
-            .with_context(|| format!("failed to lock {}", path.display()))?;
-        Ok(Self { _file: file })
-    }
-}
-
-fn state_dir() -> Result<PathBuf> {
-    Config::path()?
-        .parent()
-        .map(Path::to_path_buf)
-        .context("tokeman config path has no parent")
-}
-
 fn state_path() -> Result<PathBuf> {
     Ok(state_dir()?.join(STATE_FILE))
 }
 
 fn lock_path() -> Result<PathBuf> {
     Ok(state_dir()?.join(LOCK_FILE))
-}
-
-fn ensure_private_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        set_permissions(parent, 0o700)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_permissions(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    ensure_private_parent(path)?;
-    let parent = path.parent().context("admission state has no parent")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    set_permissions(temp.path(), 0o600)?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    set_permissions(path, 0o600)?;
-    Ok(())
 }
 
 fn load_state() -> AdmissionState {
@@ -229,7 +164,7 @@ fn load_state() -> AdmissionState {
 fn save_state(state: &AdmissionState) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(state)?;
     bytes.push(b'\n');
-    write_atomic(&state_path()?, &bytes)
+    write_atomic(&state_path()?, &bytes, 0o600)
 }
 
 fn prune_state(state: &mut AdmissionState, now: i64) {
@@ -258,9 +193,26 @@ fn shell_quote(value: &str) -> String {
 }
 
 pub fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
-    let account = match std::env::var(ACCOUNT_ENV) {
-        Ok(account) if !account.trim().is_empty() => account,
-        _ => return Ok(()),
+    let now = Utc::now().timestamp();
+    let started_at = (pid > 0).then(|| process_started_at(pid)).flatten();
+    // The hook's TOKEMAN_ACCOUNT mirrors the settings Claude reloaded most
+    // recently, which after /clear or /compact in a long-lived process is not
+    // the token that process has cached. Prefer the credential timeline and
+    // fall back to the marker only when the timeline knows nothing.
+    let derived = started_at.and_then(|started_at| {
+        crate::credential_history::account_at(
+            &crate::rotation::credential_timeline(),
+            started_at,
+            now,
+        )
+    });
+    let account = match derived {
+        Some(Some(account)) => account,
+        Some(None) => return Ok(()),
+        None => match std::env::var(ACCOUNT_ENV) {
+            Ok(account) if !account.trim().is_empty() => account,
+            _ => return Ok(()),
+        },
     };
     let input: SessionStartInput =
         serde_json::from_slice(input).context("invalid Claude SessionStart hook input")?;
@@ -268,7 +220,6 @@ pub fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
         bail!("Claude SessionStart hook omitted session_id");
     }
 
-    let now = Utc::now().timestamp();
     let scan_offset = std::fs::metadata(&input.transcript_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -285,12 +236,12 @@ pub fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
         source: input.source,
         observed_at: now,
         pid: (pid > 0).then_some(pid),
-        process_started_at: (pid > 0).then(|| process_started_at(pid)).flatten(),
+        process_started_at: started_at,
         scan_offset,
         last_model,
     };
 
-    let _lock = StateLock::acquire()?;
+    let _lock = FileLock::acquire(&lock_path()?)?;
     let mut state = load_state();
     prune_state(&mut state, now);
     state.sessions.insert(input.session_id, binding);
@@ -474,11 +425,21 @@ fn merge_limit(limits: &mut Vec<ObservedLimit>, incoming: ObservedLimit) -> bool
     }
 }
 
-fn scan_binding(binding: &mut SessionBinding, now: i64) -> Result<(Vec<ObservedLimit>, bool)> {
-    // SessionStart is the credential boundary we can observe exactly. Claude
-    // notices settings changes while running, but auth reload is not reliable
-    // enough to attribute a rejection to a later default event.
-    scan_binding_with_default_resolver(binding, now, |_| None)
+fn scan_binding(
+    binding: &mut SessionBinding,
+    now: i64,
+    timeline: &[crate::credential_history::CredentialEvent],
+) -> Result<(Vec<ObservedLimit>, bool)> {
+    // Attribute each rejection to the account the process was spending when
+    // it happened. A process on an expiring login token moves to the then
+    // default when that token is refused, so the SessionStart account can go
+    // stale; the timeline follows it. Without a start time, keep the binding.
+    let started_at = binding.process_started_at;
+    scan_binding_with_default_resolver(binding, now, |observed_at| {
+        started_at.and_then(|started_at| {
+            crate::credential_history::account_at(timeline, started_at, observed_at)
+        })
+    })
 }
 
 fn scan_binding_with_default_resolver<F>(
@@ -554,7 +515,7 @@ where
 /// Returns the number of new authoritative rate-limit observations. A caller
 /// can use this to bypass its normal polling cadence and rotate immediately.
 pub fn scan_transcripts(tokens: &[Token]) -> Result<usize> {
-    let _lock = StateLock::acquire()?;
+    let _lock = FileLock::acquire(&lock_path()?)?;
     let mut state = load_state();
     let now = Utc::now().timestamp();
     prune_state(&mut state, now);
@@ -564,12 +525,13 @@ pub fn scan_transcripts(tokens: &[Token]) -> Result<usize> {
         .collect::<HashSet<_>>();
     let mut incoming = Vec::new();
     let mut state_changed = false;
+    let timeline = crate::rotation::credential_timeline();
 
     for binding in state.sessions.values_mut() {
         if !configured.contains(binding.account.as_str()) {
             continue;
         }
-        let (limits, changed) = scan_binding(binding, now)?;
+        let (limits, changed) = scan_binding(binding, now, &timeline)?;
         incoming.extend(limits);
         state_changed |= changed;
     }
@@ -696,7 +658,7 @@ pub fn record_manual_limit(
     if reset <= Utc::now().timestamp() {
         bail!("quarantine reset must be in the future");
     }
-    let _lock = StateLock::acquire()?;
+    let _lock = FileLock::acquire(&lock_path()?)?;
     let mut state = load_state();
     let now = Utc::now().timestamp();
     prune_state(&mut state, now);
@@ -717,7 +679,7 @@ pub fn record_manual_limit(
 }
 
 pub fn clear_limits(account: &str, model: Option<ModelFamily>) -> Result<usize> {
-    let _lock = StateLock::acquire()?;
+    let _lock = FileLock::acquire(&lock_path()?)?;
     let mut state = load_state();
     let before = state.limits.len();
     state.limits.retain(|limit| {
@@ -835,6 +797,7 @@ mod tests {
     use super::*;
     use crate::probe::{RateLimits, UnifiedQuota};
     use serde_json::json;
+    use std::io::Write;
 
     fn probe(name: &str) -> ProbeResult {
         ProbeResult {

@@ -15,6 +15,31 @@ pub struct Window {
     pub reset: i64,
 }
 
+impl Window {
+    /// Fraction of the window left (unclamped).
+    pub fn remaining(&self) -> f64 {
+        1.0 - self.utilization
+    }
+}
+
+/// Health bucket for a remaining fraction, shared by every UI's color scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Ok,
+    Low,
+    Critical,
+}
+
+pub fn level(remaining: f64) -> Level {
+    if remaining > 0.50 {
+        Level::Ok
+    } else if remaining > 0.20 {
+        Level::Low
+    } else {
+        Level::Critical
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)] // all fields populated from API response headers
 pub struct UnifiedQuota {
@@ -34,7 +59,21 @@ pub struct UnifiedQuota {
     pub overage_disabled_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl UnifiedQuota {
+    /// Session, weekly and overage windows that are present, paired with the
+    /// caller's label for each (in that order).
+    pub fn windows(
+        &self,
+        labels: [&'static str; 3],
+    ) -> impl Iterator<Item = (&'static str, &Window)> {
+        labels
+            .into_iter()
+            .zip([&self.session, &self.weekly, &self.overage])
+            .filter_map(|(label, window)| Some((label, window.as_ref()?)))
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize)]
 pub struct RateLimits {
     pub requests_limit: Option<i64>,
     pub requests_remaining: Option<i64>,
@@ -304,7 +343,7 @@ async fn probe_model_usage(
     client: &reqwest::Client,
     token: &Token,
 ) -> (Option<ModelUsage>, Option<String>) {
-    let Some(usage_key) = token.usage_key.as_deref() else {
+    let Some(usage_key) = token.usage_credential(Utc::now().timestamp_millis()) else {
         return (None, None);
     };
     let response = client
@@ -338,15 +377,34 @@ pub async fn validate_usage_key(usage_key: &str) -> Result<ModelUsage, String> {
         .map_err(|error| error.to_string())?;
     let token = Token {
         name: "validation".into(),
-        key: String::new(),
-        usage_key: Some(usage_key.into()),
+        access_token: Some(usage_key.into()),
+        ..Token::default()
     };
     let (usage, error) = probe_model_usage(&client, &token).await;
     usage.ok_or_else(|| error.unwrap_or_else(|| "usage data unavailable".into()))
 }
 
+/// Error reported for an account with neither a live login nor a setup token.
+/// Rotation treats it like a refused credential: it is an answer, not a
+/// network hiccup worth retrying on the fast cadence.
+pub const NO_CREDENTIAL: &str = "no usable credential";
+
 pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult {
     let probed_at = Utc::now();
+    let Some(credential) = token.credential(probed_at.timestamp_millis()) else {
+        return ProbeResult {
+            token_name: token.name.clone(),
+            probed_at,
+            quota: None,
+            model_usage: None,
+            model_usage_error: None,
+            rate_limits: RateLimits::default(),
+            error: Some(format!(
+                "{NO_CREDENTIAL}: run `tokeman login {}`",
+                token.name
+            )),
+        };
+    };
 
     let body = json!({
         "model": PROBE_MODEL,
@@ -360,12 +418,12 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
         .header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
     // OAuth tokens (sk-ant-oat01-*) use Bearer auth + beta header; API keys use x-api-key
-    if token.key.starts_with("sk-ant-oat01-") {
+    if credential.value.starts_with("sk-ant-oat01-") {
         req = req
-            .header("Authorization", format!("Bearer {}", token.key))
+            .header("Authorization", format!("Bearer {}", credential.value))
             .header("anthropic-beta", "oauth-2025-04-20");
     } else {
-        req = req.header("x-api-key", &token.key);
+        req = req.header("x-api-key", credential.value);
     }
 
     let result = req.json(&body).send().await;
@@ -404,14 +462,7 @@ pub async fn probe_token(client: &reqwest::Client, token: &Token) -> ProbeResult
             quota: None,
             model_usage: None,
             model_usage_error: None,
-            rate_limits: RateLimits {
-                requests_limit: None,
-                requests_remaining: None,
-                input_tokens_limit: None,
-                input_tokens_remaining: None,
-                output_tokens_limit: None,
-                output_tokens_remaining: None,
-            },
+            rate_limits: RateLimits::default(),
             error: Some(e.to_string()),
         },
     };

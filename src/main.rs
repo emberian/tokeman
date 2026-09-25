@@ -1,14 +1,19 @@
 mod admission;
 mod chart;
+mod claude_login;
 mod config;
+mod credential_history;
 mod display;
 mod launch;
+mod openai;
+mod private_fs;
 mod probe;
 mod rotation;
 mod stats;
 mod store;
 #[cfg(feature = "tray")]
 mod terminal;
+mod text;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;
@@ -115,9 +120,121 @@ enum Command {
         #[command(subcommand)]
         action: UsageAction,
     },
+    /// Manage Codex (OpenAI) accounts and migrate running Codex sessions
+    Codex {
+        #[command(subcommand)]
+        action: CodexAction,
+    },
+    /// Grant a configured account the full OAuth scope set via the browser
+    ///
+    /// A `claude setup-token` credential is inference-only, so tokeman has to
+    /// spend quota to measure quota. A login credential carries `user:profile`
+    /// and can read `/api/oauth/usage` for free.
+    Login {
+        /// Account to log in (defaults to the first one still missing scope)
+        name: Option<String>,
+        /// Walk every account that still needs it, in configured order
+        #[arg(long)]
+        more: bool,
+    },
     /// Run as a system tray application
     #[cfg(feature = "tray")]
     Tray,
+}
+
+#[derive(Subcommand)]
+enum CodexAction {
+    /// Register a Codex profile directory (a CODEX_HOME)
+    Add {
+        /// Display name for the account
+        name: String,
+        /// Path used as CODEX_HOME, e.g. ~/.codex-homes/espark
+        codex_home: String,
+        /// Optional human label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Unregister a Codex profile
+    Remove {
+        /// Configured account name
+        name: String,
+    },
+    /// Find Codex profiles on disk and optionally register them
+    Discover {
+        /// Register everything discovered
+        #[arg(long)]
+        adopt: bool,
+    },
+    /// Seed profiles from a file of `<name> <access-token>` lines
+    Import {
+        /// File with one `<name> <access-token-jwt>` per line
+        from: std::path::PathBuf,
+        /// Directory to create profiles under (default: ~/.codex-homes)
+        #[arg(long)]
+        homes_root: Option<String>,
+        /// Do not register the imported accounts in tokens.toml
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Probe every configured account's quota
+    List {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh OAuth tokens before they rot into a 401
+    Refresh {
+        /// Limit to one account (default: all)
+        name: Option<String>,
+        /// Refresh even if the stored bundle is still fresh
+        #[arg(long)]
+        force: bool,
+        /// Refresh when last_refresh is older than this many days
+        #[arg(long, default_value_t = openai::refresh::DEFAULT_MAX_AGE_DAYS)]
+        max_age_days: i64,
+    },
+    /// Copy an account's credentials into another profile directory
+    Seat {
+        /// Configured account to seat
+        account: String,
+        /// Target CODEX_HOME to write into
+        #[arg(long)]
+        into: String,
+    },
+    /// Migrate a running Codex onto another account without restarting it
+    Reseat {
+        /// CODEX_HOME whose app-server should be migrated (default: ~/.codex)
+        #[arg(long)]
+        codex_home: Option<String>,
+        /// Account to move to (default: best viable)
+        #[arg(long)]
+        account: Option<String>,
+        /// Report the decision without contacting the app-server
+        #[arg(long)]
+        dry_run: bool,
+        /// Migrate onto the named account even if it is rate limited
+        #[arg(long)]
+        force: bool,
+    },
+    /// Follow a running Codex and migrate it before its account runs out
+    Watch {
+        /// CODEX_HOME to watch (default: ~/.codex)
+        #[arg(long)]
+        codex_home: Option<String>,
+        /// Migrate once remaining headroom drops below this fraction
+        #[arg(long, default_value = "0.20")]
+        min_remaining: f64,
+        /// Evaluate once and exit instead of following notifications
+        #[arg(long)]
+        once: bool,
+    },
+    /// Print the CODEX_HOME of the account with the most headroom
+    Best {
+        /// Rank by a per-model bucket instead (e.g. "spark"), which is metered
+        /// separately from the account-wide window
+        #[arg(long)]
+        limit: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,38 +354,32 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Add { name, key }) => {
-            let mut cfg = config::Config::load()?;
-            cfg.add_token(name.clone(), key);
-            cfg.save()?;
+            config::Config::update(|cfg| {
+                cfg.add_token(name.clone(), key);
+                Ok(())
+            })?;
             rotation::reconcile_keychain_after_login()?;
             println!("Added token '{name}'");
         }
         Some(Command::Remove { name }) => {
-            let mut cfg = config::Config::load()?;
-            if cfg.remove_token(&name) {
-                cfg.save()?;
-                println!("Removed token '{name}'");
-            } else {
+            let (_, removed) = config::Config::update(|cfg| Ok(cfg.remove_token(&name)))?;
+            if !removed {
                 bail!("Token '{name}' not found");
             }
+            println!("Removed token '{name}'");
         }
         Some(Command::List) => {
             let cfg = config::Config::load()?;
             if cfg.tokens.is_empty() {
                 println!("No tokens configured. Use `tokeman add <name> <key>` to add one.");
             } else {
+                let now_ms = Utc::now().timestamp_millis();
                 for t in &cfg.tokens {
-                    let masked = mask_key(&t.key);
-                    println!(
-                        "  {} — {} — model usage: {}",
-                        t.name,
-                        masked,
-                        if t.usage_key.is_some() {
-                            "captured"
-                        } else {
-                            "not captured"
-                        }
-                    );
+                    let setup = t
+                        .setup_key()
+                        .map(mask_key)
+                        .unwrap_or_else(|| "no setup token".into());
+                    println!("  {} — {} — {}", t.name, setup, describe_login(t, now_ms));
                 }
             }
         }
@@ -309,6 +420,9 @@ async fn main() -> Result<()> {
         Some(Command::Launch { auto, args }) => {
             let cfg = config::Config::load()?;
             launch::run(cfg, auto, args).await?;
+        }
+        Some(Command::Login { name, more }) => {
+            login_accounts(name, more).await?;
         }
         Some(Command::Rotate { action }) => {
             let cfg = config::Config::load()?;
@@ -440,16 +554,18 @@ async fn main() -> Result<()> {
         }
         Some(Command::Usage { action }) => match action {
             UsageAction::Capture { name } => {
-                let mut cfg = config::Config::load()?;
-                if !cfg.tokens.iter().any(|token| token.name == name) {
+                if !config::Config::load()?
+                    .tokens
+                    .iter()
+                    .any(|token| token.name == name)
+                {
                     bail!("Token '{name}' not found");
                 }
                 let usage_key = read_claude_usage_key()?;
                 let usage = probe::validate_usage_key(&usage_key)
                     .await
                     .map_err(anyhow::Error::msg)?;
-                cfg.set_usage_key(&name, usage_key);
-                cfg.save()?;
+                config::Config::update(|cfg| Ok(cfg.set_usage_key(&name, usage_key)))?;
                 rotation::reconcile_keychain_after_login()?;
                 let buckets = usage.buckets();
                 let summary = if buckets.is_empty() {
@@ -469,6 +585,39 @@ async fn main() -> Result<()> {
                 };
                 println!("captured profile usage credential for {name}; {summary}");
             }
+        },
+        Some(Command::Codex { action }) => match action {
+            CodexAction::Add {
+                name,
+                codex_home,
+                label,
+            } => openai::cli::add(name, codex_home, label)?,
+            CodexAction::Remove { name } => openai::cli::remove(&name)?,
+            CodexAction::Discover { adopt } => openai::cli::discover(adopt)?,
+            CodexAction::Import {
+                from,
+                homes_root,
+                no_register,
+            } => openai::cli::import(from, homes_root, !no_register).await?,
+            CodexAction::List { json } => openai::cli::list(json || cli.json).await?,
+            CodexAction::Refresh {
+                name,
+                force,
+                max_age_days,
+            } => openai::cli::refresh_accounts(name, force, max_age_days).await?,
+            CodexAction::Seat { account, into } => openai::cli::seat(&account, &into).await?,
+            CodexAction::Reseat {
+                codex_home,
+                account,
+                dry_run,
+                force,
+            } => openai::cli::reseat(codex_home, account, dry_run, force).await?,
+            CodexAction::Watch {
+                codex_home,
+                min_remaining,
+                once,
+            } => openai::cli::watch(codex_home, min_remaining, once).await?,
+            CodexAction::Best { limit } => openai::cli::best_home(limit).await?,
         },
         #[cfg(feature = "tray")]
         Some(Command::Tray) => {
@@ -552,6 +701,30 @@ fn mask_key(key: &str) -> String {
     }
 }
 
+/// One-line summary of an account's login grant, without secrets.
+fn describe_login(token: &config::Token, now_ms: i64) -> String {
+    if let Some(error) = &token.login_error {
+        return format!(
+            "login refused ({error}); run `tokeman login {}`",
+            token.name
+        );
+    }
+    if !token.is_refreshable() {
+        return match token.access_token {
+            Some(_) => "captured usage token (not refreshable)".into(),
+            None => "no login (inference-only)".into(),
+        };
+    }
+    match token.expires_at {
+        Some(expires_at) if expires_at > now_ms => format!(
+            "login, full scope, access token valid {}m",
+            (expires_at - now_ms) / 60_000
+        ),
+        Some(_) => "login, access token expired (refresh pending)".into(),
+        None => "login, expiry unknown".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask_key;
@@ -562,4 +735,100 @@ mod tests {
         assert!(masked.starts_with("abcdefghijklmnop..."));
         assert!(masked.ends_with("stuv"));
     }
+}
+
+/// Drive the browser login flow for one account, or for every account that
+/// still lacks a refreshable login.
+///
+/// `--more` exists so the accounts come from the config in order rather than
+/// being typed out one email at a time. Each round is: open a URL, paste what
+/// the page shows, move on. `skip` passes on an account, `q` stops. Naming an
+/// account that is not configured yet enrolls it without a setup token.
+async fn login_accounts(name: Option<String>, more: bool) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let cfg = config::Config::load()?;
+    let needs_login = |token: &&config::Token| !token.is_refreshable();
+    let targets: Vec<String> = match (&name, more) {
+        (Some(name), _) => vec![name.clone()],
+        (None, true) => cfg
+            .tokens
+            .iter()
+            .filter(needs_login)
+            .map(|token| token.name.clone())
+            .collect(),
+        (None, false) => cfg
+            .tokens
+            .iter()
+            .find(needs_login)
+            .map(|token| vec![token.name.clone()])
+            .unwrap_or_default(),
+    };
+    if targets.is_empty() {
+        println!("every configured account already has a refreshable login.");
+        return Ok(());
+    }
+
+    let total = targets.len();
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut done = 0usize;
+    for (index, account) in targets.iter().enumerate() {
+        let pkce = claude_login::begin()?;
+        println!();
+        println!("[{}/{}] {account}", index + 1, total);
+        if !cfg.tokens.iter().any(|token| &token.name == account) {
+            println!("  (not configured yet: it will be added as a login-only account)");
+        }
+        println!("  sign in as this account, then paste what the page shows:");
+        println!();
+        println!("  {}", pkce.url);
+        println!();
+        print!("  code (or `skip` / `q`): ");
+        std::io::stdout().flush().ok();
+        let Some(line) = lines.next() else { break };
+        let line = line?;
+        let answer = line.trim();
+        if answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit") {
+            break;
+        }
+        if answer.is_empty() || answer.eq_ignore_ascii_case("skip") {
+            println!("  skipped {account}");
+            continue;
+        }
+        match claude_login::exchange(answer, &pkce).await {
+            Ok(bundle) => {
+                if bundle.refresh_token.is_none() {
+                    eprintln!(
+                        "  {account}: the grant came back without a refresh token; not stored"
+                    );
+                    continue;
+                }
+                if !bundle.has_profile_scope() {
+                    eprintln!(
+                        "  {account}: granted scopes are {:?} -- no user:profile, so /feedback and usage reads will still be refused",
+                        bundle.scopes
+                    );
+                }
+                let scopes = bundle.scopes.join(" ");
+                // Save after each account: a failure on number five must not
+                // discard the four logins already completed.
+                config::Config::update(|cfg| {
+                    cfg.set_login_bundle(account, bundle, Utc::now().timestamp_millis());
+                    Ok(())
+                })?;
+                done += 1;
+                println!("  {account}: stored ({scopes})");
+            }
+            Err(error) => eprintln!("  {account}: {error:#}"),
+        }
+    }
+    println!();
+    println!("{done}/{total} account(s) updated.");
+    if done > 0 {
+        println!(
+            "the rotation service installs these on its next cycle; `tokeman rotate status` shows which credential each account uses."
+        );
+    }
+    Ok(())
 }
