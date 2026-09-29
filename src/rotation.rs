@@ -839,13 +839,20 @@ pub fn is_viable(
     policy: &RotationSettings,
     target_model: Option<&str>,
 ) -> bool {
+    above_floors(result, floors(mode, policy), target_model)
+}
+
+fn above_floors(
+    result: &ProbeResult,
+    (five_floor, seven_floor): (f64, f64),
+    target_model: Option<&str>,
+) -> bool {
     if !status_allows(result) {
         return false;
     }
     let Some((five, seven)) = utilization(result) else {
         return false;
     };
-    let (five_floor, seven_floor) = floors(mode, policy);
     // Compare utilization directly: 1.0 - 0.95 can be slightly greater than
     // 0.05 and accidentally make the exact boundary appear viable.
     five < 1.0 - five_floor
@@ -998,6 +1005,62 @@ pub fn floors(mode: RotationMode, policy: &RotationSettings) -> (f64, f64) {
         ),
         RotationMode::SipAndDrain => (policy.sip_min_5h_remaining, policy.sip_min_7d_remaining),
     }
+}
+
+/// The room a replacement must offer. Higher than the normal floors so that
+/// every switch, which costs every running session a cold prompt cache, buys a
+/// long dwell.
+pub fn landing_floors(policy: &RotationSettings) -> (f64, f64) {
+    (policy.land_min_5h_remaining, policy.land_min_7d_remaining)
+}
+
+/// Whether the default should stay where it is.
+///
+/// The fleet's mode deliberately plays no part. Evaluating the default against
+/// whichever floors the fleet implied evicted an account at 5% the moment some
+/// other account reset and the fleet flipped back to normal mode. Instead:
+/// stay until the normal floors are crossed and a worthwhile landing exists,
+/// or, when none does, drain in place down to the sip floors.
+fn should_stay(
+    current: &ProbeResult,
+    landing_exists: bool,
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+) -> bool {
+    let normal = floors(RotationMode::Normal, policy);
+    let sip = floors(RotationMode::SipAndDrain, policy);
+    above_floors(current, normal, target_model)
+        || (!landing_exists && above_floors(current, sip, target_model))
+}
+
+/// Whether any account offers the room a switch has to buy.
+fn landing_exists(
+    results: &[ProbeResult],
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+) -> bool {
+    results
+        .iter()
+        .any(|result| above_floors(result, landing_floors(policy), target_model))
+}
+
+/// Where to go when leaving: the roomiest account above the landing floors,
+/// or, as a last resort, the roomiest one above the sip floors.
+pub fn choose_landing<'a>(
+    results: &'a [ProbeResult],
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+    bound: &BTreeMap<String, usize>,
+) -> Option<&'a ProbeResult> {
+    choose_above(results, landing_floors(policy), policy, target_model, bound).or_else(|| {
+        choose_above(
+            results,
+            floors(RotationMode::SipAndDrain, policy),
+            policy,
+            target_model,
+            bound,
+        )
+    })
 }
 
 pub fn interval_secs(mode: RotationMode, policy: &RotationSettings) -> u64 {
@@ -1153,9 +1216,19 @@ pub fn choose_best_with_load<'a>(
     target_model: Option<&str>,
     bound: &BTreeMap<String, usize>,
 ) -> Option<&'a ProbeResult> {
+    choose_above(results, floors(mode, policy), policy, target_model, bound)
+}
+
+fn choose_above<'a>(
+    results: &'a [ProbeResult],
+    edges: (f64, f64),
+    policy: &RotationSettings,
+    target_model: Option<&str>,
+    bound: &BTreeMap<String, usize>,
+) -> Option<&'a ProbeResult> {
     let mut viable: Vec<_> = results
         .iter()
-        .filter(|result| is_viable(result, mode, policy, target_model))
+        .filter(|result| above_floors(result, edges, target_model))
         .collect();
     viable.sort_by(|a, b| {
         let (a_five, a_seven) = utilization(a).unwrap_or((1.0, 1.0));
@@ -1167,13 +1240,13 @@ pub fn choose_best_with_load<'a>(
         // Once two candidates offer equal landing room, consume the one whose
         // limiting window replenishes sooner.
         compare_f64(
-            loaded_dwell_score(b, mode, policy, target_model, bound),
-            loaded_dwell_score(a, mode, policy, target_model, bound),
+            loaded_dwell_score(b, edges, policy, target_model, bound),
+            loaded_dwell_score(a, edges, policy, target_model, bound),
         )
         .then_with(|| {
             compare_optional_delay(
-                limiting_reset_delay_secs(a, mode, policy, target_model),
-                limiting_reset_delay_secs(b, mode, policy, target_model),
+                limiting_reset_delay_secs(a, edges, target_model),
+                limiting_reset_delay_secs(b, edges, target_model),
             )
         })
         .then_with(|| compare_f64(a_five, b_five))
@@ -1188,12 +1261,12 @@ pub fn choose_best_with_load<'a>(
 /// deprioritized but never scored below an account with no room at all.
 fn loaded_dwell_score(
     result: &ProbeResult,
-    mode: RotationMode,
+    edges: (f64, f64),
     policy: &RotationSettings,
     target_model: Option<&str>,
     bound: &BTreeMap<String, usize>,
 ) -> f64 {
-    let raw = dwell_score(result, mode, policy, target_model);
+    let raw = dwell_score(result, edges, target_model);
     if !raw.is_finite() {
         return raw;
     }
@@ -1201,29 +1274,20 @@ fn loaded_dwell_score(
     raw - (sessions as f64) * policy.per_session_reserve
 }
 
-fn dwell_score(
-    result: &ProbeResult,
-    mode: RotationMode,
-    policy: &RotationSettings,
-    target_model: Option<&str>,
-) -> f64 {
-    let Some((five_margin, seven_margin)) = normalized_margins(result, mode, policy) else {
+fn dwell_score(result: &ProbeResult, edges: (f64, f64), target_model: Option<&str>) -> f64 {
+    let Some((five_margin, seven_margin)) = normalized_margins(result, edges) else {
         return f64::NEG_INFINITY;
     };
-    let (_, seven_floor) = floors(mode, policy);
+    let (_, seven_floor) = edges;
     relevant_model_windows(result, target_model)
         .into_iter()
         .map(|window| ((1.0 - window.utilization) - seven_floor) / (1.0 - seven_floor))
         .fold(five_margin.min(seven_margin), f64::min)
 }
 
-fn normalized_margins(
-    result: &ProbeResult,
-    mode: RotationMode,
-    policy: &RotationSettings,
-) -> Option<(f64, f64)> {
+fn normalized_margins(result: &ProbeResult, edges: (f64, f64)) -> Option<(f64, f64)> {
     let (five_used, seven_used) = utilization(result)?;
-    let (five_floor, seven_floor) = floors(mode, policy);
+    let (five_floor, seven_floor) = edges;
     let five_margin = ((1.0 - five_used) - five_floor) / (1.0 - five_floor);
     let seven_margin = ((1.0 - seven_used) - seven_floor) / (1.0 - seven_floor);
     Some((five_margin, seven_margin))
@@ -1233,15 +1297,14 @@ fn normalized_margins(
 /// above its active floor. A reset value of zero means the API omitted it.
 fn limiting_reset_delay_secs(
     result: &ProbeResult,
-    mode: RotationMode,
-    policy: &RotationSettings,
+    edges: (f64, f64),
     target_model: Option<&str>,
 ) -> Option<i64> {
     let quota = result.quota.as_ref()?;
     let session = quota.session.as_ref()?;
     let weekly = quota.weekly.as_ref()?;
-    let (five_margin, seven_margin) = normalized_margins(result, mode, policy)?;
-    let (_, seven_floor) = floors(mode, policy);
+    let (five_margin, seven_margin) = normalized_margins(result, edges)?;
+    let (_, seven_floor) = edges;
     let mut windows = vec![(five_margin, session.reset), (seven_margin, weekly.reset)];
     windows.extend(
         relevant_model_windows(result, target_model)
@@ -1308,6 +1371,36 @@ fn describe(result: Option<&ProbeResult>) -> String {
         }
         _ => "quota unavailable".into(),
     }
+}
+
+/// `describe`, plus the startup model's own weekly buckets. Those gate
+/// viability too, and a log line that omits them reads as a switch away from
+/// an account with plenty of room.
+fn describe_for(result: Option<&ProbeResult>, target_model: Option<&str>) -> String {
+    let mut description = describe(result);
+    let (Some(result), Some(model)) = (result, target_model) else {
+        return description;
+    };
+    // `describe` already reports the family-wide Opus and Sonnet windows.
+    let usage = result.model_usage.as_ref();
+    let family_wide = |window: &crate::probe::Window| {
+        usage.is_some_and(|usage| {
+            [usage.opus_weekly.as_ref(), usage.sonnet_weekly.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|reported| std::ptr::eq(reported, window))
+        })
+    };
+    for window in relevant_model_windows(result, target_model)
+        .into_iter()
+        .filter(|window| !family_wide(window))
+    {
+        description.push_str(&format!(
+            ", {model} 7d {:.0}% left",
+            (1.0 - window.utilization) * 100.0
+        ));
+    }
+    description
 }
 
 /// Fold this cycle's outcomes into the recheck schedule.
@@ -1780,13 +1873,10 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     }
 
     if mode != previous_mode {
-        let (five, seven) = floors(mode, &config.rotation);
         append_log(&format!(
-            "entered {} mode; sampling every {}s and rotating at {:.0}% 5h / {:.0}% 7d",
+            "entered {} mode; sampling every {}s",
             mode.label(),
             interval_secs(mode, &config.rotation),
-            five * 100.0,
-            seven * 100.0
         ));
     }
 
@@ -1833,13 +1923,35 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         ));
     }
 
-    let current_healthy = current_result
-        .is_some_and(|result| is_viable(result, mode, &config.rotation, target_model.as_deref()));
-    if current_healthy && !options.force {
+    let landing = choose_landing(&results, &config.rotation, target_model.as_deref(), &bound);
+    let staying = current_result.is_some_and(|result| {
+        should_stay(
+            result,
+            landing_exists(&results, &config.rotation, target_model.as_deref()),
+            &config.rotation,
+            target_model.as_deref(),
+        )
+    });
+    // Whether the default is above its normal floors, as opposed to draining
+    // in place because nothing roomier exists.
+    let current_healthy = current_result.is_some_and(|result| {
+        is_viable(
+            result,
+            RotationMode::Normal,
+            &config.rotation,
+            target_model.as_deref(),
+        )
+    });
+    if staying && !options.force {
         let message = format!(
-            "kept {} ({})",
+            "kept {} ({}{})",
             current_name.as_deref().unwrap_or("default token"),
-            describe(current_result)
+            describe_for(current_result, target_model.as_deref()),
+            if current_healthy {
+                ""
+            } else {
+                "; draining in place, no account above the landing floors"
+            }
         );
         return Ok(RotationOutcome::held(
             "kept",
@@ -1850,13 +1962,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         ));
     }
 
-    let Some(best) = choose_best_with_load(
-        &results,
-        mode,
-        &config.rotation,
-        target_model.as_deref(),
-        &bound,
-    ) else {
+    let Some(best) = landing else {
         let active = active_label.clone();
         let message = format!(
             "no viable token; kept {}",
@@ -1899,10 +2005,22 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         Some(result) if is_hard_auth_failure(result) => {
             format!("authentication rejected ({})", describe(Some(result)))
         }
+        Some(result)
+            if !is_viable(
+                result,
+                RotationMode::SipAndDrain,
+                &config.rotation,
+                target_model.as_deref(),
+            ) =>
+        {
+            format!(
+                "sip floor reached ({})",
+                describe_for(Some(result), target_model.as_deref())
+            )
+        }
         Some(result) => format!(
-            "{} threshold reached ({})",
-            mode.label(),
-            describe(Some(result))
+            "normal floor reached ({})",
+            describe_for(Some(result), target_model.as_deref())
         ),
     };
     let message = format!(
@@ -1910,7 +2028,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         current_name.as_deref().unwrap_or("/login"),
         best.token_name,
         trigger,
-        describe(Some(best))
+        describe_for(Some(best), target_model.as_deref())
     );
 
     if options.dry_run {
@@ -3085,13 +3203,13 @@ mod tests {
     fn exact_normal_floor_is_not_viable() {
         let policy = RotationSettings::default();
         assert!(!is_viable(
-            &result("at-floor", 0.90, 0.0),
+            &result("at-floor", 1.0 - policy.normal_min_5h_remaining, 0.0),
             RotationMode::Normal,
             &policy,
             Some("opus")
         ));
         assert!(!is_viable(
-            &result("weekly-floor", 0.0, 0.95),
+            &result("weekly-floor", 0.0, 1.0 - policy.normal_min_7d_remaining),
             RotationMode::Normal,
             &policy,
             Some("opus")
@@ -3211,7 +3329,7 @@ mod tests {
     fn sip_mode_unlocks_the_reserve_band() {
         let policy = RotationSettings::default();
         let results = vec![
-            result("five-hour-scrap", 0.91, 0.94),
+            result("five-hour-scrap", 0.95, 0.96),
             result("weekly-scrap", 0.97, 0.96),
         ];
         assert_eq!(
@@ -3326,6 +3444,82 @@ mod tests {
         );
     }
 
+    fn stays(current: &ProbeResult, others: &[ProbeResult]) -> bool {
+        let policy = RotationSettings::default();
+        should_stay(
+            current,
+            landing_exists(others, &policy, Some("opus")),
+            &policy,
+            Some("opus"),
+        )
+    }
+
+    #[test]
+    fn the_default_stays_until_its_own_floor_however_roomy_the_rest() {
+        // 8% five-hour and 6% weekly are both above the exit floors.
+        let fresh = vec![result("fresh", 0.0, 0.0)];
+        assert!(stays(&result("current", 0.92, 0.50), &fresh));
+        assert!(stays(&result("current", 0.20, 0.94), &fresh));
+        assert!(!stays(&result("current", 0.93, 0.50), &fresh));
+        assert!(!stays(&result("current", 0.20, 0.95), &fresh));
+    }
+
+    #[test]
+    fn below_its_floor_the_default_drains_in_place_rather_than_land_on_scraps() {
+        // 2026-09-29 01:59: leaving otto for boot at 10% five-hour bought a
+        // 40-second dwell and a second switch, each a fleet-wide cold cache.
+        let scraps = vec![
+            result("boot", 0.90, 0.24),
+            result("boto", 0.90, 0.24),
+            result("tobo", 0.00, 0.94),
+        ];
+        assert!(stays(&result("otto", 0.95, 0.87), &scraps));
+        // Only at the sip floor does it give up, and then on the roomiest.
+        assert!(!stays(&result("otto", 0.98, 0.87), &scraps));
+    }
+
+    #[test]
+    fn landing_prefers_real_room_and_falls_back_to_the_roomiest_scrap() {
+        let policy = RotationSettings::default();
+        let land = |results: &[ProbeResult]| {
+            choose_landing(results, &policy, Some("opus"), &BTreeMap::new())
+                .map(|result| result.token_name.clone())
+        };
+        // 2026-09-29 03:26: tobo (7d 5% left) was chosen and left again 80s
+        // later. With a real landing anywhere, it must not be picked.
+        assert_eq!(
+            land(&[result("tobo", 0.00, 0.95), result("otto", 0.50, 0.30)]),
+            Some("otto".into())
+        );
+        assert_eq!(
+            land(&[result("tobo", 0.00, 0.95), result("boto", 0.97, 0.26)]),
+            Some("tobo".into())
+        );
+        assert_eq!(land(&[result("dead", 0.99, 0.99)]), None);
+    }
+
+    #[test]
+    fn a_model_bucket_is_a_weekly_floor_like_any_other() {
+        // 2026-09-29 08:59: boto left at 32% five-hour, 25% weekly because its
+        // Fable limit had 9% left. At the 5% weekly floor it stays.
+        let fable = |used| result_with_scoped_bucket("boto", "fable", "Fable", used);
+        let policy = RotationSettings::default();
+        let fresh = [result("otto", 0.0, 0.27)];
+        let landing = landing_exists(&fresh, &policy, Some("claude-fable-5-1"));
+        let stays = |used| should_stay(&fable(used), landing, &policy, Some("claude-fable-5-1"));
+        assert!(stays(0.91));
+        assert!(!stays(0.95));
+    }
+
+    #[test]
+    fn landing_floors_cannot_sit_below_the_exit_floors() {
+        let policy = RotationSettings {
+            land_min_5h_remaining: 0.05,
+            ..RotationSettings::default()
+        };
+        assert!(policy.validate().is_err());
+    }
+
     #[test]
     fn degraded_probe_uses_fast_retry_cadence() {
         let policy = RotationSettings::default();
@@ -3339,7 +3533,7 @@ mod tests {
     #[test]
     fn approaching_floor_uses_fast_retry_cadence() {
         let policy = RotationSettings::default();
-        let active = result("active", 0.80, 0.20);
+        let active = result("active", 0.88, 0.20);
         assert_eq!(
             next_probe_interval_secs(RotationMode::Normal, Some(&active), true, &policy),
             policy.sip_probe_interval_secs

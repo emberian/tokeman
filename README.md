@@ -124,17 +124,12 @@ back on.
 
 How running Claude processes see these values matters for everything below.
 Claude copies settings `env` into its process environment whenever the file
-changes, but its API client keeps the token it cached at startup until the API
-refuses it. Only then does it re-read the environment. So:
-
-- A process on a **setup token** keeps its launch account for its whole life.
-  Rotating the default only moves new or restarted processes.
-- A process on a **login token** keeps its account until that token expires
-  (8 hours) or is refreshed: a refresh revokes the access token it replaces.
-  Its next request is refused, it waits (up to the 401 wait above) for settings
-  to offer a live token, and continues on whatever the default is by then. No
-  restart is needed, and an account rotated away from stops being drained by
-  its next refresh at the latest.
+changes, and a running process adopts a new default within seconds. Measured
+on 2026-09-28/29: at every switch, each subagent of a 20-agent swarm re-created
+its entire prompt cache (100k-800k tokens apiece) within 20 seconds, about 47M
+cache-creation tokens across a dozen switches. Prompt caches are per account,
+so **every switch costs every running session a cold cache**. That is why the
+policy below is built to switch rarely.
 
 The daemon refreshes each login 30 minutes before expiry and rewrites settings
 when the default's token changes, so that retry is normally immediate. If a
@@ -145,49 +140,33 @@ Tokeman deliberately does **not** use `apiKeyHelper`: Claude treats that hook as
 an external API-key credential, while tokeman stores Claude.ai OAuth bearer
 tokens.
 
-Default selection is sticky: a healthy account remains the startup default so
-the fleet preserves prompt-cache locality. When a floor is genuinely crossed,
-tokeman chooses the viable account with the largest balanced headroom so new or
-restarted sessions can absorb cold prompt-cache creation. If two candidates
-offer the same landing room, the limiting window that replenishes soonest wins.
+Default selection is sticky. Once an account is the default, it stays the
+default until one of its own windows crosses a floor, however much roomier
+another account is and whatever state the rest of the fleet is in:
 
-A `/login` record left in the Keychain would undermine that recovery: when
-Claude's token is refused and the stored login has a refresh token, Claude
-refreshes the Keychain login instead of waiting for settings to offer a new
-env token. So during explicit foreground enrollment
-(`tokeman add`, `tokeman usage capture`) and installation, Tokeman privately
-backs up that Claude login field and suppresses it while preserving MCP and
-unknown Keychain fields. `rotate pause` and `rotate uninstall` restore the saved
-login unless a newer manual `/login` has replaced it. Ordinary daemon cycles
-never access Keychain, so an unattended swarm cannot deadlock on a permission
-dialog. After a later manual `/login`, finish enrollment with `tokeman add` or
-`tokeman usage capture` before leaving the managed fleet unattended.
+1. **Leave** at 7% five-hour remaining or 5% seven-day remaining (a model
+   bucket for the startup model, such as the Fable limit, counts as a
+   seven-day window), but only for an account with at least 25% five-hour
+   and 10% seven-day remaining. Landing just above a floor bought dwells of
+   under a minute for the price of a fleet-wide cold cache.
+2. **Drain in place** when no account meets that landing floor: the default
+   stays until 2% five-hour / 3% seven-day remaining, or until it is refused,
+   and only then moves to the roomiest account still above those floors.
 
-Every credential tokeman installs is recorded, by fingerprint only, in a
-credential history. Replaying it from a process's start time through each token
-expiry gives the account that process is actually spending, which is what
-session listings, drain warnings and admission feedback use. (Neither the
-`TOKEMAN_ACCOUNT` a hook sees nor the token in `ps eww` can answer this: both
-show what settings offer, not what the process has cached.) Installation also
-adds a small `SessionStart` hook that records session id, process id and
-transcript path, so rejections in a transcript can be attributed. The
-dashboard's `D` marker means “default for new processes.”
+Among accounts that qualify, tokeman picks the largest balanced headroom; if
+two offer the same, the one whose limiting window replenishes soonest wins.
+Probing runs every 120 seconds, and every 20 seconds once the default is near
+a floor or no account is above the normal floors.
 
-The default policy has two stages:
-
-1. **Normal:** probe every 120 seconds and rotate at 10% five-hour remaining or
-   10% seven-day remaining.
-2. **Sip-and-drain:** when no token remains above both normal floors, probe
-   every 20 seconds and drain the reserve pool to 2% five-hour / 3% seven-day.
-
-That second stage prevents seven accounts with 9% five-hour capacity apiece
-from stranding roughly 63% of a full window between them. Exact thresholds and
-cadences are configurable:
+Draining in place keeps accounts from each stranding a few percent of a
+window. Exact thresholds and cadences are configurable:
 
 ```toml
 [rotation]
-normal_min_5h_remaining = 0.10
-normal_min_7d_remaining = 0.10
+normal_min_5h_remaining = 0.07
+normal_min_7d_remaining = 0.05
+land_min_5h_remaining = 0.25
+land_min_7d_remaining = 0.10
 sip_min_5h_remaining = 0.02
 sip_min_7d_remaining = 0.03
 normal_probe_interval_secs = 120

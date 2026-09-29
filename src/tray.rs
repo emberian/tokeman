@@ -62,8 +62,12 @@ fn make_icon(color: [u8; 3]) -> tray_icon::Icon {
 
 fn select_best<'a>(results: &'a [ProbeResult], config: &Config) -> Option<&'a ProbeResult> {
     let target_model = rotation::target_model_name().ok().flatten();
-    let mode = rotation::mode_for(results, &config.rotation, target_model.as_deref());
-    rotation::choose_best(results, mode, &config.rotation, target_model.as_deref())
+    rotation::choose_landing(
+        results,
+        &config.rotation,
+        target_model.as_deref(),
+        &Default::default(),
+    )
 }
 
 fn level_rgb(level: Level) -> [u8; 3] {

@@ -210,19 +210,32 @@ fn default_probe_interval() -> u64 {
     30
 }
 
+/// Leave the default at 7% five-hour remaining, when somewhere worth landing
+/// exists.
 fn default_normal_min_5h() -> f64 {
-    0.10
+    0.07
 }
 
-/// Rotate while a tenth of the week is still unspent.
+/// Leave the default at 5% weekly remaining.
 ///
-/// This used to be 0.05. A switch does not stop the outgoing account being
-/// drained: sessions bound to it keep their launch credential until they exit,
-/// and that tail was measured at 1% of the weekly quota at the median but 28%
-/// at the worst across 70 switches. A 5% floor cannot absorb that, which is how
-/// an account tokeman had already rotated away from still reached 96% used.
-/// Ten percent leaves room for the tail to land in.
+/// This was 0.10 on the belief that sessions keep draining an account after
+/// the default moves off it. They do not: a running Claude process adopts a
+/// new default within seconds (every subagent of a 20-agent swarm re-created
+/// its whole prompt cache within 20s of each switch on 2026-09-28/29). There
+/// is no tail to leave room for, and each premature switch costs the fleet a
+/// full cold cache.
 fn default_normal_min_7d() -> f64 {
+    0.05
+}
+
+/// A replacement must offer at least this much five-hour room. Landing just
+/// above the exit floor bought a dwell of under a minute for the price of a
+/// fleet-wide cold cache.
+fn default_land_min_5h() -> f64 {
+    0.25
+}
+
+fn default_land_min_7d() -> f64 {
     0.10
 }
 
@@ -274,6 +287,12 @@ pub struct RotationSettings {
     pub sip_min_5h_remaining: f64,
     #[serde(default = "default_sip_min_7d")]
     pub sip_min_7d_remaining: f64,
+    /// Minimum room a replacement needs before the default leaves an account
+    /// that is below its normal floors but above its sip floors.
+    #[serde(default = "default_land_min_5h")]
+    pub land_min_5h_remaining: f64,
+    #[serde(default = "default_land_min_7d")]
+    pub land_min_7d_remaining: f64,
     #[serde(default = "default_normal_rotation_interval")]
     pub normal_probe_interval_secs: u64,
     #[serde(default = "default_sip_rotation_interval")]
@@ -294,6 +313,8 @@ impl Default for RotationSettings {
             normal_min_7d_remaining: default_normal_min_7d(),
             sip_min_5h_remaining: default_sip_min_5h(),
             sip_min_7d_remaining: default_sip_min_7d(),
+            land_min_5h_remaining: default_land_min_5h(),
+            land_min_7d_remaining: default_land_min_7d(),
             normal_probe_interval_secs: default_normal_rotation_interval(),
             sip_probe_interval_secs: default_sip_rotation_interval(),
             per_session_reserve: default_per_session_reserve(),
@@ -309,6 +330,8 @@ impl RotationSettings {
             ("normal_min_7d_remaining", self.normal_min_7d_remaining),
             ("sip_min_5h_remaining", self.sip_min_5h_remaining),
             ("sip_min_7d_remaining", self.sip_min_7d_remaining),
+            ("land_min_5h_remaining", self.land_min_5h_remaining),
+            ("land_min_7d_remaining", self.land_min_7d_remaining),
         ] {
             if !(0.0..1.0).contains(&value) {
                 bail!("rotation.{name} must be at least 0 and less than 1");
@@ -319,6 +342,11 @@ impl RotationSettings {
         }
         if self.sip_min_7d_remaining > self.normal_min_7d_remaining {
             bail!("rotation.sip_min_7d_remaining must not exceed the normal floor");
+        }
+        if self.land_min_5h_remaining < self.normal_min_5h_remaining
+            || self.land_min_7d_remaining < self.normal_min_7d_remaining
+        {
+            bail!("rotation.land_min_* must not be below the normal floors");
         }
         if self.normal_probe_interval_secs == 0 || self.sip_probe_interval_secs == 0 {
             bail!("rotation probe intervals must be at least one second");
@@ -570,6 +598,8 @@ impl Config {
             ),
             ("sip_min_5h_remaining", self.rotation.sip_min_5h_remaining),
             ("sip_min_7d_remaining", self.rotation.sip_min_7d_remaining),
+            ("land_min_5h_remaining", self.rotation.land_min_5h_remaining),
+            ("land_min_7d_remaining", self.rotation.land_min_7d_remaining),
         ] {
             set_item(rotation, key, value(number));
         }
