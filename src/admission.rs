@@ -195,17 +195,12 @@ fn shell_quote(value: &str) -> String {
 pub fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
     let now = Utc::now().timestamp();
     let started_at = (pid > 0).then(|| process_started_at(pid)).flatten();
-    // The hook's TOKEMAN_ACCOUNT mirrors the settings Claude reloaded most
-    // recently, which after /clear or /compact in a long-lived process is not
-    // the token that process has cached. Prefer the credential timeline and
-    // fall back to the marker only when the timeline knows nothing.
-    let derived = started_at.and_then(|started_at| {
-        crate::credential_history::account_at(
-            &crate::rotation::credential_timeline(),
-            started_at,
-            now,
-        )
-    });
+    // A live process spends whatever settings offer now, so the credential
+    // timeline and the hook's TOKEMAN_ACCOUNT normally agree. Prefer the
+    // timeline and fall back to the marker only when the timeline knows
+    // nothing.
+    let derived =
+        crate::credential_history::account_at(&crate::rotation::credential_timeline(), now);
     let account = match derived {
         Some(Some(account)) => account,
         Some(None) => return Ok(()),
@@ -431,14 +426,12 @@ fn scan_binding(
     timeline: &[crate::credential_history::CredentialEvent],
 ) -> Result<(Vec<ObservedLimit>, bool)> {
     // Attribute each rejection to the account the process was spending when
-    // it happened. A process on an expiring login token moves to the then
-    // default when that token is refused, so the SessionStart account can go
-    // stale; the timeline follows it. Without a start time, keep the binding.
-    let started_at = binding.process_started_at;
+    // it happened: the one settings offered at that moment, since a live
+    // process re-reads the settings credential for every API client. The
+    // SessionStart account goes stale at the first switch; the timeline does
+    // not.
     scan_binding_with_default_resolver(binding, now, |observed_at| {
-        started_at.and_then(|started_at| {
-            crate::credential_history::account_at(timeline, started_at, observed_at)
-        })
+        crate::credential_history::account_at(timeline, observed_at)
     })
 }
 

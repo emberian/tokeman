@@ -1,19 +1,28 @@
 //! Which credential `settings.json` offered Claude, and when.
 //!
-//! A running Claude process caches the OAuth token it resolved at startup and
-//! keeps it until the API refuses it. Only then does it re-read its
-//! environment, which by that time mirrors whatever `settings.json` holds. So
-//! the account a process is spending is a function of two things tokeman
-//! controls: the token installed when the process started, and every token
-//! installed at the moments earlier ones expired. This file records exactly
-//! that, keyed by fingerprint so no secret is ever written here.
+//! tokeman hands Claude its credential through the `env` block of
+//! `~/.claude/settings.json`. A running Claude process follows that file: on
+//! every change it copies the settings `env` into its own environment, and
+//! every API client it builds first clears its in-memory OAuth token and
+//! re-derives it from `CLAUDE_CODE_OAUTH_TOKEN` as it stands at that moment
+//! (Claude Code 2.1.282 through 2.1.287, read from the binary). So a live
+//! process spends whatever settings offer *now*, from its next request on;
+//! it does not keep the token it started with.
 //!
-//! Replaying the history gives a derived account for any process at any time,
-//! which is what admission feedback and drain accounting need. It replaces two
-//! older signals that were both wrong once settings hot-reload is involved:
-//! the `TOKEMAN_ACCOUNT` a SessionStart hook sees (the current settings, not
-//! the cached credential) and the token visible in `ps eww` (the exec-time
-//! environment, which settings override).
+//! Measured, not only read: over the 39 default switches from 2026-09-29 to
+//! 2026-10-01 the outgoing account stopped burning by the first probe after
+//! the switch (0% further 5h use in 37 of 39), and the incoming one took the
+//! whole load. A session that tokeman attributed to its launch account was
+//! refused, minutes after a switch, with the 5h reset time of the new default.
+//!
+//! The one known exception is a session whose workspace was never trusted:
+//! Claude re-applies settings `env` on change only once trust is accepted, so
+//! such a session keeps its launch-time token. tokeman cannot see trust per
+//! process, so it does not try.
+//!
+//! The history is still worth keeping: it answers which account a rejection
+//! seen in a transcript was charged to, at the moment it happened. Entries are
+//! keyed by fingerprint, so no secret is ever written here.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -21,8 +30,8 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const HISTORY_FILE: &str = "claude-credential-history.jsonl";
-/// Old entries only matter while a process that started under them may still
-/// be alive; processes rarely live a month.
+/// Old entries only matter while a transcript rejection from their period may
+/// still be scanned; a month covers any session that is still being read.
 const RETENTION_SECS: i64 = 30 * 24 * 3600;
 const COMPACT_ABOVE_BYTES: u64 = 512 * 1024;
 
@@ -115,8 +124,7 @@ pub const REVOKE: &str = "revoke";
 
 /// Combine recorded events with default changes reconstructed from the
 /// rotation log, for the period before this file existed. Legacy entries
-/// carry no expiry, which reproduces the old semantics exactly: a process
-/// keeps its launch account for its whole life.
+/// carry no fingerprint or expiry; only the account and the moment matter.
 pub fn with_legacy(
     mut events: Vec<CredentialEvent>,
     legacy: impl IntoIterator<Item = (i64, Option<String>)>,
@@ -138,64 +146,21 @@ pub fn with_legacy(
     events
 }
 
-/// The account a Claude process started at `started_at` is spending at `at`.
+/// The account a live Claude process was spending at `at`: the one settings
+/// offered at that moment. When the process started does not matter, because
+/// it re-reads the settings credential for every API client it builds.
 ///
-/// Outer `None`: nothing is known about the credential at process start.
-/// Inner `None`: settings offered no managed credential at that point.
+/// Outer `None`: nothing is known about the credential at `at`.
+/// Inner `None`: settings offered no managed credential then (pause).
 ///
-/// The process holds the credential installed when it started. When that
-/// credential expires, its next request is refused and it adopts whatever
-/// settings offer at that moment. If settings still offer the same expired
-/// token (tokeman was asleep), it keeps retrying until a newer one appears.
-pub fn account_at(events: &[CredentialEvent], started_at: i64, at: i64) -> Option<Option<String>> {
-    // A token stops working at its expiry or its revocation, whichever is
-    // first; revocations are not offers.
-    let revoked_at = |fingerprint: Option<&str>| {
-        events
-            .iter()
-            .filter(|event| event.kind == REVOKE && event.fingerprint.as_deref() == fingerprint)
-            .map(|event| event.at)
-            .min()
-    };
-    let offers: Vec<&CredentialEvent> =
-        events.iter().filter(|event| event.kind != REVOKE).collect();
-    let mut index = offers.iter().rposition(|event| event.at <= started_at)?;
-    loop {
-        let current = offers[index];
-        let ends_at = match (
-            current.expires_at,
-            revoked_at(current.fingerprint.as_deref()),
-        ) {
-            (Some(expiry), Some(revoked)) => Some(expiry.min(revoked)),
-            (expiry, revoked) => expiry.or(revoked),
-        };
-        let Some(expired_at) = ends_at.filter(|end| *end <= at) else {
-            return Some(current.account.clone());
-        };
-        let offered = offers
-            .iter()
-            .rposition(|event| event.at <= expired_at)
-            .unwrap_or(index)
-            .max(index);
-        let next = if offers[offered].fingerprint != current.fingerprint {
-            offered
-        } else {
-            // Settings still offered the refused token: the first later
-            // installation is what the retrying process picks up.
-            match offers[offered + 1..]
-                .iter()
-                .position(|event| event.fingerprint != current.fingerprint)
-            {
-                Some(offset) => offered + 1 + offset,
-                None => return Some(current.account.clone()),
-            }
-        };
-        if offers[next].at > at {
-            // The replacement arrived after the moment asked about.
-            return Some(current.account.clone());
-        }
-        index = next;
-    }
+/// Revocations are not offers. A revoked or expired token that settings still
+/// offer is still the account the process is charged to: it is refused, and
+/// waits for settings to offer a replacement.
+pub fn account_at(events: &[CredentialEvent], at: i64) -> Option<Option<String>> {
+    events
+        .iter()
+        .rfind(|event| event.kind != REVOKE && event.at <= at)
+        .map(|event| event.account.clone())
 }
 
 #[cfg(test)]
@@ -213,59 +178,49 @@ mod tests {
     }
 
     #[test]
-    fn a_setup_token_process_keeps_its_launch_account() {
+    fn a_live_process_follows_a_switch_before_its_token_expires() {
+        // The process started on `a`, whose token is good for hours more.
+        // Settings switch to `b`; the process spends `b` from then on.
+        let events = vec![
+            event(0, "a", "a0", Some(100_000)),
+            event(500, "b", "b0", Some(100_000)),
+        ];
+        assert_eq!(account_at(&events, 400), Some(Some("a".into())));
+        assert_eq!(account_at(&events, 600), Some(Some("b".into())));
+    }
+
+    #[test]
+    fn a_setup_token_process_follows_the_default_too() {
         let events = vec![event(0, "a", "a0", None), event(100, "b", "b0", None)];
-        assert_eq!(account_at(&events, 50, 10_000), Some(Some("a".into())));
+        assert_eq!(account_at(&events, 10_000), Some(Some("b".into())));
     }
 
     #[test]
-    fn an_expired_login_token_moves_the_process_to_the_current_default() {
-        let events = vec![
-            event(0, "a", "a0", Some(1_000)),
-            event(500, "b", "b0", Some(3_000)),
-        ];
-        // Still on a's token before it expires, even though b is the default.
-        assert_eq!(account_at(&events, 10, 900), Some(Some("a".into())));
-        // Refused at 1000; settings then offer b.
-        assert_eq!(account_at(&events, 10, 1_200), Some(Some("b".into())));
+    fn a_revocation_is_not_an_offer() {
+        let revoke = CredentialEvent {
+            at: 400,
+            account: Some("a".into()),
+            fingerprint: Some("a0".into()),
+            expires_at: None,
+            kind: REVOKE.into(),
+        };
+        let events = vec![event(0, "a", "a0", Some(10_000)), revoke];
+        assert_eq!(account_at(&events, 500), Some(Some("a".into())));
     }
 
     #[test]
-    fn a_refresh_of_the_same_account_keeps_attribution() {
-        let events = vec![
-            event(0, "a", "a0", Some(1_000)),
-            event(800, "a", "a1", Some(2_000)),
-            event(1_800, "a", "a2", Some(3_000)),
-        ];
-        assert_eq!(account_at(&events, 10, 2_500), Some(Some("a".into())));
-    }
-
-    #[test]
-    fn a_late_refresh_is_adopted_when_it_arrives() {
-        // a0 expired at 1000 but tokeman only installed b at 1500.
-        let events = vec![
-            event(0, "a", "a0", Some(1_000)),
-            event(1_500, "b", "b0", None),
-        ];
-        assert_eq!(account_at(&events, 10, 1_200), Some(Some("a".into())));
-        assert_eq!(account_at(&events, 10, 1_600), Some(Some("b".into())));
+    fn a_pause_offers_no_managed_credential() {
+        let mut pause = event(200, "a", "a0", None);
+        pause.account = None;
+        pause.fingerprint = None;
+        let events = vec![event(0, "a", "a0", None), pause];
+        assert_eq!(account_at(&events, 300), Some(None));
     }
 
     #[test]
     fn nothing_known_before_the_first_event() {
         let events = vec![event(100, "a", "a0", None)];
-        assert_eq!(account_at(&events, 50, 200), None);
-    }
-
-    #[test]
-    fn a_chain_of_expiries_is_followed() {
-        let events = vec![
-            event(0, "a", "a0", Some(100)),
-            event(50, "b", "b0", Some(200)),
-            event(150, "c", "c0", None),
-        ];
-        assert_eq!(account_at(&events, 10, 150), Some(Some("b".into())));
-        assert_eq!(account_at(&events, 10, 250), Some(Some("c".into())));
+        assert_eq!(account_at(&events, 50), None);
     }
 
     #[test]
@@ -276,7 +231,8 @@ mod tests {
             [(10, Some("a".into())), (2_000, Some("z".into()))],
         );
         assert_eq!(merged.len(), 2);
-        assert_eq!(account_at(&merged, 20, 5_000), Some(Some("a".into())));
+        assert_eq!(account_at(&merged, 500), Some(Some("a".into())));
+        assert_eq!(account_at(&merged, 5_000), Some(Some("b".into())));
     }
 
     #[test]
@@ -284,24 +240,5 @@ mod tests {
         assert_eq!(fingerprint("abc"), fingerprint("abc"));
         assert_ne!(fingerprint("abc"), fingerprint("abd"));
         assert_eq!(fingerprint("abc").len(), 16);
-    }
-
-    #[test]
-    fn a_refresh_elsewhere_moves_sessions_at_revocation_not_expiry() {
-        let revoke = CredentialEvent {
-            at: 400,
-            account: Some("a".into()),
-            fingerprint: Some("a0".into()),
-            expires_at: None,
-            kind: REVOKE.into(),
-        };
-        let events = vec![
-            event(0, "a", "a0", Some(10_000)),
-            event(200, "b", "b0", Some(10_000)),
-            revoke,
-        ];
-        assert_eq!(account_at(&events, 10, 300), Some(Some("a".into())));
-        // a0 was revoked at 400 when `a` refreshed; the process adopted b.
-        assert_eq!(account_at(&events, 10, 500), Some(Some("b".into())));
     }
 }

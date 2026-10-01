@@ -133,74 +133,11 @@ pub struct ClaudeSessionStatus {
     pub tty: Option<String>,
     pub started_at: chrono::DateTime<Utc>,
     pub session_id: Option<String>,
-    /// Exact for an inherited process credential or SessionStart launch
-    /// binding, otherwise an estimate from default history.
+    /// What settings offer now, from the credential timeline: a live process
+    /// adopts it at its next request. The SessionStart record stands in only
+    /// when the timeline is empty.
     pub account: Option<String>,
     pub credential_source: String,
-}
-
-/// An account that is no longer the default, still has live sessions bound to
-/// it, and has fallen below a rotation floor.
-///
-/// Rotating the default protects only *new* processes. Nothing previously
-/// noticed when the account tokeman had just stepped away from kept being
-/// drained past its floor by the sessions left on it, so the fleet could
-/// exhaust an account the policy believed it had already rescued.
-#[derive(Debug, Clone, Serialize)]
-pub struct AbandonedDrain {
-    pub account: String,
-    pub bound_sessions: usize,
-    pub remaining_5h: Option<f64>,
-    pub remaining_7d: Option<f64>,
-}
-
-impl AbandonedDrain {
-    pub fn summary(&self) -> String {
-        let pct = |value: Option<f64>| match value {
-            Some(value) => format!("{:.0}%", value * 100.0),
-            None => "n/a".to_string(),
-        };
-        format!(
-            "{} is below floor (5h {} left, 7d {} left) with {} live session(s) still bound to it",
-            self.account,
-            pct(self.remaining_5h),
-            pct(self.remaining_7d),
-            self.bound_sessions
-        )
-    }
-}
-
-/// Accounts being drained past their floor by sessions the daemon can no
-/// longer move. Restarting or resuming those sessions is the only way to
-/// release them, so the point of this is to say so out loud.
-pub fn abandoned_drains(
-    results: &[ProbeResult],
-    default: Option<&str>,
-    bound: &BTreeMap<String, usize>,
-    mode: RotationMode,
-    policy: &RotationSettings,
-    target_model: Option<&str>,
-) -> Vec<AbandonedDrain> {
-    let mut drains: Vec<_> = results
-        .iter()
-        .filter(|result| Some(result.token_name.as_str()) != default)
-        .filter(|result| has_quota_reading(result))
-        .filter(|result| !is_viable(result, mode, policy, target_model))
-        .filter_map(|result| {
-            let sessions = bound.get(&result.token_name).copied().unwrap_or(0);
-            (sessions > 0).then(|| {
-                let (remaining_5h, remaining_7d) = remaining(result);
-                AbandonedDrain {
-                    account: result.token_name.clone(),
-                    bound_sessions: sessions,
-                    remaining_5h,
-                    remaining_7d,
-                }
-            })
-        })
-        .collect();
-    drains.sort_by(|a, b| a.account.cmp(&b.account));
-    drains
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,7 +157,6 @@ pub struct RotationStatus {
     /// Usage-limit resets on offer to logged-in accounts, one line each.
     pub resets_on_offer: Vec<String>,
     pub live_sessions: Vec<ClaudeSessionStatus>,
-    pub abandoned_drains: Vec<AbandonedDrain>,
     pub tokens: Vec<RotationTokenStatus>,
 }
 
@@ -250,10 +186,6 @@ fn auth_backoff_secs(failures: u32) -> f64 {
 struct CadenceState {
     #[serde(default)]
     last_probe_epoch: f64,
-    /// Accounts already reported as drained-while-abandoned, so a standing
-    /// condition is logged on the transition instead of every probe cycle.
-    #[serde(default)]
-    drained_accounts: Vec<String>,
     /// Per-account recheck schedule for hard authentication failures.
     #[serde(default)]
     auth_backoff: BTreeMap<String, AuthBackoff>,
@@ -286,7 +218,6 @@ impl Default for CadenceState {
     fn default() -> Self {
         Self {
             last_probe_epoch: 0.0,
-            drained_accounts: Vec::new(),
             auth_backoff: BTreeMap::new(),
             mode: Some(RotationMode::Normal),
             probe_interval_secs: None,
@@ -630,10 +561,11 @@ fn configured_target_model(settings: &Map<String, Value>) -> Option<&str> {
 /// Point `settings.json` at an account's current credential.
 ///
 /// Returns the history event to record once the settings are saved. Claude
-/// copies settings `env` into its process environment on every change, so
-/// running sessions see this immediately, but each keeps using its cached
-/// token until the API refuses it; the event is what lets tokeman reconstruct
-/// which account every process is actually spending.
+/// copies settings `env` into its process environment on every change and
+/// re-derives its OAuth token from that environment for every API client it
+/// builds, so running sessions spend this account from their next request.
+/// The event is what lets tokeman say, after the fact, which account a
+/// rejection seen in a transcript was charged to.
 fn install_credential(
     settings: &mut Map<String, Value>,
     token: &Token,
@@ -1172,24 +1104,6 @@ fn degraded_probe_summary(results: &[ProbeResult], expected: usize) -> String {
         "{available}/{expected} quota readings; unavailable [{}]",
         groups.join("; ")
     )
-}
-
-/// Live Claude sessions still bound to each account.
-///
-/// A Claude process resolves its credential once at startup, so an account the
-/// daemon has rotated away from keeps burning until those processes exit.
-/// Measured across 70 switches: the outgoing account burns a further 1% of its
-/// weekly quota at the median, but up to 28% when several sessions are bound to
-/// it. That tail is how an account tokeman had already decided to protect still
-/// reached 96% used, hours after it stopped being the default.
-pub fn bound_session_counts(config: &Config) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for session in claude_sessions(config) {
-        if let Some(account) = session.account {
-            *counts.entry(account).or_insert(0) += 1;
-        }
-    }
-    counts
 }
 
 /// Compatibility wrapper: load-blind selection, used by the tray and by tests
@@ -1811,36 +1725,11 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             .map(|_| "unmanaged OAuth token".to_string())
     });
 
-    // Sessions bound to an account are burn the daemon cannot redirect: a
-    // Claude process keeps the credential it resolved at startup. Read them
-    // once per cycle so both the landing-zone choice and the drain watch below
-    // work from the same picture.
-    let bound = bound_session_counts(config);
-    let drains = abandoned_drains(
-        &results,
-        current_name.as_deref(),
-        &bound,
-        mode,
-        &config.rotation,
-        target_model.as_deref(),
-    );
-    let drained_now: Vec<String> = drains.iter().map(|d| d.account.clone()).collect();
-    if drained_now != cadence.drained_accounts {
-        for drain in &drains {
-            if !cadence.drained_accounts.contains(&drain.account) {
-                append_log(&format!(
-                    "WARNING abandoned drain: {}; rotating the default cannot move them -- restart or resume those sessions to release it",
-                    drain.summary()
-                ));
-            }
-        }
-        for account in &cadence.drained_accounts {
-            if !drained_now.contains(account) {
-                append_log(&format!("abandoned drain cleared for {account}"));
-            }
-        }
-        cadence.drained_accounts = drained_now;
-    }
+    // Sessions the daemon cannot move would be committed burn on a landing
+    // candidate. There are none to count: a live Claude process re-reads the
+    // settings credential for every API client it builds, so the whole fleet
+    // follows the default from its next request (see `credential_history`).
+    let stranded: BTreeMap<String, usize> = BTreeMap::new();
 
     let next_interval =
         next_probe_interval_secs(mode, current_result, complete_probe, &config.rotation);
@@ -1923,7 +1812,12 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         ));
     }
 
-    let landing = choose_landing(&results, &config.rotation, target_model.as_deref(), &bound);
+    let landing = choose_landing(
+        &results,
+        &config.rotation,
+        target_model.as_deref(),
+        &stranded,
+    );
     let staying = current_result.is_some_and(|result| {
         should_stay(
             result,
@@ -2137,13 +2031,34 @@ fn parse_ps_session(line: &str) -> Option<(u32, Option<String>, chrono::DateTime
     Some((pid, tty, started_at))
 }
 
-/// Inspect live Claude processes without exposing credentials.
+const TIMELINE_SOURCE: &str = "credential timeline";
+const SESSION_START_SOURCE: &str = "SessionStart binding";
+
+/// The account a live process is spending and how that was determined.
 ///
-/// The account is derived from the credential timeline: the token settings
-/// offered when the process started, followed through every expiry at which
-/// Claude would have adopted a newer one. Neither the SessionStart hook's
-/// environment nor `ps eww` can say this: both show what settings offer now or
-/// at exec time, not the token the process has cached.
+/// A live Claude process re-reads the settings credential for every API
+/// client it builds, so it spends whatever the credential timeline says
+/// settings offer now, whatever it started on. The SessionStart record is a
+/// fallback for a timeline that knows nothing yet.
+fn attribute_session(
+    timeline: &[CredentialEvent],
+    now: i64,
+    binding: Option<&admission::BoundSession>,
+) -> (Option<String>, String) {
+    match credential_history::account_at(timeline, now) {
+        Some(Some(account)) => (Some(account), TIMELINE_SOURCE.to_string()),
+        Some(None) => (None, "no managed credential (/login)".to_string()),
+        None => match binding {
+            Some(binding) => (
+                Some(binding.account.clone()),
+                SESSION_START_SOURCE.to_string(),
+            ),
+            None => (None, "unknown (predates recorded default)".to_string()),
+        },
+    }
+}
+
+/// Inspect live Claude processes without exposing credentials.
 pub fn claude_sessions(_config: &Config) -> Vec<ClaudeSessionStatus> {
     let Ok(output) = Command::new("/bin/ps")
         .args(["-axo", "pid=,tty=,lstart=,comm="])
@@ -2161,18 +2076,7 @@ pub fn claude_sessions(_config: &Config) -> Vec<ClaudeSessionStatus> {
         .filter_map(parse_ps_session)
         .map(|(pid, tty, started_at)| {
             let binding = admission::binding_for_pid(pid, started_at.timestamp());
-            let (account, credential_source) =
-                match credential_history::account_at(&timeline, started_at.timestamp(), now) {
-                    Some(Some(account)) => (Some(account), "credential timeline".to_string()),
-                    Some(None) => (None, "no managed credential (/login)".to_string()),
-                    None => match &binding {
-                        Some(binding) => (
-                            Some(binding.account.clone()),
-                            "SessionStart binding".to_string(),
-                        ),
-                        None => (None, "unknown (predates recorded default)".to_string()),
-                    },
-                };
+            let (account, credential_source) = attribute_session(&timeline, now, binding.as_ref());
             ClaudeSessionStatus {
                 pid,
                 tty,
@@ -2193,10 +2097,10 @@ pub fn session_summary(sessions: &[ClaudeSessionStatus]) -> String {
     }
     let mut counts = BTreeMap::<String, usize>::new();
     for session in sessions {
-        let prefix = if session.credential_source == "credential timeline" {
-            ""
-        } else {
+        let prefix = if session.credential_source == SESSION_START_SOURCE {
             "~"
+        } else {
+            ""
         };
         *counts
             .entry(format!(
@@ -2320,22 +2224,6 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
         })
         .collect();
     let live_sessions = claude_sessions(config);
-    let bound = live_sessions
-        .iter()
-        .fold(BTreeMap::new(), |mut acc, session| {
-            if let Some(account) = session.account.clone() {
-                *acc.entry(account).or_insert(0usize) += 1;
-            }
-            acc
-        });
-    let drains = abandoned_drains(
-        &results,
-        current_name.as_deref(),
-        &bound,
-        mode,
-        &config.rotation,
-        target_model.as_deref(),
-    );
 
     let header_sampling =
         describe_header_sampling(config, &cadence, target_model.as_deref(), now_epoch());
@@ -2361,7 +2249,6 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
         resets_on_offer,
         header_sampling,
         live_sessions,
-        abandoned_drains: drains,
         tokens,
     })
 }
@@ -2399,17 +2286,22 @@ pub fn print_status(status: &RotationStatus) {
         status.target_model.as_deref().unwrap_or("unknown")
     );
     println!(
-        "live Claude processes: {} ({}; ~=startup estimate, unmarked=derived from credential history)",
+        "live Claude processes: {} ({})",
         status.live_sessions.len(),
         session_summary(&status.live_sessions)
     );
-    for drain in &status.abandoned_drains {
-        println!("  ! ABANDONED DRAIN: {}", drain.summary());
-        println!(
-            "    {:<22} rotating the default cannot move these; restart or resume them",
+    println!(
+        "    each spends the default from its next request: Claude re-reads the settings credential for every API client (except in an untrusted workspace); the account shown is what settings.json offers now{}",
+        if status
+            .live_sessions
+            .iter()
+            .any(|session| session.credential_source == SESSION_START_SOURCE)
+        {
+            ", ~ = SessionStart hook record (no credential history)"
+        } else {
             ""
-        );
-    }
+        }
+    );
     println!(
         "default thresholds: change at 5h <= {:.0}% left or 7d <= {:.0}% left",
         status.min_5h_remaining * 100.0,
@@ -3777,49 +3669,43 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_drain_reports_only_bound_non_default_accounts_below_floor() {
-        let policy = RotationSettings::default();
-        let results = vec![
-            result("default", 0.99, 0.99),
-            result("drained", 0.99, 0.99),
-            result("spare", 0.99, 0.99),
-            result("healthy", 0.10, 0.10),
+    fn a_live_session_on_a_drained_account_is_not_reported_as_stranded() {
+        // Started on `drained`, whose login token is good for hours more, then
+        // the default moved to `fresh`. The process spends `fresh` from its
+        // next request, so nothing is reported on `drained`.
+        let offer = |at, account: &str, expires_at| CredentialEvent {
+            at,
+            account: Some(account.into()),
+            fingerprint: Some(format!("{account}-fp")),
+            expires_at,
+            kind: "switch".into(),
+        };
+        let timeline = vec![
+            offer(1_000, "drained", Some(100_000)),
+            offer(5_000, "fresh", Some(100_000)),
         ];
-        let drains = abandoned_drains(
-            &results,
-            Some("default"),
-            &load(&[("default", 2), ("drained", 3), ("healthy", 4)]),
-            RotationMode::Normal,
-            &policy,
-            None,
-        );
-        // `default` is excluded (rotation handles it), `spare` has no bound
-        // sessions, `healthy` is above the floor. Only `drained` qualifies.
-        assert_eq!(drains.len(), 1);
-        assert_eq!(drains[0].account, "drained");
-        assert_eq!(drains[0].bound_sessions, 3);
-        assert!(drains[0].summary().contains("3 live session(s)"));
+        let binding = admission::BoundSession {
+            session_id: "s".into(),
+            account: "drained".into(),
+            transcript_path: std::path::PathBuf::from("/nonexistent"),
+        };
+        let (account, source) = attribute_session(&timeline, 6_000, Some(&binding));
+        assert_eq!(account.as_deref(), Some("fresh"));
+        assert_eq!(source, TIMELINE_SOURCE);
     }
 
     #[test]
-    fn abandoned_drain_ignores_accounts_with_no_quota_reading() {
-        let policy = RotationSettings::default();
-        let mut broken = result("broken", 0.99, 0.99);
-        broken.quota = None;
-        broken.error = Some("HTTP 401 Unauthorized".into());
-        let drains = abandoned_drains(
-            &results_of(vec![broken]),
-            Some("default"),
-            &load(&[("broken", 2)]),
-            RotationMode::Normal,
-            &policy,
-            None,
-        );
-        assert!(drains.is_empty());
-    }
-
-    fn results_of(results: Vec<ProbeResult>) -> Vec<ProbeResult> {
-        results
+    fn the_session_start_record_stands_in_only_without_history() {
+        let binding = admission::BoundSession {
+            session_id: "s".into(),
+            account: "launch".into(),
+            transcript_path: std::path::PathBuf::from("/nonexistent"),
+        };
+        let (account, source) = attribute_session(&[], 6_000, Some(&binding));
+        assert_eq!(account.as_deref(), Some("launch"));
+        assert_eq!(source, SESSION_START_SOURCE);
+        let (account, _) = attribute_session(&[], 6_000, None);
+        assert_eq!(account, None);
     }
 
     fn auth_failure(name: &str, code: &str) -> ProbeResult {
