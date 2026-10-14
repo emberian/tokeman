@@ -412,8 +412,8 @@ struct Canvas {
 impl Canvas {
     fn new(width: u32, height: u32, background: [u8; 4]) -> Self {
         let mut pixels = vec![0; width as usize * height as usize * 4];
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&background);
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            *pixel = background;
         }
         Self {
             width,
