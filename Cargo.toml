@@ -1,6 +1,6 @@
 [package]
 name = "tokeman"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Anthropic token usage visualizer"
 repository = "https://github.com/emberian/tokeman"
@@ -47,7 +47,6 @@ toml_edit = { version = "0.22", features = ["serde"] }
 tray-icon = { version = "0.21", optional = true }
 eframe = { version = "0.33", optional = true, features = ["glow"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
 # Codex's app-server control socket is JSON-RPC over WebSocket-over-Unix.
 tokio-tungstenite = "0.24"
 sha2 = "0.10"
