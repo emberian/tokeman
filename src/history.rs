@@ -51,6 +51,25 @@ pub enum EventKind {
     Unknown,
 }
 
+impl EventKind {
+    /// The on-disk spelling, for log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Activate => "activate",
+            Self::Install => "install",
+            Self::Refresh => "refresh",
+            Self::Upgrade => "upgrade",
+            Self::Fallback => "fallback",
+            Self::Repair => "repair",
+            Self::Pause => "pause",
+            Self::Legacy => "legacy",
+            Self::Revoke => "revoke",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// A non-reversible identifier for a credential value (16 hex characters).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

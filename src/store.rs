@@ -264,6 +264,63 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
     })
 }
 
+/// Burn rates over an account's snapshots, between consecutive readings of
+/// the same reset window.
+#[derive(Debug, Clone, Serialize)]
+pub struct Stats {
+    pub account: String,
+    pub snapshots: usize,
+    /// Fraction of the window used per hour, from the latest pair.
+    pub session_rate: Option<f64>,
+    pub weekly_rate: Option<f64>,
+    pub weekly_rate_mean: Option<f64>,
+    pub weekly_rate_stddev: Option<f64>,
+    pub weekly_rate_peak: Option<f64>,
+    pub session_hours_left: Option<f64>,
+    pub weekly_hours_left: Option<f64>,
+}
+
+impl Stats {
+    pub fn compute(account: &str, snapshots: &[Snapshot]) -> Self {
+        let rates = |series: Series| -> Vec<f64> {
+            snapshots
+                .windows(2)
+                .filter_map(|pair| {
+                    let hours = (pair[1].at - pair[0].at).num_seconds() as f64 / 3600.0;
+                    let (a, b) = (pair[0].window(series)?, pair[1].window(series)?);
+                    let rate = (b.used - a.used) / hours;
+                    (hours > 0.0
+                        && a.resets_at == b.resets_at
+                        && b.used >= a.used
+                        && rate.is_finite())
+                    .then_some(rate)
+                })
+                .collect()
+        };
+        let session = rates(Series::Session);
+        let weekly = rates(Series::Weekly);
+        let mean = (!weekly.is_empty()).then(|| weekly.iter().sum::<f64>() / weekly.len() as f64);
+        let stddev = mean.map(|mean| {
+            (weekly.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / weekly.len() as f64).sqrt()
+        });
+        let hours_left = |latest: Option<f64>, series: Series| {
+            let rate = latest.filter(|&r| r > 0.0)?;
+            Some(snapshots.last()?.window(series)?.remaining() / rate)
+        };
+        Self {
+            account: account.to_owned(),
+            snapshots: snapshots.len(),
+            session_rate: session.last().copied(),
+            weekly_rate: weekly.last().copied(),
+            weekly_rate_mean: mean,
+            weekly_rate_stddev: stddev,
+            weekly_rate_peak: weekly.iter().copied().reduce(f64::max),
+            session_hours_left: hours_left(session.last().copied(), Series::Session),
+            weekly_hours_left: hours_left(weekly.last().copied(), Series::Weekly),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
