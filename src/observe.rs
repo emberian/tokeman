@@ -708,7 +708,7 @@ pub fn quarantine(
         bail!("quarantine reset must be in the future");
     }
     if let Some(model) = &model
-        && model.family().map(Family::from) != Some(family)
+        && Family::of(model.as_str()) != family
     {
         bail!(
             "model '{model}' does not belong to the {} family",
@@ -1118,6 +1118,11 @@ mod tests {
         assert_eq!(result.weekly.map(|window| window.used), Some(0.2));
         assert_eq!(Family::of("claude-fable-5-1"), Family::Fable);
         assert_eq!(Family::of("claude-haiku-4-5"), Family::General);
+        assert_eq!(
+            Family::of(ModelKey::new("haiku45").as_str()),
+            Family::General
+        );
+        assert_eq!(Family::of(ModelKey::new("Opus 4.8").as_str()), Family::Opus);
     }
 
     #[test]
