@@ -1,127 +1,79 @@
+//! Probe history: one row per reading, in sqlite, for charts and stats.
+//!
+//! The schema is the one every row since 0.1.0 was written with; legacy
+//! Opus/Sonnet columns are read into buckets and no longer written.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use serde::Serialize;
 use std::time::Duration;
 
-use serde::Serialize;
-
-use crate::probe::{ModelQuotaBucket, ModelUsageSource, ProbeResult, Window};
+use crate::paths;
+use crate::quota::{Bucket, ModelKey, Reading, Source, Window};
 
 pub struct Store {
     conn: Connection,
 }
 
+/// One stored reading.
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)] // fields are populated from DB and available for queries
 pub struct Snapshot {
-    pub token_name: String,
-    pub probed_at: DateTime<Utc>,
-    pub unified_status: Option<String>,
-    pub utilization_5h: Option<f64>,
-    pub reset_5h: Option<i64>,
-    pub utilization_7d: Option<f64>,
-    pub reset_7d: Option<i64>,
-    pub representative_claim: Option<String>,
+    pub account: String,
+    pub at: DateTime<Utc>,
+    pub status: Option<String>,
+    pub claim: Option<String>,
+    pub session: Option<Window>,
+    pub weekly: Option<Window>,
     pub overage_status: Option<String>,
-    pub utilization_overage: Option<f64>,
-    pub reset_overage: Option<i64>,
+    pub overage: Option<Window>,
     pub error: Option<String>,
-    pub utilization_opus_7d: Option<f64>,
-    pub reset_opus_7d: Option<i64>,
-    pub utilization_sonnet_7d: Option<f64>,
-    pub reset_sonnet_7d: Option<i64>,
-    pub model_usage_error: Option<String>,
-    pub model_usage_buckets: Vec<ModelQuotaBucket>,
+    pub profile_error: Option<String>,
+    pub buckets: Vec<Bucket>,
 }
 
-/// A plottable utilization series stored on a snapshot.
+/// A series a chart can draw.
 #[derive(Clone, Copy)]
 pub enum Series<'a> {
-    FiveHour,
-    SevenDay,
+    Session,
+    Weekly,
     Overage,
-    Model(&'a str),
+    Model(&'a ModelKey),
 }
 
 impl Snapshot {
-    /// Model buckets, with legacy Opus/Sonnet columns folded in by the same
-    /// rule as `ModelUsage::buckets` (only when no bucket already has the key).
-    pub fn model_buckets(&self) -> Vec<ModelQuotaBucket> {
-        let mut buckets = self.model_usage_buckets.clone();
-        for (key, label, utilization, reset) in [
-            ("opus", "Opus", self.utilization_opus_7d, self.reset_opus_7d),
-            (
-                "sonnet",
-                "Sonnet",
-                self.utilization_sonnet_7d,
-                self.reset_sonnet_7d,
-            ),
-        ] {
-            if let Some(utilization) = utilization
-                && !buckets.iter().any(|bucket| bucket.key == key)
-            {
-                buckets.push(ModelQuotaBucket {
-                    key: key.into(),
-                    label: label.into(),
-                    window: Window {
-                        utilization,
-                        reset: reset.unwrap_or(0),
-                    },
-                    source: ModelUsageSource::Profile,
-                });
-            }
-        }
-        buckets
-    }
-
-    /// (utilization, reset) for one series, if this snapshot recorded it.
-    pub fn window(&self, series: Series) -> Option<(f64, Option<i64>)> {
+    pub fn window(&self, series: Series) -> Option<Window> {
         match series {
-            Series::FiveHour => Some((self.utilization_5h?, self.reset_5h)),
-            Series::SevenDay => Some((self.utilization_7d?, self.reset_7d)),
-            Series::Overage => Some((self.utilization_overage?, self.reset_overage)),
-            Series::Model(key) => {
-                if let Some(bucket) = self.model_usage_buckets.iter().find(|b| b.key == key) {
-                    return Some((bucket.window.utilization, Some(bucket.window.reset)));
-                }
-                match key {
-                    "opus" => Some((self.utilization_opus_7d?, self.reset_opus_7d)),
-                    "sonnet" => Some((self.utilization_sonnet_7d?, self.reset_sonnet_7d)),
-                    _ => None,
-                }
-            }
+            Series::Session => self.session,
+            Series::Weekly => self.weekly,
+            Series::Overage => self.overage,
+            Series::Model(key) => self
+                .buckets
+                .iter()
+                .find(|b| &b.key == key)
+                .map(|b| b.window),
         }
     }
 }
 
 impl Store {
     pub fn open() -> Result<Self> {
-        let path = Self::db_path()?;
+        Self::open_at(&paths::snapshots_db())
+    }
+
+    pub fn open_at(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)
+        let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        crate::private_fs::set_mode(&path, 0o600)?;
+        crate::fs::set_mode(path, 0o600)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
-    }
-
-    fn db_path() -> Result<PathBuf> {
-        let base = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".local")
-                    .join("share")
-            });
-        Ok(base.join("tokeman").join("snapshots.db"))
     }
 
     fn init(&self) -> Result<()> {
@@ -150,7 +102,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time
                 ON snapshots(token_name, probed_at);",
         )?;
-        // Existing databases predate these columns; ALTER fails harmlessly when present.
+        // Databases from 0.1.x predate these columns; ALTER fails harmlessly when present.
         for column in [
             "error TEXT",
             "utilization_opus_7d REAL",
@@ -167,61 +119,47 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert(&self, result: &ProbeResult) -> Result<()> {
-        fn split(window: Option<&Window>) -> (Option<f64>, Option<i64>) {
-            (window.map(|w| w.utilization), window.map(|w| w.reset))
-        }
-        let quota = result.quota.as_ref();
-        let (u5h, r5h) = split(quota.and_then(|q| q.session.as_ref()));
-        let (u7d, r7d) = split(quota.and_then(|q| q.weekly.as_ref()));
-        let (u_ov, r_ov) = split(quota.and_then(|q| q.overage.as_ref()));
-        let usage = result.model_usage.as_ref();
-        let (u_opus, r_opus) = split(usage.and_then(|u| u.opus_weekly.as_ref()));
-        let (u_sonnet, r_sonnet) = split(usage.and_then(|u| u.sonnet_weekly.as_ref()));
-        let model_usage_buckets = usage
-            .map(|usage| serde_json::to_string(&usage.buckets()))
+    pub fn insert(&self, reading: &Reading) -> Result<()> {
+        let split = |window: Option<Window>| (window.map(|w| w.used), window.map(|w| w.resets_at));
+        let (u5h, r5h) = split(reading.session);
+        let (u7d, r7d) = split(reading.weekly);
+        let overage = reading.overage.as_ref();
+        let (u_ov, r_ov) = split(overage.and_then(|o| o.window));
+        let buckets = (!reading.buckets.is_empty())
+            .then(|| serde_json::to_string(&reading.buckets))
             .transpose()?;
-
         self.conn.execute(
             "INSERT INTO snapshots (
-                token_name, probed_at,
-                unified_status, utilization_5h, reset_5h,
+                token_name, probed_at, unified_status, utilization_5h, reset_5h,
                 utilization_7d, reset_7d, representative_claim,
                 overage_status, utilization_overage, reset_overage, error,
-                utilization_opus_7d, reset_opus_7d,
-                utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                model_usage_buckets
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18
-            )",
+                model_usage_error, model_usage_buckets
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
-                result.token_name,
-                result.probed_at.to_rfc3339(),
-                quota.map(|q| q.status.as_str()),
+                reading.account,
+                DateTime::from_timestamp(reading.at, 0)
+                    .unwrap_or_default()
+                    .to_rfc3339(),
+                reading.verdict.as_str(),
                 u5h,
                 r5h,
                 u7d,
                 r7d,
-                quota.map(|q| q.representative_claim.as_str()),
-                quota.and_then(|q| q.overage_status.as_deref()),
+                reading.claim.as_deref(),
+                overage.and_then(|o| o.status.as_deref()),
                 u_ov,
                 r_ov,
-                result.error.as_deref(),
-                u_opus,
-                r_opus,
-                u_sonnet,
-                r_sonnet,
-                result.model_usage_error.as_deref(),
-                model_usage_buckets,
+                reading.error.as_ref().map(ToString::to_string),
+                reading.profile_error.as_deref(),
+                buckets,
             ],
         )?;
         Ok(())
     }
 
-    pub fn recent(&self, token_name: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
+    pub fn recent(&self, account: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
         let limit = limit as i64;
-        match token_name {
+        match account {
             Some(name) => self.query(
                 "WHERE token_name = ?1 ORDER BY probed_at DESC LIMIT ?2",
                 params![name, limit],
@@ -230,15 +168,11 @@ impl Store {
         }
     }
 
-    pub fn for_token_since(&self, token_name: &str, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
+    pub fn for_account_since(&self, account: &str, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
         self.query(
             "WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
-            params![token_name, since.to_rfc3339()],
+            params![account, since.to_rfc3339()],
         )
-    }
-
-    pub fn all(&self) -> Result<Vec<Snapshot>> {
-        self.query("ORDER BY probed_at ASC", [])
     }
 
     pub fn all_since(&self, since: DateTime<Utc>) -> Result<Vec<Snapshot>> {
@@ -249,7 +183,7 @@ impl Store {
     }
 
     fn query(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Snapshot>> {
-        const SELECT_COLS: &str =
+        const SELECT: &str =
             "SELECT token_name, probed_at, unified_status, utilization_5h, reset_5h,
                     utilization_7d, reset_7d, representative_claim,
                     overage_status, utilization_overage, reset_overage, error,
@@ -257,109 +191,151 @@ impl Store {
                     utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
                     model_usage_buckets
              FROM snapshots";
-        let mut stmt = self.conn.prepare(&format!("{SELECT_COLS} {tail}"))?;
+        let mut stmt = self.conn.prepare(&format!("{SELECT} {tail}"))?;
         let snapshots = stmt
-            .query_map(params, Self::map_row)?
+            .query_map(params, map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(snapshots)
     }
+}
 
-    fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
-        let probed_at_str: String = row.get(1)?;
-        let mut model_usage_buckets: Vec<ModelQuotaBucket> = row
-            .get::<_, Option<String>>(17)?
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
-        // Rows written before keys were canonicalized say `claudeopus48`
-        // where newer ones say `opus48`; one key keeps one history line.
-        for bucket in &mut model_usage_buckets {
-            bucket.key = crate::probe::model_key(&bucket.key);
-        }
-        let probed_at = DateTime::parse_from_rfc3339(&probed_at_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                NaiveDateTime::parse_from_str(&probed_at_str, "%Y-%m-%dT%H:%M:%S%.f")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-
-        Ok(Snapshot {
-            token_name: row.get(0)?,
-            probed_at,
-            unified_status: row.get(2)?,
-            utilization_5h: row.get(3)?,
-            reset_5h: row.get(4)?,
-            utilization_7d: row.get(5)?,
-            reset_7d: row.get(6)?,
-            representative_claim: row.get(7)?,
-            overage_status: row.get(8)?,
-            utilization_overage: row.get(9)?,
-            reset_overage: row.get(10)?,
-            error: row.get(11)?,
-            utilization_opus_7d: row.get(12)?,
-            reset_opus_7d: row.get(13)?,
-            utilization_sonnet_7d: row.get(14)?,
-            reset_sonnet_7d: row.get(15)?,
-            model_usage_error: row.get(16)?,
-            model_usage_buckets,
+fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
+    let window = |used: Option<f64>, reset: Option<i64>| {
+        used.map(|used| Window::new(used, reset.unwrap_or(0)))
+    };
+    let at: String = row.get(1)?;
+    let at = DateTime::parse_from_rfc3339(&at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(&at, "%Y-%m-%dT%H:%M:%S%.f").map(|ndt| ndt.and_utc())
         })
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let mut buckets: Vec<Bucket> = row
+        .get::<_, Option<String>>(17)?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    // Rows written before keys were canonical say `claudeopus48` for `opus48`.
+    for bucket in &mut buckets {
+        bucket.key = ModelKey::new(bucket.key.as_str());
     }
+    // Legacy Opus/Sonnet columns, only when no bucket carries the family.
+    for (family, used, reset) in [
+        (
+            "opus",
+            row.get::<_, Option<f64>>(12)?,
+            row.get::<_, Option<i64>>(13)?,
+        ),
+        (
+            "sonnet",
+            row.get::<_, Option<f64>>(14)?,
+            row.get::<_, Option<i64>>(15)?,
+        ),
+    ] {
+        let key = ModelKey::new(family);
+        if let Some(window) = window(used, reset)
+            && !buckets.iter().any(|bucket| bucket.key == key)
+        {
+            buckets.push(Bucket {
+                label: family[..1].to_ascii_uppercase() + &family[1..],
+                key,
+                window,
+                source: Source::Profile,
+            });
+        }
+    }
+    Ok(Snapshot {
+        account: row.get(0)?,
+        at,
+        status: row.get(2)?,
+        session: window(row.get(3)?, row.get(4)?),
+        weekly: window(row.get(5)?, row.get(6)?),
+        claim: row.get(7)?,
+        overage_status: row.get(8)?,
+        overage: window(row.get(9)?, row.get(10)?),
+        error: row.get(11)?,
+        profile_error: row.get(16)?,
+        buckets,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::{Overage, Verdict};
+
+    fn reading() -> Reading {
+        Reading {
+            account: "acct".into(),
+            at: 1_700_000_000,
+            verdict: Verdict::Allowed,
+            claim: Some("five_hour".into()),
+            session: Some(Window::new(0.25, 10)),
+            weekly: Some(Window::new(0.5, 20)),
+            buckets: vec![Bucket {
+                key: ModelKey::new("Opus 4.8"),
+                label: "Opus 4.8".into(),
+                window: Window::new(0.75, 30),
+                source: Source::Profile,
+            }],
+            overage: Some(Overage {
+                status: Some("ok".into()),
+                window: Some(Window::new(0.1, 40)),
+                ..Overage::default()
+            }),
+            error: None,
+            profile_error: None,
+        }
+    }
 
     #[test]
-    fn legacy_model_columns_fold_in_only_when_bucket_missing() {
-        let bucket = |key: &str, utilization: f64| ModelQuotaBucket {
-            key: key.into(),
-            label: key.into(),
-            window: Window {
-                utilization,
-                reset: 7,
-            },
-            source: ModelUsageSource::ObservedRejection,
-        };
-        let snapshot = Snapshot {
-            token_name: "t".into(),
-            probed_at: Utc::now(),
-            unified_status: None,
-            utilization_5h: Some(0.1),
-            reset_5h: None,
-            utilization_7d: None,
-            reset_7d: None,
-            representative_claim: None,
-            overage_status: None,
-            utilization_overage: None,
-            reset_overage: None,
-            error: None,
-            utilization_opus_7d: Some(0.2),
-            reset_opus_7d: Some(1),
-            utilization_sonnet_7d: Some(0.3),
-            reset_sonnet_7d: Some(2),
-            model_usage_error: None,
-            model_usage_buckets: vec![bucket("opus", 0.9)],
-        };
-        let keys: Vec<_> = snapshot
-            .model_buckets()
-            .into_iter()
-            .map(|b| (b.key, b.window.utilization))
-            .collect();
-        assert_eq!(keys, [("opus".into(), 0.9), ("sonnet".into(), 0.3)]);
-        assert_eq!(snapshot.window(Series::Model("opus")), Some((0.9, Some(7))));
+    fn a_reading_round_trips_through_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_at(&dir.path().join("s.db")).unwrap();
+        store.insert(&reading()).unwrap();
+        let rows = store.recent(Some("acct"), 5).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.at.timestamp(), 1_700_000_000);
+        assert_eq!(row.status.as_deref(), Some("allowed"));
+        assert_eq!(row.window(Series::Session), Some(Window::new(0.25, 10)));
+        assert_eq!(row.window(Series::Overage), Some(Window::new(0.1, 40)));
         assert_eq!(
-            snapshot.window(Series::Model("sonnet")),
-            Some((0.3, Some(2)))
+            row.window(Series::Model(&ModelKey::new("opus48"))),
+            Some(Window::new(0.75, 30))
         );
-        assert_eq!(snapshot.window(Series::Model("fable")), None);
-        assert_eq!(snapshot.window(Series::FiveHour), Some((0.1, None)));
-        assert_eq!(snapshot.window(Series::SevenDay), None);
+        assert!(store.recent(Some("other"), 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_model_columns_fold_in_only_when_no_bucket_has_the_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_at(&dir.path().join("s.db")).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO snapshots (token_name, probed_at, utilization_opus_7d, reset_opus_7d,
+                    utilization_sonnet_7d, model_usage_buckets)
+                 VALUES ('old', '2026-01-01T00:00:00Z', 0.4, 7, 0.2,
+                    '[{\"key\":\"claudeopus48\",\"label\":\"Opus 4.8\",\"window\":{\"utilization\":0.9,\"reset\":1},\"source\":\"profile\"}]')",
+                [],
+            )
+            .unwrap();
+        let row = store.recent(None, 1).unwrap().remove(0);
+        let keys: Vec<_> = row
+            .buckets
+            .iter()
+            .map(|b| b.key.as_str().to_owned())
+            .collect();
+        assert_eq!(keys, ["opus48", "opus", "sonnet"]);
+        assert_eq!(
+            row.window(Series::Model(&ModelKey::new("sonnet"))),
+            Some(Window::new(0.2, 0))
+        );
     }
 }
