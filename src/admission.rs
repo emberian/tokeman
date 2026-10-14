@@ -18,6 +18,13 @@ use crate::probe::{
 };
 
 pub const ACCOUNT_ENV: &str = "TOKEMAN_ACCOUNT";
+/// Declares outright whether a session spends this machine's Anthropic
+/// subscription, overriding the base-URL heuristic. Set it to 1 when a session
+/// reaches Anthropic through a gateway (so `ANTHROPIC_BASE_URL` points at the
+/// gateway rather than Anthropic), or to 0 to keep a session out of admission
+/// state entirely.
+pub const SPENDS_ENV: &str = "TOKEMAN_SESSION_SPENDS";
+const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const STATE_FILE: &str = "claude-admission-state.json";
 const LOCK_FILE: &str = "claude-admission-state.lock";
 const SESSION_RETENTION_DAYS: i64 = 14;
@@ -192,7 +199,60 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn env_flag(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_anthropic_base_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    // Keep bracketed IPv6 literals intact; only strip a trailing :port.
+    let host = match host_port.rfind(':') {
+        Some(index) if !host_port[index + 1..].contains(']') => &host_port[..index],
+        _ => host_port,
+    };
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == "anthropic.com" || host.ends_with(".anthropic.com")
+}
+
+/// Whether the session this hook fired for spends the machine's Anthropic
+/// subscription quota.
+///
+/// A session pointed at a third-party endpoint must not be bound to an
+/// Anthropic account. The binding is what later attributes transcript text to
+/// a token, so a GLM or Kimi session reporting *its own* provider's "weekly
+/// limit" would be recorded as an Anthropic usage limit and rotate the default
+/// away from a token that was never touched. Hooks are children of the Claude
+/// Code process, so they inherit the launcher's `ANTHROPIC_BASE_URL`.
+fn session_spends_anthropic_quota() -> bool {
+    if let Some(explicit) = env_flag(SPENDS_ENV) {
+        return explicit;
+    }
+    // Bedrock and Vertex sessions bill the cloud account, not the subscription.
+    for flag in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"] {
+        if env_flag(flag).unwrap_or(false) {
+            return false;
+        }
+    }
+    match std::env::var(BASE_URL_ENV) {
+        Ok(url) if !url.trim().is_empty() => is_anthropic_base_url(url.trim()),
+        _ => true,
+    }
+}
+
 pub fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
+    if !session_spends_anthropic_quota() {
+        return Ok(());
+    }
     let now = Utc::now().timestamp();
     let started_at = (pid > 0).then(|| process_started_at(pid)).flatten();
     // A live process spends whatever settings offer now, so the credential
@@ -827,6 +887,50 @@ mod tests {
             },
             error: None,
         }
+    }
+
+    #[test]
+    fn anthropic_base_urls_are_recognised() {
+        for url in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com:443/v1/messages",
+            "HTTPS://API.ANTHROPIC.COM/",
+            "https://anthropic.com",
+        ] {
+            assert!(is_anthropic_base_url(url), "expected Anthropic: {url}");
+        }
+    }
+
+    #[test]
+    fn third_party_base_urls_are_not_anthropic() {
+        for url in [
+            "https://api.z.ai/api/anthropic",
+            "https://api.kimi.com/coding",
+            "https://cli-chat-proxy.grok.com",
+            "http://127.0.0.1:8317",
+            "http://localhost:8317/v1",
+            // A lookalike host must not pass as Anthropic.
+            "https://api.anthropic.com.evil.test/v1",
+            "https://notanthropic.com",
+        ] {
+            assert!(!is_anthropic_base_url(url), "expected third party: {url}");
+        }
+    }
+
+    #[test]
+    fn env_flag_parses_the_usual_spellings() {
+        assert_eq!(env_flag("TOKEMAN_TEST_FLAG_UNSET_XYZ"), None);
+        for (raw, want) in [
+            ("1", true), ("true", true), ("YES", true), (" on ", true),
+            ("0", false), ("false", false), ("No", false), ("off", false),
+        ] {
+            unsafe { std::env::set_var("TOKEMAN_TEST_FLAG_XYZ", raw) };
+            assert_eq!(env_flag("TOKEMAN_TEST_FLAG_XYZ"), Some(want), "raw={raw:?}");
+        }
+        unsafe { std::env::set_var("TOKEMAN_TEST_FLAG_XYZ", "banana") };
+        assert_eq!(env_flag("TOKEMAN_TEST_FLAG_XYZ"), None);
+        unsafe { std::env::remove_var("TOKEMAN_TEST_FLAG_XYZ") };
     }
 
     #[test]
