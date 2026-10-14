@@ -104,6 +104,8 @@ tokeman add <name> <key>         # add a token
 tokeman remove <name>            # remove a token
 tokeman history [--last N]       # show recent snapshots
 tokeman stats                    # burn rates and usage statistics
+tokeman settings [show]          # launch settings (args, dangerous mode, terminal, binary)
+tokeman settings set <key> <value>  # change one; the tray apps write through this
 ```
 
 ### Startup-default rotation

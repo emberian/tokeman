@@ -187,66 +187,6 @@ struct TokemanConfig {
         return config
     }
 
-    func save() {
-        var lines: [String] = []
-        for token in tokens {
-            lines.append("[[tokens]]")
-            lines.append("name = \"\(Self.escapeToml(token.name))\"")
-            lines.append("key = \"\(Self.escapeToml(token.key))\"")
-            if let usageKey = token.usageKey {
-                lines.append("usage_key = \"\(Self.escapeToml(usageKey))\"")
-            }
-            lines.append("")
-        }
-        lines.append("[settings]")
-        if !settings.launchArgs.isEmpty {
-            let args = settings.launchArgs
-                .map { "\"\(Self.escapeToml($0))\"" }
-                .joined(separator: ", ")
-            lines.append("launch_args = [\(args)]")
-        }
-        lines.append("dangerous_mode = \(settings.dangerousMode)")
-        if let terminal = settings.terminal {
-            lines.append("terminal = \"\(Self.escapeToml(terminal))\"")
-        }
-        if let claudeBin = settings.claudeBin {
-            lines.append("claude_bin = \"\(Self.escapeToml(claudeBin))\"")
-        }
-        lines.append("probe_interval_secs = \(settings.probeIntervalSecs)")
-        lines.append("")
-        lines.append("[rotation]")
-        lines.append("normal_min_5h_remaining = \(rotation.normalMin5hRemaining)")
-        lines.append("normal_min_7d_remaining = \(rotation.normalMin7dRemaining)")
-        lines.append("sip_min_5h_remaining = \(rotation.sipMin5hRemaining)")
-        lines.append("sip_min_7d_remaining = \(rotation.sipMin7dRemaining)")
-        lines.append("normal_probe_interval_secs = \(rotation.normalProbeIntervalSecs)")
-        lines.append("sip_probe_interval_secs = \(rotation.sipProbeIntervalSecs)")
-        lines.append("")
-
-        let content = lines.joined(separator: "\n")
-        let url = URL(fileURLWithPath: Self.configPath)
-        let directory = url.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: Self.configPath
-            )
-        } catch {
-            fputs("tokeman tray: failed to save config: \(error)\n", stderr)
-        }
-    }
-
-    private static func escapeToml(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-         .replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
     private static func unquote(_ s: String) -> String {
         if s.hasPrefix("\"") && s.hasSuffix("\"") && s.count >= 2 {
             if let data = s.data(using: .utf8),
@@ -411,19 +351,35 @@ class TokemanViewModel: ObservableObject {
     }
 
     func toggleDangerMode() {
-        config.settings.dangerousMode.toggle()
-        config.save()
+        let enable = !config.settings.dangerousMode
+        // Move the switch at once; the reload below confirms what was saved.
+        config.settings.dangerousMode = enable
+        Task {
+            await setSetting("dangerous_mode", enable ? "true" : "false")
+            reloadConfig()
+        }
     }
 
     func saveSettings(launchArgs: String, terminal: String, claudeBin: String, probeInterval: String) {
-        config.settings.launchArgs = launchArgs
-            .components(separatedBy: .whitespaces)
-            .filter { !$0.isEmpty }
-        config.settings.terminal = terminal.isEmpty ? nil : terminal
-        config.settings.claudeBin = claudeBin.isEmpty ? nil : claudeBin
-        config.settings.probeIntervalSecs = Int(probeInterval) ?? 30
-        config.save()
-        reloadConfig()
+        Task {
+            await setSetting("launch_args", launchArgs)
+            await setSetting("terminal", terminal)
+            await setSetting("claude_bin", claudeBin)
+            await setSetting("probe_interval_secs", probeInterval)
+            reloadConfig()
+        }
+    }
+
+    /// Every write to tokens.toml goes through tokeman itself. Its writer
+    /// takes the config lock and keeps comments and every field this app does
+    /// not model: login grants (whose refresh tokens are single-use), Codex
+    /// accounts and the rotation floors. This app used to rewrite the file
+    /// from its own line parser and lost all of them.
+    private func setSetting(_ key: String, _ value: String) async {
+        let output = await shell(findTokenman(), args: ["settings", "set", key, value])
+        if !output.hasPrefix("set ") {
+            fputs("tokeman tray: could not set \(key): \(output)\n", stderr)
+        }
     }
 
     func launchToken(_ name: String) {

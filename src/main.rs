@@ -155,9 +155,27 @@ enum Command {
         /// Account to refresh (default: every account with a login)
         name: Option<String>,
     },
+    /// Show or change the launch settings in tokens.toml
+    Settings {
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
+    },
     /// Run as a system tray application
     #[cfg(feature = "tray")]
     Tray,
+}
+
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Print every launch setting
+    Show,
+    /// Set one launch setting (launch_args, dangerous_mode, terminal,
+    /// claude_bin, probe_interval_secs); an empty value clears it
+    Set {
+        key: String,
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -489,6 +507,23 @@ async fn main() -> Result<()> {
             }
             println!("{refreshed} grant(s) refreshed.");
         }
+        Some(Command::Settings { action }) => match action.unwrap_or(SettingsAction::Show) {
+            SettingsAction::Show => {
+                let settings = config::Config::load()?.settings;
+                println!("launch_args = {}", settings.launch_args.join(" "));
+                println!("dangerous_mode = {}", settings.dangerous_mode);
+                println!("terminal = {}", settings.terminal.as_deref().unwrap_or(""));
+                println!(
+                    "claude_bin = {}",
+                    settings.claude_bin.as_deref().unwrap_or("")
+                );
+                println!("probe_interval_secs = {}", settings.probe_interval_secs);
+            }
+            SettingsAction::Set { key, value } => {
+                config::Config::update(|cfg| cfg.settings.set(&key, &value))?;
+                println!("set {key} = {value}");
+            }
+        },
         Some(Command::Rotate { action }) => {
             let cfg = config::Config::load()?;
             match action {

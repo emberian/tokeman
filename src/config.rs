@@ -395,6 +395,71 @@ impl LaunchSettings {
     }
 }
 
+impl LaunchSettings {
+    /// Every key `tokeman settings set` accepts.
+    pub const KEYS: [&'static str; 5] = [
+        "launch_args",
+        "dangerous_mode",
+        "terminal",
+        "claude_bin",
+        "probe_interval_secs",
+    ];
+
+    /// Set one field from its command-line spelling. An empty value clears
+    /// `terminal` and `claude_bin` and empties `launch_args`, which is split
+    /// on whitespace.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let value = value.trim();
+        match key {
+            "launch_args" => {
+                self.launch_args = value.split_whitespace().map(str::to_owned).collect()
+            }
+            "dangerous_mode" => {
+                self.dangerous_mode = match value {
+                    "true" | "on" | "1" => true,
+                    "false" | "off" | "0" => false,
+                    _ => bail!("dangerous_mode takes true or false, not {value:?}"),
+                }
+            }
+            "terminal" => self.terminal = (!value.is_empty()).then(|| value.to_owned()),
+            "claude_bin" => self.claude_bin = (!value.is_empty()).then(|| value.to_owned()),
+            "probe_interval_secs" => {
+                self.probe_interval_secs = match value.parse() {
+                    Ok(secs) if secs >= 1 => secs,
+                    _ => bail!("probe_interval_secs takes a whole number of seconds, at least 1"),
+                }
+            }
+            _ => bail!("unknown setting {key:?}; one of {}", Self::KEYS.join(", ")),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_settings_tests {
+    use super::LaunchSettings;
+
+    #[test]
+    fn set_parses_each_key_and_rejects_the_rest() {
+        let mut settings = LaunchSettings::default();
+        settings.set("launch_args", "  --model opus  ").unwrap();
+        assert_eq!(settings.launch_args, ["--model", "opus"]);
+        settings.set("launch_args", "").unwrap();
+        assert!(settings.launch_args.is_empty());
+        settings.set("dangerous_mode", "true").unwrap();
+        assert!(settings.dangerous_mode);
+        assert!(settings.set("dangerous_mode", "maybe").is_err());
+        settings.set("terminal", "iTerm2").unwrap();
+        assert_eq!(settings.terminal.as_deref(), Some("iTerm2"));
+        settings.set("terminal", "").unwrap();
+        assert_eq!(settings.terminal, None);
+        settings.set("probe_interval_secs", "45").unwrap();
+        assert_eq!(settings.probe_interval_secs, 45);
+        assert!(settings.set("probe_interval_secs", "0").is_err());
+        assert!(settings.set("colour", "red").is_err());
+    }
+}
+
 impl Default for LaunchSettings {
     fn default() -> Self {
         Self {
