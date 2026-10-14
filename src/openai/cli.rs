@@ -167,8 +167,8 @@ pub async fn list(json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<12} {:<26} {:<7} {:<16} {:<16} {}",
-        "ACCOUNT", "EMAIL", "PLAN", "PRIMARY", "SECONDARY", "STATE"
+        "{:<12} {:<26} {:<7} {:<16} {:<16} STATE",
+        "ACCOUNT", "EMAIL", "PLAN", "PRIMARY", "SECONDARY"
     );
     for result in &results {
         println!(

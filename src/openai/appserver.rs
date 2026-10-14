@@ -90,7 +90,7 @@ impl AppServer {
 
     async fn send(&mut self, message: &Value) -> Result<()> {
         self.socket
-            .send(Message::Text(serde_json::to_string(message)?.into()))
+            .send(Message::Text(serde_json::to_string(message)?))
             .await
             .context("failed to write to control socket")?;
         Ok(())
