@@ -18,7 +18,7 @@ use crate::terminal;
 
 enum BgCmd {
     ForceRefresh,
-    UpdateConfig(Config),
+    UpdateConfig(Box<Config>),
     Shutdown,
 }
 
@@ -137,7 +137,7 @@ fn spawn_bg_thread(
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(BgCmd::ForceRefresh) | Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Ok(BgCmd::UpdateConfig(new_cfg)) => {
-                            config = new_cfg;
+                            config = *new_cfg;
                             deadline = Instant::now()
                                 + std::time::Duration::from_secs(
                                     config.settings.probe_interval_secs.max(1),
@@ -443,7 +443,9 @@ impl TokemaApp {
                 }) {
                     self.config = fresh;
                 }
-                let _ = self.bg_tx.send(BgCmd::UpdateConfig(self.config.clone()));
+                let _ = self
+                    .bg_tx
+                    .send(BgCmd::UpdateConfig(Box::new(self.config.clone())));
             }
 
             let painter = ui.painter();
@@ -538,7 +540,9 @@ impl TokemaApp {
                 }) {
                     self.config = fresh;
                 }
-                let _ = self.bg_tx.send(BgCmd::UpdateConfig(self.config.clone()));
+                let _ = self
+                    .bg_tx
+                    .send(BgCmd::UpdateConfig(Box::new(self.config.clone())));
                 self.settings_open = false;
             }
             if ui.button("Cancel").clicked() {

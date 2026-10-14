@@ -370,6 +370,7 @@ enum RotateAction {
 enum ModelArg {
     Opus,
     Sonnet,
+    Fable,
     General,
 }
 
@@ -378,6 +379,7 @@ impl From<ModelArg> for admission::ModelFamily {
         match value {
             ModelArg::Opus => Self::Opus,
             ModelArg::Sonnet => Self::Sonnet,
+            ModelArg::Fable => Self::Fable,
             ModelArg::General => Self::General,
         }
     }
