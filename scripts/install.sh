@@ -19,6 +19,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
     /usr/bin/codesign --force --sign - --timestamp=none "$binary"
   fi
   /usr/bin/codesign --verify --strict "$binary"
-fi
+  "$binary" rotate install
+else
+  cat <<EOF
+installed $binary
 
-"$binary" rotate install
+The background rotation service is a macOS LaunchAgent, so none was installed
+here. Run the monitor under your own supervisor instead, for example a systemd
+user unit whose ExecStart is:
+
+  $binary rotate daemon
+EOF
+fi
