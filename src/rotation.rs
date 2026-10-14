@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 // process census goes through tokio::process.
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
@@ -2052,21 +2053,71 @@ struct DefaultEvent {
     account: Option<String>,
 }
 
+/// What a stat says about a log file's contents: length and modification
+/// time, or `None` when the file does not exist.
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+/// Default changes reconstructed from the rotation log, kept until either
+/// log file changes.
+///
+/// The JSONL credential history is the primary source; the log only fills in
+/// the period before it existed, and that period never changes. Yet every
+/// caller of [`credential_timeline`] (each 20-second daemon cycle through
+/// `scan_transcripts`, each status or TUI refresh, each SessionStart hook)
+/// was re-reading and re-parsing up to two 4 MB files to get the same answer.
+struct LegacyEventCache {
+    stamps: Vec<FileStamp>,
+    events: Vec<DefaultEvent>,
+}
+
+impl LegacyEventCache {
+    /// Whether the cached events still describe the files behind `stamps`.
+    /// An append changes the length, a rotation changes both files.
+    fn is_fresh(&self, stamps: &[FileStamp]) -> bool {
+        self.stamps == stamps
+    }
+}
+
+static LEGACY_EVENTS: Mutex<Option<LegacyEventCache>> = Mutex::new(None);
+
+/// Default changes from one or more rotation logs, oldest first.
+fn parse_default_events<'a>(logs: impl IntoIterator<Item = &'a str>) -> Vec<DefaultEvent> {
+    let mut events: Vec<DefaultEvent> = logs
+        .into_iter()
+        .flat_map(|contents| contents.lines().filter_map(parse_default_event))
+        .collect();
+    events.sort_by_key(|event| event.at);
+    events
+}
+
 fn default_events() -> Vec<DefaultEvent> {
     let Ok(path) = log_path() else {
         return Vec::new();
     };
-    let mut events = [previous_log_path(&path), path]
+    let paths = [previous_log_path(&path), path];
+    let stamps: Vec<FileStamp> = paths.iter().map(|path| file_stamp(path)).collect();
+    let mut cache = LEGACY_EVENTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cache.as_ref()
+        && cached.is_fresh(&stamps)
+    {
+        return cached.events.clone();
+    }
+    let contents: Vec<String> = paths
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
-        .flat_map(|contents| {
-            contents
-                .lines()
-                .filter_map(parse_default_event)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    events.sort_by_key(|event| event.at);
+        .collect();
+    let events = parse_default_events(contents.iter().map(String::as_str));
+    *cache = Some(LegacyEventCache {
+        stamps,
+        events: events.clone(),
+    });
     events
 }
 
@@ -3663,6 +3714,32 @@ mod tests {
         .unwrap();
         assert_eq!(paused.account, None);
         assert!(parse_default_event("2026-07-26T22:25:00Z kept ember@example.com").is_none());
+    }
+
+    #[test]
+    fn legacy_events_merge_both_logs_in_time_order() {
+        let older = "2026-07-26T22:23:09Z explicitly activated a@example.com\n\
+                     2026-07-26T22:25:00Z kept a@example.com\n";
+        let newer = "2026-07-26T22:23:19Z switch a@example.com -> b@example.com; floor\n";
+        let accounts: Vec<_> = parse_default_events([newer, older])
+            .into_iter()
+            .map(|event| event.account.unwrap())
+            .collect();
+        assert_eq!(accounts, ["a@example.com", "b@example.com"]);
+    }
+
+    #[test]
+    fn the_legacy_event_cache_is_reused_until_a_log_changes() {
+        let stamps: Vec<FileStamp> = vec![None, Some((10, None))];
+        let cache = LegacyEventCache {
+            stamps: stamps.clone(),
+            events: Vec::new(),
+        };
+        assert!(cache.is_fresh(&stamps));
+        // An appended line changes the length.
+        assert!(!cache.is_fresh(&[None, Some((11, None))]));
+        // A rotation moves the log aside and starts a new one.
+        assert!(!cache.is_fresh(&[Some((10, None)), None]));
     }
 
     #[test]
