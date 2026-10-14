@@ -203,6 +203,16 @@ struct CadenceState {
     header_samples: BTreeMap<String, HeaderSample>,
 }
 
+impl CadenceState {
+    /// Drop per-account entries for accounts no longer in the config, so a
+    /// removed account's backoff and samples do not outlive it in state.
+    fn retain_accounts(&mut self, tokens: &[Token]) {
+        let configured = |name: &String| tokens.iter().any(|token| token.name == *name);
+        self.auth_backoff.retain(|name, _| configured(name));
+        self.header_samples.retain(|name, _| configured(name));
+    }
+}
+
 /// What an occasional target-model probe saw of the limits only that model's
 /// responses carry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1642,6 +1652,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     }
 
     let mut cadence = load_cadence();
+    cadence.retain_accounts(&config.tokens);
     let previous_mode = cadence.mode.unwrap_or(RotationMode::Normal);
     let probe_started_epoch = now_epoch();
     if options.scheduled && new_admission_limits == 0 {
@@ -3824,6 +3835,32 @@ mod tests {
         assert_eq!(auth_backoff_secs(3), 1200.0);
         assert_eq!(auth_backoff_secs(4), 1800.0);
         assert_eq!(auth_backoff_secs(50), 1800.0);
+    }
+
+    #[test]
+    fn state_forgets_accounts_that_left_the_config() {
+        let mut cadence = CadenceState::default();
+        for name in ["kept", "removed"] {
+            cadence.auth_backoff.insert(
+                name.into(),
+                AuthBackoff {
+                    failures: 1,
+                    next_attempt_epoch: 0.0,
+                    last_error: String::new(),
+                },
+            );
+            cadence.header_samples.insert(
+                name.into(),
+                HeaderSample {
+                    sampled_at: 0.0,
+                    answered: false,
+                    window: None,
+                },
+            );
+        }
+        cadence.retain_accounts(&[login_account("kept")]);
+        assert_eq!(cadence.auth_backoff.keys().collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(cadence.header_samples.keys().collect::<Vec<_>>(), ["kept"]);
     }
 
     fn login_account(name: &str) -> Token {
