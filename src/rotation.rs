@@ -173,6 +173,19 @@ struct AuthBackoff {
     failures: u32,
     next_attempt_epoch: f64,
     last_error: String,
+    /// Fingerprint of the credential that was refused. The refusal is an
+    /// answer about that credential only: once the account offers another
+    /// one (a refreshed login, a new `tokeman login`, a new setup key) the
+    /// backoff no longer applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+}
+
+/// Fingerprint of the credential `token` would offer at `now` (epoch seconds).
+fn credential_fingerprint(token: &Token, now: f64) -> Option<String> {
+    token
+        .credential((now * 1000.0) as i64)
+        .map(|credential| credential_history::fingerprint(credential.value))
 }
 
 /// 5m, 10m, 20m, then every 30m. Long enough to stop the bleeding, short
@@ -210,6 +223,15 @@ impl CadenceState {
         let configured = |name: &String| tokens.iter().any(|token| token.name == *name);
         self.auth_backoff.retain(|name, _| configured(name));
         self.header_samples.retain(|name, _| configured(name));
+    }
+
+    /// Whether `token` is still parked: its recheck is not due and it still
+    /// offers the credential that was refused. A changed credential is probed
+    /// on the next cycle, however much of the backoff is left.
+    fn in_auth_backoff(&self, token: &Token, now: f64) -> bool {
+        self.auth_backoff.get(&token.name).is_some_and(|entry| {
+            now < entry.next_attempt_epoch && entry.credential == credential_fingerprint(token, now)
+        })
     }
 }
 
@@ -1345,6 +1367,7 @@ fn describe_for(result: Option<&ProbeResult>, target_model: Option<&str>) -> Str
 /// Fold this cycle's outcomes into the recheck schedule.
 fn update_auth_backoff(
     backoff: &mut BTreeMap<String, AuthBackoff>,
+    tokens: &[Token],
     results: &[ProbeResult],
     probed: &std::collections::HashSet<String>,
     now: f64,
@@ -1361,10 +1384,15 @@ fn update_auth_backoff(
                     failures: 0,
                     next_attempt_epoch: 0.0,
                     last_error: String::new(),
+                    credential: None,
                 });
             entry.failures = entry.failures.saturating_add(1);
             entry.last_error = result.error.clone().unwrap_or_default();
             entry.next_attempt_epoch = now + auth_backoff_secs(entry.failures);
+            entry.credential = tokens
+                .iter()
+                .find(|token| token.name == result.token_name)
+                .and_then(|token| credential_fingerprint(token, now));
             if entry.failures == 1 {
                 newly_parked.push(result.token_name.clone());
             }
@@ -1456,12 +1484,7 @@ fn describe_header_sampling(
         .tokens
         .iter()
         .filter(|token| token.usage_credential((now * 1000.0) as i64).is_none())
-        .filter(|token| {
-            cadence
-                .auth_backoff
-                .get(&token.name)
-                .is_none_or(|entry| now >= entry.next_attempt_epoch)
-        })
+        .filter(|token| !cadence.in_auth_backoff(token, now))
         .collect();
     if eligible.is_empty() {
         return format!("{model}: no account needs sampling");
@@ -1555,13 +1578,11 @@ async fn probe_and_store(
     force: bool,
     sample: bool,
 ) -> Vec<ProbeResult> {
-    let (due, skipped): (Vec<_>, Vec<_>) = config.tokens.iter().cloned().partition(|token| {
-        force
-            || cadence
-                .auth_backoff
-                .get(&token.name)
-                .is_none_or(|entry| now >= entry.next_attempt_epoch)
-    });
+    let (due, skipped): (Vec<_>, Vec<_>) = config
+        .tokens
+        .iter()
+        .cloned()
+        .partition(|token| force || !cadence.in_auth_backoff(token, now));
     let sample_with = sample.then(|| sample_model(target_model)).flatten();
     let to_sample: Vec<Token> = match sample_with {
         Some(_) => due
@@ -1707,13 +1728,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     let probed: std::collections::HashSet<String> = config
         .tokens
         .iter()
-        .filter(|token| {
-            options.force
-                || cadence
-                    .auth_backoff
-                    .get(&token.name)
-                    .is_none_or(|entry| probe_now >= entry.next_attempt_epoch)
-        })
+        .filter(|token| options.force || !cadence.in_auth_backoff(token, probe_now))
         .map(|token| token.name.clone())
         .collect();
     // A dry run must not spend target-model requests.
@@ -1726,7 +1741,13 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         !options.dry_run,
     )
     .await;
-    for account in update_auth_backoff(&mut cadence.auth_backoff, &results, &probed, probe_now) {
+    for account in update_auth_backoff(
+        &mut cadence.auth_backoff,
+        &config.tokens,
+        &results,
+        &probed,
+        probe_now,
+    ) {
         append_log(&format!(
             "{account} refused authentication; rechecking on a backoff instead of every cycle"
         ));
@@ -3808,7 +3829,7 @@ mod tests {
             .collect();
         let results = vec![auth_failure("dead", "401"), result("live", 0.1, 0.1)];
 
-        let parked = update_auth_backoff(&mut backoff, &results, &probed, 1_000.0);
+        let parked = update_auth_backoff(&mut backoff, &[], &results, &probed, 1_000.0);
         assert_eq!(parked, vec!["dead".to_string()]);
         let entry = backoff.get("dead").expect("parked");
         assert_eq!(entry.failures, 1);
@@ -3816,14 +3837,48 @@ mod tests {
         assert!(!backoff.contains_key("live"));
 
         // Repeated refusals lengthen the wait, and only the first is announced.
-        let parked = update_auth_backoff(&mut backoff, &results, &probed, 2_000.0);
+        let parked = update_auth_backoff(&mut backoff, &[], &results, &probed, 2_000.0);
         assert!(parked.is_empty());
         assert_eq!(backoff["dead"].failures, 2);
         assert_eq!(backoff["dead"].next_attempt_epoch, 2_000.0 + 600.0);
 
         // A later success releases it immediately.
-        update_auth_backoff(&mut backoff, &[result("dead", 0.1, 0.1)], &probed, 3_000.0);
+        update_auth_backoff(
+            &mut backoff,
+            &[],
+            &[result("dead", 0.1, 0.1)],
+            &probed,
+            3_000.0,
+        );
         assert!(backoff.is_empty());
+    }
+
+    #[test]
+    fn a_changed_credential_ends_the_backoff_early() {
+        let mut token = login_account("dead");
+        let mut cadence = CadenceState::default();
+        let probed: std::collections::HashSet<String> = ["dead".to_string()].into_iter().collect();
+        update_auth_backoff(
+            &mut cadence.auth_backoff,
+            std::slice::from_ref(&token),
+            &[auth_failure("dead", "401")],
+            &probed,
+            1_000.0,
+        );
+        assert!(cadence.in_auth_backoff(&token, 1_100.0));
+        // The refused credential stays parked until its recheck is due.
+        assert!(!cadence.in_auth_backoff(&token, 1_300.0));
+
+        // A refreshed login (or a new setup key) is a different credential;
+        // the refusal on file was about the old one, so the account is probed
+        // on the next cycle instead of waiting out the backoff.
+        token.access_token = Some("sk-ant-oat01-access-dead-2".into());
+        assert!(!cadence.in_auth_backoff(&token, 1_100.0));
+
+        // Entries written before the fingerprint existed name no credential;
+        // they are re-asked once and re-parked against the current one.
+        cadence.auth_backoff.get_mut("dead").unwrap().credential = None;
+        assert!(!cadence.in_auth_backoff(&token, 1_100.0));
     }
 
     #[test]
@@ -3833,7 +3888,7 @@ mod tests {
         let mut timeout = result("flaky", 0.0, 0.0);
         timeout.quota = None;
         timeout.error = Some("error sending request for url (https://api.anthropic.com)".into());
-        update_auth_backoff(&mut backoff, &[timeout], &probed, 1_000.0);
+        update_auth_backoff(&mut backoff, &[], &[timeout], &probed, 1_000.0);
         assert!(
             backoff.is_empty(),
             "a network error is a hiccup, not a refusal -- retry it immediately"
@@ -3849,12 +3904,13 @@ mod tests {
                 failures: 4,
                 next_attempt_epoch: 9_999.0,
                 last_error: "HTTP 401 Unauthorized".into(),
+                credential: None,
             },
         );
         // Not in `probed`: this cycle carried it forward without asking.
         let probed: std::collections::HashSet<String> = ["live".to_string()].into_iter().collect();
         let carried = auth_failure("dead", "401");
-        update_auth_backoff(&mut backoff, &[carried], &probed, 5_000.0);
+        update_auth_backoff(&mut backoff, &[], &[carried], &probed, 5_000.0);
         assert_eq!(
             backoff["dead"].failures, 4,
             "carried-forward rows must not escalate"
@@ -3881,6 +3937,7 @@ mod tests {
                     failures: 1,
                     next_attempt_epoch: 0.0,
                     last_error: String::new(),
+                    credential: None,
                 },
             );
             cadence.header_samples.insert(
