@@ -790,18 +790,6 @@ fn describe_login(token: &config::Token, now_ms: i64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::mask_key;
-
-    #[test]
-    fn mask_key_handles_unicode_without_slicing_bytes() {
-        let masked = mask_key("abcdefghijklmnop💥qrstuv");
-        assert!(masked.starts_with("abcdefghijklmnop..."));
-        assert!(masked.ends_with("stuv"));
-    }
-}
-
 /// Drive the browser login flow for one account, or for every account that
 /// still lacks a refreshable login.
 ///
@@ -1086,4 +1074,16 @@ async fn use_reset(
         println!("cooling down until {until}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_handles_unicode_without_slicing_bytes() {
+        let masked = mask_key("abcdefghijklmnop💥qrstuv");
+        assert!(masked.starts_with("abcdefghijklmnop..."));
+        assert!(masked.ends_with("stuv"));
+    }
 }
