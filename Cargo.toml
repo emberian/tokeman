@@ -46,7 +46,6 @@ toml_edit = { version = "0.22", features = ["serde"] }
 # System tray (feature-gated)
 tray-icon = { version = "0.21", optional = true }
 eframe = { version = "0.33", optional = true, features = ["glow"] }
-axum = "0.8"
 # Codex's app-server control socket is JSON-RPC over WebSocket-over-Unix.
 tokio-tungstenite = "0.24"
 sha2 = "0.10"
@@ -58,3 +57,7 @@ security-framework = "3.7"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[dev-dependencies]
+# Loopback servers for the probe, profile, OAuth, resets and Codex tests.
+axum = "0.8"
