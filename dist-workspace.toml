@@ -5,6 +5,8 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
+# The plan job holds contents: write; do not run it on pull requests.
+pr-run-mode = "skip"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -18,10 +20,9 @@ hosting = "github"
 aarch64-apple-darwin = "macos-14"
 x86_64-apple-darwin = "macos-14"
 
-# Pin every action by commit so a moved tag cannot change what the release
-# workflow runs. Keep in step with the SHAs in .github/workflows/release.yml
-# (`dist generate` rewrites that file from this table).
+# Actions in the generated release.yml, pinned to the commit each tag named here pointed at.
+# Update by re-resolving the tag and re-running `dist generate`; never run pinact on release.yml.
 [dist.github-action-commits]
 "actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6
-"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f" # v6
 "actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131" # v7
+"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f" # v6
