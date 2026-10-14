@@ -34,6 +34,9 @@ const SESSION_RETENTION_DAYS: i64 = 14;
 pub enum ModelFamily {
     Opus,
     Sonnet,
+    /// Metered by its own weekly limit (`7d_oi`), separate from the general
+    /// weekly window and from Opus.
+    Fable,
     General,
 }
 
@@ -44,6 +47,8 @@ impl ModelFamily {
             Self::Opus
         } else if lower.contains("sonnet") {
             Self::Sonnet
+        } else if lower.contains("fable") {
+            Self::Fable
         } else {
             Self::General
         }
@@ -53,6 +58,7 @@ impl ModelFamily {
         match self {
             Self::Opus => "Opus",
             Self::Sonnet => "Sonnet",
+            Self::Fable => "Fable",
             Self::General => "general",
         }
     }
@@ -445,10 +451,12 @@ fn limit_from_message(
     Some(ObservedLimit {
         account: binding.account.clone(),
         model,
-        // The newly discovered weekly limits can be version-specific: Opus
-        // 4.8 may reject while Opus 5 on the same account succeeds. Preserve
-        // the concrete model instead of poisoning the entire family bucket.
-        model_id: (window == LimitWindow::Weekly && model != ModelFamily::General)
+        // Weekly limits are per model: Opus 4.8 may reject while Opus 5 on
+        // the same account succeeds, and the Fable limit is its own window.
+        // Preserve the concrete model whenever it is known, whatever family
+        // it falls in, so the rejection becomes a scoped bucket for that
+        // model instead of poisoning the account's general weekly window.
+        model_id: (window == LimitWindow::Weekly)
             .then_some(model_id)
             .flatten(),
         window,
@@ -629,6 +637,30 @@ pub fn apply_observed_limits(results: &mut [ProbeResult]) {
     }
 }
 
+/// Record an exhausted per-model weekly bucket on a probe result, replacing
+/// any reading the probe carried for the same key.
+fn set_rejected_bucket(result: &mut ProbeResult, key: String, label: &str, reset: i64) {
+    let usage = result.model_usage.get_or_insert_with(ModelUsage::default);
+    let observed = ModelQuotaBucket {
+        key: key.clone(),
+        label: label.to_owned(),
+        window: Window {
+            utilization: 1.0,
+            reset,
+        },
+        source: ModelUsageSource::ObservedRejection,
+    };
+    if let Some(bucket) = usage
+        .scoped_weekly
+        .iter_mut()
+        .find(|bucket| bucket.key == key)
+    {
+        *bucket = observed;
+    } else {
+        usage.scoped_weekly.push(observed);
+    }
+}
+
 fn apply_limit(result: &mut ProbeResult, limit: &ObservedLimit) {
     // A concrete weekly rejection constrains exactly that model, not its whole
     // family. Preserve it as a scoped bucket so the startup model matcher can
@@ -637,31 +669,17 @@ fn apply_limit(result: &mut ProbeResult, limit: &ObservedLimit) {
         && let Some(model_id) = limit.model_id.as_deref()
     {
         let key = model_key(model_id);
-        if key.is_empty() {
-            return;
-        }
-        let usage = result.model_usage.get_or_insert_with(ModelUsage::default);
-        let observed = ModelQuotaBucket {
-            key: key.clone(),
-            label: model_id.to_owned(),
-            window: Window {
-                utilization: 1.0,
-                reset: limit.reset,
-            },
-            source: ModelUsageSource::ObservedRejection,
-        };
-        if let Some(bucket) = usage
-            .scoped_weekly
-            .iter_mut()
-            .find(|bucket| bucket.key == key)
-        {
-            *bucket = observed;
-        } else {
-            usage.scoped_weekly.push(observed);
+        if !key.is_empty() {
+            set_rejected_bucket(result, key, model_id, limit.reset);
         }
         return;
     }
     match (limit.window, limit.model) {
+        // The Fable limit is one family-wide window; this is the same bucket
+        // the profile endpoint and the `7d_oi` header report it under.
+        (LimitWindow::Weekly, ModelFamily::Fable) => {
+            set_rejected_bucket(result, "fable".into(), "Fable", limit.reset);
+        }
         (LimitWindow::Weekly, ModelFamily::Opus) => {
             let usage = result.model_usage.get_or_insert_with(ModelUsage::default);
             usage.opus_weekly = Some(Window {
@@ -1063,6 +1081,104 @@ mod tests {
                 .and_then(|quota| quota.weekly.as_ref())
                 .map(|window| window.utilization),
             Some(0.2)
+        );
+    }
+
+    #[test]
+    fn fable_weekly_rejection_is_a_fable_bucket_not_the_general_weekly() {
+        // A Fable session hitting "weekly limit" means the Fable limit
+        // (7d_oi), which has nothing to do with the account's general weekly
+        // window or its Opus room.
+        let binding = SessionBinding {
+            session_id: "session".into(),
+            account: "ember".into(),
+            transcript_path: PathBuf::from("/tmp/transcript"),
+            cwd: None,
+            source: None,
+            observed_at: 1_785_185_840,
+            pid: None,
+            process_started_at: None,
+            scan_offset: 0,
+            last_model: Some("claude-fable-5-1".into()),
+        };
+        let limit = limit_from_message(
+            &binding,
+            "You've hit your weekly limit · resets Aug 1 at 9am (America/New_York)",
+            1_785_185_840,
+        )
+        .unwrap();
+        assert_eq!(limit.model, ModelFamily::Fable);
+        assert_eq!(limit.model_id.as_deref(), Some("claude-fable-5-1"));
+
+        let mut result = probe("ember");
+        apply_limit(&mut result, &limit);
+        let quota = result.quota.as_ref().unwrap();
+        assert_eq!(
+            quota.status, "allowed",
+            "general window must stay as probed"
+        );
+        assert_eq!(quota.weekly.as_ref().unwrap().utilization, 0.2);
+        let usage = result.model_usage.unwrap();
+        assert!(usage.opus_weekly.is_none());
+        assert_eq!(usage.scoped_weekly.len(), 1);
+        assert_eq!(usage.scoped_weekly[0].key, "fable51");
+        assert_eq!(usage.scoped_weekly[0].window.utilization, 1.0);
+        assert_eq!(
+            usage.scoped_weekly[0].source,
+            ModelUsageSource::ObservedRejection
+        );
+    }
+
+    #[test]
+    fn a_family_wide_fable_limit_lands_on_the_shared_fable_bucket() {
+        // A manual `--model fable` quarantine, or a rejection with no concrete
+        // model, keys the bucket the way the header and profile readers do,
+        // so it replaces their reading instead of sitting next to it.
+        let mut result = probe("ember");
+        result.model_usage = Some(ModelUsage {
+            scoped_weekly: vec![ModelQuotaBucket {
+                key: "fable".into(),
+                label: "Fable".into(),
+                window: Window {
+                    utilization: 0.4,
+                    reset: 1,
+                },
+                source: ModelUsageSource::Headers,
+            }],
+            ..ModelUsage::default()
+        });
+        apply_limit(
+            &mut result,
+            &ObservedLimit {
+                account: "ember".into(),
+                model: ModelFamily::Fable,
+                model_id: None,
+                window: LimitWindow::Weekly,
+                observed_at: 1,
+                reset: 2,
+                session_id: None,
+                source: "manual quarantine".into(),
+            },
+        );
+        let usage = result.model_usage.unwrap();
+        assert_eq!(usage.scoped_weekly.len(), 1);
+        assert_eq!(usage.scoped_weekly[0].key, "fable");
+        assert_eq!(usage.scoped_weekly[0].window.utilization, 1.0);
+        assert_eq!(usage.scoped_weekly[0].window.reset, 2);
+        assert_eq!(
+            result
+                .quota
+                .as_ref()
+                .unwrap()
+                .weekly
+                .as_ref()
+                .unwrap()
+                .utilization,
+            0.2
+        );
+        assert_eq!(
+            ModelFamily::from_model("claude-fable-5-1"),
+            ModelFamily::Fable
         );
     }
 
