@@ -369,6 +369,31 @@ Tray launches first update Claude's shared OAuth setting, then open a terminal
 without placing credentials in AppleScript, process arguments, or scrollback.
 iTerm2 launches also get a `tokeman · managed` session badge.
 
+### Codex accounts
+
+Codex (OpenAI) resolves its credentials per request from `$CODEX_HOME`, so
+several Codex processes can hold different accounts at once and a running one
+can be moved between accounts without a restart. `tokeman codex` manages a set
+of profile directories the same way `rotate` manages the Claude default:
+
+```sh
+tokeman codex add <name> <codex-home>   # register a profile directory
+tokeman codex discover                  # find profiles on disk, optionally register them
+tokeman codex import <file>             # seed profiles from `<name> <access-token>` lines
+tokeman codex list                      # probe every account's quota
+tokeman codex refresh                   # renew OAuth tokens before they rot into a 401
+tokeman codex best                      # print the CODEX_HOME with the most headroom
+tokeman codex seat <account> --into <dir>   # copy an account's credentials into a profile
+tokeman codex reseat                    # move a running Codex onto another account
+tokeman codex watch                     # follow a running Codex and move it before it runs out
+```
+
+A migration is announced to the running Codex over its app-server socket
+rather than left for it to discover through a 401, because Codex's 401
+recovery refuses a swapped account. The rotation daemon refreshes every
+registered profile on a half-hour sweep so a parked account is still alive when
+rotation reaches for it.
+
 ### One-shot mode
 
 Run `tokeman` with no arguments. Probes every configured token concurrently,
