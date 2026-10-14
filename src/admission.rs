@@ -211,7 +211,9 @@ fn env_flag(name: &str) -> Option<bool> {
 fn is_anthropic_base_url(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     // Keep bracketed IPv6 literals intact; only strip a trailing :port.
     let host = match host_port.rfind(':') {
         Some(index) if !host_port[index + 1..].contains(']') => &host_port[..index],
@@ -922,8 +924,14 @@ mod tests {
     fn env_flag_parses_the_usual_spellings() {
         assert_eq!(env_flag("TOKEMAN_TEST_FLAG_UNSET_XYZ"), None);
         for (raw, want) in [
-            ("1", true), ("true", true), ("YES", true), (" on ", true),
-            ("0", false), ("false", false), ("No", false), ("off", false),
+            ("1", true),
+            ("true", true),
+            ("YES", true),
+            (" on ", true),
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("off", false),
         ] {
             unsafe { std::env::set_var("TOKEMAN_TEST_FLAG_XYZ", raw) };
             assert_eq!(env_flag("TOKEMAN_TEST_FLAG_XYZ"), Some(want), "raw={raw:?}");

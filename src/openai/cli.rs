@@ -438,7 +438,7 @@ async fn reseat_home(
 /// Input is one `<name> <access-token-jwt>` per line (blank lines and `#`
 /// comments ignored). Each token is decoded for its account id, seeded into a
 /// fresh profile directory, and registered as an access-only account. These are
-/// stopgaps — see [`seat_access_only`] — so they carry an `access_only` flag and
+/// stopgaps — see [`crate::openai::authfile::seat_access_only`] — so they carry an `access_only` flag and
 /// a label noting when the token expires.
 pub async fn import(from: PathBuf, homes_root: Option<String>, register: bool) -> Result<()> {
     use crate::openai::authfile::{IdClaims, seat_access_only};
