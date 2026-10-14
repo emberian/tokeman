@@ -384,35 +384,51 @@ fn write_claude_keychain_document(document: &Value) -> Result<()> {
         .context("could not update Claude's Keychain credential")
 }
 
+/// The backup to leave on disk when the Keychain holds no login to suppress.
+///
+/// An earlier capture is the record `pause` and `uninstall` restore. Finding
+/// the Keychain empty on a later check means that capture already succeeded,
+/// not that there was never anything to save, so the record is kept rather
+/// than replaced with nothing.
+fn settled_login_backup(existing: Option<LoginKeychainBackup>) -> LoginKeychainBackup {
+    LoginKeychainBackup {
+        version: LOGIN_BACKUP_VERSION,
+        state: "suppressed".into(),
+        claude_ai_oauth: existing.and_then(|backup| backup.claude_ai_oauth),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn suppress_login_shadow(force_check: bool) -> Result<bool> {
-    if !force_check && load_login_backup()?.is_some_and(|backup| backup.state == "suppressed") {
+    let existing = load_login_backup()?;
+    if !force_check
+        && existing
+            .as_ref()
+            .is_some_and(|backup| backup.state == "suppressed")
+    {
         return Ok(false);
     }
 
     let Some(mut document) = read_claude_keychain_document()? else {
-        save_login_backup(&LoginKeychainBackup {
-            version: LOGIN_BACKUP_VERSION,
-            state: "suppressed".into(),
-            claude_ai_oauth: None,
-        })?;
+        save_login_backup(&settled_login_backup(existing))?;
         return Ok(false);
     };
-    let login = split_claude_login(&mut document)?;
+    let Some(login) = split_claude_login(&mut document)? else {
+        save_login_backup(&settled_login_backup(existing))?;
+        return Ok(false);
+    };
     let mut backup = LoginKeychainBackup {
         version: LOGIN_BACKUP_VERSION,
         state: "captured".into(),
-        claude_ai_oauth: login,
+        claude_ai_oauth: Some(login),
     };
     // Capture before mutation. If the Keychain write is interrupted, the next
     // call sees `captured` and retries rather than falsely assuming success.
     save_login_backup(&backup)?;
-    if backup.claude_ai_oauth.is_some() {
-        write_claude_keychain_document(&document)?;
-    }
+    write_claude_keychain_document(&document)?;
     backup.state = "suppressed".into();
     save_login_backup(&backup)?;
-    Ok(backup.claude_ai_oauth.is_some())
+    Ok(true)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3031,6 +3047,36 @@ mod tests {
         let mut document = json!(["not", "an", "object"]);
         assert!(split_claude_login(&mut document).is_err());
         assert!(restore_claude_login(&mut document, json!({})).is_err());
+    }
+
+    #[test]
+    fn an_empty_keychain_does_not_erase_the_captured_login_backup() {
+        // The login was suppressed and backed up earlier; a later forced
+        // check (`tokeman add`) finds the Keychain without a login. The
+        // record `pause` restores must survive that check.
+        let captured = LoginKeychainBackup {
+            version: LOGIN_BACKUP_VERSION,
+            state: "suppressed".into(),
+            claude_ai_oauth: Some(json!({"refreshToken": "saved"})),
+        };
+        let settled = settled_login_backup(Some(captured));
+        assert_eq!(settled.state, "suppressed");
+        assert_eq!(
+            settled.claude_ai_oauth,
+            Some(json!({"refreshToken": "saved"}))
+        );
+
+        // A capture whose Keychain write was interrupted is settled the same
+        // way once the login is seen to be gone.
+        let interrupted = LoginKeychainBackup {
+            version: LOGIN_BACKUP_VERSION,
+            state: "captured".into(),
+            claude_ai_oauth: Some(json!({"refreshToken": "saved"})),
+        };
+        assert_eq!(settled_login_backup(Some(interrupted)).state, "suppressed");
+
+        // With nothing saved and nothing in the Keychain there is nothing to keep.
+        assert_eq!(settled_login_backup(None).claude_ai_oauth, None);
     }
 
     fn result(name: &str, five_used: f64, seven_used: f64) -> ProbeResult {
