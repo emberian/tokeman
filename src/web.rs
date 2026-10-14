@@ -1,9 +1,10 @@
 use anyhow::Result as AnyResult;
 use axum::{
     Json,
-    extract::Query,
+    extract::{Query, Request},
     http::{HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use chrono::{Duration, Utc};
@@ -20,7 +21,7 @@ async fn index() -> impl IntoResponse {
         [(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(
-                "default-src 'self'; script-src 'self' https://d3js.org 'unsafe-inline'; \
+                "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; \
                  style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
                  object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
             ),
@@ -386,12 +387,59 @@ fn extract_text_preview(obj: &Value) -> String {
     }
 }
 
+/// Whether a `Host` or `Origin` authority names this machine.
+///
+/// The listener is bound to loopback, but that only limits which machines can
+/// connect. A page from any site can still drive the user's own browser at
+/// 127.0.0.1 by rebinding its hostname to it (DNS rebinding); the request
+/// then arrives with that site's name in `Host`. Answering only to names that
+/// mean "here" closes that path, and the session previews this server
+/// returns are worth closing it for.
+fn authority_is_local(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+async fn require_local_authority(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host_ok = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(authority_is_local);
+    let origin_ok = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|origin| {
+            origin
+                .split_once("://")
+                .is_some_and(|(_, authority)| authority_is_local(authority))
+        });
+    if host_ok && origin_ok {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::MISDIRECTED_REQUEST,
+            "tokeman answers only to localhost",
+        )
+            .into_response()
+    }
+}
+
 pub async fn serve(port: u16, open_browser: bool) -> AnyResult<()> {
     let app = axum::Router::new()
         .route("/", get(index))
         .route("/api/snapshots", get(api_snapshots))
         .route("/api/sessions", get(api_sessions))
-        .route("/api/session-detail", get(api_session_detail));
+        .route("/api/session-detail", get(api_session_detail))
+        .layer(middleware::from_fn(require_local_authority));
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
@@ -426,7 +474,29 @@ fn open_url(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_session_id;
+    use super::{authority_is_local, valid_session_id};
+
+    #[test]
+    fn only_loopback_names_count_as_local() {
+        for local in [
+            "localhost",
+            "LOCALHOST:9847",
+            "127.0.0.1:9847",
+            "[::1]:9847",
+            "[::1]",
+        ] {
+            assert!(authority_is_local(local), "{local}");
+        }
+        for remote in [
+            "attacker.example:9847",
+            "localhost.attacker.example",
+            "127.0.0.1.nip.io:9847",
+            "[::ffff:127.0.0.1]:9847",
+            "",
+        ] {
+            assert!(!authority_is_local(remote), "{remote}");
+        }
+    }
 
     #[test]
     fn session_id_rejects_path_traversal() {

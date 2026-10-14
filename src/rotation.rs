@@ -542,21 +542,9 @@ fn save_claude_settings(settings: &Map<String, Value>) -> Result<()> {
     let path = claude_settings_path()?;
     let mut bytes = serde_json::to_vec_pretty(settings)?;
     bytes.push(b'\n');
-    let existing_mode = file_mode(&path).unwrap_or(0o600);
-    write_atomic(&path, &bytes, existing_mode)
-}
-
-#[cfg(unix)]
-fn file_mode(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions().mode() & 0o777)
-}
-
-#[cfg(not(unix))]
-fn file_mode(_path: &Path) -> Option<u32> {
-    None
+    // The file carries a bearer token once tokeman manages it, so it is
+    // owner-only from then on regardless of the mode it was created with.
+    write_atomic(&path, &bytes, 0o600)
 }
 
 /// A non-empty string from Claude settings' `env` block.
