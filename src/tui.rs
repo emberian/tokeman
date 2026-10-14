@@ -67,7 +67,8 @@ struct App {
     refresh_interval: Duration,
     default_token: Option<String>,
     target_model: Option<String>,
-    live_sessions: Vec<rotation::ClaudeSessionStatus>,
+    /// `None` until the first census, or when the census failed.
+    live_sessions: Option<Vec<rotation::ClaudeSessionStatus>>,
     policy_mode: rotation::RotationMode,
 }
 
@@ -76,7 +77,6 @@ impl App {
         let refresh_interval = Duration::from_secs(config.settings.probe_interval_secs.max(1));
         let default_token = rotation::default_token_name(&config).ok().flatten();
         let target_model = rotation::target_model_name().ok().flatten();
-        let live_sessions = rotation::claude_sessions(&config);
         Self {
             results: Vec::new(),
             selected: 0,
@@ -92,12 +92,12 @@ impl App {
             refresh_interval,
             default_token,
             target_model,
-            live_sessions,
+            live_sessions: None,
             policy_mode: rotation::RotationMode::Normal,
         }
     }
 
-    fn apply_probe_results(&mut self, mut results: Vec<ProbeResult>) {
+    async fn apply_probe_results(&mut self, mut results: Vec<ProbeResult>) {
         let _ = admission::scan_transcripts(&self.config.tokens);
         admission::apply_observed_limits(&mut results);
         for r in &results {
@@ -117,7 +117,7 @@ impl App {
         );
         self.default_token = rotation::default_token_name(&self.config).ok().flatten();
         self.target_model = rotation::target_model_name().ok().flatten();
-        self.live_sessions = rotation::claude_sessions(&self.config);
+        self.live_sessions = rotation::claude_sessions().await.ok();
         self.policy_mode = rotation::safe_mode_for(
             &self.results,
             self.config.tokens.len(),
@@ -222,6 +222,7 @@ impl Drop for TerminalSession {
 pub async fn run(config: Config) -> Result<()> {
     let store = Store::open()?;
     let mut app = App::new(config, store);
+    app.live_sessions = rotation::claude_sessions().await.ok();
     let startup_executable = rotation::executable_identity();
 
     let terminal_session = TerminalSession::enter()?;
@@ -245,7 +246,7 @@ pub async fn run(config: Config) -> Result<()> {
                 .take()
                 .expect("active probe was present")
                 .await?;
-            app.apply_probe_results(results);
+            app.apply_probe_results(results).await;
         }
         if app.last_probe.elapsed() >= app.refresh_interval && active_probe.is_none() {
             active_probe = Some(app.spawn_probe());
@@ -336,7 +337,7 @@ fn draw(f: &mut Frame, app: &App) {
         app.default_token.as_deref().unwrap_or("/login"),
         app.target_model.as_deref().unwrap_or("model?"),
         countdown.as_secs(),
-        rotation::session_summary(&app.live_sessions),
+        rotation::session_summary(app.live_sessions.as_deref()),
         mode.label(),
         floor_5h * 100.0,
         floor_7d * 100.0,

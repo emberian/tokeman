@@ -156,7 +156,8 @@ pub struct RotationStatus {
     pub header_sampling: String,
     /// Usage-limit resets on offer to logged-in accounts, one line each.
     pub resets_on_offer: Vec<String>,
-    pub live_sessions: Vec<ClaudeSessionStatus>,
+    /// `None` when the process census failed or timed out.
+    pub live_sessions: Option<Vec<ClaudeSessionStatus>>,
     pub tokens: Vec<RotationTokenStatus>,
 }
 
@@ -231,8 +232,18 @@ impl Default for CadenceState {
 struct RotationLock;
 
 impl RotationLock {
+    /// Blocks until the lock is held, and says so when the wait is real: a
+    /// probe cycle in the daemon can own the lock for a network timeout, and
+    /// a CLI command that silently stops looks hung.
     fn acquire() -> Result<FileLock> {
-        FileLock::acquire(&lock_path()?)
+        let path = lock_path()?;
+        if let Some(lock) = FileLock::try_acquire(&path)? {
+            return Ok(lock);
+        }
+        eprintln!(
+            "waiting for the rotation lock (another tokeman holds it, usually the daemon mid-cycle)"
+        );
+        FileLock::acquire(&path)
     }
 }
 
@@ -2059,15 +2070,26 @@ fn attribute_session(
 }
 
 /// Inspect live Claude processes without exposing credentials.
-pub fn claude_sessions(_config: &Config) -> Vec<ClaudeSessionStatus> {
-    let Ok(output) = Command::new("/bin/ps")
+/// How long the process census may take before it is reported as unknown.
+/// `ps` walks every process on the box; on 2026-10-14 the daemon's own
+/// census took 10-24 minutes per call under a load average of 200 while it
+/// held the rotation lock, and every `tokeman rotate` command queued behind it.
+const CENSUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Every live Claude Code process and the account it spends, or an error
+/// when the census could not be taken in time. Callers must not read an
+/// error as "no sessions".
+pub async fn claude_sessions() -> Result<Vec<ClaudeSessionStatus>> {
+    let census = tokio::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,tty=,lstart=,comm="])
-        .output()
-    else {
-        return Vec::new();
-    };
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(CENSUS_TIMEOUT, census)
+        .await
+        .with_context(|| format!("ps did not answer within {}s", CENSUS_TIMEOUT.as_secs()))?
+        .context("could not run ps")?;
     if !output.status.success() {
-        return Vec::new();
+        bail!("ps exited with {}", output.status);
     }
     let timeline = credential_timeline();
     let now = Utc::now().timestamp();
@@ -2088,10 +2110,14 @@ pub fn claude_sessions(_config: &Config) -> Vec<ClaudeSessionStatus> {
         })
         .collect::<Vec<_>>();
     sessions.sort_by_key(|session| session.started_at);
-    sessions
+    Ok(sessions)
 }
 
-pub fn session_summary(sessions: &[ClaudeSessionStatus]) -> String {
+/// Per-account counts of live sessions; `None` is a census that failed.
+pub fn session_summary(sessions: Option<&[ClaudeSessionStatus]>) -> String {
+    let Some(sessions) = sessions else {
+        return "unknown (process census failed)".into();
+    };
     if sessions.is_empty() {
         return "none detected".into();
     }
@@ -2223,7 +2249,13 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
             }
         })
         .collect();
-    let live_sessions = claude_sessions(config);
+    let live_sessions = match claude_sessions().await {
+        Ok(sessions) => Some(sessions),
+        Err(error) => {
+            append_log(&format!("WARNING process census failed: {error:#}"));
+            None
+        }
+    };
 
     let header_sampling =
         describe_header_sampling(config, &cadence, target_model.as_deref(), now_epoch());
@@ -2285,15 +2317,16 @@ pub fn print_status(status: &RotationStatus) {
         "selection model: {} (only matching model-scoped buckets affect rotation)",
         status.target_model.as_deref().unwrap_or("unknown")
     );
+    let live_sessions = status.live_sessions.as_deref();
     println!(
         "live Claude processes: {} ({})",
-        status.live_sessions.len(),
-        session_summary(&status.live_sessions)
+        live_sessions.map_or("?".to_string(), |sessions| sessions.len().to_string()),
+        session_summary(live_sessions)
     );
     println!(
         "    each spends the default from its next request: Claude re-reads the settings credential for every API client (except in an untrusted workspace); the account shown is what settings.json offers now{}",
-        if status
-            .live_sessions
+        if live_sessions
+            .unwrap_or_default()
             .iter()
             .any(|session| session.credential_source == SESSION_START_SOURCE)
         {
@@ -2823,6 +2856,12 @@ exec "$binary" rotate daemon
         install_observer_hook(&mut settings, &binary);
         commit_settings(&settings, event)?;
 
+        // `Standard`, not `Background`: a Background agent is scheduled below
+        // every normal process, and this daemon matters most exactly when the
+        // box is pegged by the swarms spending the quota it manages. On
+        // 2026-10-14 (load average ~200 on 12 cores) the Background daemon's
+        // 20-second cycle stretched to 10-24 minutes and the default stayed on
+        // an exhausted account. Its own CPU use is under two minutes a day.
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2844,8 +2883,7 @@ exec "$binary" rotate daemon
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>ProcessType</key><string>Background</string>
-  <key>LowPriorityIO</key><true/>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
   <key>Umask</key><integer>63</integer>
@@ -3651,8 +3689,10 @@ mod tests {
 
     #[test]
     fn a_reserve_of_zero_reproduces_load_blind_selection() {
-        let mut policy = RotationSettings::default();
-        policy.per_session_reserve = 0.0;
+        let policy = RotationSettings {
+            per_session_reserve: 0.0,
+            ..RotationSettings::default()
+        };
         let results = vec![result("busy", 0.10, 0.10), result("idle", 0.10, 0.10)];
         assert_eq!(
             choose_best_with_load(

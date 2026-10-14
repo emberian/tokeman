@@ -71,19 +71,36 @@ pub struct FileLock {
 }
 
 impl FileLock {
+    /// Block until the lock is held.
     pub fn acquire(path: &Path) -> Result<Self> {
         use fs2::FileExt;
-        ensure_private_parent(path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .with_context(|| format!("failed to open lock {}", path.display()))?;
-        set_mode(path, 0o600)?;
+        let file = open_lock_file(path)?;
         file.lock_exclusive()
             .with_context(|| format!("failed to lock {}", path.display()))?;
         Ok(Self { _file: file })
     }
+
+    /// Take the lock only if nobody holds it; `None` means another process does.
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        use fs2::FileExt;
+        let file = open_lock_file(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("failed to lock {}", path.display())),
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> Result<File> {
+    ensure_private_parent(path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to open lock {}", path.display()))?;
+    set_mode(path, 0o600)?;
+    Ok(file)
 }
