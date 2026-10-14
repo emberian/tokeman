@@ -479,12 +479,17 @@ published to GitHub Releases with prebuilt binaries for:
 - macOS (ARM64, x86_64)
 - Linux (ARM64, x86_64)
 
-To cut a release:
+To cut a release, bump `version` in `Cargo.toml`, add the section to
+`CHANGELOG.md` (cargo-dist uses it as the release notes), then:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
+
+Before pushing, `scripts/check-linux.sh` runs clippy and builds the tests for
+Linux from a macOS checkout (needs `zig` and the Linux target from rustup), the
+same checks CI's Ubuntu job runs.
 
 ## Roadmap
 
