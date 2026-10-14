@@ -404,8 +404,10 @@ mod tests {
 
     #[test]
     fn the_state_file_keeps_its_spelling() {
-        let mut cadence = Cadence::default();
-        cadence.mode = Some(Mode::Sip);
+        let mut cadence = Cadence {
+            mode: Some(Mode::Sip),
+            ..Cadence::default()
+        };
         cadence.record_refusals(&[account("a")], [&refused("a")], 1.0);
         let json = serde_json::to_string(&cadence).unwrap();
         assert!(json.contains("\"mode\":\"sip-and-drain\""));
