@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 - unreleased
+
+A rewrite from the knowledge 0.2.0 accumulated, built to DESIGN.md. Same
+account file, settings.json keys, hook, history files and commands; the
+code is a library with no UI dependency plus a thin binary, organised by
+domain, with the rotation policy as a pure module whose tests are its
+specification.
+
+- Removed: the web dashboard and transcript session browser (`tokeman
+  browse`), `per_session_reserve`, and the legacy Opus/Sonnet-specific
+  fields (old history rows still read).
+- Readings carry per-model buckets with a canonical key and a source
+  (profile, headers, observed rejection, carried sample); the family-wide
+  Fable limit from the `7d_oi` header is one of them.
+- Every state on disk is a typed enum with the same spelling as before.
+- A dry run writes nothing anywhere; every subprocess wait is bounded; every
+  lock wait is announced; the daemon runs at Standard priority.
+- Probe failures are typed (no credential, network, HTTP) and grouped by
+  cause in log lines.
+- Cargo: axum is test-only; the Linux build has no OpenSSL.
+
 ## 0.2.0 - 2026-10-14
 
 The first release since March. The daemon now manages refreshable browser

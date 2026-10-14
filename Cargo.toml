@@ -1,8 +1,8 @@
 [package]
 name = "tokeman"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Anthropic token usage visualizer"
+description = "Keeps Claude Code on an Anthropic account with room left"
 repository = "https://github.com/emberian/tokeman"
 
 [features]
