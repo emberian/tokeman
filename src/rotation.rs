@@ -2,6 +2,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+// Only the launchd service management and Keychain paths shell out; the
+// process census goes through tokio::process.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +66,9 @@ impl RotationMode {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RotateOptions {
     pub force: bool,
+    /// Decide without writing anything: no settings, no cadence state, no
+    /// snapshots, no Keychain change, no rotation log. What a real run would
+    /// have recorded is printed to stderr instead.
     pub dry_run: bool,
     pub scheduled: bool,
 }
@@ -1396,14 +1402,23 @@ fn update_auth_backoff(
             if entry.failures == 1 {
                 newly_parked.push(result.token_name.clone());
             }
-        } else if backoff.remove(&result.token_name).is_some() {
-            append_log(&format!(
-                "{} answered again; clearing authentication backoff",
-                result.token_name
-            ));
+        } else {
+            backoff.remove(&result.token_name);
         }
     }
     newly_parked
+}
+
+/// Accounts whose backoff entry `after` no longer carries: they answered again.
+fn released_accounts(
+    before: &BTreeMap<String, AuthBackoff>,
+    after: &BTreeMap<String, AuthBackoff>,
+) -> Vec<String> {
+    before
+        .keys()
+        .filter(|account| !after.contains_key(*account))
+        .cloned()
+        .collect()
 }
 
 /// Model families with a weekly limit that only appears in rate-limit headers
@@ -1562,7 +1577,8 @@ fn apply_header_samples(
 }
 
 /// Probe every account that is not in authentication backoff, record the
-/// snapshots, and restate the refusals of the ones that are.
+/// snapshots (when `store` is set), and restate the refusals of the ones that
+/// are.
 ///
 /// When `sample` is set and the startup model has a header-only limit, the
 /// accounts due for a sample are probed with that model instead of Haiku.
@@ -1577,6 +1593,7 @@ async fn probe_and_store(
     now: f64,
     force: bool,
     sample: bool,
+    store: bool,
 ) -> Vec<ProbeResult> {
     let (due, skipped): (Vec<_>, Vec<_>) = config
         .tokens
@@ -1609,7 +1626,7 @@ async fn probe_and_store(
     record_header_samples(&samples, &mut cadence.header_samples, now);
     apply_header_samples(&mut results, &cadence.header_samples, now);
     admission::apply_observed_limits(&mut results);
-    if let Ok(store) = Store::open() {
+    if store && let Ok(store) = Store::open() {
         for result in &results {
             let _ = store.insert(result);
         }
@@ -1657,21 +1674,30 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             "rotation is paused",
         ));
     }
-    if !options.scheduled && suppress_login_shadow(false)? {
+    // A dry run reports what the cycle would have recorded instead of
+    // recording it: the rotation log is state too (`default_events` reads it).
+    let note = |message: &str| {
+        if options.dry_run {
+            eprintln!("dry run: {message}");
+        } else {
+            append_log(message);
+        }
+    };
+    if !options.scheduled && !options.dry_run && suppress_login_shadow(false)? {
         append_log("suppressed short-lived /login Keychain auth before managed rotation");
     }
 
     let new_admission_limits = match admission::scan_transcripts(&config.tokens) {
         Ok(observed) => observed,
         Err(error) => {
-            append_log(&format!(
+            note(&format!(
                 "ERROR Claude admission feedback scan failed: {error:#}"
             ));
             0
         }
     };
     if new_admission_limits > 0 {
-        append_log(&format!(
+        note(&format!(
             "observed {new_admission_limits} Claude quota rejection(s); reevaluating default now"
         ));
     }
@@ -1697,7 +1723,9 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         // Track probe starts, not completions. Otherwise request latency is
         // silently added to the configured cadence (20s + a 15s timeout).
         cadence.last_probe_epoch = probe_started_epoch;
-        save_cadence(&cadence)?;
+        if !options.dry_run {
+            save_cadence(&cadence)?;
+        }
     }
 
     let mut settings = load_claude_settings()?;
@@ -1731,7 +1759,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         .filter(|token| options.force || !cadence.in_auth_backoff(token, probe_now))
         .map(|token| token.name.clone())
         .collect();
-    // A dry run must not spend target-model requests.
+    // A dry run must not spend target-model requests or record snapshots.
     let results = probe_and_store(
         config,
         &mut cadence,
@@ -1739,18 +1767,28 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
         probe_now,
         options.force,
         !options.dry_run,
+        !options.dry_run,
     )
     .await;
+    let mut auth_backoff = cadence.auth_backoff.clone();
     for account in update_auth_backoff(
-        &mut cadence.auth_backoff,
+        &mut auth_backoff,
         &config.tokens,
         &results,
         &probed,
         probe_now,
     ) {
-        append_log(&format!(
+        note(&format!(
             "{account} refused authentication; rechecking on a backoff instead of every cycle"
         ));
+    }
+    for account in released_accounts(&cadence.auth_backoff, &auth_backoff) {
+        note(&format!(
+            "{account} answered again; clearing authentication backoff"
+        ));
+    }
+    if !options.dry_run {
+        cadence.auth_backoff = auth_backoff;
     }
     let probe_has_quota = results.iter().any(has_quota_reading);
     let complete_probe = probe_is_complete(&results, config.tokens.len());
@@ -1788,7 +1826,14 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     } else {
         cadence.consecutive_degraded_probes = cadence.consecutive_degraded_probes.saturating_add(1);
     }
-    save_cadence(&cadence)?;
+    if options.dry_run {
+        eprintln!(
+            "dry run: would record {} mode with the next probe in {next_interval}s",
+            mode.label()
+        );
+    } else {
+        save_cadence(&cadence)?;
+    }
 
     if !probe_has_quota {
         let active = active_label.clone();
@@ -1798,7 +1843,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             next_interval,
             degraded_probe_summary(&results, config.tokens.len())
         );
-        append_log(&message);
+        note(&message);
         return Ok(RotationOutcome::held(
             "probe-failed",
             mode,
@@ -1809,7 +1854,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
     }
 
     if mode != previous_mode {
-        append_log(&format!(
+        note(&format!(
             "entered {} mode; sampling every {}s",
             mode.label(),
             interval_secs(mode, &config.rotation),
@@ -1828,7 +1873,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             next_interval,
             degraded_probe_summary(&results, config.tokens.len())
         );
-        append_log(&message);
+        note(&message);
         return Ok(RotationOutcome::held(
             "partial-probe-hold",
             mode,
@@ -1849,7 +1894,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             next_interval,
             degraded_probe_summary(&results, config.tokens.len())
         );
-        append_log(&message);
+        note(&message);
         return Ok(RotationOutcome::held(
             "default-probe-degraded",
             mode,
@@ -1909,7 +1954,7 @@ pub async fn rotate(config: &Config, options: RotateOptions) -> Result<RotationO
             "no viable token; kept {}",
             active.as_deref().unwrap_or("/login")
         );
-        append_log(&message);
+        note(&message);
         return Ok(RotationOutcome::held(
             "no-viable-token",
             mode,
@@ -2196,6 +2241,7 @@ pub async fn status(config: &Config) -> Result<RotationStatus> {
         now_epoch(),
         true,
         false,
+        true,
     )
     .await;
     let previous_mode = cadence.mode.unwrap_or(RotationMode::Normal);
@@ -3842,7 +3888,9 @@ mod tests {
         assert_eq!(backoff["dead"].failures, 2);
         assert_eq!(backoff["dead"].next_attempt_epoch, 2_000.0 + 600.0);
 
-        // A later success releases it immediately.
+        // A later success releases it immediately, and the release is
+        // reported by comparing the schedule before and after.
+        let before = backoff.clone();
         update_auth_backoff(
             &mut backoff,
             &[],
@@ -3851,6 +3899,11 @@ mod tests {
             3_000.0,
         );
         assert!(backoff.is_empty());
+        assert_eq!(
+            released_accounts(&before, &backoff),
+            vec!["dead".to_string()]
+        );
+        assert!(released_accounts(&backoff, &before).is_empty());
     }
 
     #[test]
