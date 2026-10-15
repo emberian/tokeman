@@ -266,9 +266,10 @@ pub async fn sample_all<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::testing::serve;
+    use crate::anthropic::testing::{dead_client, serve, temp_cache};
+    use crate::testing::{bucket, profile_only_account, setup_account};
     use axum::Router;
-    use axum::http::{HeaderMap as AxumHeaders, StatusCode};
+    use axum::http::StatusCode;
     use axum::routing::{get, post};
     use reqwest::header::HeaderValue;
 
@@ -362,12 +363,9 @@ mod tests {
         assert!(ModelKey::new("claude-fable-5-1").is_limited_by(&fable.key));
 
         let mut with_profile = reading_of("a", 0, &None);
-        with_profile.buckets.push(Bucket {
-            key: ModelKey::new("Fable 5"),
-            label: "Fable 5".into(),
-            window: Window::new(0.1, 1),
-            source: Source::Profile,
-        });
+        with_profile
+            .buckets
+            .push(bucket("Fable 5", "Fable 5", 0.1, Source::Profile));
         attach_model_weekly(&mut with_profile, Some(Window::new(0.7, 5_000)));
         assert_eq!(with_profile.buckets.len(), 1);
         assert_eq!(with_profile.buckets[0].source, Source::Profile);
@@ -375,48 +373,24 @@ mod tests {
 
     #[tokio::test]
     async fn an_account_without_a_credential_is_refused_without_a_request() {
-        let account = Account::new("empty");
-        let reading = probe(
-            &Client::with_base("http://127.0.0.1:9", "http://127.0.0.1:9/t"),
-            &account,
-            PROBE_MODEL,
-            7,
-        )
-        .await;
+        let reading = probe(&dead_client(), &Account::new("empty"), PROBE_MODEL, 7).await;
         assert_eq!(reading.error, Some(ProbeError::NoCredential));
         assert!(reading.is_refused());
         assert_eq!(reading.at, 7);
     }
 
-    fn quota_headers(status: &str, model_weekly: Option<&str>) -> axum::http::HeaderMap {
-        let mut headers = AxumHeaders::new();
-        headers.insert(
-            "anthropic-ratelimit-unified-status",
-            status.parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "0.3".parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-reset",
-            "100".parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-utilization",
-            "0.6".parse().unwrap(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-reset",
-            "200".parse().unwrap(),
-        );
+    fn quota_headers(status: &str, model_weekly: Option<&str>) -> HeaderMap {
+        let mut pairs = vec![
+            ("anthropic-ratelimit-unified-status", status),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.3"),
+            ("anthropic-ratelimit-unified-5h-reset", "100"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d-reset", "200"),
+        ];
         if let Some(used) = model_weekly {
-            headers.insert(
-                "anthropic-ratelimit-unified-7d_oi-utilization",
-                used.parse().unwrap(),
-            );
+            pairs.push(("anthropic-ratelimit-unified-7d_oi-utilization", used));
         }
-        headers
+        headers(&pairs)
     }
 
     /// `/v1/messages` answers by model: Haiku allowed with headers, Fable 5.1
@@ -426,7 +400,7 @@ mod tests {
         Router::new()
             .route(
                 "/v1/messages",
-                post(|headers: AxumHeaders, body: String| async move {
+                post(|headers: HeaderMap, body: String| async move {
                     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body["max_tokens"], 1);
                     assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
@@ -439,8 +413,8 @@ mod tests {
                     );
                     let model = body["model"].as_str().unwrap_or_default();
                     let (status, headers) = match model {
-                        "claude-opus-4-8" => (StatusCode::UNAUTHORIZED, AxumHeaders::new()),
-                        "claude-fable-5-2" => (StatusCode::TOO_MANY_REQUESTS, AxumHeaders::new()),
+                        "claude-opus-4-8" => (StatusCode::UNAUTHORIZED, HeaderMap::new()),
+                        "claude-fable-5-2" => (StatusCode::TOO_MANY_REQUESTS, HeaderMap::new()),
                         "claude-fable-5-1" => (
                             StatusCode::TOO_MANY_REQUESTS,
                             quota_headers("rejected", Some("1.0")),
@@ -465,17 +439,10 @@ mod tests {
             )
     }
 
-    fn setup_account(name: &str) -> Account {
-        let mut account = Account::new(name);
-        account.setup_key = Some("sk-ant-oat01-setup".into());
-        account
-    }
-
     #[tokio::test]
     async fn a_probe_reads_the_headers_and_classifies_refusals() {
         let client = serve(fake_api()).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = profile::Cache::at(dir.path().join("reads.json"));
+        let (_dir, cache) = temp_cache();
         let account = setup_account("a");
         let probe = |model| probe_with(&client, &cache, &account, model, PROBE_TIMEOUT, 50);
 
@@ -506,8 +473,7 @@ mod tests {
     #[tokio::test]
     async fn a_bare_429_is_a_refusal_and_the_profile_row_outranks_the_headers() {
         let client = serve(fake_api()).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = profile::Cache::at(dir.path().join("reads.json"));
+        let (_dir, cache) = temp_cache();
 
         let bare = sample(
             &client,
@@ -524,7 +490,7 @@ mod tests {
         assert!(!bare.is_refused(), "a 429 is not definitive");
         assert!(bare.buckets.is_empty());
 
-        let login = crate::testing::profile_only_account("l", "profile-token");
+        let login = profile_only_account("l", "profile-token");
         let reading = probe_with(
             &client,
             &cache,

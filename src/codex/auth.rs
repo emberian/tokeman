@@ -251,6 +251,17 @@ pub(crate) mod tests {
         format!("{header}.{payload}.sig")
     }
 
+    /// A bundle refreshed just now with no id_token or account id.
+    pub(crate) fn bundle(access_token: &str, refresh_token: &str) -> TokenBundle {
+        TokenBundle {
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+            id_token: None,
+            account_id: None,
+            last_refresh: Some(Utc::now()),
+        }
+    }
+
     pub(crate) fn id_token(email: &str, account_id: &str, plan: &str) -> String {
         jwt(json!({
             "email": email,
@@ -285,15 +296,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         home.write_tokens(&TokenBundle {
-            access_token: "new-access".into(),
-            refresh_token: "new-refresh".into(),
-            id_token: None,
             account_id: Some("acct".into()),
             last_refresh: Some(
                 DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
                     .unwrap()
                     .into(),
             ),
+            ..bundle("new-access", "new-refresh")
         })
         .unwrap();
         let auth = home.read().unwrap();
@@ -326,11 +335,8 @@ pub(crate) mod tests {
         let home = CodexHome::new(dir.path());
         std::fs::write(home.auth_path(), r#"{"tokens":"garbage"}"#).unwrap();
         home.write_tokens(&TokenBundle {
-            access_token: "a".into(),
-            refresh_token: "r".into(),
-            id_token: None,
-            account_id: None,
             last_refresh: None,
+            ..bundle("a", "r")
         })
         .unwrap();
         assert_eq!(home.read().unwrap().access_token(), Some("a"));
@@ -351,14 +357,7 @@ pub(crate) mod tests {
         assert!(!auth.is_stale(7, Utc::now()));
         assert!(auth.is_stale(7, Utc::now() + chrono::Duration::days(8)));
         assert!(seat_access_only("", "acct", &home).is_err());
-        let incomplete = TokenBundle {
-            access_token: "a".into(),
-            refresh_token: String::new(),
-            id_token: None,
-            account_id: None,
-            last_refresh: None,
-        };
-        assert!(seat(&incomplete, &home).is_err());
+        assert!(seat(&bundle("a", ""), &home).is_err());
     }
 
     #[test]

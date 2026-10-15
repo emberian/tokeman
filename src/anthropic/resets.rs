@@ -282,7 +282,8 @@ pub fn describe_grant(grant: &ResetGrant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::testing::serve;
+    use crate::anthropic::testing::{serve, temp_cache};
+    use crate::testing::{profile_only_account, setup_account};
     use axum::Router;
     use axum::routing::{get, post};
 
@@ -406,11 +407,9 @@ mod tests {
     #[tokio::test]
     async fn status_and_claims_go_through_the_profile_token() {
         let client = serve(fake_api()).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::at(dir.path().join("reads.json"));
-        let mut account = Account::new("acct");
-        account.setup_key = Some("sk-ant-oat01-setup".into());
-        let error = status(&client, &cache, &account, false, 1)
+        let (_dir, cache) = temp_cache();
+        let setup_only = setup_account("acct");
+        let error = status(&client, &cache, &setup_only, false, 1)
             .await
             .unwrap_err();
         assert!(
@@ -418,7 +417,7 @@ mod tests {
             "{error}"
         );
 
-        let account = crate::testing::profile_only_account(&account.name, "profile");
+        let account = profile_only_account("acct", "profile");
         let status = status(&client, &cache, &account, false, 1).await.unwrap();
         assert_eq!(status.cedar_ember.unwrap().grants().len(), 1);
         assert!(

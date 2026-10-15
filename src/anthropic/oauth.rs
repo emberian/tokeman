@@ -272,16 +272,12 @@ async fn post_token(client: &Client, body: &serde_json::Value) -> Result<Grant, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::testing::serve;
+    use crate::anthropic::testing::{dead_client, serve};
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    fn dead_client() -> Client {
-        Client::with_base("http://127.0.0.1:9", "http://127.0.0.1:9/t")
-    }
 
     #[test]
     fn authorize_url_carries_profile_scope_and_a_challenge() {
@@ -300,18 +296,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_code_from_another_attempt_is_refused() {
+    async fn a_foreign_or_empty_paste_is_refused_before_any_request() {
         let pkce = begin(None).expect("pkce");
         let error = exchange(&dead_client(), "somecode#not-our-state", &pkce)
             .await
             .expect_err("state mismatch must be rejected before any network call");
         assert!(matches!(error, Error::Paste(_)));
         assert!(error.to_string().contains("state mismatch"));
-    }
-
-    #[tokio::test]
-    async fn an_empty_paste_is_refused() {
-        let pkce = begin(None).expect("pkce");
         assert!(matches!(
             exchange(&dead_client(), "   ", &pkce).await,
             Err(Error::Paste(_))

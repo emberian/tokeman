@@ -593,6 +593,8 @@ pub async fn probe_all(client: &Client, accounts: &[CodexAccount]) -> Vec<Probe>
 pub(crate) mod tests {
     use super::*;
     use crate::codex::auth::TokenBundle;
+    use crate::codex::auth::tests::{bundle, id_token};
+    use crate::testing::{codex_account, serve};
     use axum::Router;
     use axum::body::Bytes;
     use axum::extract::State as AxumState;
@@ -601,16 +603,6 @@ pub(crate) mod tests {
     use axum::routing::{get, post};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
-
-    /// Serve `app` on a loopback port; returns its base URL.
-    pub(crate) async fn serve(app: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{address}")
-    }
 
     /// One request as the fake backend saw it.
     #[derive(Debug, Clone)]
@@ -712,6 +704,11 @@ pub(crate) mod tests {
         (StatusCode::OK, headers, body.to_string())
     }
 
+    /// A bare answer with no headers.
+    pub(crate) fn status(code: StatusCode, body: &str) -> (StatusCode, HeaderMap, String) {
+        (code, HeaderMap::new(), body.into())
+    }
+
     pub(crate) fn challenge() -> (StatusCode, HeaderMap, String) {
         let mut headers = HeaderMap::new();
         headers.insert("cf-mitigated", "challenge".parse().unwrap());
@@ -749,22 +746,15 @@ pub(crate) mod tests {
     pub(crate) fn profile(dir: &std::path::Path, name: &str, refresh_token: &str) -> CodexAccount {
         let home = CodexHome::new(dir.join(name));
         home.write_tokens(&TokenBundle {
-            access_token: format!("access-{name}"),
-            refresh_token: refresh_token.to_owned(),
-            id_token: Some(crate::codex::auth::tests::id_token(
+            id_token: Some(id_token(
                 &format!("{name}@x.y"),
                 &format!("acct-{name}"),
                 "plus",
             )),
-            account_id: None,
-            last_refresh: Some(Utc::now()),
+            ..bundle(&format!("access-{name}"), refresh_token)
         })
         .unwrap();
-        CodexAccount {
-            name: name.to_owned(),
-            codex_home: home.path().display().to_string(),
-            ..CodexAccount::default()
-        }
+        codex_account(name, &home.path().display().to_string())
     }
 
     #[test]
@@ -827,11 +817,7 @@ pub(crate) mod tests {
 
     #[test]
     fn viability_follows_the_limit_block() {
-        let account = CodexAccount {
-            name: "a".into(),
-            codex_home: "/nowhere".into(),
-            ..CodexAccount::default()
-        };
+        let account = codex_account("a", "/nowhere");
         let at = Utc::now();
         let with = |limit: Option<RateLimit>, reason: Option<&str>| {
             Probe::new(
@@ -923,11 +909,7 @@ pub(crate) mod tests {
         let backend = Backend::default().usage_answers(vec![
             challenge(),
             ok(usage_body(0.0, 0.0)),
-            (
-                StatusCode::UNAUTHORIZED,
-                HeaderMap::new(),
-                r#"{"detail": "token  expired"}"#.into(),
-            ),
+            status(StatusCode::UNAUTHORIZED, r#"{"detail": "token  expired"}"#),
         ]);
         let client = backend.client().await;
         let probes = probe_all(&client, &[first, second]).await;
@@ -989,19 +971,11 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = Backend::default().usage_answers(vec![ok(usage_body(0.0, 0.0))]);
         let client = backend.client().await;
-        let missing = CodexAccount {
-            name: "missing".into(),
-            codex_home: dir.path().join("missing").display().to_string(),
-            ..CodexAccount::default()
-        };
+        let missing = codex_account("missing", &dir.path().join("missing").display().to_string());
         let no_token = CodexHome::new(dir.path().join("no-token"));
         std::fs::create_dir_all(no_token.path()).unwrap();
         std::fs::write(no_token.auth_path(), r#"{"tokens":{"refresh_token":"r"}}"#).unwrap();
-        let no_token = CodexAccount {
-            name: "no-token".into(),
-            codex_home: no_token.path().display().to_string(),
-            ..CodexAccount::default()
-        };
+        let no_token = codex_account("no-token", &no_token.path().display().to_string());
         let probes = probe_all(&client, &[missing, no_token]).await;
         assert!(matches!(probes[0].error, Some(ProbeError::AuthFile { .. })));
         assert_eq!(probes[1].error, Some(ProbeError::AuthFileHasNoAccessToken));

@@ -362,7 +362,8 @@ pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<Vec<Buck
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::testing::serve;
+    use crate::anthropic::testing::{serve, temp_cache};
+    use crate::testing::{bucket, profile_only_account, setup_account};
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::get;
@@ -379,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_usage_percent_is_normalized_to_fraction() {
+    fn profile_usage_windows_normalize_percent_and_stay_unknown_when_incomplete() {
         let window = usage_window(&UsageWindow {
             utilization: Some(67.5),
             resets_at: Some("2026-07-31T12:34:56Z".into()),
@@ -387,10 +388,6 @@ mod tests {
         .expect("valid profile usage window");
         assert!((window.used - 0.675).abs() < f64::EPSILON);
         assert_eq!(window.resets_at, 1_785_501_296);
-    }
-
-    #[test]
-    fn incomplete_profile_window_stays_unknown() {
         assert!(
             usage_window(&UsageWindow {
                 utilization: None,
@@ -579,20 +576,12 @@ mod tests {
     #[test]
     fn merging_replaces_same_keyed_buckets_or_records_the_failure() {
         let mut reading = Reading::failed("a", 0, crate::quota::ProbeError::NoCredential);
-        reading.buckets.push(Bucket {
-            key: ModelKey::new("Opus 5"),
-            label: "Opus 5".into(),
-            window: Window::new(0.1, 1),
-            source: Source::Carried,
-        });
+        reading
+            .buckets
+            .push(bucket("Opus 5", "Opus 5", 0.1, Source::Carried));
         merge(
             &mut reading,
-            Some(Ok(vec![Bucket {
-                key: ModelKey::new("Opus 5"),
-                label: "Opus 5".into(),
-                window: Window::new(0.4, 2),
-                source: Source::Profile,
-            }])),
+            Some(Ok(vec![bucket("Opus 5", "Opus 5", 0.4, Source::Profile)])),
         );
         assert_eq!(reading.buckets.len(), 1);
         assert_eq!(reading.buckets[0].source, Source::Profile);
@@ -657,8 +646,7 @@ mod tests {
             ),
         ]);
         let client = serve(router).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::at(dir.path().join("reads.json"));
+        let (_dir, cache) = temp_cache();
         let read = |now, fresh| cache.read(&client, "acct", "tok", Endpoint::Usage, fresh, now);
 
         assert_eq!(read(1000, false).await.unwrap(), good);
@@ -695,29 +683,18 @@ mod tests {
             (StatusCode::OK, None, serde_json::json!({"limits": []})),
         ]);
         let client = serve(router).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::at(dir.path().join("reads.json"));
-        let error = cache
-            .read(&client, "acct", "tok", Endpoint::Usage, false, 100)
-            .await
-            .unwrap_err();
+        let (dir, cache) = temp_cache();
+        let read = |now| cache.read(&client, "acct", "tok", Endpoint::Usage, false, now);
+        let error = read(100).await.unwrap_err();
         assert!(error.to_string().contains("HTTP 500"), "{error}");
         let entry = cache.load().remove("acct|usage").unwrap();
         assert_eq!(entry.retry_after, 100 + ERROR_RETRY_SECS);
         assert_eq!(entry.rate_limited, 0);
         // Still inside the minute: no request.
-        assert!(
-            cache
-                .read(&client, "acct", "tok", Endpoint::Usage, false, 150)
-                .await
-                .is_err()
-        );
+        assert!(read(150).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // After it: fetched, and the entry's backoff state is cleared.
-        cache
-            .read(&client, "acct", "tok", Endpoint::Usage, false, 161)
-            .await
-            .unwrap();
+        read(161).await.unwrap();
         let entry = cache.load().remove("acct|usage").unwrap();
         assert_eq!(entry.retry_after, 0);
         assert!(entry.last_error.is_none());
@@ -737,12 +714,10 @@ mod tests {
     async fn usage_needs_a_profile_token_and_reports_parse_failures() {
         let (router, _) = scripted(vec![(StatusCode::OK, None, serde_json::json!([1, 2]))]);
         let client = serve(router).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::at(dir.path().join("reads.json"));
-        let mut account = Account::new("acct");
-        account.setup_key = Some("sk-ant-oat01-setup".into());
-        assert!(usage(&client, &cache, &account, 10).await.is_none());
-        let account = crate::testing::profile_only_account("acct", "captured");
+        let (_dir, cache) = temp_cache();
+        let setup_only = setup_account("acct");
+        assert!(usage(&client, &cache, &setup_only, 10).await.is_none());
+        let account = profile_only_account("acct", "captured");
         let outcome = usage(&client, &cache, &account, 10).await.unwrap();
         assert!(
             outcome

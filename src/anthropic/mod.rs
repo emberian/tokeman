@@ -233,20 +233,26 @@ pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
 pub(crate) mod testing {
     //! A loopback server the modules' tests point a [`Client`] at.
 
-    use super::Client;
+    use super::{Client, profile};
     use axum::Router;
 
     /// Serve `router` on a free loopback port for the rest of the test.
     pub async fn serve(router: Router) -> Client {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a loopback port");
-        let addr = listener.local_addr().expect("local address");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-        let base = format!("http://{addr}");
+        let base = crate::testing::serve(router).await;
         Client::with_base(&base, &format!("{base}/v1/oauth/token"))
+    }
+
+    /// A client whose endpoints nothing answers: for paths that must fail
+    /// before any request.
+    pub fn dead_client() -> Client {
+        Client::with_base("http://127.0.0.1:9", "http://127.0.0.1:9/t")
+    }
+
+    /// A profile cache in a fresh directory; keep the guard for its lifetime.
+    pub fn temp_cache() -> (tempfile::TempDir, profile::Cache) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = profile::Cache::at(dir.path().join("reads.json"));
+        (dir, cache)
     }
 }
 
@@ -294,7 +300,7 @@ mod tests {
 
     #[test]
     fn credentials_pick_their_auth_scheme() {
-        let client = Client::with_base("http://127.0.0.1:9", "http://127.0.0.1:9/t");
+        let client = testing::dead_client();
         let oauth = client
             .messages(Credential::Setup("sk-ant-oat01-x"))
             .build()

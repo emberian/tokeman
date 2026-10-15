@@ -206,7 +206,14 @@ pub async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::auth::tests::bundle;
     use reqwest::StatusCode;
+
+    /// An unroutable endpoint: failures must come before any request.
+    fn dead_client() -> Client {
+        Client::with_endpoints("http://127.0.0.1:1/usage", "http://127.0.0.1:1/token", "id")
+            .unwrap()
+    }
 
     #[test]
     fn failures_classify_by_code_then_status() {
@@ -252,10 +259,7 @@ mod tests {
             r#"{"tokens":{"access_token":"a","refresh_token":""}}"#,
         )
         .unwrap();
-        // An unroutable endpoint: the failure must come before any request.
-        let client =
-            Client::with_endpoints("http://127.0.0.1:1/usage", "http://127.0.0.1:1/token", "id")
-                .unwrap();
+        let client = dead_client();
         let error = refresh_home(&client, &home).await.unwrap_err();
         assert_eq!(error.failure, Failure::NoRefreshToken);
         assert!(error.to_string().contains("auth.json"));
@@ -270,17 +274,8 @@ mod tests {
     async fn a_fresh_profile_is_left_alone_unless_forced() {
         let dir = tempfile::tempdir().unwrap();
         let home = CodexHome::new(dir.path());
-        home.write_tokens(&TokenBundle {
-            access_token: "a".into(),
-            refresh_token: "r".into(),
-            id_token: None,
-            account_id: None,
-            last_refresh: Some(Utc::now()),
-        })
-        .unwrap();
-        let client =
-            Client::with_endpoints("http://127.0.0.1:1/usage", "http://127.0.0.1:1/token", "id")
-                .unwrap();
+        home.write_tokens(&bundle("a", "r")).unwrap();
+        let client = dead_client();
         assert_eq!(
             refresh(&client, &home, false, 7, Utc::now()).await.unwrap(),
             None

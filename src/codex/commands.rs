@@ -820,10 +820,10 @@ pub async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::auth::TokenBundle;
-    use crate::codex::auth::tests::id_token;
-    use crate::codex::probe::tests::{Backend, challenge, ok, profile, usage_body};
-    use axum::http::{HeaderMap, StatusCode};
+    use crate::codex::auth::tests::{bundle, id_token, jwt};
+    use crate::codex::probe::tests::{Backend, challenge, ok, profile, status, usage_body};
+    use crate::testing::codex_account;
+    use axum::http::StatusCode;
     use serde_json::json;
 
     /// Push an account's `last_refresh` back by `days`.
@@ -847,11 +847,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let default = dir.path().join(".codex");
         let lane = dir.path().join(".codex-homes").join("work");
-        let fleet = fleet_of(vec![CodexAccount {
-            name: "work".into(),
-            codex_home: lane.display().to_string(),
-            ..CodexAccount::default()
-        }]);
+        let fleet = fleet_of(vec![codex_account("work", &lane.display().to_string())]);
         let found = survey(&[default.clone(), lane.clone()], &fleet);
         assert_eq!(
             found,
@@ -893,10 +889,7 @@ mod tests {
         assert_eq!(auth.account_id(), Some("acct-ops"));
         assert_eq!(auth.refresh_token(), None);
         // A token without the account claim, and an empty file, are errors.
-        let no_account = format!(
-            "x {}\n",
-            crate::codex::auth::tests::jwt(json!({"email": "x"}))
-        );
+        let no_account = format!("x {}\n", jwt(json!({"email": "x"})));
         assert!(import_into(&no_account, dir.path(), false).is_err());
         assert!(import_into("# nothing\n", dir.path(), false).is_err());
         assert!(import_into("x not-a-jwt\n", dir.path(), false).is_err());
@@ -980,10 +973,8 @@ mod tests {
             body: String::new(),
         });
         let fleet = fleet_of(vec![CodexAccount {
-            name: "parked".into(),
-            codex_home: "/homes/parked".into(),
             parked: true,
-            ..CodexAccount::default()
+            ..codex_account("parked", "/homes/parked")
         }]);
         assert_eq!(best_of(&probes, &fleet, None).unwrap().account, "roomy");
         assert_eq!(
@@ -1021,7 +1012,7 @@ mod tests {
         let new_id = id_token("rejected@x.y", "acct-rejected", "pro");
         let backend = Backend::default()
             .usage_answers(vec![
-                (StatusCode::UNAUTHORIZED, HeaderMap::new(), "{}".into()),
+                status(StatusCode::UNAUTHORIZED, "{}"),
                 ok(usage_body(0.0, 0.0)),
             ])
             .token_answers(vec![(
@@ -1072,13 +1063,7 @@ mod tests {
         let events = sweep(&client, &accounts, &mut needs_login).await;
         assert!(events.is_empty(), "{events:?}");
         CodexHome::new(orphan.home())
-            .write_tokens(&TokenBundle {
-                access_token: "a".into(),
-                refresh_token: "r".into(),
-                id_token: None,
-                account_id: None,
-                last_refresh: Some(Utc::now()),
-            })
+            .write_tokens(&bundle("a", "r"))
             .unwrap();
         let events = sweep(&client, &accounts, &mut needs_login).await;
         assert_eq!(
@@ -1096,11 +1081,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let account = profile(dir.path(), "one", "r1");
         let backend = Backend::default()
-            .usage_answers(vec![(
-                StatusCode::UNAUTHORIZED,
-                HeaderMap::new(),
-                "{}".into(),
-            )])
+            .usage_answers(vec![status(StatusCode::UNAUTHORIZED, "{}")])
             .token_answers(vec![
                 (StatusCode::BAD_GATEWAY, "upstream".into()),
                 (
