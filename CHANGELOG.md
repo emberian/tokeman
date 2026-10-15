@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - unreleased
+## 0.3.0 - 2026-10-14
 
 A rewrite from the knowledge 0.2.0 accumulated, built to DESIGN.md. Same
 account file, settings.json keys, hook, history files and commands; the
