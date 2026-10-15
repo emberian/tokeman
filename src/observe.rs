@@ -854,22 +854,12 @@ fn format_reset(reset: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::bucket;
     use serde_json::json;
     use std::io::Write;
 
     fn reading(name: &str) -> Reading {
-        Reading {
-            account: name.into(),
-            at: 0,
-            verdict: Verdict::Allowed,
-            claim: None,
-            session: Some(Window::new(0.1, 0)),
-            weekly: Some(Window::new(0.2, 0)),
-            buckets: Vec::new(),
-            overage: None,
-            error: None,
-            profile_error: None,
-        }
+        crate::testing::reading(name, 0.1, 0.2)
     }
 
     fn binding(last_model: Option<&str>) -> SessionBinding {
@@ -904,30 +894,23 @@ mod tests {
         "You've hit your weekly limit · resets Aug 1 at 9am (America/New_York)";
 
     #[test]
-    fn anthropic_base_urls_are_recognised() {
-        for url in [
-            "https://api.anthropic.com",
-            "https://api.anthropic.com/v1",
-            "https://api.anthropic.com:443/v1/messages",
-            "HTTPS://API.ANTHROPIC.COM/",
-            "https://anthropic.com",
-        ] {
-            assert!(is_anthropic_base_url(url), "expected Anthropic: {url}");
-        }
-    }
-
-    #[test]
-    fn third_party_base_urls_are_not_anthropic() {
-        for url in [
-            "https://api.z.ai/api/anthropic",
-            "https://api.kimi.com/coding",
-            "https://cli-chat-proxy.grok.com",
-            "http://127.0.0.1:8317",
-            "http://localhost:8317/v1",
-            "https://api.anthropic.com.evil.test/v1",
-            "https://notanthropic.com",
-        ] {
-            assert!(!is_anthropic_base_url(url), "expected third party: {url}");
+    fn anthropic_base_urls_are_recognised_and_third_parties_are_not() {
+        let cases = [
+            ("https://api.anthropic.com", true),
+            ("https://api.anthropic.com/v1", true),
+            ("https://api.anthropic.com:443/v1/messages", true),
+            ("HTTPS://API.ANTHROPIC.COM/", true),
+            ("https://anthropic.com", true),
+            ("https://api.z.ai/api/anthropic", false),
+            ("https://api.kimi.com/coding", false),
+            ("https://cli-chat-proxy.grok.com", false),
+            ("http://127.0.0.1:8317", false),
+            ("http://localhost:8317/v1", false),
+            ("https://api.anthropic.com.evil.test/v1", false),
+            ("https://notanthropic.com", false),
+        ];
+        for (url, anthropic) in cases {
+            assert_eq!(is_anthropic_base_url(url), anthropic, "{url}");
         }
     }
 
@@ -950,41 +933,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_weekly_reset_with_date() {
-        let observed = DateTime::parse_from_rfc3339("2026-07-27T20:17:20Z")
+    fn reset_messages_parse_dates_and_roll_bare_clocks_to_tomorrow() {
+        let local = |message, observed| {
+            let reset = parse_reset_from_message(message, observed).unwrap();
+            DateTime::from_timestamp(reset, 0)
+                .unwrap()
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %-I%P")
+                .to_string()
+        };
+        let dated = DateTime::parse_from_rfc3339("2026-07-27T20:17:20Z")
             .unwrap()
             .timestamp();
-        let reset = parse_reset_from_message(WEEKLY_MESSAGE, observed).unwrap();
-        let local = DateTime::from_timestamp(reset, 0)
-            .unwrap()
-            .with_timezone(&Local);
-        assert_eq!(local.format("%Y-%m-%d %-I%P").to_string(), "2026-08-01 9am");
-    }
-
-    #[test]
-    fn parses_same_day_clock_or_rolls_to_tomorrow() {
-        let observed = Local
+        assert_eq!(local(WEEKLY_MESSAGE, dated), "2026-08-01 9am");
+        let afternoon = Local
             .with_ymd_and_hms(2026, 7, 27, 16, 0, 0)
             .single()
             .unwrap()
             .timestamp();
-        let reset =
-            parse_reset_from_message("session limit · resets 11pm (America/New_York)", observed)
-                .unwrap();
-        let local = DateTime::from_timestamp(reset, 0)
-            .unwrap()
-            .with_timezone(&Local);
         assert_eq!(
-            local.format("%Y-%m-%d %-I%P").to_string(),
+            local("session limit · resets 11pm (America/New_York)", afternoon),
             "2026-07-27 11pm"
         );
-        let reset =
-            parse_reset_from_message("session limit · resets 3pm (America/New_York)", observed)
-                .unwrap();
-        let local = DateTime::from_timestamp(reset, 0)
-            .unwrap()
-            .with_timezone(&Local);
-        assert_eq!(local.format("%Y-%m-%d %-I%P").to_string(), "2026-07-28 3pm");
+        assert_eq!(
+            local("session limit · resets 3pm (America/New_York)", afternoon),
+            "2026-07-28 3pm"
+        );
         assert_eq!(parse_clock("12:30am"), NaiveTime::from_hms_opt(0, 30, 0));
         assert_eq!(parse_clock("13pm"), None);
     }
@@ -1100,12 +1074,9 @@ mod tests {
     #[test]
     fn a_family_wide_fable_limit_lands_on_the_shared_fable_bucket() {
         let mut result = reading("ember");
-        result.buckets.push(Bucket {
-            key: ModelKey::new("fable"),
-            label: "Fable".into(),
-            window: Window::new(0.4, 1),
-            source: Source::Headers,
-        });
+        result
+            .buckets
+            .push(bucket("fable", "Fable", 0.4, Source::Headers));
         apply_limit(
             &mut result,
             &limit(Family::Fable, None, LimitWindow::Weekly),
@@ -1126,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_rejection_for_the_same_reset_is_not_new() {
+    fn a_repeated_rejection_for_the_same_reset_is_not_new_but_a_new_reset_replaces_it() {
         let first = ObservedLimit {
             observed_at: 100,
             resets_at: 1_000,
@@ -1145,16 +1116,7 @@ mod tests {
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].observed_at, 100);
         assert_eq!(limits[0].session_id.as_deref(), Some("first"));
-    }
 
-    #[test]
-    fn rejection_for_a_new_reset_replaces_the_old_window() {
-        let mut limits = vec![ObservedLimit {
-            observed_at: 100,
-            resets_at: 1_000,
-            session_id: Some("old".into()),
-            ..limit(Family::Opus, None, LimitWindow::Weekly)
-        }];
         let replacement = ObservedLimit {
             observed_at: 2_000,
             resets_at: 3_000,
@@ -1162,6 +1124,7 @@ mod tests {
             ..limit(Family::Opus, None, LimitWindow::Weekly)
         };
         assert!(merge_limit(&mut limits, replacement));
+        assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].resets_at, 3_000);
         assert_eq!(limits[0].session_id.as_deref(), Some("new"));
     }

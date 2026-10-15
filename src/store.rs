@@ -350,10 +350,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_reading_round_trips_through_the_store() {
+    fn open() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(&dir.path().join("s.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn a_reading_round_trips_through_the_store() {
+        let (_dir, store) = open();
         store.insert(&reading()).unwrap();
         let rows = store.recent(Some("acct"), 5).unwrap();
         assert_eq!(rows.len(), 1);
@@ -371,8 +376,7 @@ mod tests {
 
     #[test]
     fn legacy_model_columns_fold_in_only_when_no_bucket_has_the_family() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_at(&dir.path().join("s.db")).unwrap();
+        let (_dir, store) = open();
         store
             .conn
             .execute(

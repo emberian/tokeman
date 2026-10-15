@@ -226,48 +226,14 @@ impl Cadence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Login;
-    use crate::quota::Verdict;
+    use crate::testing::{FAR_FUTURE_MS, bucket, login_account, refused};
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.into(),
-            setup_key: Some(format!("sk-ant-oat01-setup-{name}")),
-            login: Some(Login {
-                access_token: Some(format!("sk-ant-oat01-access-{name}")),
-                refresh_token: Some("r".into()),
-                expires_at: Some(i64::MAX / 2),
-                obtained_at: Some(0),
-                scopes: vec!["user:inference".into()],
-                error: None,
-            }),
-        }
-    }
-
-    fn refused(name: &str) -> Reading {
-        Reading::failed(
-            name,
-            0,
-            ProbeError::Http {
-                status: 401,
-                body: "nope".into(),
-            },
-        )
+        login_account(name, FAR_FUTURE_MS)
     }
 
     fn fine(name: &str) -> Reading {
-        Reading {
-            account: name.into(),
-            at: 0,
-            verdict: Verdict::Allowed,
-            claim: None,
-            session: Some(Window::new(0.1, 0)),
-            weekly: Some(Window::new(0.1, 0)),
-            buckets: Vec::new(),
-            overage: None,
-            error: None,
-            profile_error: None,
-        }
+        crate::testing::reading(name, 0.1, 0.1)
     }
 
     #[test]
@@ -365,10 +331,8 @@ mod tests {
 
         let mut sampled = fine("s");
         sampled.set_bucket(Bucket {
-            key: ModelKey::family_wide(Family::Fable),
-            label: "Fable".into(),
             window: Window::new(0.6, 5_000),
-            source: Source::Headers,
+            ..bucket("fable", "Fable", 0.6, Source::Headers)
         });
         assert!(cadence.record_samples([&sampled], 10.0).is_empty());
         assert!(!cadence.due_for_sample(&setup_only, &policy, 20.0));

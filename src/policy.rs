@@ -382,61 +382,34 @@ pub fn decide<'a>(situation: &Situation<'a>, policy: &PolicySettings) -> Decisio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::{Bucket, ProbeError, Source, Verdict};
+    use crate::quota::{ProbeError, Source};
+    use crate::testing::{bucket, reading, reading_with_bucket, reading_with_resets};
 
     fn key(model: &str) -> ModelKey {
         ModelKey::new(model)
     }
 
-    fn reading(name: &str, session_used: f64, weekly_used: f64) -> Reading {
-        with_resets(name, session_used, weekly_used, 0, 0)
-    }
-
-    fn with_resets(
-        name: &str,
-        session_used: f64,
-        weekly_used: f64,
-        session_reset: i64,
-        weekly_reset: i64,
-    ) -> Reading {
-        Reading {
-            account: name.into(),
-            at: 0,
-            verdict: Verdict::Allowed,
-            claim: Some("five_hour".into()),
-            session: Some(Window::new(session_used, session_reset)),
-            weekly: Some(Window::new(weekly_used, weekly_reset)),
-            buckets: Vec::new(),
-            overage: None,
-            error: None,
-            profile_error: None,
-        }
-    }
-
-    fn with_bucket(name: &str, bucket: &str, label: &str, used: f64) -> Reading {
-        let mut r = reading(name, 0.0, 0.0);
-        r.buckets.push(Bucket {
-            key: key(bucket),
-            label: label.into(),
-            window: Window::new(used, 0),
-            source: Source::Profile,
-        });
-        r
+    fn opus() -> Option<ModelKey> {
+        Some(key("opus"))
     }
 
     fn with_opus(name: &str, session_used: f64, weekly_used: f64, opus_used: f64) -> Reading {
-        let mut r = reading(name, session_used, weekly_used);
-        r.buckets.push(Bucket {
-            key: key("opus"),
-            label: "Opus".into(),
-            window: Window::new(opus_used, 0),
-            source: Source::Profile,
-        });
-        r
+        reading_with_bucket(name, session_used, weekly_used, "opus", "Opus", opus_used)
     }
 
-    fn opus() -> Option<ModelKey> {
-        Some(key("opus"))
+    /// Viability under the default floors for an opus session.
+    fn viable_in(r: &Reading, mode: Mode) -> bool {
+        viable(r, mode, &PolicySettings::default(), opus().as_ref())
+    }
+
+    /// Viability under the default normal floors for a session on `model`.
+    fn viable_for(r: &Reading, model: &str) -> bool {
+        viable(
+            r,
+            Mode::Normal,
+            &PolicySettings::default(),
+            Some(&key(model)),
+        )
     }
 
     fn best<'a>(readings: &'a [Reading], mode: Mode, model: Option<&ModelKey>) -> Option<&'a str> {
@@ -457,84 +430,50 @@ mod tests {
     #[test]
     fn exact_normal_floor_is_not_viable() {
         let policy = PolicySettings::default();
-        let viable = |r: &Reading| super::viable(r, Mode::Normal, &policy, opus().as_ref());
-        assert!(!viable(&reading(
-            "at-floor",
-            1.0 - policy.normal_min_5h_remaining,
-            0.0
-        )));
-        assert!(!viable(&reading(
-            "weekly-floor",
-            0.0,
-            1.0 - policy.normal_min_7d_remaining
-        )));
+        let at_floor = reading("at-floor", 1.0 - policy.normal_min_5h_remaining, 0.0);
+        let weekly_floor = reading("weekly-floor", 0.0, 1.0 - policy.normal_min_7d_remaining);
+        assert!(!viable_in(&at_floor, Mode::Normal));
+        assert!(!viable_in(&weekly_floor, Mode::Normal));
     }
 
     #[test]
     fn known_opus_floor_is_part_of_shared_default_viability() {
-        let policy = PolicySettings::default();
-        let floor = policy.normal_min_7d_remaining;
-        let viable = |r: &Reading| super::viable(r, Mode::Normal, &policy, opus().as_ref());
-        assert!(!viable(&with_opus("opus-wall", 0.0, 0.0, 1.0 - floor)));
-        assert!(viable(&with_opus(
-            "opus-room",
-            0.0,
-            0.0,
-            1.0 - floor - 0.01
-        )));
+        let floor = PolicySettings::default().normal_min_7d_remaining;
+        let wall = with_opus("opus-wall", 0.0, 0.0, 1.0 - floor);
+        let room = with_opus("opus-room", 0.0, 0.0, 1.0 - floor - 0.01);
+        assert!(!viable_in(&wall, Mode::Normal));
+        assert!(viable_in(&room, Mode::Normal));
     }
 
     #[test]
     fn exhausted_opus_48_bucket_does_not_poison_opus_5_or_fable() {
-        let policy = PolicySettings::default();
-        let r = with_bucket("separate-models", "opus48", "Opus 4.8", 1.0);
-        let viable = |model: &str| super::viable(&r, Mode::Normal, &policy, Some(&key(model)));
-        assert!(viable("opus"));
-        assert!(!viable("claude-opus-4-8"));
-        assert!(viable("claude-fable-5-1"));
+        let r = reading_with_bucket("separate-models", 0.0, 0.0, "opus48", "Opus 4.8", 1.0);
+        assert!(viable_for(&r, "opus"));
+        assert!(!viable_for(&r, "claude-opus-4-8"));
+        assert!(viable_for(&r, "claude-fable-5-1"));
     }
 
     #[test]
     fn the_fable_limit_gates_fable_sessions_only() {
-        let policy = PolicySettings::default();
-        let r = with_bucket("profile", "fable", "Fable", 1.0);
-        let viable = |model: &str| super::viable(&r, Mode::Normal, &policy, Some(&key(model)));
-        assert!(!viable("claude-fable-5-1"));
-        assert!(!viable("fable"));
-        assert!(viable("opus"));
+        let r = reading_with_bucket("profile", 0.0, 0.0, "fable", "Fable", 1.0);
+        assert!(!viable_for(&r, "claude-fable-5-1"));
+        assert!(!viable_for(&r, "fable"));
+        assert!(viable_for(&r, "opus"));
     }
 
     #[test]
     fn the_opus_alias_obeys_the_opus_5_bucket() {
-        let policy = PolicySettings::default();
-        let r = with_bucket("opus-five", "claudeopus5", "Opus 5", 0.95);
-        assert!(!viable(&r, Mode::Normal, &policy, Some(&key("opus[1m]"))));
+        let r = reading_with_bucket("opus-five", 0.0, 0.0, "claudeopus5", "Opus 5", 0.95);
+        assert!(!viable_for(&r, "opus[1m]"));
     }
 
     #[test]
     fn unrelated_family_bucket_does_not_affect_selection() {
-        let policy = PolicySettings::default();
         let mut r = with_opus("family-split", 0.0, 0.0, 0.10);
-        r.buckets.push(Bucket {
-            key: key("sonnet"),
-            label: "Sonnet".into(),
-            window: Window::new(1.0, 0),
-            source: Source::Profile,
-        });
-        assert!(viable(&r, Mode::Normal, &policy, Some(&key("opus"))));
-        assert!(!viable(&r, Mode::Normal, &policy, Some(&key("sonnet"))));
-    }
-
-    #[test]
-    fn replacement_landing_score_includes_known_opus_capacity() {
-        let readings = [
-            with_opus("general-room-opus-tight", 0.0, 0.0, 0.80),
-            with_opus("balanced-for-opus", 0.10, 0.10, 0.10),
-        ];
-        assert_eq!(
-            best(&readings, Mode::Normal, opus().as_ref()),
-            Some("balanced-for-opus")
-        );
+        r.buckets
+            .push(bucket("sonnet", "Sonnet", 1.0, Source::Profile));
+        assert!(viable_for(&r, "opus"));
+        assert!(!viable_for(&r, "sonnet"));
     }
 
     #[test]
@@ -568,60 +507,66 @@ mod tests {
 
     #[test]
     fn sip_floors_are_hard_boundaries() {
-        let policy = PolicySettings::default();
-        let viable = |r: &Reading| super::viable(r, Mode::Sip, &policy, opus().as_ref());
-        assert!(!viable(&reading("five-hour-floor", 0.98, 0.50)));
-        assert!(!viable(&reading("weekly-floor", 0.50, 0.97)));
-        assert!(viable(&reading("scraps", 0.979, 0.969)));
+        assert!(!viable_in(
+            &reading("five-hour-floor", 0.98, 0.50),
+            Mode::Sip
+        ));
+        assert!(!viable_in(&reading("weekly-floor", 0.50, 0.97), Mode::Sip));
+        assert!(viable_in(&reading("scraps", 0.979, 0.969), Mode::Sip));
     }
 
     #[test]
-    fn replacement_prefers_long_balanced_dwell() {
-        let readings = [
-            reading("short-five", 0.70, 0.15),
-            reading("balanced", 0.14, 0.14),
-            reading("short-weekly", 0.05, 0.77),
+    fn replacement_ranks_by_dwell_then_headroom_then_the_limiting_reset() {
+        let cases: [(&str, Vec<Reading>, &str); 5] = [
+            (
+                "the landing score includes known opus capacity",
+                vec![
+                    with_opus("general-room-opus-tight", 0.0, 0.0, 0.80),
+                    with_opus("balanced-for-opus", 0.10, 0.10, 0.10),
+                ],
+                "balanced-for-opus",
+            ),
+            (
+                "a long balanced dwell beats a short one",
+                vec![
+                    reading("short-five", 0.70, 0.15),
+                    reading("balanced", 0.14, 0.14),
+                    reading("short-weekly", 0.05, 0.77),
+                ],
+                "balanced",
+            ),
+            (
+                "the soonest limiting reset breaks a headroom tie",
+                vec![
+                    reading_with_resets("same-dwell-later", 0.10, 0.20, 900, 3_600),
+                    reading_with_resets("same-dwell-first", 0.10, 0.20, 900, 600),
+                ],
+                "same-dwell-first",
+            ),
+            (
+                "headroom beats an earlier reset",
+                vec![
+                    reading_with_resets("roomy", 0.08, 0.01, 3_600, 86_400),
+                    reading_with_resets("soon-but-tight", 0.06, 0.54, 600, 600),
+                ],
+                "roomy",
+            ),
+            (
+                "only the limiting window's reset counts",
+                vec![
+                    reading_with_resets("non-limiting-reset", 0.00, 0.50, 60, 7_200),
+                    reading_with_resets("limiting-reset", 0.40, 0.10, 600, 9_000),
+                ],
+                "limiting-reset",
+            ),
         ];
-        assert_eq!(
-            best(&readings, Mode::Normal, opus().as_ref()),
-            Some("balanced")
-        );
-    }
-
-    #[test]
-    fn replacement_uses_soonest_limiting_reset_as_a_headroom_tiebreaker() {
-        let readings = [
-            with_resets("same-dwell-later", 0.10, 0.20, 900, 3_600),
-            with_resets("same-dwell-first", 0.10, 0.20, 900, 600),
-        ];
-        assert_eq!(
-            best(&readings, Mode::Normal, opus().as_ref()),
-            Some("same-dwell-first")
-        );
-    }
-
-    #[test]
-    fn replacement_headroom_beats_an_earlier_reset() {
-        let readings = [
-            with_resets("roomy", 0.08, 0.01, 3_600, 86_400),
-            with_resets("soon-but-tight", 0.06, 0.54, 600, 600),
-        ];
-        assert_eq!(
-            best(&readings, Mode::Normal, opus().as_ref()),
-            Some("roomy")
-        );
-    }
-
-    #[test]
-    fn replacement_uses_the_limiting_windows_reset() {
-        let readings = [
-            with_resets("non-limiting-reset", 0.00, 0.50, 60, 7_200),
-            with_resets("limiting-reset", 0.40, 0.10, 600, 9_000),
-        ];
-        assert_eq!(
-            best(&readings, Mode::Normal, opus().as_ref()),
-            Some("limiting-reset")
-        );
+        for (why, readings, want) in cases {
+            assert_eq!(
+                best(&readings, Mode::Normal, opus().as_ref()),
+                Some(want),
+                "{why}"
+            );
+        }
     }
 
     #[test]
@@ -668,12 +613,8 @@ mod tests {
         let fresh = [reading("otto", 0.0, 0.27)];
         let landing = landing_exists(&fresh, &policy, Some(&fable));
         let stays = |used| {
-            should_stay(
-                &with_bucket("boto", "fable", "Fable", used),
-                landing,
-                &policy,
-                Some(&fable),
-            )
+            let current = reading_with_bucket("boto", 0.0, 0.0, "fable", "Fable", used);
+            should_stay(&current, landing, &policy, Some(&fable))
         };
         assert!(stays(0.91));
         assert!(!stays(0.95));
@@ -683,21 +624,14 @@ mod tests {
     fn cadence_is_fast_when_degraded_or_near_a_floor_and_normal_otherwise() {
         let policy = PolicySettings::default();
         let fast = policy.sip_probe_interval_secs;
+        let interval = |session, weekly, healthy| {
+            let current = reading("a", session, weekly);
+            next_interval_secs(Mode::Normal, Some(&current), healthy, &policy)
+        };
+        assert_eq!(interval(0.10, 0.10, false), fast);
+        assert_eq!(interval(0.88, 0.20, true), fast);
         assert_eq!(
-            next_interval_secs(
-                Mode::Normal,
-                Some(&reading("a", 0.10, 0.10)),
-                false,
-                &policy
-            ),
-            fast
-        );
-        assert_eq!(
-            next_interval_secs(Mode::Normal, Some(&reading("a", 0.88, 0.20)), true, &policy),
-            fast
-        );
-        assert_eq!(
-            next_interval_secs(Mode::Normal, Some(&reading("a", 0.20, 0.20)), true, &policy),
+            interval(0.20, 0.20, true),
             policy.normal_probe_interval_secs
         );
     }
@@ -724,12 +658,7 @@ mod tests {
         assert!(expired.is_refused());
         assert!(complete(std::slice::from_ref(&expired), 1));
         assert!(!current_unreadable(Some("expired"), Some(&expired)));
-        assert!(!viable(
-            &expired,
-            Mode::Normal,
-            &PolicySettings::default(),
-            opus().as_ref()
-        ));
+        assert!(!viable_in(&expired, Mode::Normal));
     }
 
     #[test]

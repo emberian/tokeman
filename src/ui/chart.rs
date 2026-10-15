@@ -616,6 +616,7 @@ fn glyph(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::point;
 
     #[test]
     fn ellipsize_respects_character_count() {
@@ -666,14 +667,6 @@ mod tests {
         );
         assert_eq!(Metric::Overage.floors(&policy), None);
         assert_eq!(Metric::Model(ModelKey::new("fable")).floors(&policy), None);
-    }
-
-    fn point(at: i64, remaining: f64, resets_at: Option<i64>) -> Point {
-        Point {
-            at,
-            remaining,
-            resets_at,
-        }
     }
 
     #[test]

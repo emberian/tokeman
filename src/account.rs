@@ -593,22 +593,10 @@ fn sync_tables<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const HOUR_MS: i64 = 3_600_000;
+    use crate::testing::{HOUR_MS, codex_account, profile_only_account};
 
     fn login_account(expires_at: i64) -> Account {
-        Account {
-            name: "acct".into(),
-            setup_key: Some("sk-ant-oat01-setup".into()),
-            login: Some(Login {
-                access_token: Some("sk-ant-oat01-access".into()),
-                refresh_token: Some("sk-ant-ort01-refresh".into()),
-                expires_at: Some(expires_at),
-                obtained_at: Some(expires_at - 8 * HOUR_MS),
-                scopes: vec!["user:inference".into(), "user:profile".into()],
-                error: None,
-            }),
-        }
+        crate::testing::login_account("acct", expires_at)
     }
 
     #[test]
@@ -616,7 +604,7 @@ mod tests {
         let account = login_account(10 * HOUR_MS);
         let credential = account.credential(0).unwrap();
         assert!(credential.is_login());
-        assert_eq!(credential.value(), "sk-ant-oat01-access");
+        assert_eq!(credential.value(), "sk-ant-oat01-access-acct");
         assert!(
             credential
                 .scopes()
@@ -631,7 +619,7 @@ mod tests {
         refused.login.as_mut().unwrap().error = Some("invalid_grant".into());
         assert_eq!(
             refused.credential(0),
-            Some(Credential::Setup("sk-ant-oat01-setup"))
+            Some(Credential::Setup("sk-ant-oat01-setup-acct"))
         );
         // One minute left is too little to hand to a session.
         let expiring = login_account(60_000);
@@ -643,7 +631,7 @@ mod tests {
 
     #[test]
     fn a_captured_access_token_without_refresh_is_never_installed() {
-        let account = crate::testing::profile_only_account("acct", "captured");
+        let account = profile_only_account("acct", "captured");
         assert!(!account.credential(0).unwrap().is_login());
         assert_eq!(account.profile_token(0), Some("captured"));
         assert!(!account.needs_refresh(0));
@@ -739,11 +727,8 @@ mod tests {
         let mut fleet = Fleet::default();
         fleet.accounts.push(login_account(HOUR_MS));
         fleet.upsert_codex(CodexAccount {
-            name: "work".into(),
-            codex_home: "~/.codex-homes/work".into(),
-            label: None,
             parked: true,
-            access_only: false,
+            ..codex_account("work", "~/.codex-homes/work")
         });
         fleet.launch.terminal = Some("iTerm2".into());
         let rendered = fleet.render("").unwrap();

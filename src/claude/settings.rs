@@ -287,24 +287,18 @@ pub fn remove_observer_hook(settings: &mut Settings) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Login;
     use crate::history::Fingerprint;
-
-    const HOUR_MS: i64 = 3_600_000;
+    use crate::testing::HOUR_MS;
 
     fn login_account(name: &str) -> Account {
-        Account {
-            name: name.into(),
-            setup_key: Some(format!("sk-ant-oat01-setup-{name}")),
-            login: Some(Login {
-                access_token: Some(format!("sk-ant-oat01-access-{name}")),
-                refresh_token: Some("sk-ant-ort01-refresh".into()),
-                expires_at: Some(8 * HOUR_MS),
-                obtained_at: Some(0),
-                scopes: vec!["user:inference".into(), "user:profile".into()],
-                error: None,
-            }),
-        }
+        crate::testing::login_account(name, 8 * HOUR_MS)
+    }
+
+    /// Fresh settings with `account` installed as a switch.
+    fn installed(account: &Account) -> Settings {
+        let mut settings = Settings::new();
+        install(&mut settings, account, 0, EventKind::Switch).unwrap();
+        settings
     }
 
     #[test]
@@ -330,8 +324,7 @@ mod tests {
     #[test]
     fn falling_back_to_a_setup_token_withdraws_the_scope_claim() {
         let mut account = login_account("a");
-        let mut settings = Settings::new();
-        install(&mut settings, &account, 0, EventKind::Switch).unwrap();
+        let mut settings = installed(&account);
         account.login.as_mut().unwrap().error = Some("invalid_grant".into());
         assert_eq!(
             reinstall_reason(&settings, &account, 0),
@@ -359,13 +352,11 @@ mod tests {
     #[test]
     fn reinstall_reasons_distinguish_upgrade_refresh_and_repair() {
         let mut account = login_account("a");
-        let mut settings = Settings::new();
         // Settings still hold the setup token from before `tokeman login`.
-        let setup_only = Account {
+        let mut settings = installed(&Account {
             login: None,
             ..account.clone()
-        };
-        install(&mut settings, &setup_only, 0, EventKind::Switch).unwrap();
+        });
         assert_eq!(
             reinstall_reason(&settings, &account, 0),
             Some(EventKind::Upgrade)
@@ -392,8 +383,7 @@ mod tests {
 
     #[test]
     fn clearing_removes_every_managed_key() {
-        let mut settings = Settings::new();
-        install(&mut settings, &login_account("a"), 0, EventKind::Switch).unwrap();
+        let mut settings = installed(&login_account("a"));
         settings
             .get_mut("env")
             .and_then(Value::as_object_mut)
@@ -404,8 +394,7 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env["UNRELATED"], "kept");
         assert!(!clear(&mut settings));
-        let mut only_ours = Settings::new();
-        install(&mut only_ours, &login_account("a"), 0, EventKind::Switch).unwrap();
+        let mut only_ours = installed(&login_account("a"));
         assert!(clear(&mut only_ours));
         assert!(!only_ours.contains_key("env"));
     }

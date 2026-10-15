@@ -736,9 +736,7 @@ mod tests {
     #[test]
     fn the_dot_follows_the_best_weekly_window() {
         assert_eq!(status_color(None), GRAY);
-        let mut reading = Reading::failed("a", 0, crate::quota::ProbeError::NoCredential);
-        reading.error = None;
-        reading.weekly = Some(Window::new(0.1, 0));
+        let mut reading = crate::testing::reading("a", 0.0, 0.1);
         assert_eq!(status_color(Some(&reading)), level_rgb(Level::Ok));
         reading.weekly = Some(Window::new(0.9, 0));
         assert_eq!(status_color(Some(&reading)), level_rgb(Level::Critical));

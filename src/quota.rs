@@ -435,6 +435,7 @@ impl Reading {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::bucket;
 
     fn key(s: &str) -> ModelKey {
         ModelKey::new(s)
@@ -479,18 +480,7 @@ mod tests {
     }
 
     fn reading(session_used: f64, weekly_used: f64) -> Reading {
-        Reading {
-            account: "a".into(),
-            at: 0,
-            verdict: Verdict::Allowed,
-            claim: None,
-            session: Some(Window::new(session_used, 100)),
-            weekly: Some(Window::new(weekly_used, 200)),
-            buckets: Vec::new(),
-            overage: None,
-            error: None,
-            profile_error: None,
-        }
+        crate::testing::reading("a", session_used, weekly_used)
     }
 
     #[test]
@@ -503,12 +493,8 @@ mod tests {
     #[test]
     fn a_limiting_bucket_is_a_weekly_floor_and_an_unrelated_one_is_not() {
         let mut r = reading(0.1, 0.1);
-        r.buckets.push(Bucket {
-            key: key("Opus 4.8"),
-            label: "Opus 4.8".into(),
-            window: Window::new(0.99, 0),
-            source: Source::Profile,
-        });
+        r.buckets
+            .push(bucket("Opus 4.8", "Opus 4.8", 0.99, Source::Profile));
         assert!(!r.above(0.05, 0.05, Some(&key("claude-opus-4-8"))));
         assert!(r.above(0.05, 0.05, Some(&key("claude-opus-5"))));
         assert!(r.above(0.05, 0.05, Some(&key("claude-sonnet-4-5"))));

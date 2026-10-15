@@ -793,26 +793,14 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::{Bucket, ProbeError, Verdict};
+    use crate::quota::ProbeError;
+    use crate::testing::{bucket, point};
 
     fn reading() -> Reading {
-        Reading {
-            account: "a".into(),
-            at: 0,
-            verdict: Verdict::Allowed,
-            claim: None,
-            session: Some(Window::new(0.2, 0)),
-            weekly: Some(Window::new(0.4, 0)),
-            buckets: vec![Bucket {
-                key: ModelKey::new("fable"),
-                label: "Fable".into(),
-                window: Window::new(0.1, 0),
-                source: Source::Observed,
-            }],
-            overage: None,
-            error: None,
-            profile_error: None,
-        }
+        let mut r = crate::testing::reading("a", 0.2, 0.4);
+        r.buckets
+            .push(bucket("fable", "Fable", 0.1, Source::Observed));
+        r
     }
 
     #[test]
@@ -840,18 +828,7 @@ mod tests {
 
     #[test]
     fn chart_segments_count_hours_back_from_now() {
-        let points = [
-            Point {
-                at: 3600,
-                remaining: 0.5,
-                resets_at: None,
-            },
-            Point {
-                at: 3960,
-                remaining: 0.25,
-                resets_at: None,
-            },
-        ];
+        let points = [point(3600, 0.5, None), point(3960, 0.25, None)];
         assert_eq!(
             chart_segments(&points, 7200),
             [vec![(-1.0, 50.0), (-0.9, 25.0)]]
