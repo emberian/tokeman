@@ -1,8 +1,9 @@
 //! Builders every test module shares. Test-only.
 #![allow(dead_code)]
 
-use crate::account::{Account, Login};
+use crate::account::{Account, CodexAccount, Login};
 use crate::quota::{Bucket, ModelKey, ProbeError, Reading, Source, Verdict, Window};
+use crate::ui::chart::Point;
 
 pub const HOUR_MS: i64 = 3_600_000;
 /// An expiry no test clock reaches.
@@ -106,4 +107,35 @@ pub fn profile_only_account(name: &str, token: &str) -> Account {
             ..Login::default()
         }),
     }
+}
+
+/// A Codex profile registered at `codex_home`, neither parked nor access-only.
+pub fn codex_account(name: &str, codex_home: &str) -> CodexAccount {
+    CodexAccount {
+        name: name.into(),
+        codex_home: codex_home.into(),
+        ..CodexAccount::default()
+    }
+}
+
+/// One chart point.
+pub fn point(at: i64, remaining: f64, resets_at: Option<i64>) -> Point {
+    Point {
+        at,
+        remaining,
+        resets_at,
+    }
+}
+
+/// Serve `router` on a free loopback port for the rest of the test; returns
+/// its base URL.
+pub async fn serve(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let addr = listener.local_addr().expect("local address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
 }
