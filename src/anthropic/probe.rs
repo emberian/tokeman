@@ -524,8 +524,7 @@ mod tests {
         assert!(!bare.is_refused(), "a 429 is not definitive");
         assert!(bare.buckets.is_empty());
 
-        let mut login = setup_account("l");
-        login.capture_profile_token("profile-token".into());
+        let login = crate::testing::profile_only_account("l", "profile-token");
         let reading = probe_with(
             &client,
             &cache,

@@ -104,11 +104,6 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ResetAction>,
     },
-    /// Capture Claude's current /login credential for profile reads
-    Usage {
-        #[command(subcommand)]
-        action: UsageAction,
-    },
     /// Show or change the launch settings in tokens.toml
     Settings {
         #[command(subcommand)]
@@ -239,12 +234,6 @@ pub enum ResetAction {
         #[arg(long)]
         yes: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub enum UsageAction {
-    /// Copy Claude's /login credential to this account for profile reads
-    Capture { name: String },
 }
 
 #[derive(Subcommand)]

@@ -24,8 +24,6 @@ const FIRST_BACKOFF_SECS: i64 = 600;
 const MAX_BACKOFF_SECS: i64 = 3600;
 /// After an error that is not a rate limit (network, 5xx).
 const ERROR_RETRY_SECS: i64 = 60;
-/// The cache key of a read that bypasses every account.
-const VALIDATION_ACCOUNT: &str = "validation";
 
 /// Which form of the endpoint to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,27 +357,6 @@ pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<Vec<Buck
         Some(Err(error)) => reading.profile_error = Some(error),
         None => {}
     }
-}
-
-/// Check a freshly captured token: always asks the endpoint, never the cache.
-pub async fn validate(
-    client: &Client,
-    cache: &Cache,
-    bearer: &str,
-    now: i64,
-) -> std::result::Result<Vec<Bucket>, String> {
-    let body = cache
-        .read(
-            client,
-            VALIDATION_ACCOUNT,
-            bearer,
-            Endpoint::Usage,
-            true,
-            now,
-        )
-        .await
-        .map_err(|error| format!("{error:#}"))?;
-    parse(&body).map_err(|error| format!("usage response parse failed: {error}"))
 }
 
 #[cfg(test)]
@@ -765,7 +742,7 @@ mod tests {
         let mut account = Account::new("acct");
         account.setup_key = Some("sk-ant-oat01-setup".into());
         assert!(usage(&client, &cache, &account, 10).await.is_none());
-        account.capture_profile_token("captured".into());
+        let account = crate::testing::profile_only_account("acct", "captured");
         let outcome = usage(&client, &cache, &account, 10).await.unwrap();
         assert!(
             outcome

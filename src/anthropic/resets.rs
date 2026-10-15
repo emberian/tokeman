@@ -418,7 +418,7 @@ mod tests {
             "{error}"
         );
 
-        account.capture_profile_token("profile".into());
+        let account = crate::testing::profile_only_account(&account.name, "profile");
         let status = status(&client, &cache, &account, false, 1).await.unwrap();
         assert_eq!(status.cedar_ember.unwrap().grants().len(), 1);
         assert!(

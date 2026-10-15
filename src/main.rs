@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use tokeman::account::Fleet;
-use tokeman::cli::{Cli, Command, ResetAction, RotateAction, SettingsAction, UsageAction};
+use tokeman::cli::{Cli, Command, ResetAction, RotateAction, SettingsAction};
 use tokeman::daemon::{self, cycle};
 use tokeman::store::{Stats, Store};
 use tokeman::ui::text;
@@ -177,11 +177,6 @@ async fn dispatch(command: Command) -> Result<()> {
                 yes,
             } => tokeman::ui::interactive::use_reset(&name, grant.as_deref(), session, yes).await?,
         },
-        Command::Usage {
-            action: UsageAction::Capture { name },
-        } => {
-            tokeman::ui::interactive::capture_usage(&name).await?;
-        }
         Command::Settings { action } => match action.unwrap_or(SettingsAction::Show) {
             SettingsAction::Show => {
                 for (key, value) in Fleet::load()?.launch.entries() {

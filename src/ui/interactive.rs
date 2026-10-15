@@ -1,14 +1,12 @@
-//! Commands that talk to the user: the browser login, resets, and capturing
-//! Claude's own /login credential.
+//! Commands that talk to the user: the browser login and resets.
 
 use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result, bail};
 
 use crate::account::Fleet;
-use crate::anthropic::profile::{self, Cache};
+use crate::anthropic::profile::Cache;
 use crate::anthropic::{Client, oauth, resets};
-use crate::daemon;
 
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
@@ -287,52 +285,4 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
         ),
     }
     Ok(())
-}
-
-/// Copy Claude's own /login access token to an account, for profile reads.
-pub async fn capture_usage(name: &str) -> Result<()> {
-    let token = claude_login_token()?;
-    let now = now_secs();
-    match profile::validate(Client::shared(), &Cache::default(), &token, now).await {
-        Ok(buckets) => {
-            Fleet::update(|fleet| {
-                fleet.ensure_account(name).capture_profile_token(token);
-                Ok(())
-            })?;
-            println!(
-                "captured Claude's login credential for {name} ({} model bucket(s) readable)",
-                buckets.len()
-            );
-            daemon::reconcile_after_login()
-        }
-        Err(error) => bail!("Claude's current login cannot read profile usage: {error}"),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn claude_login_token() -> Result<String> {
-    let output = std::process::Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()?;
-    if !output.status.success() {
-        bail!("could not read Claude's Keychain credential");
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("Claude Keychain credential is not valid JSON")?;
-    value
-        .pointer("/claudeAiOauth/accessToken")
-        .and_then(serde_json::Value::as_str)
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .context("Claude Keychain credential has no OAuth access token")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn claude_login_token() -> Result<String> {
-    bail!("`tokeman usage capture` reads Claude's macOS Keychain")
 }

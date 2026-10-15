@@ -9,7 +9,9 @@ domain, with the rotation policy as a pure module whose tests are its
 specification.
 
 - Removed: the web dashboard and transcript session browser (`tokeman
-  browse`), `per_session_reserve`, and the legacy Opus/Sonnet-specific
+  browse`), `tokeman usage capture` (`tokeman login` replaced it; a
+  captured token already on disk still serves profile reads),
+  `per_session_reserve`, and the legacy Opus/Sonnet-specific
   fields (old history rows still read).
 - Readings carry per-model buckets with a canonical key and a source
   (profile, headers, observed rejection, carried sample); the family-wide

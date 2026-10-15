@@ -21,4 +21,6 @@ pub mod policy;
 pub mod quota;
 pub mod settings;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod ui;

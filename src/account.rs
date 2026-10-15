@@ -190,19 +190,6 @@ impl Account {
         }
         login.error = None;
     }
-
-    /// Keep a captured access token for profile reads. A live login already
-    /// covers them, and replacing its access token would desynchronize it from
-    /// its refresh token, so it is left alone.
-    pub fn capture_profile_token(&mut self, token: String) {
-        if self.is_refreshable() {
-            return;
-        }
-        self.login = Some(Login {
-            access_token: Some(token),
-            ..Login::default()
-        });
-    }
 }
 
 /// A Codex profile directory (a `CODEX_HOME`) tokeman probes, refreshes and
@@ -656,16 +643,10 @@ mod tests {
 
     #[test]
     fn a_captured_access_token_without_refresh_is_never_installed() {
-        let mut account = Account::new("acct");
-        account.setup_key = Some("sk-ant-oat01-setup".into());
-        account.capture_profile_token("captured".into());
+        let account = crate::testing::profile_only_account("acct", "captured");
         assert!(!account.credential(0).unwrap().is_login());
         assert_eq!(account.profile_token(0), Some("captured"));
         assert!(!account.needs_refresh(0));
-        // A live login is left alone by a capture.
-        let mut live = login_account(10 * HOUR_MS);
-        live.capture_profile_token("captured".into());
-        assert_eq!(live.profile_token(0), Some("sk-ant-oat01-access"));
     }
 
     #[test]
