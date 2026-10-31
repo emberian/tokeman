@@ -82,7 +82,7 @@ pub async fn login_accounts(name: Option<&str>, more: bool) -> Result<()> {
                 Fleet::update(|fleet| {
                     fleet
                         .ensure_account(account)
-                        .apply_grant(grant, chrono::Utc::now().timestamp_millis());
+                        .record_login(grant, chrono::Utc::now().timestamp_millis());
                     Ok(())
                 })?;
                 done += 1;

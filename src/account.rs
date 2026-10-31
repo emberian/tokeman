@@ -34,6 +34,10 @@ pub struct Login {
     pub expires_at: Option<i64>,
     /// Epoch milliseconds when the access token was minted.
     pub obtained_at: Option<i64>,
+    /// Epoch milliseconds of the browser login this grant descends from.
+    /// Refresh tokens have lasted about a month from it, however often the
+    /// access token was renewed.
+    pub logged_in_at: Option<i64>,
     pub scopes: Vec<String>,
     /// Why the refresh token was refused for good. While set, the account
     /// falls back to its setup key until `tokeman login` runs again.
@@ -43,6 +47,22 @@ pub struct Login {
 impl Login {
     pub fn is_refreshable(&self) -> bool {
         self.refresh_token.is_some() && self.error.is_none()
+    }
+
+    /// Whole days since the browser login, when known.
+    pub fn age_days(&self, now_ms: i64) -> Option<i64> {
+        self.logged_in_at
+            .map(|at| (now_ms - at).max(0) / 86_400_000)
+    }
+}
+
+/// Warn this many days after a login; refresh tokens have expired at about 28.
+const LOGIN_WARNING_DAYS: i64 = 21;
+
+impl Login {
+    pub fn is_ageing(&self, now_ms: i64) -> bool {
+        self.age_days(now_ms)
+            .is_some_and(|days| days >= LOGIN_WARNING_DAYS)
     }
 }
 
@@ -189,6 +209,14 @@ impl Account {
             login.scopes = grant.scopes;
         }
         login.error = None;
+    }
+
+    /// Store the grant of a fresh browser login and remember when it was made.
+    pub fn record_login(&mut self, grant: Grant, now_ms: i64) {
+        self.apply_grant(grant, now_ms);
+        if let Some(login) = self.login.as_mut() {
+            login.logged_in_at = Some(now_ms);
+        }
     }
 }
 
@@ -358,6 +386,7 @@ impl Fleet {
                 );
                 set_opt(table, "expires_at", record.expires_at.map(value));
                 set_opt(table, "obtained_at", record.obtained_at.map(value));
+                set_opt(table, "logged_in_at", record.logged_in_at.map(value));
                 set_opt(
                     table,
                     "scopes",
@@ -486,6 +515,8 @@ struct Record {
     #[serde(default)]
     obtained_at: Option<i64>,
     #[serde(default)]
+    logged_in_at: Option<i64>,
+    #[serde(default)]
     scopes: Option<Vec<String>>,
     #[serde(default)]
     login_error: Option<String>,
@@ -504,6 +535,7 @@ impl From<Record> for Account {
                 refresh_token: record.refresh_token,
                 expires_at: record.expires_at,
                 obtained_at: record.obtained_at,
+                logged_in_at: record.logged_in_at,
                 scopes: record.scopes.unwrap_or_default(),
                 error: record.login_error,
             }),
@@ -521,6 +553,7 @@ impl From<Account> for Record {
             refresh_token: login.refresh_token,
             expires_at: login.expires_at,
             obtained_at: login.obtained_at,
+            logged_in_at: login.logged_in_at,
             scopes: (!login.scopes.is_empty()).then_some(login.scopes),
             login_error: login.error,
         }
@@ -720,6 +753,41 @@ mod tests {
             Some("sk-ant-oat01-new-setup")
         );
         assert!(fleet.accounts[0].is_refreshable());
+    }
+
+    #[test]
+    fn a_login_remembers_its_date_and_ages_out_of_warning_range() {
+        let mut account = Account::new("acct");
+        account.record_login(
+            Grant {
+                access_token: "a".into(),
+                refresh_token: Some("r".into()),
+                expires_at: Some(9 * HOUR_MS),
+                scopes: Vec::new(),
+            },
+            HOUR_MS,
+        );
+        let login = account.login.as_ref().unwrap();
+        assert_eq!(login.logged_in_at, Some(HOUR_MS));
+        assert_eq!(login.age_days(HOUR_MS + 20 * 24 * HOUR_MS), Some(20));
+        assert!(!login.is_ageing(HOUR_MS + 20 * 24 * HOUR_MS));
+        assert!(login.is_ageing(HOUR_MS + 21 * 24 * HOUR_MS));
+        // A refresh keeps the login date.
+        account.apply_grant(
+            Grant {
+                access_token: "b".into(),
+                ..Grant::default()
+            },
+            5 * HOUR_MS,
+        );
+        assert_eq!(account.login.as_ref().unwrap().logged_in_at, Some(HOUR_MS));
+        let mut fleet = Fleet::default();
+        fleet.accounts.push(account);
+        let reparsed = Fleet::parse(&fleet.render("").unwrap()).unwrap();
+        assert_eq!(
+            reparsed.accounts[0].login.as_ref().unwrap().logged_in_at,
+            Some(HOUR_MS)
+        );
     }
 
     #[test]

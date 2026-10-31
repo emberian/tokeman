@@ -176,7 +176,7 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
     if !login.is_refreshable() {
         return "captured usage token (not refreshable)".into();
     }
-    match login.expires_at {
+    let token = match login.expires_at {
         Some(expires_at) if expires_at > now_ms => {
             format!(
                 "login, full scope, access token valid {}m",
@@ -185,6 +185,14 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
         }
         Some(_) => "login, access token expired (refresh pending)".into(),
         None => "login, expiry unknown".into(),
+    };
+    match login.age_days(now_ms) {
+        Some(days) if login.is_ageing(now_ms) => format!(
+            "{token}; logged in {days} days ago, and refresh tokens have lasted about a month: run `tokeman login {}` soon",
+            account.name
+        ),
+        Some(days) => format!("{token}; logged in {days} days ago"),
+        None => token,
     }
 }
 

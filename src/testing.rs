@@ -81,6 +81,7 @@ pub fn login_account(name: &str, expires_at_ms: i64) -> Account {
             refresh_token: Some("sk-ant-ort01-refresh".into()),
             expires_at: Some(expires_at_ms),
             obtained_at: Some(expires_at_ms - 8 * HOUR_MS),
+            logged_in_at: Some(expires_at_ms - 8 * HOUR_MS),
             scopes: vec!["user:inference".into(), "user:profile".into()],
             error: None,
         }),
