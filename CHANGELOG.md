@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 - 2026-10-31
+
+- A reading no longer needs both shared windows. Since late October the
+  API omits a window with no usage from a healthy answer (a 200 carries the
+  weekly headers and no `5h-*` headers at all), which made every healthy
+  account read as "no quota headers", kept the daemon on the fast cadence
+  with a probe that never completed, and left the default where it was.
+  An unreported window limits nothing; status and log lines show it as
+  `--` / `unreported`.
+- Parsed and pinned by tests: today's 200 and 429 header shapes, including
+  the new per-window `-status` headers.
+
 ## 0.3.0 - 2026-10-14
 
 A rewrite from the knowledge 0.2.0 accumulated, built to DESIGN.md. Same

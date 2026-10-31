@@ -282,6 +282,52 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_account_may_report_only_its_weekly_window() {
+        // Observed 2026-10-31 on a 200: no 5h headers at all, per-window
+        // `-status` headers, and a `fallback-percentage`.
+        let quota = parse_quota(&headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day",
+            ),
+            ("anthropic-ratelimit-unified-reset", "1793998800"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.74"),
+            ("anthropic-ratelimit-unified-7d-reset", "1793998800"),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "out_of_credits",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(quota.verdict, Verdict::Allowed);
+        assert_eq!(quota.session, None);
+        assert_eq!(quota.weekly, Some(Window::new(0.74, 1_793_998_800)));
+        assert_eq!(
+            quota.overage.unwrap().disabled_reason.as_deref(),
+            Some("out_of_credits")
+        );
+        // The exhausted 429 shape of the same day still carries both windows.
+        let exhausted = parse_quota(&headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.0"),
+            ("anthropic-ratelimit-unified-5h-reset", "1793461200"),
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-7d-reset", "1793448000"),
+            ("anthropic-ratelimit-unified-7d-surpassed-threshold", "1.0"),
+        ]))
+        .unwrap();
+        assert_eq!(exhausted.verdict, Verdict::Rejected);
+        assert_eq!(exhausted.session, Some(Window::new(0.0, 1_793_461_200)));
+        assert_eq!(exhausted.weekly, Some(Window::new(1.0, 1_793_448_000)));
+    }
+
+    #[test]
     fn unified_headers_become_a_quota_and_their_absence_none() {
         assert!(parse_quota(&headers(&[("x", "y")])).is_none());
         let quota = parse_quota(&headers(&[

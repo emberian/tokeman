@@ -147,7 +147,7 @@ pub fn bar(used: f64) -> String {
 
 /// A word for the reading's state and the level to colour it with.
 pub fn status_badge(reading: &Reading) -> (&'static str, Option<Level>) {
-    if reading.windows().is_none() {
+    if reading.session.is_none() && reading.weekly.is_none() {
         return if reading.error.is_some() {
             ("error", Some(Level::Critical))
         } else {
@@ -195,10 +195,11 @@ pub fn print_readings(readings: &[Reading], probe_model: &str) {
     println!("\n {BOLD}tokeman{RESET} — {ok}/{total} accounts probed with {probe_model}\n");
     for reading in readings {
         println!(" {BOLD}{}{RESET}", reading.account);
-        match (&reading.error, reading.windows()) {
-            (Some(error), None) => println!("   {RED}error: {error}{RESET}"),
-            (_, Some(_)) => print_windows(reading),
-            (None, None) => println!(
+        let reported = reading.session.is_some() || reading.weekly.is_some();
+        match (&reading.error, reported) {
+            (Some(error), false) => println!("   {RED}error: {error}{RESET}"),
+            (_, true) => print_windows(reading),
+            (None, false) => println!(
                 "   {YELLOW}no unified quota headers (an API key rather than OAuth?){RESET}"
             ),
         }
@@ -397,23 +398,27 @@ pub fn print_status(report: &Report) {
     );
     for account in &report.accounts {
         let marker = if account.is_default { "D" } else { " " };
-        match (account.remaining_session, account.remaining_weekly) {
-            (Some(session), Some(weekly)) => println!(
-                " {marker} {:<24} 5h {:>3.0}%  7d {:>3.0}%  {}",
+        if account.remaining_session.is_some() || account.remaining_weekly.is_some() {
+            let cell = |left: Option<f64>| {
+                left.map_or("  --".to_string(), |left| format!("{:>3.0}%", left * 100.0))
+            };
+            println!(
+                " {marker} {:<24} 5h {}  7d {}  {}",
                 account.name,
-                session * 100.0,
-                weekly * 100.0,
+                cell(account.remaining_session),
+                cell(account.remaining_weekly),
                 if account.viable {
                     "ready"
                 } else {
                     "below floor"
                 }
-            ),
-            _ => println!(
+            );
+        } else {
+            println!(
                 " {marker} {:<24} {}",
                 account.name,
                 account.error.as_deref().unwrap_or("no quota headers")
-            ),
+            );
         }
         println!("   {:<24} offers {}", "", account.credential);
         if account.buckets.is_empty() {

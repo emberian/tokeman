@@ -171,16 +171,18 @@ fn coverage_summary(readings: &[Reading], expected: usize) -> String {
 
 /// `5h 32% left, 7d 25% left, Fable 7d 9% left`.
 pub fn describe(reading: Option<&Reading>, model: Option<&ModelKey>) -> String {
-    let Some(reading) = reading else {
+    let Some(reading) = reading.filter(|reading| reading.has_quota()) else {
         return "quota unavailable".into();
     };
-    let Some((session, weekly)) = reading.remaining() else {
-        return "quota unavailable".into();
+    let left = |left: Option<f64>| {
+        left.map_or("unreported".to_string(), |left| {
+            format!("{:.0}% left", left * 100.0)
+        })
     };
     let mut text = format!(
-        "5h {:.0}% left, 7d {:.0}% left",
-        session * 100.0,
-        weekly * 100.0
+        "5h {}, 7d {}",
+        left(reading.session_remaining()),
+        left(reading.weekly_remaining())
     );
     for bucket in reading
         .buckets

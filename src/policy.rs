@@ -184,10 +184,36 @@ pub fn choose_above<'a>(
         })
 }
 
+/// Use of the shared windows; an unreported window has none.
 fn used(reading: &Reading) -> (f64, f64) {
+    (
+        reading.session.map_or(0.0, |w| w.used),
+        reading.weekly.map_or(0.0, |w| w.used),
+    )
+}
+
+/// Every reported window with its floor: the shared ones, then the model
+/// buckets that limit `model`.
+fn limiting_windows<'a>(
+    reading: &'a Reading,
+    floors: Floors,
+    model: Option<&'a ModelKey>,
+) -> impl Iterator<Item = (f64, i64)> + 'a {
     reading
-        .windows()
-        .map_or((1.0, 1.0), |(session, weekly)| (session.used, weekly.used))
+        .session
+        .iter()
+        .map(move |w| (margin(w, floors.session), w.resets_at))
+        .chain(
+            reading
+                .weekly
+                .iter()
+                .map(move |w| (margin(w, floors.weekly), w.resets_at)),
+        )
+        .chain(
+            reading
+                .windows_limiting(model)
+                .map(move |w| (margin(w, floors.weekly), w.resets_at)),
+        )
 }
 
 /// Room above the floor, as a fraction of the room the floor leaves.
@@ -197,31 +223,21 @@ fn margin(window: &Window, floor: f64) -> f64 {
 
 /// The smallest normalized margin across every window that limits `model`.
 fn dwell_score(reading: &Reading, floors: Floors, model: Option<&ModelKey>) -> f64 {
-    let Some((session, weekly)) = reading.windows() else {
+    if !reading.has_quota() {
         return f64::NEG_INFINITY;
-    };
-    reading
-        .windows_limiting(model)
-        .map(|window| margin(window, floors.weekly))
-        .fold(
-            margin(&session, floors.session).min(margin(&weekly, floors.weekly)),
-            f64::min,
-        )
+    }
+    limiting_windows(reading, floors, model)
+        .map(|(margin, _)| margin)
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Seconds until the reset of the window with the least room above its
 /// floor. `None` when the server sent no reset for it.
 fn reset_delay(reading: &Reading, floors: Floors, model: Option<&ModelKey>) -> Option<i64> {
-    let (session, weekly) = reading.windows()?;
-    let mut windows = vec![
-        (margin(&session, floors.session), session.resets_at),
-        (margin(&weekly, floors.weekly), weekly.resets_at),
-    ];
-    windows.extend(
-        reading
-            .windows_limiting(model)
-            .map(|window| (margin(window, floors.weekly), window.resets_at)),
-    );
+    if !reading.has_quota() {
+        return None;
+    }
+    let mut windows: Vec<(f64, i64)> = limiting_windows(reading, floors, model).collect();
     windows.sort_by(|(a_margin, a_reset), (b_margin, b_reset)| {
         compare_f64(*a_margin, *b_margin).then_with(|| match (*a_reset > 0, *b_reset > 0) {
             (true, true) => a_reset.cmp(b_reset),
@@ -256,10 +272,13 @@ pub fn next_interval_secs(
     policy: &PolicySettings,
 ) -> u64 {
     let near_floor = |reading: &Reading| {
-        reading.remaining().is_none_or(|(session, weekly)| {
-            session <= policy.normal_min_5h_remaining * 2.0
-                || weekly <= policy.normal_min_7d_remaining * 2.0
-        })
+        !reading.has_quota()
+            || reading
+                .session_remaining()
+                .is_some_and(|left| left <= policy.normal_min_5h_remaining * 2.0)
+            || reading
+                .weekly_remaining()
+                .is_some_and(|left| left <= policy.normal_min_7d_remaining * 2.0)
     };
     if mode == Mode::Sip
         || !complete
@@ -659,6 +678,27 @@ mod tests {
         assert!(complete(std::slice::from_ref(&expired), 1));
         assert!(!current_unreadable(Some("expired"), Some(&expired)));
         assert!(!viable_in(&expired, Mode::Normal));
+    }
+
+    #[test]
+    fn an_account_reporting_only_its_weekly_window_is_a_complete_reading() {
+        let policy = PolicySettings::default();
+        let mut idle = reading("idle", 0.0, 0.26);
+        idle.session = None;
+        assert!(complete(std::slice::from_ref(&idle), 1));
+        assert!(viable(&idle, Mode::Normal, &policy, opus().as_ref()));
+        assert_eq!(
+            best(
+                &[idle.clone(), reading("busy", 0.5, 0.5)],
+                Mode::Normal,
+                opus().as_ref()
+            ),
+            Some("idle")
+        );
+        assert_eq!(
+            next_interval_secs(Mode::Normal, Some(&idle), true, &policy),
+            policy.normal_probe_interval_secs
+        );
     }
 
     #[test]

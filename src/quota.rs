@@ -330,10 +330,11 @@ pub struct Reading {
     /// The limit the server named as binding (`session`, `weekly`, ...).
     #[serde(default)]
     pub claim: Option<String>,
-    /// The 5-hour window.
+    /// The 5-hour window; `None` when the probe did not report it, which
+    /// the API does for a window with no usage.
     #[serde(default)]
     pub session: Option<Window>,
-    /// The 7-day window.
+    /// The 7-day window, likewise.
     #[serde(default)]
     pub weekly: Option<Window>,
     /// Per-model weekly limits, including the family-wide Fable limit.
@@ -365,21 +366,21 @@ impl Reading {
         }
     }
 
-    /// Both shared windows, when the probe reported them.
-    pub fn windows(&self) -> Option<(Window, Window)> {
-        Some((self.session?, self.weekly?))
+    /// Fraction left in the session window, when the probe reported one.
+    pub fn session_remaining(&self) -> Option<f64> {
+        self.session.map(|window| window.remaining())
     }
 
-    /// Fractions left in the session and weekly windows.
-    pub fn remaining(&self) -> Option<(f64, f64)> {
-        self.windows()
-            .map(|(session, weekly)| (session.remaining(), weekly.remaining()))
+    pub fn weekly_remaining(&self) -> Option<f64> {
+        self.weekly.map(|window| window.remaining())
     }
 
-    /// Enough to decide on: an error-free answer with both windows. A
-    /// `Rejected` verdict with windows is a reading too.
+    /// Enough to decide on: an error-free answer with at least one shared
+    /// window. The API omits a window that has no usage (since 2026-10 a
+    /// healthy account often reports only its weekly window), and an omitted
+    /// window limits nothing. A `Rejected` verdict with a window is a reading.
     pub fn has_quota(&self) -> bool {
-        self.error.is_none() && self.windows().is_some()
+        self.error.is_none() && (self.session.is_some() || self.weekly.is_some())
     }
 
     /// Refused in a way that will not change until the credential does.
@@ -414,18 +415,16 @@ impl Reading {
             .map(|bucket| &bucket.window)
     }
 
-    /// Whether the account can take sessions on `model`: allowed, with the
-    /// session window above `session_floor` and the weekly window and every
-    /// limiting model bucket above `weekly_floor`.
+    /// Whether the account can take sessions on `model`: allowed, with every
+    /// reported shared window above its floor and every limiting model bucket
+    /// above the weekly floor.
     pub fn above(&self, session_floor: f64, weekly_floor: f64, model: Option<&ModelKey>) -> bool {
-        if self.error.is_some() || !self.verdict.allows() {
-            return false;
-        }
-        let Some((session, weekly)) = self.windows() else {
-            return false;
-        };
-        session.above(session_floor)
-            && weekly.above(weekly_floor)
+        self.has_quota()
+            && self.verdict.allows()
+            && self
+                .session
+                .is_none_or(|window| window.above(session_floor))
+            && self.weekly.is_none_or(|window| window.above(weekly_floor))
             && self
                 .windows_limiting(model)
                 .all(|window| window.above(weekly_floor))
@@ -499,6 +498,21 @@ mod tests {
         assert!(r.above(0.05, 0.05, Some(&key("claude-opus-5"))));
         assert!(r.above(0.05, 0.05, Some(&key("claude-sonnet-4-5"))));
         assert!(r.above(0.05, 0.05, None));
+    }
+
+    #[test]
+    fn a_window_the_api_omits_limits_nothing() {
+        let mut weekly_only = reading(0.0, 0.74);
+        weekly_only.session = None;
+        assert!(weekly_only.has_quota());
+        assert_eq!(weekly_only.session_remaining(), None);
+        assert!(weekly_only.above(0.99, 0.05, None));
+        assert!(!weekly_only.above(0.0, 0.30, None));
+        let mut nothing = reading(0.0, 0.0);
+        nothing.session = None;
+        nothing.weekly = None;
+        assert!(!nothing.has_quota());
+        assert!(!nothing.above(0.0, 0.0, None));
     }
 
     #[test]
