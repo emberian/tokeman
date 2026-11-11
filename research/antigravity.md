@@ -1,6 +1,7 @@
 # Google Antigravity: quota reading and account switching
 
-Researched 2026-11-11 against `agy` 1.5.5 (`~/.local/bin/agy`, built 2026-11-10) and
+Researched 2026-11-11 against `agy` 1.5.5 (`~/.local/bin/agy`, built 2026-11-10; the strings this
+note relies on were re-checked in 1.5.6, and the switching experiment ran on 1.5.6) and
 Antigravity.app 2.0.1 (`/Applications/Antigravity.app`, May 2026). Each fact is tagged:
 
 - **[live]** verified with a real request on 2026-11-11
@@ -248,49 +249,75 @@ the transcript-rejection analogue for an account that tokeman is not polling.
 
 ## Account switching
 
-**CLI (`agy`): feasible by slot swap. Documented plan; not executed.**
+**CLI (`agy`): works by slot swap. [live, 2026-11-11, `agy` 1.5.6]** Built as
+`tokeman services use <name>` (`src/providers/agy.rs`).
 
 The slot is one Keychain generic password: service `gemini`, account `antigravity`, in the login
 keychain. `agy` writes it through go-keyring, which drives `/usr/bin/security`. The item's
-access list therefore trusts `/usr/bin/security` and not tokeman. A write from tokeman through
-security-framework would put tokeman on the list and could make `agy`'s next read prompt. The
-switch has to use the same tool. go-keyring keeps the secret off the command line by running
-`security -i` and writing the command to its stdin, and tokeman should do the same:
+access list therefore trusts `/usr/bin/security` and not tokeman, so the switch uses the same
+tool. go-keyring keeps the secret off the command line by running `security -i` and writing the
+command to its stdin; tokeman does the same:
 
 ```
 /usr/bin/security -i            (stdin, one line, then EOF; bounded wait)
 add-generic-password -U -s gemini -a antigravity -w go-keyring-base64:<base64(JSON)>
 ```
 
-where JSON is exactly `agy`'s shape for the target account:
+where JSON is `agy`'s own compact shape, in this field order:
 
 ```json
-{"token": {"access_token": "<ya29…>", "token_type": "Bearer", "refresh_token": "<1//…>",
-           "expiry": "<RFC 3339 with offset>", "expires_in": 3599},
- "auth_method": "consumer",
- "id_token_email": "<the account's email>"}
+{"token":{"access_token":"<ya29…>","token_type":"Bearer","refresh_token":"<1//…>",
+          "expiry":"<RFC 3339 with offset>","expires_in":3599},
+ "auth_method":"consumer","id_token_email":"<the account's email>"}
 ```
 
-- A stale `access_token` and `expiry` are fine: `agy` refreshes with the refresh token and
-  rewrites the item. The client is shared and the refresh token does not rotate, so copying a
-  grant into the slot never invalidates tokeman's copy, and swapping back restores the old account
-  exactly. **[live: no rotation, same client]**
-- Also rewrite `~/.gemini/antigravity-cli/antigravity-oauth-token` (0600, same JSON without the
-  prefix). `agy` reads it when the Keychain times out. Otherwise a slow Keychain silently puts the
-  old account back.
-- Back up first: read the current item (`find-generic-password -s gemini -a antigravity -w`)
-  and keep the value byte-for-byte, so `pause`/`restore` can put it back the way
-  `claude/keychain.rs` does for Claude's login.
-- Does a running `agy` pick the switch up? The binary contains `Stored token metadata changed
-  externally; updating in-memory auth session` and `Rebinding LanguageServer backend for auth change`
-  **[code]**, so it probably notices without a restart. **Untested.** Testing it means
-  rewriting ember's live login while an `agy` runs. Running a throwaway `agy` against a private
-  `HOME` with `SSH_TTY` set (CodexBar's file-storage trick) is not safe either: `agy` contains
-  `Failed to clear stale keyring credential after file fallback`, so a file-mode run may delete
-  the login-keychain item, and that item is shared across `HOME`s. Test both when ember can
-  watch, with the original value saved.
-- Expect the cost of a Claude switch: open conversations re-authenticate and server-side caches
-  are per account.
+What was done and seen (no `agy` CLI process was running at the start; Antigravity.app was, and
+it does not use this slot):
+
+1. Backup: the item's value (763 bytes with `security`'s trailing newline) and the credential
+   files in `~/.gemini/antigravity-cli/` (`antigravity-oauth-token`, `settings.json`,
+   `jetski_state.pbtxt`, `installation_id`), each read back and compared. The 7.2 GB of
+   conversations and logs were not copied; a swap does not touch them.
+2. Baseline: `agy models` is a quota-free identity check. It lists models and its log
+   (`~/.gemini/antigravity-cli/cli.log`) says `OAuth: authenticated successfully as first@example.com`.
+3. Swap: wrote `second@example.com`'s grant (from the app's `state.vscdb`, freshly refreshed) with
+   the command above. `security` exited 0, the item read back equal, `cdat` was kept and `mdat`
+   moved. `agy models` then logged `keyringAuth: loaded token`, `ChainedAuth: authenticated via
+   keyring`, `OAuth: authenticated successfully as second@example.com`, and did not rewrite the item.
+   Google's userinfo for the slot's access token said `second@example.com`, and
+   `retrieveUserQuotaSummary` with it returned that account's four windows.
+4. Restore: wrote the saved value back. The item compared equal to the backup byte for byte,
+   and `agy models` logged `first@example.com` again without rewriting the item.
+5. The same round trip through the built binary against a copied tokens.toml
+   (`services use second@example.com`, `agy models`, `services use --previous`) gave the same
+   results, and the item again equalled the original backup.
+
+Findings:
+
+- **A newly started `agy` uses whatever the slot holds.** No restart of anything else, no
+  re-login, no prompt.
+- **A running `agy` does not notice the swap.** A long-lived `agy acp` server signed in as
+  `second@example.com` kept that account for 90 s of idling and through a new session after the
+  slot went back to `first@example.com`; its log never printed `Stored token metadata changed
+  externally`. tokeman therefore counts running `agy` processes after a switch and says they
+  need a restart.
+- **`agy` refreshes early and writes the slot when it does.** Started on an access token with
+  143 s left, it refreshed at once (`token refreshed, new expiry=…`) and rewrote the item. So a
+  slot value with a stale access token is fine, and the item changes under tokeman whenever
+  `agy` refreshes; the backup is of the value at the moment of the switch.
+- **The fallback token file.** `~/.gemini/antigravity-cli/antigravity-oauth-token` held a copy
+  of the `cmrx64` grant from 2026-11-09. It was still there after the first swap and the first
+  `agy models`, and gone after the `agy acp` run that refreshed and saved the other account's
+  token; nothing in the log mentions it. It was put back from the backup. tokeman rewrites the
+  file with the seated account's JSON when it exists and does not create it when it does not;
+  with the file rewritten, `agy models` signed in from the Keychain as expected.
+- The client is shared and the refresh token does not rotate, so seating a grant never
+  invalidates tokeman's copy, and seating the other one back restores the first account.
+- Not done, on purpose: running `agy` in file-storage mode (`SSH_TTY`). The binary contains
+  `Failed to clear stale keyring credential after file fallback`, so such a run may delete the
+  shared Keychain item.
+- Switching is manual. The daemon does not seat accounts. Expect the cost of a Claude switch:
+  server-side caches are per account.
 
 **IDE (Antigravity.app): possible but not worth it.** Swapping means rewriting the protobuf in
 `state.vscdb` while the app is closed, and the cached `userStatus` would still show the old email.

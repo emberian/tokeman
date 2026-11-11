@@ -122,7 +122,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 .iter()
                 .filter_map(|service| service.usage.clone())
                 .collect();
-            text::print_service_list(&fleet.services, &latest, overview.at);
+            let seated = tokeman::ui::services_cli::seated(&fleet.services).await;
+            text::print_service_list(&fleet.services, &latest, seated.as_deref(), overview.at);
             for offer in &overview.resets_on_offer {
                 println!(
                     "\n reset on offer: {}: {} (`tokeman resets use`; read {})",

@@ -109,6 +109,16 @@ pub fn reset_claims_dir() -> PathBuf {
     config_dir().join("reset-claims")
 }
 
+/// The agy Keychain value the last `services use` replaced (0600).
+pub fn agy_login_backup() -> PathBuf {
+    config_dir().join("agy-login-backup.json")
+}
+
+/// Serializes seatings of the agy login.
+pub fn agy_seat_lock() -> PathBuf {
+    config_dir().join("agy-seat.lock")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }

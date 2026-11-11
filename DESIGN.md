@@ -80,6 +80,9 @@ src/
     kimi.rs      Kimi Code: /coding/v1/usages (Bearer) -> Meters + booster Balance; plan name from /coding/v1/me
     antigravity.rs  Google OAuth refresh (own access-token cache), retrieveUserQuotaSummary -> Meters,
                  discover() from agy's Keychain item / token file and the app's state.vscdb (read-only)
+    agy.rs       the agy CLI's login slot (Keychain item via /usr/bin/security, bounded): which account it holds,
+                 seat an Antigravity account in it (locked, previous value backed up 0600, read back), put the previous back.
+                 Manual only (`services use`); the daemon never seats. Running agy processes keep their account.
   daemon/
     mod.rs       the loop
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record
@@ -156,6 +159,12 @@ pub enum Service { Antigravity, Zai, Kimi }                  // serde: lowercase
 pub struct ServiceAccount { name, service, key, key_file, refresh_token, access_token, expires_at, label }
 pub struct Meter { group: Option<String>, label: String, window: Window, span_secs: Option<i64>, amount: Option<Amount> }
 pub struct Usage { service, account, at, plan: Option<String>, meters: Vec<Meter>, balances: Vec<Balance>, error: Option<String> }
+impl Usage { fn room(group: Option<&str>) -> Option<f64> }   // fraction left on the tightest (matching) meter
+pub fn by_room(&[Usage], Service, group) -> Vec<(&Usage, f64)>   // most room first; failed reads left out
+// providers/agy.rs
+pub struct Slot { email, refresh_token }  impl Slot { fn holds(&ServiceAccount) -> bool }   // same grant or same email
+pub struct Seated { email, previous: Option<String>, changed: bool }
+pub fn slot() -> Result<Option<Slot>> ; pub async fn seat(&Client, &ServiceAccount) -> Result<Seated> ; pub async fn seat_previous() -> Result<Seated>
 impl Fleet { fn load() ; fn update(|&mut Fleet| -> T) -> T  /* locked RMW, comments kept */ }
 
 // policy.rs  (pure; the tests are the spec). Landing spends expiring room

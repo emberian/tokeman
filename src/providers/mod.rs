@@ -7,6 +7,7 @@
 //! account: &ServiceAccount, now: i64) -> Usage` and never panics or returns
 //! `Err`: a failure is a `Usage` with `error` set.
 
+pub mod agy;
 pub mod antigravity;
 pub mod kimi;
 pub mod zai;
@@ -71,7 +72,19 @@ pub async fn read_all(
 }
 
 /// A subscription service tokeman can read quota from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Service {
     Antigravity,
@@ -256,6 +269,41 @@ impl Usage {
             .iter()
             .max_by(|a, b| a.window.used.total_cmp(&b.window.used))
     }
+
+    /// The fraction left on the tightest meter, counting only the meters
+    /// whose group contains `group` (any case) when one is given. `None` for
+    /// a failed read or when no meter matches.
+    pub fn room(&self, group: Option<&str>) -> Option<f64> {
+        if self.error.is_some() {
+            return None;
+        }
+        let wanted = group.map(str::to_lowercase);
+        self.meters
+            .iter()
+            .filter(|meter| match (&wanted, &meter.group) {
+                (None, _) => true,
+                (Some(wanted), Some(group)) => group.to_lowercase().contains(wanted),
+                (Some(_), None) => false,
+            })
+            .map(|meter| meter.window.remaining())
+            .min_by(f64::total_cmp)
+    }
+}
+
+/// The accounts of `service` that answered, most room first; ties keep the
+/// order of `usages`.
+pub fn by_room<'a>(
+    usages: &'a [Usage],
+    service: Service,
+    group: Option<&str>,
+) -> Vec<(&'a Usage, f64)> {
+    let mut ranked: Vec<_> = usages
+        .iter()
+        .filter(|usage| usage.service == service)
+        .filter_map(|usage| Some((usage, usage.room(group)?)))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked
 }
 
 /// A response body cut to one short line, for an error message.
@@ -271,6 +319,55 @@ pub(crate) fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(account: &str, meters: &[(&str, f64)]) -> Usage {
+        Usage {
+            meters: meters
+                .iter()
+                .map(|(group, used)| Meter {
+                    group: Some((*group).into()),
+                    label: "weekly".into(),
+                    window: Window::new(*used, 0),
+                    span_secs: None,
+                    amount: None,
+                })
+                .collect(),
+            error: None,
+            ..Usage::failed(Service::Antigravity, account, 0, "")
+        }
+    }
+
+    #[test]
+    fn accounts_rank_by_their_tightest_meter_within_the_asked_group() {
+        let usages = [
+            usage(
+                "a",
+                &[("Gemini Models", 0.9), ("Claude and GPT models", 0.1)],
+            ),
+            usage(
+                "b",
+                &[("Gemini Models", 0.3), ("Claude and GPT models", 0.5)],
+            ),
+            Usage::failed(Service::Antigravity, "down", 0, "refused"),
+            Usage {
+                service: Service::Zai,
+                ..usage("glm", &[("x", 0.0)])
+            },
+        ];
+        let names = |group: Option<&str>| -> Vec<&str> {
+            by_room(&usages, Service::Antigravity, group)
+                .iter()
+                .map(|(usage, _)| usage.account.as_str())
+                .collect()
+        };
+        // Overall, a's Gemini limit (10% left) is tighter than b's worst (50%).
+        assert_eq!(names(None), ["b", "a"]);
+        assert_eq!(names(Some("claude")), ["a", "b"]);
+        assert_eq!(names(Some("gemini")), ["b", "a"]);
+        assert_eq!(names(Some("no such group")), Vec::<&str>::new());
+        let ranked = by_room(&usages, Service::Antigravity, Some("claude"));
+        assert!((ranked[0].1 - 0.9).abs() < 1e-9);
+    }
 
     #[test]
     fn the_key_comes_inline_or_trimmed_from_its_file() {
