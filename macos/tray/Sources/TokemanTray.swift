@@ -2,361 +2,394 @@ import SwiftUI
 import Foundation
 import Charts
 
-// MARK: - JSON models (matches `tokeman --json` output)
+// This app is a viewer. It reads through `tokeman list --json` (everything
+// tokeman has stored, read without a request or a write), `tokeman history
+// --json` and `tokeman settings show`, and never opens tokens.toml itself.
+// The background service keeps those stores fresh; only when no service is
+// installed does the app probe on its own interval, as `tokeman` would.
+// It changes things only through `tokeman settings set` and, for a Launch
+// button, `tokeman rotate use`.
 
-struct TokenResult: Codable, Identifiable {
-    var id: String { token_name }
-    let token_name: String
-    let probed_at: String
-    let quota: Quota?
-    let model_usage: ModelUsage?
-    let model_usage_error: String?
-    let error: String?
+// MARK: - JSON models (match `tokeman list --json`)
 
-    struct Quota: Codable {
-        let status: String
-        let representative_claim: String
+struct Window: Codable, Equatable {
+    let utilization: Double
+    let reset: Int64
+
+    var remaining: Double { max(0, min(1, 1.0 - utilization)) }
+}
+
+struct Overview: Codable {
+    let at: Int64
+    /// `running`, `paused` or `not-installed`.
+    let monitor: String
+    let default_account: String?
+    let target_model: String?
+    let claude: [ClaudeAccount]
+    let resets_on_offer: [ResetOffer]
+    let codex: [CodexAccount]
+    let services: [ServiceAccount]
+}
+
+struct ClaudeAccount: Codable, Identifiable {
+    var id: String { name }
+    let name: String
+    let is_default: Bool
+    let credential: String
+    let login: String
+    let login_note: String?
+    let login_warning: Bool
+    let login_ends_at: Int64?
+    let reading: Reading?
+
+    struct Reading: Codable {
+        let at: Int64
+        let status: String?
+        let error: String?
         let session: Window?
+        /// `present`, `absent` (the account has no 5h limit) or `unknown`.
+        let session_limit: String
         let weekly: Window?
         let overage: Window?
+        let buckets: [Bucket]
+        let notes: [String]
     }
 
-    struct Window: Codable {
-        let utilization: Double
-        let reset: Int64
-    }
-
-    struct ModelUsage: Codable {
-        let opus_weekly: Window?
-        let sonnet_weekly: Window?
+    struct Bucket: Codable, Identifiable {
+        var id: String { label }
+        let label: String
+        let short: String
+        let window: Window
+        let source: String
+        /// The limit's size as a fraction of the weekly limit, when it is one.
+        let share: Double?
+        /// Room for the model as a fraction of the weekly limit.
+        let room: Double
     }
 }
 
-// MARK: - History model (matches `tokeman history --json` output)
+struct ResetOffer: Codable, Identifiable {
+    var id: String { "\(account)-\(offer)" }
+    let account: String
+    let offer: String
+    let read_at: Int64
+}
+
+struct NamedWindow: Codable, Identifiable {
+    var id: String { label }
+    let label: String
+    let window: Window
+}
+
+struct CodexAccount: Codable, Identifiable {
+    var id: String { name }
+    let name: String
+    let label: String?
+    let parked: Bool
+    let reading: Reading?
+
+    struct Reading: Codable {
+        let at: Int64
+        let email: String?
+        let plan: String?
+        let state: String
+        let viable: Bool
+        let windows: [NamedWindow]
+        let extra: [Extra]
+        let reset_credits: ResetCredits?
+    }
+
+    struct Extra: Codable, Identifiable {
+        var id: String { name }
+        let name: String
+        let limited: Bool
+        let windows: [NamedWindow]
+    }
+
+    struct ResetCredits: Codable {
+        let available: Int
+        let applicable: Int?
+    }
+}
+
+struct ServiceAccount: Codable, Identifiable {
+    var id: String { "\(service)-\(name)" }
+    let name: String
+    let service: String
+    let service_label: String
+    let summary: String?
+    let usage: Usage?
+
+    struct Usage: Codable {
+        let at: Int64
+        let plan: String?
+        let meters: [Meter]
+        let balances: [Balance]?
+        let error: String?
+    }
+
+    struct Meter: Codable {
+        let group: String?
+        let label: String
+        let window: Window
+        let amount: Amount?
+    }
+
+    struct Amount: Codable {
+        let used: Double
+        let limit: Double
+        let unit: String
+    }
+
+    struct Balance: Codable {
+        let label: String
+        let left_minor: Int64
+        let total_minor: Int64?
+        let currency: String
+    }
+}
+
+// MARK: - History model (matches `tokeman history --json`)
 
 struct HistorySnapshot: Codable, Identifiable {
-    var id: String { "\(token_name)-\(probed_at)" }
-    let token_name: String
-    let probed_at: String
-    let unified_status: String?
-    let utilization_5h: Double?
-    let reset_5h: Int64?
-    let utilization_7d: Double?
-    let reset_7d: Int64?
-    let utilization_opus_7d: Double?
-    let reset_opus_7d: Int64?
-    let utilization_sonnet_7d: Double?
-    let reset_sonnet_7d: Int64?
-    let representative_claim: String?
-    let overage_status: String?
-    let utilization_overage: Double?
-    let reset_overage: Int64?
-    let error: String?
-    let model_usage_error: String?
+    var id: String { "\(account)-\(at)" }
+    let account: String
+    let at: String
+    let session: Window?
+    let weekly: Window?
+    let overage: Window?
+    let buckets: [HistoryBucket]?
 
-    var probedDate: Date {
+    struct HistoryBucket: Codable {
+        let label: String
+        let window: Window
+    }
+
+    var date: Date {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = formatter.date(from: probed_at) { return d }
+        if let d = formatter.date(from: at) { return d }
         formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: probed_at) ?? Date()
+        return formatter.date(from: at) ?? Date()
     }
 
-    func remaining(for window: ChartWindowType) -> Double? {
-        switch window {
-        case .fiveHour: return utilization_5h.map { max(0, (1.0 - $0) * 100) }
-        case .sevenDay: return utilization_7d.map { max(0, (1.0 - $0) * 100) }
-        case .opusWeekly: return utilization_opus_7d.map { max(0, (1.0 - $0) * 100) }
-        case .sonnetWeekly: return utilization_sonnet_7d.map { max(0, (1.0 - $0) * 100) }
-        case .overage: return utilization_overage.map { max(0, (1.0 - $0) * 100) }
+    /// Percent left in the named series: `7d`, `5h`, `$$` or a bucket label.
+    func remaining(for series: String) -> Double? {
+        let window: Window?
+        switch series {
+        case "7d": window = weekly
+        case "5h": window = session
+        case "$$": window = overage
+        default: window = buckets?.first(where: { $0.label == series })?.window
         }
+        return window.map { $0.remaining * 100 }
     }
 }
 
-enum ChartWindowType: String, CaseIterable {
-    case fiveHour = "5h"
-    case sevenDay = "7d"
-    case opusWeekly = "Opus"
-    case sonnetWeekly = "Sonnet"
-    case overage = "$$"
+// MARK: - Launch settings (from `tokeman settings show`)
+
+struct LaunchSettings {
+    var launchArgs: [String] = []
+    var dangerousMode = false
+    var terminal: String? = nil
+    var claudeBin: String? = nil
+    var probeIntervalSecs = 30
+
+    /// Parse the `key = value` lines `tokeman settings show` prints.
+    static func parse(_ output: String) -> LaunchSettings {
+        var settings = LaunchSettings()
+        for line in output.split(separator: "\n") {
+            guard let eq = line.range(of: " = ") ?? line.range(of: " =") else { continue }
+            let key = String(line[..<eq.lowerBound])
+            let value = String(line[eq.upperBound...]).trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "launch_args":
+                settings.launchArgs = value.split(separator: " ").map(String.init)
+            case "dangerous_mode": settings.dangerousMode = value == "true"
+            case "terminal": settings.terminal = value.isEmpty ? nil : value
+            case "claude_bin": settings.claudeBin = value.isEmpty ? nil : value
+            case "probe_interval_secs": settings.probeIntervalSecs = Int(value) ?? 30
+            default: break
+            }
+        }
+        return settings
+    }
 }
 
-// MARK: - Config reader/writer (~/.config/tokeman/tokens.toml)
+// MARK: - Text helpers
 
-struct TokemanConfig {
-    struct Token {
-        let name: String
-        let key: String
-        let usageKey: String?
+func levelColor(_ remaining: Double) -> Color {
+    if remaining > 0.5 { return .green }
+    if remaining > 0.2 { return .orange }
+    return .red
+}
+
+/// `3h20m`, `Tue 4:00PM`, `now`, or `nil` for a window with no reset pending.
+func resetText(_ reset: Int64) -> String? {
+    if reset == 0 { return nil }
+    let diff = Double(reset) - Date().timeIntervalSince1970
+    if diff <= 0 { return "now" }
+    let h = Int(diff) / 3600
+    let m = (Int(diff) % 3600) / 60
+    if h > 24 {
+        let f = DateFormatter()
+        f.dateFormat = "EEE h:mma"
+        return f.string(from: Date(timeIntervalSince1970: Double(reset)))
     }
-    struct Settings {
-        var launchArgs: [String] = []
-        var dangerousMode: Bool = false
-        var terminal: String? = nil
-        var claudeBin: String? = nil
-        var probeIntervalSecs: Int = 30
-    }
-    struct Rotation {
-        var normalMin5hRemaining = 0.10
-        var normalMin7dRemaining = 0.05
-        var sipMin5hRemaining = 0.02
-        var sipMin7dRemaining = 0.03
-        var normalProbeIntervalSecs = 120
-        var sipProbeIntervalSecs = 20
-    }
+    return h > 0 ? "\(h)h\(m)m" : "\(m)m"
+}
 
-    var tokens: [Token] = []
-    var settings: Settings = Settings()
-    var rotation: Rotation = Rotation()
+func ageText(_ at: Int64) -> String {
+    let secs = max(0, Int(Date().timeIntervalSince1970) - Int(at))
+    if secs < 60 { return "just now" }
+    if secs < 3600 { return "\(secs / 60)m ago" }
+    if secs < 86_400 { return "\(secs / 3600)h ago" }
+    return "\(secs / 86_400)d ago"
+}
 
-    static var configPath: String {
-        let configDir = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
-            ?? "\(NSHomeDirectory())/.config"
-        return "\(configDir)/tokeman/tokens.toml"
-    }
-
-    static func load() -> TokemanConfig {
-        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
-            return TokemanConfig()
-        }
-
-        var config = TokemanConfig()
-        var section = ""
-        var curName: String?
-        var curKey: String?
-        var curUsageKey: String?
-
-        for line in content.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if t.isEmpty || t.hasPrefix("#") { continue }
-
-            if t == "[[tokens]]" {
-                if let n = curName, let k = curKey {
-                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
-                }
-                curName = nil; curKey = nil; curUsageKey = nil
-                section = "tokens"; continue
-            }
-            if t == "[settings]" {
-                if let n = curName, let k = curKey {
-                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
-                }
-                curName = nil; curKey = nil; curUsageKey = nil
-                section = "settings"; continue
-            }
-            if t == "[rotation]" {
-                if let n = curName, let k = curKey {
-                    config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
-                }
-                curName = nil; curKey = nil; curUsageKey = nil
-                section = "rotation"; continue
-            }
-
-            guard let eq = t.firstIndex(of: "=") else { continue }
-            let key = t[..<eq].trimmingCharacters(in: .whitespaces)
-            let val = t[t.index(after: eq)...].trimmingCharacters(in: .whitespaces)
-
-            if section == "tokens" {
-                if key == "name" { curName = unquote(val) }
-                if key == "key" { curKey = unquote(val) }
-                if key == "usage_key" { curUsageKey = unquote(val) }
-            } else if section == "settings" {
-                switch key {
-                case "dangerous_mode": config.settings.dangerousMode = val == "true"
-                case "terminal": config.settings.terminal = unquote(val)
-                case "claude_bin": config.settings.claudeBin = unquote(val)
-                case "probe_interval_secs": config.settings.probeIntervalSecs = Int(val) ?? 30
-                case "launch_args": config.settings.launchArgs = parseArray(val)
-                default: break
-                }
-            } else if section == "rotation" {
-                switch key {
-                case "normal_min_5h_remaining": config.rotation.normalMin5hRemaining = Double(val) ?? 0.10
-                case "normal_min_7d_remaining": config.rotation.normalMin7dRemaining = Double(val) ?? 0.05
-                case "sip_min_5h_remaining": config.rotation.sipMin5hRemaining = Double(val) ?? 0.02
-                case "sip_min_7d_remaining": config.rotation.sipMin7dRemaining = Double(val) ?? 0.03
-                case "normal_probe_interval_secs": config.rotation.normalProbeIntervalSecs = Int(val) ?? 120
-                case "sip_probe_interval_secs": config.rotation.sipProbeIntervalSecs = Int(val) ?? 20
-                default: break
-                }
-            }
-        }
-        if let n = curName, let k = curKey {
-            config.tokens.append(Token(name: n, key: k, usageKey: curUsageKey))
-        }
-        return config
-    }
-
-    private static func unquote(_ s: String) -> String {
-        if s.hasPrefix("\"") && s.hasSuffix("\"") && s.count >= 2 {
-            if let data = s.data(using: .utf8),
-               let value = try? JSONSerialization.jsonObject(with: data) as? String {
-                return value
-            }
-            return String(s.dropFirst().dropLast())
-        }
-        return s
-    }
-
-    private static func parseArray(_ s: String) -> [String] {
-        let inner = s.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        var values: [String] = []
-        var current = ""
-        var quoted = false
-        var escaped = false
-        for character in inner {
-            if escaped {
-                current.append(character)
-                escaped = false
-            } else if character == "\\" && quoted {
-                current.append(character)
-                escaped = true
-            } else if character == "\"" {
-                current.append(character)
-                quoted.toggle()
-            } else if character == "," && !quoted {
-                let value = unquote(current.trimmingCharacters(in: .whitespaces))
-                if !value.isEmpty { values.append(value) }
-                current = ""
-            } else {
-                current.append(character)
-            }
-        }
-        let value = unquote(current.trimmingCharacters(in: .whitespaces))
-        if !value.isEmpty { values.append(value) }
-        return values
-    }
+func moneyText(_ minor: Int64, _ currency: String) -> String {
+    let amount = String(format: "%lld.%02lld", abs(minor) / 100, abs(minor) % 100)
+    let sign = minor < 0 ? "-" : ""
+    return currency == "USD" || currency.isEmpty ? "\(sign)$\(amount)" : "\(sign)\(amount) \(currency)"
 }
 
 // MARK: - View model
 
 @MainActor
 class TokemanViewModel: ObservableObject {
-    @Published var tokens: [TokenResult] = []
+    @Published var overview: Overview?
+    @Published var isLoading = false
     @Published var isProbing = false
-    @Published var lastProbe: Date?
-    @Published var probeError: String?
-    @Published var config = TokemanConfig.load()
+    @Published var lastLoad: Date?
+    @Published var loadError: String?
+    @Published var settings = LaunchSettings()
     @Published var showSettings = false
     @Published var history: [String: [HistorySnapshot]] = [:]
 
     private var timer: Timer?
+    private var lastProbe: Date?
+    private var lastHistoryLoad: Date?
+    /// A day of history is megabytes of JSON; the charts move slowly.
+    private let historyInterval: TimeInterval = 300
+    /// The stored view is local and cheap to read.
+    private let reloadInterval: TimeInterval = 15
+
+    /// `polls: false` is for drawing one picture of the stored view.
+    let polls: Bool
+
+    init(polls: Bool = true) {
+        self.polls = polls
+        // The menu-bar icon shows the fleet's state before the first click.
+        if polls { Task { @MainActor in self.start() } }
+    }
+
+    /// Whether anything else keeps the stored reads fresh.
+    var serviceInstalled: Bool { overview?.monitor != "not-installed" }
+
+    /// Weekly room of the best Claude account whose last reading allows work.
+    var bestWeeklyRemaining: Double? {
+        overview?.claude.compactMap { account -> Double? in
+            guard let reading = account.reading, reading.error == nil,
+                  reading.status != "rejected" else { return nil }
+            return reading.weekly?.remaining
+        }.max()
+    }
 
     var statusIcon: String {
-        if tokens.isEmpty && probeError != nil { return "bolt.slash.fill" }
-        guard let best = bestToken else {
-            return tokens.isEmpty ? "bolt.fill" : "bolt.slash.fill"
-        }
-        let rem = 1.0 - (best.quota?.weekly?.utilization ?? 1.0)
-        if rem > 0.2 { return "bolt.fill" }
-        return "bolt.trianglebadge.exclamationmark.fill"
+        guard overview != nil else { return loadError == nil ? "bolt.fill" : "bolt.slash.fill" }
+        guard let best = bestWeeklyRemaining else { return "bolt.slash.fill" }
+        return best > 0.2 ? "bolt.fill" : "bolt.trianglebadge.exclamationmark.fill"
     }
 
     var statusColor: Color {
-        guard let best = bestToken else { return .gray }
-        let rem = 1.0 - (best.quota?.weekly?.utilization ?? 1.0)
-        if rem > 0.5 { return .green }
-        if rem > 0.2 { return .orange }
-        return .red
+        guard let best = bestWeeklyRemaining else { return .gray }
+        return levelColor(best)
     }
 
-    var bestToken: TokenResult? {
-        let allowed = tokens.filter {
-            ($0.quota?.status == "allowed" || $0.quota?.status == "allowed_warning")
-                && $0.error == nil
+    func start() {
+        guard polls, timer == nil else { return }
+        reload()
+        timer = Timer.scheduledTimer(withTimeInterval: reloadInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reload() }
         }
-        let normal = allowed.filter {
-            ($0.quota?.session.map { 1.0 - $0.utilization } ?? 0) > config.rotation.normalMin5hRemaining
-                && ($0.quota?.weekly.map { 1.0 - $0.utilization } ?? 0) > config.rotation.normalMin7dRemaining
+    }
+
+    /// Read the stored view, the history and the settings. No request is
+    /// made and nothing is written.
+    func reload() {
+        guard !isLoading else { return }
+        isLoading = true
+        Task {
+            await load()
+            isLoading = false
+            probeIfNobodyElseDoes()
         }
-        if !normal.isEmpty {
-            return normal.min {
-                let lhs = ($0.quota?.weekly?.utilization ?? 1.0,
-                           $0.quota?.session?.utilization ?? 1.0)
-                let rhs = ($1.quota?.weekly?.utilization ?? 1.0,
-                           $1.quota?.session?.utilization ?? 1.0)
-                return lhs < rhs
+    }
+
+    func load() async {
+        let bin = findTokeman()
+        let output = await shell(bin, args: ["list", "--json"])
+        if output.isEmpty {
+            loadError = "Could not run tokeman (looked at \(bin)). Install it with: cargo install --path ."
+        } else if let data = output.data(using: .utf8) {
+            do {
+                overview = try JSONDecoder().decode(Overview.self, from: data)
+                lastLoad = Date()
+                loadError = nil
+            } catch {
+                loadError = "This tokeman does not print the stored view (`tokeman list --json`): \(error)"
             }
         }
-        // Sip-and-drain: once normal capacity is gone, sample/rotate against the
-        // 2% five-hour and 3% weekly floors and prefer immediate 5h headroom.
-        return allowed.filter {
-            ($0.quota?.session.map { 1.0 - $0.utilization } ?? 0) > config.rotation.sipMin5hRemaining
-                && ($0.quota?.weekly.map { 1.0 - $0.utilization } ?? 0) > config.rotation.sipMin7dRemaining
-        }.min {
-            let lhs = ($0.quota?.session?.utilization ?? 1.0,
-                       $0.quota?.weekly?.utilization ?? 1.0)
-            let rhs = ($1.quota?.session?.utilization ?? 1.0,
-                       $1.quota?.weekly?.utilization ?? 1.0)
-            return lhs < rhs
-        }
+        settings = LaunchSettings.parse(await shell(bin, args: ["settings", "show"]))
+        await loadHistory(bin)
     }
 
-    func startPolling() {
+    private func loadHistory(_ bin: String) async {
+        if let last = lastHistoryLoad, Date().timeIntervalSince(last) < historyInterval { return }
+        lastHistoryLoad = Date()
+        let output = await shell(bin, args: ["history", "--json", "--since", "24"])
+        guard let data = output.data(using: .utf8),
+              let snapshots = try? JSONDecoder().decode([HistorySnapshot].self, from: data) else {
+            return
+        }
+        var grouped: [String: [HistorySnapshot]] = [:]
+        for snapshot in snapshots {
+            grouped[snapshot.account, default: []].append(snapshot)
+        }
+        for key in grouped.keys {
+            grouped[key]?.sort { $0.date < $1.date }
+        }
+        history = grouped
+    }
+
+    /// With no background service nothing refreshes the stores, so the app
+    /// probes on the configured interval, exactly as running `tokeman` does.
+    private func probeIfNobodyElseDoes() {
+        guard overview != nil, !serviceInstalled, !isProbing else { return }
+        let interval = TimeInterval(max(15, settings.probeIntervalSecs))
+        if let last = lastProbe, Date().timeIntervalSince(last) < interval { return }
         probe()
-        loadHistory()
-        timer?.invalidate()
-        let interval = TimeInterval(max(1, config.settings.probeIntervalSecs))
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.probe() }
-        }
     }
 
+    /// Probe every Claude account now (`tokeman --json`), then show the result.
     func probe() {
         guard !isProbing else { return }
         isProbing = true
-        probeError = nil
+        lastProbe = Date()
         Task {
-            let bin = findTokenman()
-            let output = await shell(bin, args: ["--json"])
-            if output.isEmpty {
-                probeError = "Could not run tokeman — install with: cargo install --path ."
-            } else if let data = output.data(using: .utf8),
-               let decoded = try? JSONDecoder().decode([TokenResult].self, from: data) {
-                tokens = decoded
-                lastProbe = Date()
-                probeError = nil
-                loadHistory()
-            } else {
-                probeError = "Failed to parse tokeman output"
-            }
+            _ = await shell(findTokeman(), args: ["--json"])
             isProbing = false
+            reload()
         }
-    }
-
-    func loadHistory() {
-        Task {
-            let bin = findTokenman()
-            let output = await shell(bin, args: ["history", "--json", "--since", "24"])
-            guard let data = output.data(using: .utf8),
-                  let snapshots = try? JSONDecoder().decode([HistorySnapshot].self, from: data) else {
-                return
-            }
-            var grouped: [String: [HistorySnapshot]] = [:]
-            for s in snapshots {
-                grouped[s.token_name, default: []].append(s)
-            }
-            // Sort each group by time
-            for key in grouped.keys {
-                grouped[key]?.sort { $0.probedDate < $1.probedDate }
-            }
-            history = grouped
-        }
-    }
-
-    func reloadConfig() {
-        config = TokemanConfig.load()
-        timer?.invalidate()
-        startPolling()
     }
 
     func toggleDangerMode() {
-        let enable = !config.settings.dangerousMode
+        let enable = !settings.dangerousMode
         // Move the switch at once; the reload below confirms what was saved.
-        config.settings.dangerousMode = enable
+        settings.dangerousMode = enable
         Task {
             await setSetting("dangerous_mode", enable ? "true" : "false")
-            reloadConfig()
+            reload()
         }
     }
 
@@ -366,49 +399,50 @@ class TokemanViewModel: ObservableObject {
             await setSetting("terminal", terminal)
             await setSetting("claude_bin", claudeBin)
             await setSetting("probe_interval_secs", probeInterval)
-            reloadConfig()
+            reload()
         }
     }
 
-    /// Every write to tokens.toml goes through tokeman itself. Its writer
-    /// takes the config lock and keeps comments and every field this app does
-    /// not model: login grants (whose refresh tokens are single-use), Codex
-    /// accounts and the rotation floors. This app used to rewrite the file
-    /// from its own line parser and lost all of them.
+    /// Every write to tokens.toml goes through tokeman itself: its writer
+    /// takes the config lock and keeps comments and every field.
     private func setSetting(_ key: String, _ value: String) async {
-        let output = await shell(findTokenman(), args: ["settings", "set", key, value])
+        let output = await shell(findTokeman(), args: ["settings", "set", key, value])
         if !output.hasPrefix("set ") {
             fputs("tokeman tray: could not set \(key): \(output)\n", stderr)
         }
     }
 
-    func launchToken(_ name: String) {
-        guard config.tokens.contains(where: { $0.name == name }) else { return }
-        let bin = config.settings.claudeBin ?? "claude"
-        var args = config.settings.launchArgs
-        if config.settings.dangerousMode && !args.contains("--dangerously-skip-permissions") {
+    private var claudeCommand: String {
+        let bin = settings.claudeBin ?? "claude"
+        var args = settings.launchArgs
+        if settings.dangerousMode && !args.contains("--dangerously-skip-permissions") {
             args.append("--dangerously-skip-permissions")
         }
-        let cmd = ([bin] + args).map(shellQuote).joined(separator: " ")
+        return ([bin] + args).map(shellQuote).joined(separator: " ")
+    }
+
+    /// Make `name` the default, then open Claude in a terminal.
+    func launchAccount(_ name: String) {
+        guard overview?.claude.contains(where: { $0.name == name }) == true else { return }
+        let cmd = claudeCommand
         Task {
-            let tokeman = findTokenman()
-            let result = await shell(tokeman, args: ["rotate", "use", name])
+            let result = await shell(findTokeman(), args: ["rotate", "use", name])
             guard !result.isEmpty else {
-                probeError = "Could not activate \(name) through tokeman"
+                loadError = "Could not activate \(name) through tokeman"
                 return
             }
-            launchTerminal(cmd: cmd, terminal: config.settings.terminal)
+            launchTerminal(cmd: cmd, terminal: settings.terminal)
         }
     }
 
+    /// Open Claude on whichever account the rotation policy picks.
     func launchBest() {
-        guard let best = bestToken else { return }
-        launchToken(best.token_name)
+        launchTerminal(cmd: "\(shellQuote(findTokeman())) launch", terminal: settings.terminal)
     }
 
     // --- helpers ---
 
-    private func findTokenman() -> String {
+    private func findTokeman() -> String {
         let candidates = [
             ProcessInfo.processInfo.environment["TOKEMAN_BIN"],
             "\(NSHomeDirectory())/.cargo/bin/tokeman",
@@ -442,25 +476,7 @@ class TokemanViewModel: ObservableObject {
     }
 
     private func shell(_ path: String, args: [String]) async -> String {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global().async {
-                let proc = Process()
-                let pipe = Pipe()
-                proc.executableURL = URL(fileURLWithPath: path)
-                proc.arguments = args
-                proc.standardOutput = pipe
-                proc.standardError = FileHandle.nullDevice
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                } catch {
-                    cont.resume(returning: "")
-                    return
-                }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                cont.resume(returning: String(data: data, encoding: .utf8) ?? "")
-            }
-        }
+        await runTokeman(path, args: args)
     }
 
     private func shellQuote(_ value: String) -> String {
@@ -503,31 +519,42 @@ class TokemanViewModel: ObservableObject {
     }
 }
 
+/// Run tokeman and return its stdout; empty when it could not run. The
+/// output is drained before the wait, so a large answer cannot fill the pipe
+/// and stall the child.
+func runTokeman(_ path: String, args: [String]) async -> String {
+    await withCheckedContinuation { cont in
+        DispatchQueue.global().async {
+            let proc = Process()
+            let pipe = Pipe()
+            proc.executableURL = URL(fileURLWithPath: path)
+            proc.arguments = args
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try proc.run()
+            } catch {
+                cont.resume(returning: "")
+                return
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            cont.resume(returning: String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+}
+
 // MARK: - Views
 
 struct GaugeRow: View {
     let label: String
-    let window: TokenResult.Window
+    var labelWidth: CGFloat = 34
+    let window: Window
+    var note: String? = nil
 
-    private var remaining: Double { max(0, min(1, 1.0 - window.utilization)) }
-
-    private var barColor: Color {
-        if remaining > 0.5 { return .green }
-        if remaining > 0.2 { return .orange }
-        return .red
-    }
-
-    private var resetText: String {
-        let diff = Double(window.reset) - Date().timeIntervalSince1970
-        if diff <= 0 { return "now" }
-        let h = Int(diff) / 3600
-        let m = (Int(diff) % 3600) / 60
-        if h > 24 {
-            let f = DateFormatter()
-            f.dateFormat = "EEE h:mma"
-            return f.string(from: Date(timeIntervalSince1970: Double(window.reset)))
-        }
-        return h > 0 ? "\(h)h\(m)m" : "\(m)m"
+    private var caption: String {
+        let reset = resetText(window.reset).map { "resets \($0)" } ?? "no reset pending"
+        return note.map { "\(reset) · \($0)" } ?? reset
     }
 
     var body: some View {
@@ -536,62 +563,95 @@ struct GaugeRow: View {
                 Text(label)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: 34, alignment: .trailing)
+                    .frame(width: labelWidth, alignment: .trailing)
 
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(.quaternary)
                         RoundedRectangle(cornerRadius: 3)
-                            .fill(barColor)
-                            .frame(width: geo.size.width * remaining)
+                            .fill(levelColor(window.remaining))
+                            .frame(width: geo.size.width * window.remaining)
                     }
                 }
                 .frame(height: 12)
 
-                Text("\(Int(remaining * 100))%")
+                Text("\(Int((window.remaining * 100).rounded()))%")
                     .font(.system(size: 11, design: .monospaced))
                     .frame(width: 36, alignment: .trailing)
             }
 
-            HStack {
-                Spacer().frame(width: 40)
-                Text("resets \(resetText)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
+            Text(caption)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.leading, labelWidth + 6)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// A dim line under a card's gauges.
+struct Caption: View {
+    let text: String
+    var color: Color = .secondary
+    var lines: Int? = nil
+
+    init(_ text: String, color: Color = .secondary, lines: Int? = nil) {
+        self.text = text
+        self.color = color
+        self.lines = lines
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundStyle(color)
+            .lineLimit(lines)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+struct Card<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) { content }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct SectionTitle: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
     }
 }
 
 struct MiniUtilizationChart: View {
     let snapshots: [HistorySnapshot]
-    let window: ChartWindowType = .sevenDay
 
     private var chartColor: Color {
-        guard let last = snapshots.last,
-              let rem = last.remaining(for: window) else { return .green }
-        if rem > 50 { return .green }
-        if rem > 20 { return .orange }
-        return .red
+        guard let rem = snapshots.last?.remaining(for: "7d") else { return .green }
+        return levelColor(rem / 100)
     }
 
     var body: some View {
         Chart {
             ForEach(snapshots) { snap in
-                if let rem = snap.remaining(for: window) {
-                    AreaMark(
-                        x: .value("Time", snap.probedDate),
-                        y: .value("Remaining", rem)
-                    )
-                    .foregroundStyle(chartColor.opacity(0.15))
-
-                    LineMark(
-                        x: .value("Time", snap.probedDate),
-                        y: .value("Remaining", rem)
-                    )
-                    .foregroundStyle(chartColor)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                if let rem = snap.remaining(for: "7d") {
+                    AreaMark(x: .value("Time", snap.date), y: .value("Remaining", rem))
+                        .foregroundStyle(chartColor.opacity(0.15))
+                    LineMark(x: .value("Time", snap.date), y: .value("Remaining", rem))
+                        .foregroundStyle(chartColor)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5))
                 }
             }
         }
@@ -602,22 +662,32 @@ struct MiniUtilizationChart: View {
     }
 }
 
-struct TokenDetailChart: View {
+struct AccountDetailChart: View {
     let snapshots: [HistorySnapshot]
-    @State private var selectedWindow: ChartWindowType = .sevenDay
+    @State private var series = "7d"
+
+    /// The weekly and 5h windows, each per-model limit seen, and extra usage.
+    private var seriesNames: [String] {
+        var names = ["7d", "5h"]
+        for snapshot in snapshots {
+            for bucket in snapshot.buckets ?? [] where !names.contains(bucket.label) {
+                names.append(bucket.label)
+            }
+        }
+        return names + ["$$"]
+    }
 
     var body: some View {
         VStack(spacing: 6) {
-            Picker("Window", selection: $selectedWindow) {
-                ForEach(ChartWindowType.allCases, id: \.self) { w in
-                    Text(w.rawValue).tag(w)
+            Picker("Window", selection: $series) {
+                ForEach(seriesNames, id: \.self) { name in
+                    Text(name).tag(name)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
 
             Chart {
-                // Threshold lines
                 RuleMark(y: .value("Warning", 20))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                     .foregroundStyle(.orange.opacity(0.5))
@@ -626,21 +696,11 @@ struct TokenDetailChart: View {
                     .foregroundStyle(.red.opacity(0.5))
 
                 ForEach(snapshots) { snap in
-                    if let rem = snap.remaining(for: selectedWindow) {
-                        LineMark(
-                            x: .value("Time", snap.probedDate),
-                            y: .value("Remaining %", rem)
-                        )
-                        .foregroundStyle(.blue)
-                        .lineStyle(StrokeStyle(lineWidth: 2))
-                        .interpolationMethod(.monotone)
-
-                        PointMark(
-                            x: .value("Time", snap.probedDate),
-                            y: .value("Remaining %", rem)
-                        )
-                        .foregroundStyle(.blue)
-                        .symbolSize(15)
+                    if let rem = snap.remaining(for: series) {
+                        LineMark(x: .value("Time", snap.date), y: .value("Remaining %", rem))
+                            .foregroundStyle(.blue)
+                            .lineStyle(StrokeStyle(lineWidth: 2))
+                            .interpolationMethod(.monotone)
                     }
                 }
             }
@@ -654,7 +714,7 @@ struct TokenDetailChart: View {
                 }
             }
             .chartXAxis {
-                AxisMarks { val in
+                AxisMarks { _ in
                     AxisGridLine()
                     AxisValueLabel(format: .dateTime.hour().minute())
                 }
@@ -672,12 +732,12 @@ struct ComparisonChart: View {
             ForEach(Array(history.keys.sorted()), id: \.self) { name in
                 if let snaps = history[name] {
                     ForEach(snaps) { snap in
-                        if let rem = snap.remaining(for: .sevenDay) {
+                        if let rem = snap.remaining(for: "7d") {
                             LineMark(
-                                x: .value("Time", snap.probedDate),
+                                x: .value("Time", snap.date),
                                 y: .value("Remaining %", rem)
                             )
-                            .foregroundStyle(by: .value("Token", name))
+                            .foregroundStyle(by: .value("Account", name))
                             .lineStyle(StrokeStyle(lineWidth: 1.5))
                             .interpolationMethod(.monotone)
                         }
@@ -700,102 +760,219 @@ struct ComparisonChart: View {
                 AxisValueLabel(format: .dateTime.hour())
             }
         }
-        .chartLegend(.visible)
-        .frame(height: 100)
+        .chartLegend(.hidden)
+        .frame(height: 80)
     }
 }
 
-struct TokenCard: View {
-    let token: TokenResult
+struct ClaudeCard: View {
+    let account: ClaudeAccount
     let history: [HistorySnapshot]?
     let onLaunch: () -> Void
     @State private var showDetail = false
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(token.token_name).font(.headline)
-
-                if let status = token.quota?.status {
-                    Text(status)
-                        .font(.caption)
-                        .foregroundStyle(statusColor(status))
-                }
-
-                Spacer()
-
-                Button("Launch") { onLaunch() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-
-            if let q = token.quota {
-                if let s = q.session { GaugeRow(label: "5h", window: s) }
-                if let w = q.weekly { GaugeRow(label: "7d", window: w) }
-                if let w = token.model_usage?.opus_weekly {
-                    GaugeRow(label: "Opus", window: w)
-                } else {
-                    UnavailableGaugeRow(label: "Opus")
-                }
-                if let w = token.model_usage?.sonnet_weekly {
-                    GaugeRow(label: "Son", window: w)
-                } else {
-                    UnavailableGaugeRow(label: "Son")
-                }
-                if let o = q.overage { GaugeRow(label: "$$", window: o) }
-
-                // Mini chart (7d trend)
-                if let snaps = history, snaps.count >= 2 {
-                    MiniUtilizationChart(snapshots: snaps)
-                        .padding(.top, 2)
-                }
-            } else if let err = token.error {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-
-            // Detail chart (tap to expand)
-            if showDetail, let snaps = history, snaps.count >= 2 {
-                TokenDetailChart(snapshots: snaps)
-                    .padding(.top, 4)
-            }
-        }
-        .padding(10)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if history != nil && (history?.count ?? 0) >= 2 {
-                withAnimation(.easeInOut(duration: 0.2)) { showDetail.toggle() }
-            }
-        }
-    }
-
-    private func statusColor(_ s: String) -> Color {
-        switch s {
+    private func statusColor(_ status: String) -> Color {
+        switch status {
         case "allowed": return .green
         case "allowed_warning": return .orange
         case "rejected": return .red
         default: return .secondary
         }
     }
-}
 
-struct UnavailableGaugeRow: View {
-    let label: String
+    /// How many stored readings have a weekly window to chart.
+    private var weeklyPoints: Int {
+        (history ?? []).filter { $0.weekly != nil }.count
+    }
+
+    /// `50% of the weekly, 25% of the weekly left for it`, for a limit that
+    /// is a share of the weekly one.
+    private func shareNote(_ bucket: ClaudeAccount.Bucket) -> String? {
+        guard let share = bucket.share else { return nil }
+        let size = Int((share * 100).rounded())
+        let room = Int((max(0, bucket.room) * 100).rounded())
+        return "\(size)% of the weekly, \(room)% of the weekly left for it"
+    }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(label)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 34, alignment: .trailing)
-            Text("profile usage unavailable")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-            Spacer()
+        Card {
+            HStack {
+                Text(account.name).font(.headline).lineLimit(1)
+                if account.is_default {
+                    Text("default")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.25))
+                        .clipShape(Capsule())
+                }
+                if let status = account.reading?.status {
+                    Text(status).font(.caption).foregroundStyle(statusColor(status))
+                }
+                Spacer()
+                Button("Launch") { onLaunch() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+
+            if let reading = account.reading {
+                if let session = reading.session {
+                    GaugeRow(label: "5h", window: session)
+                } else if reading.session_limit == "absent" {
+                    Caption("5h  no 5h limit on this account")
+                } else if reading.weekly != nil {
+                    Caption("5h  not reported", color: .secondary.opacity(0.6))
+                }
+                if let weekly = reading.weekly { GaugeRow(label: "7d", window: weekly) }
+                ForEach(reading.buckets) { bucket in
+                    GaugeRow(
+                        label: bucket.source == "observed-rejection" ? "\(bucket.short)!" : bucket.short,
+                        window: bucket.window,
+                        note: shareNote(bucket)
+                    )
+                }
+                if let overage = reading.overage { GaugeRow(label: "$$", window: overage) }
+                if let error = reading.error {
+                    Caption(error, color: .red, lines: 3)
+                }
+                ForEach(reading.notes, id: \.self) { note in Caption(note) }
+
+                if let snaps = history, weeklyPoints >= 2 {
+                    MiniUtilizationChart(snapshots: snaps).padding(.top, 2)
+                }
+            } else {
+                Caption("not read yet")
+            }
+
+            if let note = account.login_note {
+                Caption(note, color: account.login_warning ? .orange : .secondary)
+            }
+            if let reading = account.reading {
+                Caption("read \(ageText(reading.at))", color: .secondary.opacity(0.6))
+            }
+
+            if showDetail, let snaps = history, snaps.count >= 2 {
+                AccountDetailChart(snapshots: snaps).padding(.top, 4)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if (history?.count ?? 0) >= 2 {
+                withAnimation(.easeInOut(duration: 0.2)) { showDetail.toggle() }
+            }
+        }
+    }
+}
+
+struct CodexCard: View {
+    let account: CodexAccount
+
+    private func creditsText(_ credits: CodexAccount.ResetCredits) -> String {
+        let noun = credits.available == 1 ? "reset credit" : "reset credits"
+        if let now = credits.applicable {
+            return "\(credits.available) \(noun) (\(now) usable now)"
+        }
+        return "\(credits.available) \(noun)"
+    }
+
+    var body: some View {
+        Card {
+            HStack {
+                Text(account.name).font(.headline).lineLimit(1)
+                if let plan = account.reading?.plan { Caption(plan) }
+                if account.parked { Caption("parked") }
+                Spacer()
+                if let reading = account.reading {
+                    Text(reading.state)
+                        .font(.caption)
+                        .foregroundStyle(reading.viable ? .green : .orange)
+                        .lineLimit(2)
+                }
+            }
+            if let reading = account.reading {
+                ForEach(reading.windows) { named in
+                    GaugeRow(label: named.label, labelWidth: 50, window: named.window)
+                }
+                ForEach(reading.extra) { extra in
+                    ForEach(extra.windows) { named in
+                        GaugeRow(
+                            label: named.label,
+                            labelWidth: 50,
+                            window: named.window,
+                            note: extra.limited ? "\(extra.name), limited" : extra.name
+                        )
+                    }
+                }
+                if let credits = reading.reset_credits, credits.available > 0 {
+                    Caption(creditsText(credits), color: .green)
+                }
+                Caption("read \(ageText(reading.at))", color: .secondary.opacity(0.6))
+            } else {
+                Caption("not read yet (`tokeman codex list`)")
+            }
+        }
+    }
+}
+
+struct ServiceCard: View {
+    let account: ServiceAccount
+
+    /// The meters in the service's order, split where the group changes.
+    private var groups: [(name: String?, meters: [ServiceAccount.Meter])] {
+        var result: [(name: String?, meters: [ServiceAccount.Meter])] = []
+        for meter in account.usage?.meters ?? [] {
+            if let last = result.indices.last, result[last].name == meter.group {
+                result[last].meters.append(meter)
+            } else {
+                result.append((meter.group, [meter]))
+            }
+        }
+        return result
+    }
+
+    private func amountNote(_ meter: ServiceAccount.Meter) -> String? {
+        guard let amount = meter.amount else { return nil }
+        return "\(Int(amount.used.rounded()))/\(Int(amount.limit.rounded())) \(amount.unit)"
+    }
+
+    private func balanceText(_ balance: ServiceAccount.Balance) -> String {
+        let left = moneyText(balance.left_minor, balance.currency)
+        if let total = balance.total_minor {
+            return "\(balance.label) \(left) of \(moneyText(total, balance.currency)) left"
+        }
+        return "\(balance.label) \(left) left"
+    }
+
+    var body: some View {
+        Card {
+            HStack {
+                Text(account.name).font(.headline).lineLimit(1)
+                Caption(account.service_label)
+                if let plan = account.usage?.plan { Caption("[\(plan)]") }
+                Spacer()
+            }
+            if let usage = account.usage {
+                if let error = usage.error { Caption(error, color: .red, lines: 3) }
+                ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                    if let name = group.name {
+                        Text(name).font(.system(size: 10, weight: .medium))
+                    }
+                    ForEach(Array(group.meters.enumerated()), id: \.offset) { _, meter in
+                        GaugeRow(
+                            label: meter.label,
+                            labelWidth: 50,
+                            window: meter.window,
+                            note: amountNote(meter)
+                        )
+                    }
+                }
+                ForEach(Array((usage.balances ?? []).enumerated()), id: \.offset) { _, balance in
+                    Caption(balanceText(balance), color: .primary)
+                }
+                Caption("read \(ageText(usage.at))", color: .secondary.opacity(0.6))
+            } else {
+                Caption("not read yet (`tokeman services`)")
+            }
         }
     }
 }
@@ -859,66 +1036,99 @@ struct SettingsSection: View {
             Label("Settings", systemImage: "gear")
                 .font(.caption)
         }
-        .onAppear { loadFromConfig() }
-        .onChange(of: vm.showSettings) { _ in loadFromConfig() }
+        .onAppear { loadFromSettings() }
+        .onChange(of: vm.showSettings) { _ in loadFromSettings() }
     }
 
-    private func loadFromConfig() {
-        launchArgs = vm.config.settings.launchArgs.joined(separator: " ")
-        terminal = vm.config.settings.terminal ?? ""
-        claudeBin = vm.config.settings.claudeBin ?? ""
-        probeInterval = "\(vm.config.settings.probeIntervalSecs)"
+    private func loadFromSettings() {
+        launchArgs = vm.settings.launchArgs.joined(separator: " ")
+        terminal = vm.settings.terminal ?? ""
+        claudeBin = vm.settings.claudeBin ?? ""
+        probeInterval = "\(vm.settings.probeIntervalSecs)"
+    }
+}
+
+/// Everything the stored view holds, as cards.
+struct OverviewCards: View {
+    let overview: Overview
+    let history: [String: [HistorySnapshot]]
+    let onLaunch: (String) -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ForEach(overview.claude) { account in
+                ClaudeCard(account: account, history: history[account.name]) {
+                    onLaunch(account.name)
+                }
+            }
+
+            if !overview.resets_on_offer.isEmpty {
+                SectionTitle(title: "Resets on offer")
+                Card {
+                    ForEach(overview.resets_on_offer) { offer in
+                        Caption("\(offer.account): \(offer.offer)", color: .green)
+                        Caption("read \(ageText(offer.read_at)); use with `tokeman resets use`",
+                                color: .secondary.opacity(0.6))
+                    }
+                }
+            }
+
+            if !overview.codex.isEmpty {
+                SectionTitle(title: "Codex")
+                ForEach(overview.codex) { account in CodexCard(account: account) }
+            }
+
+            if !overview.services.isEmpty {
+                SectionTitle(title: "Services")
+                ForEach(overview.services) { account in ServiceCard(account: account) }
+            }
+        }
+        .padding(10)
     }
 }
 
 struct PopoverContent: View {
     @ObservedObject var vm: TokemanViewModel
+    /// Room for the cards before they scroll; `nil` lays every card out
+    /// at full height, for a picture.
+    var maxCardsHeight: CGFloat? = 560
+
+    private var monitorText: String {
+        switch vm.overview?.monitor {
+        case "running": return "stored reads · service running"
+        case "paused": return "stored reads · rotation paused"
+        case "not-installed": return "no service · probing here"
+        default: return ""
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
                 Text("Tokeman").font(.headline)
+                Text(monitorText).font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                if let last = vm.lastProbe {
+                if vm.isProbing {
+                    Text("probing…").font(.caption2).foregroundStyle(.secondary)
+                } else if let last = vm.lastLoad {
                     Text("\(Int(-last.timeIntervalSinceNow))s ago")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                Button(action: { vm.probe() }) {
+                // With a service the button re-reads the stores; without one it probes.
+                Button(action: { vm.serviceInstalled ? vm.reload() : vm.probe() }) {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .disabled(vm.isProbing)
+                .disabled(vm.isLoading || vm.isProbing)
+                .help(vm.serviceInstalled ? "Read the stored view again" : "Probe every account now")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
 
             Divider()
 
-            if vm.tokens.isEmpty {
-                VStack(spacing: 8) {
-                    if let err = vm.probeError {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.title2)
-                            .foregroundStyle(.orange)
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 20)
-                        Button("Retry") { vm.probe() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                    } else {
-                        ProgressView()
-                        Text("Probing tokens...")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 120)
-            } else {
-                // Comparison chart (all tokens overlaid)
+            if let overview = vm.overview {
                 if vm.history.values.contains(where: { $0.count >= 2 }) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("24h overview (7d remaining)")
@@ -930,19 +1140,21 @@ struct PopoverContent: View {
                     .padding(.top, 10)
                 }
 
-                // Token cards — no maxHeight, auto-expand for up to ~8 accounts
-                VStack(spacing: 6) {
-                    ForEach(vm.tokens) { token in
-                        TokenCard(token: token, history: vm.history[token.token_name]) {
-                            vm.launchToken(token.token_name)
+                if let maxCardsHeight {
+                    ScrollView {
+                        OverviewCards(overview: overview, history: vm.history) { name in
+                            vm.launchAccount(name)
                         }
                     }
+                    .frame(maxHeight: maxCardsHeight)
+                } else {
+                    OverviewCards(overview: overview, history: vm.history) { name in
+                        vm.launchAccount(name)
+                    }
                 }
-                .padding(10)
 
                 Divider()
 
-                // Bottom actions
                 VStack(spacing: 8) {
                     HStack {
                         Button(action: { vm.launchBest() }) {
@@ -950,22 +1162,21 @@ struct PopoverContent: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(vm.bestToken == nil)
+                        .disabled(overview.claude.isEmpty)
+                        .help("Runs `tokeman launch`: Claude on the account the policy picks")
 
-                        if let best = vm.bestToken {
-                            let pct = Int((1.0 - (best.quota?.weekly?.utilization ?? 1.0)) * 100)
-                            Text("\(best.token_name) (\(pct)%)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text("default: \(overview.default_account ?? "/login")"
+                             + (overview.target_model.map { " · \($0)" } ?? ""))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
 
                         Spacer()
                     }
 
-                    // Danger mode toggle
                     HStack {
                         Toggle(isOn: Binding(
-                            get: { vm.config.settings.dangerousMode },
+                            get: { vm.settings.dangerousMode },
                             set: { _ in vm.toggleDangerMode() }
                         )) {
                             HStack(spacing: 4) {
@@ -973,7 +1184,7 @@ struct PopoverContent: View {
                                 Text("--dangerously-skip-permissions")
                                     .font(.system(size: 11, design: .monospaced))
                             }
-                            .foregroundStyle(vm.config.settings.dangerousMode ? .red : .secondary)
+                            .foregroundStyle(vm.settings.dangerousMode ? .red : .secondary)
                         }
                         .tint(.red)
                         .toggleStyle(.switch)
@@ -982,18 +1193,37 @@ struct PopoverContent: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
+            } else {
+                VStack(spacing: 8) {
+                    if let err = vm.loadError {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 20)
+                        Button("Retry") { vm.reload() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else {
+                        ProgressView()
+                        Text("Reading the stored view...")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 120)
             }
 
             Divider()
 
-            // Settings
             SettingsSection(vm: vm)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
 
             Divider()
 
-            // Quit
             Button("Quit Tokeman") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
@@ -1002,13 +1232,53 @@ struct PopoverContent: View {
                 .padding(.vertical, 6)
         }
         .frame(width: 400)
-        .onAppear { vm.startPolling() }
+        .onAppear { vm.start() }
     }
 }
 
 // MARK: - App
 
+/// `TokemanTray --render <file.png>` draws the popover once from the stored
+/// view, at full height, and exits: a way to look at the layout without a
+/// menu bar. It reads what the app reads and probes nothing.
+@MainActor
+func renderPopover(to path: String) async -> Bool {
+    let vm = TokemanViewModel(polls: false)
+    await vm.load()
+    let view = PopoverContent(vm: vm, maxCardsHeight: nil)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.colorScheme, .dark)
+    let renderer = ImageRenderer(content: view)
+    renderer.scale = 2
+    guard let image = renderer.nsImage,
+          let tiff = image.tiffRepresentation,
+          let bitmap = NSBitmapImageRep(data: tiff),
+          let png = bitmap.representation(using: .png, properties: [:]) else {
+        return false
+    }
+    return (try? png.write(to: URL(fileURLWithPath: path))) != nil
+}
+
 @main
+enum Main {
+    static func main() {
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--render"), flag + 1 < arguments.count else {
+            TokemanTrayApp.main()
+            return
+        }
+        let path = arguments[flag + 1]
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        Task { @MainActor in
+            let drawn = await renderPopover(to: path)
+            if !drawn { fputs("tokeman tray: could not draw \(path)\n", stderr) }
+            exit(drawn ? 0 : 1)
+        }
+        app.run()
+    }
+}
+
 struct TokemanTrayApp: App {
     @StateObject private var vm = TokemanViewModel()
 

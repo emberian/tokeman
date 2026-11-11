@@ -42,7 +42,8 @@ Log each account in through the browser:
 tokeman login "my-account"       # one account (added if it is new)
 tokeman login --more             # every configured account that still needs it
 tokeman refresh [<name>]         # renew grants now (the daemon does this before expiry)
-tokeman list                     # accounts and what each one offers
+tokeman list                     # accounts, what each one offers, the last stored reads
+tokeman list --json              # everything stored about every account; no request, no write
 ```
 
 Each round prints a claude.com URL; sign in as that account and paste the code
@@ -202,10 +203,19 @@ cargo install --path . --features tray
 tokeman tray
 ```
 
-Both show every account's gauges and buckets, launch claude in a new terminal
-on a chosen or the best account, and expose the launch settings and the
-dangerous-mode toggle. Every setting they change goes through `tokeman
-settings set`, so the account file is never rewritten by a tray.
+Both show every Claude account's gauges and per-model limits (a limit that is
+a share of the weekly one says how much of the weekly it still allows, and an
+account with no 5h limit says so), each login's end date, the resets on
+offer, the Codex profiles (5H and WEEKLY windows, reset credits) and the
+service accounts. Both launch claude in a new terminal on a chosen or the
+best account and expose the launch settings and the dangerous-mode toggle.
+
+The macOS app is a viewer of what tokeman has stored (`tokeman list --json`):
+with the background service installed it makes no request and writes nothing,
+and without one it probes on the configured interval. Its settings go through
+`tokeman settings set`, so the account file is never rewritten by it.
+`Tokeman.app/Contents/MacOS/TokemanTray --render out.png` draws the popover
+once into a PNG.
 
 ### Codex accounts
 
