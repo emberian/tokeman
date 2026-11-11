@@ -18,6 +18,7 @@ pub mod launch;
 pub mod observe;
 pub mod paths;
 pub mod policy;
+pub mod providers;
 pub mod quota;
 pub mod settings;
 pub mod store;
