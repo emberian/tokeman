@@ -30,7 +30,7 @@ use crate::paths;
 use crate::quota::Window;
 
 const API: &str = "https://daily-cloudcode-pa.googleapis.com";
-const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub(super) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// Antigravity's installed-app OAuth client, as shipped in `agy` and the
 /// app's `language_server`; both sign-ins (`auth_method: consumer`) use it.
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -441,13 +441,36 @@ fn error_message(text: &str) -> String {
 }
 
 #[derive(Deserialize)]
-struct Grant {
-    access_token: String,
+pub(super) struct Grant {
+    pub access_token: String,
     #[serde(default)]
-    expires_in: Option<i64>,
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
-async fn exchange(client: &Client, token_url: &str, refresh_token: &str) -> Result<Grant> {
+impl Grant {
+    /// The account's email, from the ID token's claims.
+    pub fn email(&self) -> Option<String> {
+        use base64::Engine;
+        let claims = self.id_token.as_deref()?.split('.').nth(1)?;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims.trim_end_matches('='))
+            .ok()?;
+        serde_json::from_slice::<Value>(&claims)
+            .ok()?
+            .get("email")?
+            .as_str()
+            .filter(|email| !email.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+pub(super) async fn exchange(
+    client: &Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<Grant> {
     let response = client
         .post(token_url)
         .timeout(REQUEST_TIMEOUT)
@@ -571,7 +594,7 @@ fn account(email: String, refresh_token: String, access: Option<(String, i64)>) 
 
 /// `agy`'s stored login: `{"token": <oauth2.Token>, "auth_method", "id_token_email"}`,
 /// optionally behind go-keyring's `go-keyring-base64:` prefix.
-fn parse_cli_grant(text: &str) -> Result<Option<ServiceAccount>> {
+pub(super) fn parse_cli_grant(text: &str) -> Result<Option<ServiceAccount>> {
     use base64::Engine;
     let text = text.trim();
     let json = match text.strip_prefix("go-keyring-base64:") {
@@ -607,75 +630,17 @@ fn parse_cli_grant(text: &str) -> Result<Option<ServiceAccount>> {
 }
 
 fn cli_file_grant() -> Result<Option<ServiceAccount>> {
-    let path = paths::expand_tilde("~/.gemini/antigravity-cli/antigravity-oauth-token");
-    match read_if_present(&path)? {
+    match read_if_present(&super::agy::token_file())? {
         Some(text) => parse_cli_grant(&text),
         None => Ok(None),
     }
 }
 
-/// `agy` stores its login through go-keyring, which drives `/usr/bin/security`;
-/// the item's access list trusts that tool, so it is read the same way.
-#[cfg(target_os = "macos")]
 fn cli_keychain_grant() -> Result<Option<ServiceAccount>> {
-    let output = run_bounded(
-        "/usr/bin/security",
-        &[
-            "find-generic-password",
-            "-s",
-            "gemini",
-            "-a",
-            "antigravity",
-            "-w",
-        ],
-        Duration::from_secs(5),
-    )?;
-    match output {
+    match super::agy::read_slot()? {
         Some(text) => parse_cli_grant(&text),
         None => Ok(None),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cli_keychain_grant() -> Result<Option<ServiceAccount>> {
-    Ok(None)
-}
-
-/// Run `program`, waiting at most `timeout`; `None` when it exits non-zero
-/// (`security` does so for a missing item).
-#[cfg(target_os = "macos")]
-fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Result<Option<String>> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("could not run {program}"))?;
-    let mut stdout = child.stdout.take().context("no stdout")?;
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("{program} did not answer within {}s", timeout.as_secs());
-            }
-        }
-    };
-    let text = reader.join().unwrap_or_default();
-    Ok(status.success().then_some(text))
 }
 
 /// The Antigravity app's (VS Code fork) global state database.
