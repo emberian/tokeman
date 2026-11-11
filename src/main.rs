@@ -176,6 +176,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 session,
                 yes,
             } => tokeman::ui::interactive::use_reset(&name, grant.as_deref(), session, yes).await?,
+            ResetAction::Clear { name } => tokeman::ui::interactive::clear_pending_reset(&name)?,
         },
         Command::Settings { action } => match action.unwrap_or(SettingsAction::Show) {
             SettingsAction::Show => {

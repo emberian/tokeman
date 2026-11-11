@@ -88,6 +88,11 @@ pub fn profile_cache() -> PathBuf {
     config_dir().join("claude-profile-reads.json")
 }
 
+/// Reset claims whose outcome is not yet known, one file per account.
+pub fn reset_claims_dir() -> PathBuf {
+    config_dir().join("reset-claims")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }

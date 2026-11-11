@@ -31,8 +31,11 @@ const ERROR_RETRY_SECS: i64 = 60;
 pub enum Endpoint {
     /// Windows and per-model limits.
     Usage,
-    /// The same, plus the reset programs, as Claude Code reads it at a limit.
+    /// The same, plus the session-reset program (`juniper_tide`), as Claude
+    /// Code reads it at a limit.
     AtWall,
+    /// The same, plus the granted-reset program (`cedar_ember`).
+    CedarEmber,
 }
 
 impl Endpoint {
@@ -40,6 +43,7 @@ impl Endpoint {
         match self {
             Self::Usage => "/api/oauth/usage",
             Self::AtWall => "/api/oauth/usage?at_wall=1&skip_spend=1",
+            Self::CedarEmber => "/api/oauth/usage?cedar_ember=1&skip_spend=1",
         }
     }
 
@@ -47,6 +51,7 @@ impl Endpoint {
         match self {
             Self::Usage => format!("{account}|usage"),
             Self::AtWall => format!("{account}|at_wall"),
+            Self::CedarEmber => format!("{account}|cedar_ember"),
         }
     }
 }

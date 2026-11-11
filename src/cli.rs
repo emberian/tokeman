@@ -234,6 +234,9 @@ pub enum ResetAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Forget a grant claim whose outcome is unknown, once Settings > Usage
+    /// on claude.ai shows what happened
+    Clear { name: String },
 }
 
 #[derive(Subcommand)]

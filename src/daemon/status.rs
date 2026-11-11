@@ -236,11 +236,11 @@ async fn resets_on_offer(fleet: &Fleet) -> Vec<String> {
             continue;
         };
         for grant in program.grants() {
-            if grant.resets_left > 0 && !grant.paused {
+            if grant.is_usable(now) {
                 offers.push(format!(
                     "{}: {}",
                     account.name,
-                    resets::describe_grant(&grant)
+                    resets::describe_grant(&grant, now)
                 ));
             }
         }
