@@ -1,6 +1,9 @@
 //! The egui tray (feature `tray`): a menu-bar dot coloured by the best
 //! account's weekly room, a window of gauges per account, launch buttons,
-//! and the launch settings, edited through `Fleet::update`.
+//! and the launch settings, edited through `Fleet::update`. The Claude
+//! cards come from its own probe; the logins, the reset offers, Codex and
+//! the service accounts come from the stored view (`ui::overview`), which
+//! the daemon keeps fresh.
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -22,7 +25,11 @@ use crate::policy;
 use crate::quota::{Level, ModelKey, Reading, Source, Window};
 use crate::settings::LaunchSettings;
 use crate::store::Store;
-use crate::ui::text::{format_reset_compact, short_bucket_label, status_badge, truncate_chars};
+use crate::ui::overview::{ClaudeView, CodexView, Overview, ServiceView};
+use crate::ui::text::{
+    codex_summary, format_age, format_money, format_reset_compact, short_bucket_label,
+    status_badge, truncate_chars,
+};
 
 const WINDOW_WIDTH: f32 = 420.0;
 const GRAY: [u8; 3] = [158, 158, 158];
@@ -41,6 +48,8 @@ struct Shared {
     last_probe: Option<Instant>,
     /// The model Claude starts on, read with each probe.
     target_model: Option<ModelKey>,
+    /// The stored view, rebuilt after each probe.
+    overview: Option<Arc<Overview>>,
 }
 
 /// A filled circle with an anti-aliased edge; `None` only if the size math
@@ -146,8 +155,10 @@ fn spawn_bg_thread(
                         let _ = store.insert(reading);
                     }
                 }
+                let overview = Overview::stored(&fleet, Utc::now().timestamp());
                 {
                     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    state.overview = Some(Arc::new(overview));
                     state.readings = Arc::new(readings);
                     state.last_probe = Some(Instant::now());
                     state.target_model = target_model();
@@ -318,6 +329,18 @@ impl TrayApp {
     }
 
     fn draw_gauge(ui: &mut egui::Ui, label: &str, window: Window) {
+        Self::draw_gauge_noted(ui, label, 3, window, None);
+    }
+
+    /// A gauge whose label column is `label_width` characters wide, with an
+    /// optional note after the reset.
+    fn draw_gauge_noted(
+        ui: &mut egui::Ui,
+        label: &str,
+        label_width: usize,
+        window: Window,
+        note: Option<&str>,
+    ) {
         let remaining = window.remaining().clamp(0.0, 1.0);
         let color = level_color(Level::of(remaining));
         let remaining = remaining as f32;
@@ -326,7 +349,7 @@ impl TrayApp {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("{label:>3}"))
+                egui::RichText::new(format!("{label:>label_width$}"))
                     .monospace()
                     .size(11.0)
                     .color(egui::Color32::from_gray(140)),
@@ -355,14 +378,166 @@ impl TrayApp {
         ui.horizontal(|ui| {
             ui.add_space(35.0);
             ui.label(
-                egui::RichText::new(format!("resets {}", format_reset_compact(window.resets_at)))
+                egui::RichText::new(gauge_caption(window, note))
                     .size(10.0)
                     .color(egui::Color32::from_gray(130)),
             );
         });
     }
 
-    fn draw_account_card(&self, ui: &mut egui::Ui, reading: &Reading) {
+    fn card_frame() -> egui::Frame {
+        egui::Frame::NONE
+            .fill(egui::Color32::from_black_alpha(140))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_white_alpha(30),
+            ))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(10))
+    }
+
+    fn caption(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32) {
+        ui.label(egui::RichText::new(text).size(10.0).color(color));
+    }
+
+    fn section(ui: &mut egui::Ui, title: &str) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(title)
+                .strong()
+                .size(12.0)
+                .color(egui::Color32::from_gray(170)),
+        );
+        ui.add_space(2.0);
+    }
+
+    fn draw_codex_card(ui: &mut egui::Ui, account: &CodexView, now: i64) {
+        Self::card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&account.name).strong().size(13.0));
+                if let Some(plan) = account.reading.as_ref().and_then(|r| r.plan.as_deref()) {
+                    Self::caption(ui, plan, DIM);
+                }
+                if account.parked {
+                    Self::caption(ui, "parked", DIM);
+                }
+            });
+            let Some(reading) = &account.reading else {
+                Self::caption(ui, "not read yet (`tokeman codex list`)", DIM);
+                return;
+            };
+            let width = reading
+                .windows
+                .iter()
+                .map(|named| named.label.chars().count())
+                .max()
+                .unwrap_or(3);
+            for named in &reading.windows {
+                Self::draw_gauge_noted(ui, &named.label, width, named.window, None);
+            }
+            let color = if reading.viable { DIM } else { WARN };
+            Self::caption(
+                ui,
+                format!(
+                    "{}  ·  read {}",
+                    codex_summary(reading),
+                    format_age(reading.at, now)
+                ),
+                color,
+            );
+        });
+    }
+
+    fn draw_service_card(ui: &mut egui::Ui, account: &ServiceView, now: i64) {
+        Self::card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&account.name).strong().size(13.0));
+                Self::caption(ui, account.service_label, DIM);
+                if let Some(plan) = account.usage.as_ref().and_then(|u| u.plan.as_deref()) {
+                    Self::caption(ui, format!("[{plan}]"), DIM);
+                }
+            });
+            let Some(usage) = &account.usage else {
+                Self::caption(ui, "not read yet (`tokeman services`)", DIM);
+                return;
+            };
+            if let Some(error) = &usage.error {
+                Self::caption(ui, truncate_chars(error, 120), WARN);
+            }
+            let width = usage
+                .meters
+                .iter()
+                .map(|meter| meter.label.chars().count())
+                .max()
+                .unwrap_or(3);
+            let mut group = None;
+            for meter in &usage.meters {
+                // A service's groups (Antigravity's model families) head their gauges.
+                if meter.group != group {
+                    group = meter.group.clone();
+                    if let Some(name) = &group {
+                        Self::caption(ui, name, egui::Color32::from_gray(170));
+                    }
+                }
+                let amount = meter
+                    .amount
+                    .as_ref()
+                    .map(|a| format!("{:.0}/{:.0} {}", a.used, a.limit, a.unit));
+                Self::draw_gauge_noted(ui, &meter.label, width, meter.window, amount.as_deref());
+            }
+            for balance in &usage.balances {
+                let left = format_money(balance.left_minor, &balance.currency);
+                let text = match balance.total_minor {
+                    Some(total) => format!(
+                        "{} {left} of {} left",
+                        balance.label,
+                        format_money(total, &balance.currency)
+                    ),
+                    None => format!("{} {left} left", balance.label),
+                };
+                Self::caption(ui, text, egui::Color32::from_gray(190));
+            }
+            Self::caption(ui, format!("read {}", format_age(usage.at, now)), DIM);
+        });
+    }
+
+    /// Everything below the Claude cards: reset offers, Codex, services.
+    fn draw_stored(ui: &mut egui::Ui, overview: &Overview) {
+        let now = Utc::now().timestamp();
+        if !overview.resets_on_offer.is_empty() {
+            Self::section(ui, "Resets on offer");
+            for offer in &overview.resets_on_offer {
+                Self::caption(
+                    ui,
+                    format!(
+                        "{}: {}  (read {})",
+                        offer.account,
+                        offer.offer,
+                        format_age(offer.read_at, now)
+                    ),
+                    OFFER,
+                );
+            }
+        }
+        if !overview.codex.is_empty() {
+            Self::section(ui, "Codex");
+            for account in &overview.codex {
+                Self::draw_codex_card(ui, account, now);
+                ui.add_space(4.0);
+            }
+        }
+        if !overview.services.is_empty() {
+            Self::section(ui, "Services");
+            for account in &overview.services {
+                Self::draw_service_card(ui, account, now);
+                ui.add_space(4.0);
+            }
+        }
+    }
+
+    fn draw_account_card(&self, ui: &mut egui::Ui, reading: &Reading, view: Option<&ClaudeView>) {
         let frame = egui::Frame::NONE
             .fill(egui::Color32::from_black_alpha(140))
             .stroke(egui::Stroke::new(
@@ -417,7 +592,8 @@ impl TrayApp {
                     if bucket.source == Source::Observed {
                         label.push('!');
                     }
-                    Self::draw_gauge(ui, &label, bucket.window);
+                    let note = share_note(bucket, reading.weekly.as_ref());
+                    Self::draw_gauge_noted(ui, &label, 3, bucket.window, note.as_deref());
                 }
                 if let Some(window) = reading.overage.as_ref().and_then(|o| o.window) {
                     Self::draw_gauge(ui, "$$", window);
@@ -428,6 +604,14 @@ impl TrayApp {
                         .color(egui::Color32::from_rgb(244, 67, 54))
                         .size(11.0),
                 );
+            }
+            for line in crate::ui::text::signal_lines(&reading.signals) {
+                Self::caption(ui, line, DIM);
+            }
+            if let Some(view) = view
+                && let Some(note) = &view.login_note
+            {
+                Self::caption(ui, note, if view.login_warning { WARN } else { DIM });
             }
         });
     }
@@ -538,6 +722,35 @@ impl TrayApp {
     }
 }
 
+const DIM: egui::Color32 = egui::Color32::from_gray(120);
+const WARN: egui::Color32 = egui::Color32::from_rgb(255, 193, 7);
+const OFFER: egui::Color32 = egui::Color32::from_rgb(129, 199, 132);
+
+/// `resets 2h10m`, `no reset pending` for an idle window, then the note.
+fn gauge_caption(window: Window, note: Option<&str>) -> String {
+    let reset = if window.resets_at == 0 {
+        "no reset pending".to_owned()
+    } else {
+        format!("resets {}", format_reset_compact(window.resets_at))
+    };
+    match note {
+        Some(note) => format!("{reset}  ·  {note}"),
+        None => reset,
+    }
+}
+
+/// For a limit that is a share of the weekly: how much of the weekly it
+/// still allows.
+fn share_note(bucket: &crate::quota::Bucket, weekly: Option<&Window>) -> Option<String> {
+    bucket.share.map(|share| {
+        format!(
+            "{:.0}% of the weekly, {:.0}% of the weekly left for it",
+            share * 100.0,
+            bucket.room(weekly).max(0.0) * 100.0
+        )
+    })
+}
+
 fn settings_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
@@ -593,12 +806,13 @@ impl eframe::App for TrayApp {
             }
         }
 
-        let (readings, last_probe, target_model) = {
+        let (readings, last_probe, target_model, overview) = {
             let state = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             (
                 Arc::clone(&state.readings),
                 state.last_probe,
                 state.target_model.clone(),
+                state.overview.clone(),
             )
         };
         let best = select_best(&readings, &self.fleet, target_model.as_ref());
@@ -688,7 +902,7 @@ impl eframe::App for TrayApp {
                 ui.separator();
                 ui.add_space(4.0);
 
-                if readings.is_empty() {
+                if readings.is_empty() && overview.is_none() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
                         ui.spinner();
@@ -701,8 +915,17 @@ impl eframe::App for TrayApp {
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for reading in readings.iter() {
-                            self.draw_account_card(ui, reading);
+                            let view = overview.as_ref().and_then(|overview| {
+                                overview
+                                    .claude
+                                    .iter()
+                                    .find(|view| view.name == reading.account)
+                            });
+                            self.draw_account_card(ui, reading, view);
                             ui.add_space(6.0);
+                        }
+                        if let Some(overview) = &overview {
+                            Self::draw_stored(ui, overview);
                         }
                     });
                 }
@@ -738,6 +961,21 @@ mod tests {
     fn the_icon_is_a_disc_with_a_transparent_corner() {
         let icon = make_icon([1, 2, 3]);
         assert!(icon.is_some());
+    }
+
+    #[test]
+    fn a_shared_limit_is_noted_in_weekly_terms_and_an_idle_window_has_no_reset() {
+        let weekly = Window::new(0.4, 0);
+        let mut fable = crate::testing::bucket("fable", "Fable", 0.5, Source::Profile);
+        assert_eq!(share_note(&fable, Some(&weekly)), None);
+        fable.share = Some(0.5);
+        let note = share_note(&fable, Some(&weekly)).unwrap();
+        assert_eq!(note, "50% of the weekly, 25% of the weekly left for it");
+        assert_eq!(
+            gauge_caption(Window::new(0.0, 0), Some(&note)),
+            format!("no reset pending  ·  {note}")
+        );
+        assert_eq!(gauge_caption(Window::new(0.0, 1), None), "resets now");
     }
 
     #[test]

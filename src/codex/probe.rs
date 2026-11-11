@@ -357,7 +357,7 @@ impl fmt::Display for State {
 
 /// One probe of one account. Local signals are filled even when the request
 /// fails.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
     pub account: String,
     pub codex_home: PathBuf,

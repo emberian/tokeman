@@ -52,7 +52,8 @@ src/
   quota.rs       Window, Bucket, ModelKey, Source, Reading, Level: what is known about an account's room
   policy.rs      PURE. Mode, Floors, viability, landing choice, Decision. No IO, no clock, no strings.
   history.rs     credential history: Event, fingerprint, account_at (JSONL, same format as today)
-  store.rs       sqlite snapshot history (same schema as today), Snapshot, Series; service_readings (one Usage as JSON per row)
+  store.rs       sqlite snapshot history (same schema as today), Snapshot, Series; service_readings and codex_readings
+                 (one JSON document per row); a read-only open that creates no file, table or row
   observe.rs     ObservedLimit, SessionBinding, the SessionStart hook input, transcript scan
   anthropic/
     mod.rs       the HTTP client that identifies as Claude Code; error classification
@@ -91,10 +92,14 @@ src/
     chart.rs     PNG + iTerm2 inline, shared segment logic
     tui.rs       --watch (cards, chart, a services strip)
     services_cli.rs  `tokeman services`: list, add, remove, import antigravity
-    tray.rs      egui tray (feature "tray")
+    overview.rs  the stored view: everything last read about every account (Claude, reset offers, Codex, services),
+                 built without a request or a write; `tokeman list --json` prints it and both trays draw it
+    tray.rs      egui tray (feature "tray"): Claude cards from its own probe, the rest from the stored view
   cli.rs         clap definitions and dispatch; no logic
   launch.rs      the claude launch command and terminal handoff
-macos/tray/      Swift menu-bar app; reads tokens.toml, writes only through `tokeman settings set`
+macos/tray/      Swift menu-bar app; a viewer of `tokeman list --json`, `history --json` and `settings show` that never
+                 opens tokens.toml; probes only when no service is installed; writes only through
+                 `tokeman settings set` and `tokeman rotate use`
 ```
 
 Dropped from the tree (history keeps them): the web dashboard and its D3

@@ -170,6 +170,13 @@ impl Cache {
         }
     }
 
+    /// What the cache holds for `account`, however old, and when it was
+    /// fetched (epoch seconds). No request is made.
+    pub fn stored(&self, account: &str, endpoint: Endpoint) -> Option<(i64, serde_json::Value)> {
+        let entry = self.load().entries.remove(&endpoint.key(account))?;
+        Some((entry.fetched_at, entry.body?))
+    }
+
     /// The endpoint's JSON for `account`: from the cache when younger than
     /// [`MAX_AGE_SECS`] (unless `fresh`), or while this account or the fleet
     /// is backed off; otherwise fetched with `bearer`. `now` is epoch seconds.

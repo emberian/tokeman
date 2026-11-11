@@ -3,8 +3,9 @@
 //! The schema is the one every row since 0.1.0 was written with, plus
 //! columns added at the end (older rows read them as empty); legacy
 //! Opus/Sonnet columns are read into buckets and no longer written. Service
-//! reads (GLM, Kimi, Antigravity) live in their own table, one JSON
-//! [`Usage`] per row.
+//! reads (GLM, Kimi, Antigravity) and Codex probes live in their own tables,
+//! one JSON document per row. [`Store::open_read_only`] is for surfaces that
+//! only show what was stored: it creates no file, table or row.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -12,6 +13,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::time::Duration;
 
+use crate::codex::probe::Probe;
 use crate::paths;
 use crate::providers::{Service, Usage};
 use crate::quota::{Bucket, ModelKey, Reading, SessionLimit, Signals, Source, Window};
@@ -84,6 +86,40 @@ impl Store {
         Ok(store)
     }
 
+    /// Open the history without creating, migrating or writing anything. A
+    /// table this database does not have yet reads as an error, which the
+    /// caller treats as no rows.
+    pub fn open_read_only() -> Result<Self> {
+        Self::open_read_only_at(&paths::snapshots_db())
+    }
+
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        // A reader of a WAL database creates the `-shm` and `-wal` files when
+        // they are missing. With no `-wal` file every row is in the main
+        // file, so it is read as immutable, which creates nothing; with one,
+        // the sidecars exist already and an ordinary read-only open adds none.
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = if wal.exists() {
+            Connection::open_with_flags(path, flags)
+        } else {
+            let escaped = path
+                .display()
+                .to_string()
+                .replace('%', "%25")
+                .replace('?', "%3f")
+                .replace('#', "%23");
+            Connection::open_with_flags(
+                format!("file:{escaped}?immutable=1"),
+                flags | OpenFlags::SQLITE_OPEN_URI,
+            )
+        }
+        .with_context(|| format!("failed to open database at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS snapshots (
@@ -119,7 +155,15 @@ impl Store {
                 usage TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_service_readings_account_time
-                ON service_readings(service, account, at);",
+                ON service_readings(service, account, at);
+            CREATE TABLE IF NOT EXISTS codex_readings (
+                id INTEGER PRIMARY KEY,
+                account TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                probe TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_readings_account_time
+                ON codex_readings(account, at);",
         )?;
         // Databases from 0.1.x predate these columns; ALTER fails harmlessly when present.
         for column in [
@@ -244,6 +288,38 @@ impl Store {
             .iter()
             .filter_map(|json| serde_json::from_str(json).ok())
             .collect())
+    }
+
+    pub fn insert_codex(&self, probe: &Probe) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO codex_readings (account, at, probe) VALUES (?1, ?2, ?3)",
+            params![probe.account, probe.at, serde_json::to_string(probe)?],
+        )?;
+        Ok(())
+    }
+
+    /// The newest probe of each Codex account, in no particular order. Rows
+    /// that no longer parse are skipped.
+    pub fn latest_codex(&self) -> Result<Vec<Probe>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT probe FROM codex_readings
+             WHERE id IN (SELECT MAX(id) FROM codex_readings GROUP BY account)",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect())
+    }
+
+    /// The newest reading of each account, in no particular order.
+    pub fn latest_snapshots(&self) -> Result<Vec<Snapshot>> {
+        self.query(
+            "WHERE id IN (SELECT MAX(id) FROM snapshots GROUP BY token_name)",
+            [],
+        )
     }
 
     pub fn recent(&self, account: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
@@ -575,6 +651,84 @@ mod tests {
             store.recent_usage(None, 1).unwrap()[0].error.as_deref(),
             Some("HTTP 401")
         );
+    }
+
+    #[test]
+    fn a_read_only_open_sees_the_rows_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.db");
+        assert!(Store::open_read_only_at(&missing).is_err());
+        assert!(!missing.exists());
+
+        let path = dir.path().join("s.db");
+        {
+            let store = Store::open_at(&path).unwrap();
+            store.insert(&reading()).unwrap();
+            let mut later = reading();
+            later.at += 60;
+            later.weekly = Some(Window::new(0.6, 20));
+            store.insert(&later).unwrap();
+            let probe = crate::codex::probe::Probe {
+                account: "work".into(),
+                codex_home: "/tmp/work".into(),
+                at: 5,
+                usage: None,
+                error: None,
+                last_refresh: None,
+                email_hint: Some("a@b.c".into()),
+            };
+            store.insert_codex(&probe).unwrap();
+            store
+                .insert_codex(&crate::codex::probe::Probe { at: 9, ..probe })
+                .unwrap();
+        }
+        let files = |dir: &std::path::Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        // The writer checkpointed and removed its sidecars when it closed.
+        assert_eq!(files(dir.path()), ["s.db"]);
+        let store = Store::open_read_only_at(&path).unwrap();
+        let latest = store.latest_snapshots().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].weekly, Some(Window::new(0.6, 20)));
+        let codex = store.latest_codex().unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!((codex[0].at, codex[0].email()), (9, Some("a@b.c")));
+        assert!(
+            store.insert(&reading()).is_err(),
+            "read-only refuses a write"
+        );
+        drop(store);
+        assert_eq!(files(dir.path()), ["s.db"], "no sidecar files appear");
+
+        // While a writer holds the database open, its rows in the WAL are seen.
+        let writer = Store::open_at(&path).unwrap();
+        let mut newest = reading();
+        newest.at += 120;
+        newest.weekly = Some(Window::new(0.7, 20));
+        writer.insert(&newest).unwrap();
+        let reader = Store::open_read_only_at(&path).unwrap();
+        assert_eq!(
+            reader.latest_snapshots().unwrap()[0].weekly,
+            Some(Window::new(0.7, 20))
+        );
+        drop(reader);
+        drop(writer);
+
+        // A database from before a table existed reads as an error, not a panic.
+        let old = dir.path().join("old.db");
+        Connection::open(&old)
+            .unwrap()
+            .execute_batch("CREATE TABLE snapshots (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let store = Store::open_read_only_at(&old).unwrap();
+        assert!(store.latest_codex().is_err());
+        assert!(store.latest_usage().is_err());
     }
 
     #[test]

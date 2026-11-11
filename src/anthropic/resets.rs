@@ -328,6 +328,23 @@ pub async fn status(
     Ok(status)
 }
 
+/// The usable granted resets in the cached cedar_ember read of `account`,
+/// one line each, and when that read was made. No request is made; `None`
+/// when the account was never read.
+pub fn stored_offers(cache: &Cache, account: &str, now: i64) -> Option<(i64, Vec<String>)> {
+    let (fetched_at, body) = cache.stored(account, Endpoint::CedarEmber)?;
+    let status: ResetStatus = serde_json::from_value(body).ok()?;
+    let offers = status
+        .cedar_ember
+        .map(|program| program.grants())
+        .unwrap_or_default()
+        .iter()
+        .filter(|grant| grant.is_usable(now))
+        .map(|grant| describe_grant(grant, now))
+        .collect();
+    Some((fetched_at, offers))
+}
+
 async fn organization_uuid(client: &Client, bearer: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Profile {
@@ -805,6 +822,19 @@ mod tests {
             Some("not_at_wall")
         );
         assert!(status.errors.is_empty());
+
+        // The cached read answers later without a request, however old.
+        let then = at("2026-10-01T00:00:00Z");
+        let (read_at, offers) = stored_offers(&cache, "acct", then).unwrap();
+        assert_eq!(read_at, 1);
+        assert_eq!(offers.len(), 1);
+        assert!(offers[0].contains("usable now"), "{offers:?}");
+        let expired = at("2026-10-23T00:00:00Z");
+        assert_eq!(
+            stored_offers(&cache, "acct", expired),
+            Some((1, Vec::new()))
+        );
+        assert_eq!(stored_offers(&cache, "never-read", then), None);
     }
 
     #[tokio::test]

@@ -48,8 +48,14 @@ pub enum Command {
         /// Account to refresh (default: every account with a login)
         name: Option<String>,
     },
-    /// List configured accounts and their credentials
-    List,
+    /// List configured accounts, their credentials and the last stored reads
+    ///
+    /// Makes no request and writes nothing.
+    List {
+        /// Everything stored about every account, as JSON (what the trays read)
+        #[arg(long)]
+        json: bool,
+    },
     /// Launch claude on the best account
     Launch {
         /// Keep rotating the default while Claude runs

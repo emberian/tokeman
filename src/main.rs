@@ -85,17 +85,22 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             println!("{refreshed} grant(s) refreshed.");
         }
-        Command::List => {
+        Command::List { json } => {
             let fleet = Fleet::load()?;
-            if fleet.accounts.is_empty() && fleet.services.is_empty() {
+            let overview =
+                tokeman::ui::overview::Overview::stored(&fleet, chrono::Utc::now().timestamp());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&overview)?);
+                return Ok(());
+            }
+            if fleet.accounts.is_empty() && fleet.services.is_empty() && fleet.codex.is_empty() {
                 println!(
                     "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
                 );
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let default = daemon::default_account(&fleet)?;
             for account in &fleet.accounts {
-                let marker = if default.as_deref() == Some(account.name.as_str()) {
+                let marker = if overview.default_account.as_deref() == Some(account.name.as_str()) {
                     "*"
                 } else {
                     " "
@@ -111,10 +116,21 @@ async fn dispatch(command: Command) -> Result<()> {
                     text::describe_login(account, now_ms)
                 );
             }
-            let latest = Store::open()
-                .and_then(|store| store.latest_usage())
-                .unwrap_or_default();
-            text::print_service_list(&fleet.services, &latest, now_ms / 1000);
+            text::print_codex_list(&overview.codex, overview.at);
+            let latest: Vec<_> = overview
+                .services
+                .iter()
+                .filter_map(|service| service.usage.clone())
+                .collect();
+            text::print_service_list(&fleet.services, &latest, overview.at);
+            for offer in &overview.resets_on_offer {
+                println!(
+                    "\n reset on offer: {}: {} (`tokeman resets use`; read {})",
+                    offer.account,
+                    offer.offer,
+                    text::format_age(offer.read_at, overview.at)
+                );
+            }
         }
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate(action).await?,
@@ -124,17 +140,23 @@ async fn dispatch(command: Command) -> Result<()> {
             since,
             json,
         } => {
-            let store = Store::open()?;
-            let snapshots = match since {
+            let read = |store: &Store| match since {
                 Some(hours) => {
                     let cutoff = chrono::Utc::now()
                         - chrono::Duration::milliseconds((hours * 3_600_000.0) as i64);
                     match account.as_deref() {
-                        Some(name) => store.for_account_since(name, cutoff)?,
-                        None => store.all_since(cutoff)?,
+                        Some(name) => store.for_account_since(name, cutoff),
+                        None => store.all_since(cutoff),
                     }
                 }
-                None => store.recent(account.as_deref(), last)?,
+                None => store.recent(account.as_deref(), last),
+            };
+            // Reading history writes nothing. Only a database from an older
+            // tokeman, which lacks columns this one selects, is opened for
+            // writing so that it is migrated.
+            let snapshots = match Store::open_read_only().and_then(|store| read(&store)) {
+                Ok(snapshots) => snapshots,
+                Err(_) => read(&Store::open()?)?,
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshots)?);

@@ -893,7 +893,19 @@ pub async fn maintenance(fleet: &Fleet, state: &mut MaintenanceState) -> Vec<Mai
             }
         },
     };
-    sweep(client, &fleet.codex, needs_login).await
+    let (probes, events) = sweep_probed(client, &fleet.codex, needs_login).await;
+    record(&probes);
+    events
+}
+
+/// Keep probes in the history, for the surfaces that show stored reads.
+pub fn record(probes: &[Probe]) {
+    let Ok(store) = crate::store::Store::open() else {
+        return;
+    };
+    for probe in probes {
+        let _ = store.insert_codex(probe);
+    }
 }
 
 /// Keep every profile refreshed. The backend is asked rather than the clock:
@@ -906,9 +918,19 @@ pub async fn sweep(
     accounts: &[CodexAccount],
     needs_login: &mut BTreeSet<String>,
 ) -> Vec<MaintenanceEvent> {
+    sweep_probed(client, accounts, needs_login).await.1
+}
+
+/// [`sweep`], with the probes it decided on. They predate any refresh the
+/// sweep then made.
+async fn sweep_probed(
+    client: &Client,
+    accounts: &[CodexAccount],
+    needs_login: &mut BTreeSet<String>,
+) -> (Vec<Probe>, Vec<MaintenanceEvent>) {
     let mut events = Vec::new();
     if accounts.is_empty() {
-        return events;
+        return (Vec::new(), events);
     }
     let probes = probe::probe_all(client, accounts).await;
     let rejected: BTreeSet<&str> = probes
@@ -955,7 +977,8 @@ pub async fn sweep(
             }),
         }
     }
-    events
+    drop(rejected);
+    (probes, events)
 }
 
 #[cfg(test)]
