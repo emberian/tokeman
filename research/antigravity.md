@@ -14,8 +14,8 @@ local plaintext state.
 
 | account | where its grant lives | plan |
 |---|---|---|
-| `cmrx64@gmail.com` | `agy` CLI: macOS Keychain + file fallback | Google AI Ultra **[live]** |
-| `ember@lunar.town` | Antigravity.app (IDE): `state.vscdb` | Google AI Ultra **[live]** |
+| `first@example.com` | `agy` CLI: macOS Keychain + file fallback | Google AI Ultra **[live]** |
+| `second@example.com` | Antigravity.app (IDE): `state.vscdb` | Google AI Ultra **[live]** |
 
 Both grants come from the **same OAuth client** (see Refresh), so a grant from one store works in
 the other. **[live]**
@@ -31,7 +31,7 @@ the other. **[live]**
               "refresh_token": "<1//…, 103 chars>",
               "expiry": "2026-11-11T13:07:02.25159-08:00", "expires_in": 3599},
     "auth_method": "consumer",
-    "id_token_email": "cmrx64@gmail.com"}
+    "id_token_email": "first@example.com"}
    ```
    (`token` is a Go `oauth2.Token`.) `agy` rewrites it on every refresh; mdate was today.
    Logs say `ChainedAuth: authenticated via keyring (effective: keyring)`.
@@ -43,7 +43,7 @@ the other. **[live]**
    **[web]**, which gives a way to run `agy` against a private `HOME` without touching the
    Keychain.
 3. "Active account" is simply whatever grant is in that slot. There is one slot; no account
-   list. `~/.gemini/google_accounts.json` (`{"active": null, "old": ["ember@lunar.town"]}`) belongs
+   list. `~/.gemini/google_accounts.json` (`{"active": null, "old": ["second@example.com"]}`) belongs
    to the old Gemini CLI and is not read by `agy`.
 
 ### Antigravity.app (VS Code fork)
@@ -56,7 +56,7 @@ the other. **[live]**
   `1` access_token, `2` "Bearer", `3` refresh_token, `4 {1: expiry unix seconds}`. Entry
   `authStateWithContextSentinelKey` holds JSON `{"state":"signedIn", ...}`.
 - `antigravityUnifiedStateSync.userStatus`: base64 protobuf cache of the user status: `3` name,
-  `7` email (`ember@lunar.town`), `33` model configs, each with `15 = quotaInfo {1: remainingFraction
+  `7` email (`second@example.com`), `33` model configs, each with `15 = quotaInfo {1: remainingFraction
   (float), 2: resetTime}`. This is a cache, last written in May.
 - The stored access token expired 2026-05-25; the refresh token was still valid today.
 
@@ -139,7 +139,7 @@ QuotaSummaryBucket { string bucket_id; string display_name; string description; 
                      bool disabled; google.protobuf.Timestamp reset_time; }
 ```
 
-Real response, `cmrx64@gmail.com`, Agy-hub User-Agent:
+Real response, `first@example.com`, Agy-hub User-Agent:
 
 ```json
 {"groups": [
@@ -160,7 +160,7 @@ Real response, `cmrx64@gmail.com`, Agy-hub User-Agent:
  "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier."}
 ```
 
-`ember@lunar.town` returned the same shape, every fraction 1, with every resetTime equal to now
+`second@example.com` returned the same shape, every fraction 1, with every resetTime equal to now
 + window.
 
 Reading notes:
@@ -295,7 +295,7 @@ where JSON is exactly `agy`'s shape for the target account:
 **IDE (Antigravity.app): possible but not worth it.** Swapping means rewriting the protobuf in
 `state.vscdb` while the app is closed, and the cached `userStatus` would still show the old email.
 That app's state has not been touched since May. Treat the IDE grant as a source to import
-`ember@lunar.town` from, not as a slot to manage.
+`second@example.com` from, not as a slot to manage.
 
 **Quota for both accounts needs no switching.** tokeman can hold both refresh tokens, refresh each
 (stateless), and call `retrieveUserQuotaSummary` per account. Today's readings were taken this
@@ -319,8 +319,8 @@ way. **[live]**
 
 ## Recipe for tokeman
 
-1. Import grants: CLI Keychain item (`gemini`/`antigravity`) → `cmrx64@gmail.com`. IDE
-   `state.vscdb` `oauthToken` → `ember@lunar.town`. Store `{refresh_token, email}` per account.
+1. Import grants: CLI Keychain item (`gemini`/`antigravity`) → `first@example.com`. IDE
+   `state.vscdb` `oauthToken` → `second@example.com`. Store `{refresh_token, email}` per account.
 2. Refresh as needed (form POST above, extracting the client id and secret from `agy`).
 3. `loadCodeAssist` once per account to get `paidTier.id` and `cloudaicompanionProject`.
 4. `retrieveUserQuotaSummary` with the hub User-Agent to get groups × {5h, weekly} →
