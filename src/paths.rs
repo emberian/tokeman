@@ -104,6 +104,11 @@ pub fn codex_reset_lock() -> PathBuf {
     config_dir().join("codex-reset-pending.lock")
 }
 
+/// Reset claims whose outcome is not yet known, one file per account.
+pub fn reset_claims_dir() -> PathBuf {
+    config_dir().join("reset-claims")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }

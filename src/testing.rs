@@ -32,6 +32,8 @@ pub fn reading_with_resets(
         overage: None,
         error: None,
         profile_error: None,
+        session_limit: crate::quota::SessionLimit::Present,
+        signals: crate::quota::Signals::default(),
     }
 }
 
@@ -42,6 +44,7 @@ pub fn bucket(model: &str, label: &str, used: f64, source: Source) -> Bucket {
         label: label.into(),
         window: Window::new(used, 0),
         source,
+        share: None,
     }
 }
 
@@ -82,6 +85,7 @@ pub fn login_account(name: &str, expires_at_ms: i64) -> Account {
             expires_at: Some(expires_at_ms),
             obtained_at: Some(expires_at_ms - 8 * HOUR_MS),
             logged_in_at: Some(expires_at_ms - 8 * HOUR_MS),
+            refresh_expires_at: None,
             scopes: vec!["user:inference".into(), "user:profile".into()],
             error: None,
         }),

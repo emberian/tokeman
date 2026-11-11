@@ -161,6 +161,10 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in: Option<i64>,
+    /// Seconds the refresh token has left. It does not slide: a refresh
+    /// reports what remains of the browser login's lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_in: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
 }
@@ -169,6 +173,9 @@ pub struct TokenResponse {
 pub fn grant_of(response: TokenResponse, now_ms: i64) -> Grant {
     Grant {
         expires_at: response.expires_in.map(|seconds| now_ms + seconds * 1000),
+        refresh_expires_at: response
+            .refresh_token_expires_in
+            .map(|seconds| now_ms + seconds * 1000),
         scopes: response
             .scope
             .unwrap_or_default()
@@ -333,6 +340,7 @@ mod tests {
             access_token: "sk-ant-oat01-a".into(),
             refresh_token: Some("sk-ant-ort01-r".into()),
             expires_in: Some(28800),
+            refresh_token_expires_in: Some(2_592_000),
             scope: Some("user:profile user:inference".into()),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -342,11 +350,13 @@ mod tests {
         );
         let grant = grant_of(response, 1_000);
         assert_eq!(grant.expires_at, Some(1_000 + 28_800_000));
+        assert_eq!(grant.refresh_expires_at, Some(1_000 + 2_592_000_000));
         assert_eq!(grant.scopes, vec!["user:profile", "user:inference"]);
         assert_eq!(grant.refresh_token.as_deref(), Some("sk-ant-ort01-r"));
         let sparse: TokenResponse = serde_json::from_str(r#"{"access_token":"a"}"#).unwrap();
         let grant = grant_of(sparse, 0);
         assert_eq!(grant.expires_at, None);
+        assert_eq!(grant.refresh_expires_at, None);
         assert!(grant.scopes.is_empty());
     }
 
@@ -395,12 +405,19 @@ mod tests {
         let (router, _, bodies) = scripted(vec![(
             StatusCode::OK,
             serde_json::json!({"access_token": "new", "refresh_token": "next",
-                               "expires_in": 60, "scope": "user:profile"}),
+                               "expires_in": 60, "refresh_token_expires_in": 86400,
+                               "scope": "user:profile"}),
         )]);
         let client = serve(router).await;
+        let before = chrono::Utc::now().timestamp_millis();
         let grant = refresh(&client, "old-refresh", &["user:profile".into()])
             .await
             .unwrap();
+        assert!(
+            grant
+                .refresh_expires_at
+                .is_some_and(|at| at >= before + 86_400_000)
+        );
         assert_eq!(grant.access_token, "new");
         assert_eq!(grant.refresh_token.as_deref(), Some("next"));
         assert!(grant.expires_at.is_some_and(|at| at > 0));

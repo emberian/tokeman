@@ -13,13 +13,16 @@ use crate::anthropic::{Client, probe, resets};
 use crate::claude::{sessions, settings as claude_settings};
 use crate::observe::{self, ObservedLimit};
 use crate::policy::{self, Mode};
-use crate::quota::{ModelKey, Source};
+use crate::quota::{ModelKey, SessionLimit, Source};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BucketReport {
     pub key: ModelKey,
     pub label: String,
     pub remaining: f64,
+    /// Room for the model as a fraction of the weekly limit (a shared
+    /// bucket's share, capped by the weekly left).
+    pub room: f64,
     pub resets_at: i64,
     pub source: Source,
     /// Whether this bucket limits the startup model.
@@ -31,6 +34,8 @@ pub struct AccountReport {
     pub name: String,
     pub remaining_session: Option<f64>,
     pub remaining_weekly: Option<f64>,
+    /// Whether the account has a 5h limit at all.
+    pub session_limit: SessionLimit,
     pub buckets: Vec<BucketReport>,
     pub limits: Vec<ObservedLimit>,
     pub viable: bool,
@@ -111,6 +116,7 @@ pub async fn report(fleet: &Fleet) -> Result<Report> {
             name: reading.account.clone(),
             remaining_session: reading.session.map(|w| w.remaining()),
             remaining_weekly: reading.weekly.map(|w| w.remaining()),
+            session_limit: reading.session_limit,
             buckets: reading
                 .buckets
                 .iter()
@@ -121,6 +127,7 @@ pub async fn report(fleet: &Fleet) -> Result<Report> {
                     key: bucket.key.clone(),
                     label: bucket.label.clone(),
                     remaining: bucket.window.remaining(),
+                    room: bucket.room(reading.weekly.as_ref()),
                     resets_at: bucket.window.resets_at,
                     source: bucket.source,
                 })
@@ -229,11 +236,11 @@ async fn resets_on_offer(fleet: &Fleet) -> Vec<String> {
             continue;
         };
         for grant in program.grants() {
-            if grant.resets_left > 0 && !grant.paused {
+            if grant.is_usable(now) {
                 offers.push(format!(
                     "{}: {}",
                     account.name,
-                    resets::describe_grant(&grant)
+                    resets::describe_grant(&grant, now)
                 ));
             }
         }

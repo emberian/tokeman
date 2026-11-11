@@ -1,6 +1,7 @@
 //! Probe history: one row per reading, in sqlite, for charts and stats.
 //!
-//! The schema is the one every row since 0.1.0 was written with; legacy
+//! The schema is the one every row since 0.1.0 was written with, plus
+//! columns added at the end (older rows read them as empty); legacy
 //! Opus/Sonnet columns are read into buckets and no longer written. Service
 //! reads (GLM, Kimi, Antigravity) live in their own table, one JSON
 //! [`Usage`] per row.
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use crate::paths;
 use crate::providers::{Service, Usage};
-use crate::quota::{Bucket, ModelKey, Reading, Source, Window};
+use crate::quota::{Bucket, ModelKey, Reading, SessionLimit, Signals, Source, Window};
 
 pub struct Store {
     conn: Connection,
@@ -33,6 +34,10 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub profile_error: Option<String>,
     pub buckets: Vec<Bucket>,
+    /// `Unknown` for rows written before 0.4.
+    pub session_limit: SessionLimit,
+    /// Empty for rows written before 0.4.
+    pub signals: Signals,
 }
 
 /// A series a chart can draw.
@@ -100,7 +105,9 @@ impl Store {
                 utilization_sonnet_7d REAL,
                 reset_sonnet_7d INTEGER,
                 model_usage_error TEXT,
-                model_usage_buckets TEXT
+                model_usage_buckets TEXT,
+                session_limit TEXT,
+                signals TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time
                 ON snapshots(token_name, probed_at);
@@ -123,6 +130,8 @@ impl Store {
             "reset_sonnet_7d INTEGER",
             "model_usage_error TEXT",
             "model_usage_buckets TEXT",
+            "session_limit TEXT",
+            "signals TEXT",
         ] {
             let _ = self
                 .conn
@@ -140,13 +149,20 @@ impl Store {
         let buckets = (!reading.buckets.is_empty())
             .then(|| serde_json::to_string(&reading.buckets))
             .transpose()?;
+        let session_limit = (!reading.session_limit.is_unknown())
+            .then(|| serde_json::to_value(reading.session_limit))
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let signals = (!reading.signals.is_empty())
+            .then(|| serde_json::to_string(&reading.signals))
+            .transpose()?;
         self.conn.execute(
             "INSERT INTO snapshots (
                 token_name, probed_at, unified_status, utilization_5h, reset_5h,
                 utilization_7d, reset_7d, representative_claim,
                 overage_status, utilization_overage, reset_overage, error,
-                model_usage_error, model_usage_buckets
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                model_usage_error, model_usage_buckets, session_limit, signals
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 reading.account,
                 DateTime::from_timestamp(reading.at, 0)
@@ -164,6 +180,8 @@ impl Store {
                 reading.error.as_ref().map(ToString::to_string),
                 reading.profile_error.as_deref(),
                 buckets,
+                session_limit,
+                signals,
             ],
         )?;
         Ok(())
@@ -260,7 +278,7 @@ impl Store {
                     overage_status, utilization_overage, reset_overage, error,
                     utilization_opus_7d, reset_opus_7d,
                     utilization_sonnet_7d, reset_sonnet_7d, model_usage_error,
-                    model_usage_buckets
+                    model_usage_buckets, session_limit, signals
              FROM snapshots";
         let mut stmt = self.conn.prepare(&format!("{SELECT} {tail}"))?;
         let snapshots = stmt
@@ -317,6 +335,7 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
                 key,
                 window,
                 source: Source::Profile,
+                share: None,
             });
         }
     }
@@ -332,6 +351,14 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
         error: row.get(11)?,
         profile_error: row.get(16)?,
         buckets,
+        session_limit: row
+            .get::<_, Option<String>>(18)?
+            .and_then(|text| crate::quota::parse_wire(&text))
+            .unwrap_or_default(),
+        signals: row
+            .get::<_, Option<String>>(19)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -410,6 +437,7 @@ mod tests {
                 label: "Opus 4.8".into(),
                 window: Window::new(0.75, 30),
                 source: Source::Profile,
+                share: None,
             }],
             overage: Some(Overage {
                 status: Some("ok".into()),
@@ -418,6 +446,12 @@ mod tests {
             }),
             error: None,
             profile_error: None,
+            session_limit: SessionLimit::Absent,
+            signals: Signals {
+                claims: vec!["seven_day".into()],
+                upgrade_paths: vec!["overage".into()],
+                ..Signals::default()
+            },
         }
     }
 
@@ -443,6 +477,46 @@ mod tests {
             Some(Window::new(0.75, 30))
         );
         assert!(store.recent(Some("other"), 5).unwrap().is_empty());
+        assert_eq!(row.session_limit, SessionLimit::Absent);
+        assert_eq!(row.signals.claims, ["seven_day"]);
+        assert_eq!(row.signals.upgrade_paths, ["overage"]);
+    }
+
+    #[test]
+    fn a_database_from_0_3_gains_the_new_columns_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                    id INTEGER PRIMARY KEY, token_name TEXT NOT NULL, probed_at TEXT NOT NULL,
+                    unified_status TEXT, utilization_5h REAL, reset_5h INTEGER,
+                    utilization_7d REAL, reset_7d INTEGER, representative_claim TEXT,
+                    overage_status TEXT, utilization_overage REAL, reset_overage INTEGER,
+                    error TEXT, utilization_opus_7d REAL, reset_opus_7d INTEGER,
+                    utilization_sonnet_7d REAL, reset_sonnet_7d INTEGER,
+                    model_usage_error TEXT, model_usage_buckets TEXT);
+                 INSERT INTO snapshots (token_name, probed_at, utilization_7d, reset_7d,
+                    model_usage_buckets)
+                 VALUES ('old', '2026-10-01T00:00:00Z', 0.5, 9,
+                    '[{\"key\":\"fable\",\"label\":\"Fable\",\"window\":{\"utilization\":0.2,\"reset\":9},\"source\":\"profile\"}]');",
+            )
+            .unwrap();
+        }
+        let store = Store::open_at(&path).unwrap();
+        let old = store.recent(Some("old"), 1).unwrap().remove(0);
+        assert_eq!(old.session_limit, SessionLimit::Unknown);
+        assert!(old.signals.is_empty());
+        assert_eq!(old.buckets[0].share, None);
+        let mut new = reading();
+        new.account = "old".into();
+        new.at = 1_795_000_000;
+        new.buckets[0].share = Some(0.5);
+        store.insert(&new).unwrap();
+        let rows = store.recent(Some("old"), 2).unwrap();
+        assert_eq!(rows[0].buckets[0].share, Some(0.5));
+        assert_eq!(rows[0].session_limit, SessionLimit::Absent);
     }
 
     fn usage(service: Service, account: &str, at: i64, used: f64) -> Usage {

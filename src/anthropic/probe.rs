@@ -13,7 +13,8 @@ use serde_json::json;
 use super::{CLAUDE_CODE_IDENTITY, Client, http_error, network_error, profile};
 use crate::account::{Account, Credential};
 use crate::quota::{
-    Bucket, Family, ModelKey, Overage, ProbeError, Reading, Source, Verdict, Window,
+    Bucket, Family, Grace, ModelKey, Overage, ProbeError, Reading, SessionLimit, Signals, SlowLane,
+    Source, Verdict, Window, WindowStatus, parse_wire,
 };
 
 pub const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -33,6 +34,7 @@ pub struct Quota {
     /// The `7d_oi` window: the requested model's own weekly limit.
     pub model_weekly: Option<Window>,
     pub overage: Option<Overage>,
+    pub signals: Signals,
 }
 
 fn header_str(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -42,14 +44,93 @@ fn header_str(headers: &HeaderMap, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn header_window(headers: &HeaderMap, prefix: &str) -> Option<Window> {
-    let used = header_str(headers, &format!("{prefix}-utilization"))?
+fn header_f64(headers: &HeaderMap, key: &str) -> Option<f64> {
+    header_str(headers, key)?
+        .trim()
         .parse()
-        .ok()?;
+        .ok()
+        .filter(|value: &f64| value.is_finite())
+}
+
+/// `{prefix}-utilization` as reported, never clamped: a window can read over
+/// 1.0, and policy decides what that means.
+fn header_window(headers: &HeaderMap, prefix: &str) -> Option<Window> {
+    let used = header_f64(headers, &format!("{prefix}-utilization"))?;
     let resets_at = header_str(headers, &format!("{prefix}-reset"))
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     Some(Window::new(used, resets_at))
+}
+
+fn window_status(headers: &HeaderMap, prefix: &str) -> Option<WindowStatus> {
+    let verdict = header_str(headers, &format!("{prefix}-status")).map(|s| Verdict::parse(&s));
+    let surpassed_threshold = header_f64(headers, &format!("{prefix}-surpassed-threshold"));
+    (verdict.is_some() || surpassed_threshold.is_some()).then(|| WindowStatus {
+        verdict: verdict.unwrap_or(Verdict::Unknown),
+        surpassed_threshold,
+    })
+}
+
+fn comma_list(headers: &HeaderMap, key: &str) -> Vec<String> {
+    header_str(headers, key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn slow_lane(headers: &HeaderMap, prefix: &str) -> Option<SlowLane> {
+    let budget = header_f64(headers, &format!("{prefix}-slow-budget-utilization")).map(|used| {
+        let resets_at = header_str(headers, &format!("{prefix}-slow-budget-reset"))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Window::new(used, resets_at)
+    });
+    let lane = SlowLane {
+        offer: header_str(headers, &format!("{prefix}-slow-offer")).and_then(|v| parse_wire(&v)),
+        status: header_str(headers, &format!("{prefix}-slow-status")).and_then(|v| parse_wire(&v)),
+        retry_after_secs: header_f64(headers, &format!("{prefix}-slow-retry-after")),
+        max_wait_secs: header_f64(headers, &format!("{prefix}-slow-max-wait")),
+        budget,
+    };
+    (lane != SlowLane::default()).then_some(lane)
+}
+
+fn grace(headers: &HeaderMap, prefix: &str) -> Option<Grace> {
+    let grace = Grace {
+        status: header_str(headers, &format!("{prefix}-grace-status")),
+        session_used: header_f64(headers, &format!("{prefix}-grace-5h-utilization")),
+        weekly_used: header_f64(headers, &format!("{prefix}-grace-7d-utilization")),
+    };
+    (grace != Grace::default()).then_some(grace)
+}
+
+fn signals(headers: &HeaderMap, prefix: &str) -> Signals {
+    let fallback = header_str(headers, &format!("{prefix}-fallback"));
+    Signals {
+        session_status: window_status(headers, &format!("{prefix}-5h")),
+        weekly_status: window_status(headers, &format!("{prefix}-7d")),
+        model_weekly_status: window_status(headers, &format!("{prefix}-7d_oi")),
+        claims: headers
+            .get_all(format!("{prefix}-claim"))
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|claim| !claim.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        fallback_available: fallback.as_deref() == Some("available"),
+        fallback_percentage: header_f64(headers, &format!("{prefix}-fallback-percentage")),
+        upgrade_paths: comma_list(headers, &format!("{prefix}-upgrade-paths")),
+        slow: slow_lane(headers, prefix),
+        grace: grace(headers, prefix),
+    }
 }
 
 /// `None` without a `unified-status` header; a 429 still carries them.
@@ -73,6 +154,7 @@ pub fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
         weekly: header_window(headers, &format!("{PREFIX}-7d")),
         model_weekly: header_window(headers, &format!("{PREFIX}-7d_oi")),
         overage,
+        signals: signals(headers, PREFIX),
     })
 }
 
@@ -103,6 +185,7 @@ pub fn attach_model_weekly(reading: &mut Reading, window: Option<Window>) {
         label: Family::Fable.label().to_owned(),
         window,
         source: Source::Headers,
+        share: None,
     });
 }
 
@@ -141,24 +224,17 @@ async fn request(
 /// A reading of the shared windows; the model's own window is attached by
 /// the caller once it knows what the profile endpoint said.
 fn reading_of(account: &str, now: i64, quota: &Option<Quota>) -> Reading {
-    let mut reading = Reading {
-        account: account.to_owned(),
-        at: now,
-        verdict: Verdict::Unknown,
-        claim: None,
-        session: None,
-        weekly: None,
-        buckets: Vec::new(),
-        overage: None,
-        error: None,
-        profile_error: None,
-    };
+    let mut reading = Reading::empty(account, now);
     if let Some(quota) = quota {
         reading.verdict = quota.verdict;
         reading.claim = quota.claim.clone();
         reading.session = quota.session;
         reading.weekly = quota.weekly;
         reading.overage = quota.overage.clone();
+        reading.signals = quota.signals.clone();
+        if quota.session.is_some() {
+            reading.session_limit = SessionLimit::Present;
+        }
     }
     reading
 }
@@ -376,6 +452,112 @@ mod tests {
         assert_eq!(bare.claim, None);
         assert_eq!(bare.session, None);
         assert_eq!(bare.overage, None);
+    }
+
+    #[test]
+    fn a_fable_wall_keeps_its_overshoot_and_every_signal_is_recorded() {
+        // A live Fable 5.2 429 (2026-11-11) plus the slow and grace headers
+        // Claude Code 2.1.322 reads.
+        let mut map = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.8"),
+            ("anthropic-ratelimit-unified-7d-reset", "1794657600"),
+            ("anthropic-ratelimit-unified-7d-surpassed-threshold", "0.75"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "1794657600"),
+            ("anthropic-ratelimit-unified-fallback", "available"),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+            (
+                "anthropic-ratelimit-unified-upgrade-paths",
+                "overage, upgrade_plan",
+            ),
+            ("anthropic-ratelimit-unified-slow-offer", "treatment"),
+            ("anthropic-ratelimit-unified-slow-status", "slot_busy"),
+            ("anthropic-ratelimit-unified-slow-retry-after", "20"),
+            ("anthropic-ratelimit-unified-slow-max-wait", "1200"),
+            (
+                "anthropic-ratelimit-unified-slow-budget-utilization",
+                "0.25",
+            ),
+            (
+                "anthropic-ratelimit-unified-slow-budget-reset",
+                "1794000000",
+            ),
+            ("anthropic-ratelimit-unified-grace-7d-utilization", "0.1"),
+        ]);
+        map.append(
+            "anthropic-ratelimit-unified-claim",
+            HeaderValue::from_static("seven_day_overage_included"),
+        );
+        map.append(
+            "anthropic-ratelimit-unified-claim",
+            HeaderValue::from_static("seven_day"),
+        );
+        let quota = parse_quota(&map).unwrap();
+        assert_eq!(quota.verdict, Verdict::Rejected);
+        assert_eq!(quota.session, None);
+        assert_eq!(quota.model_weekly, Some(Window::new(1.02, 1794657600)));
+        let signals = &quota.signals;
+        assert_eq!(signals.session_status, None);
+        assert_eq!(
+            signals.weekly_status,
+            Some(WindowStatus {
+                verdict: Verdict::AllowedWarning,
+                surpassed_threshold: Some(0.75),
+            })
+        );
+        assert_eq!(
+            signals.model_weekly_status.map(|status| status.verdict),
+            Some(Verdict::Rejected)
+        );
+        assert_eq!(signals.claims, ["seven_day_overage_included", "seven_day"]);
+        assert!(signals.fallback_available);
+        assert_eq!(signals.fallback_percentage, Some(0.5));
+        assert_eq!(signals.upgrade_paths, ["overage", "upgrade_plan"]);
+        let slow = signals.slow.as_ref().unwrap();
+        assert_eq!(slow.offer, Some(crate::quota::SlowOffer::Treatment));
+        assert_eq!(slow.status, Some(crate::quota::SlowStatus::SlotBusy));
+        assert_eq!(slow.retry_after_secs, Some(20.0));
+        assert_eq!(slow.max_wait_secs, Some(1200.0));
+        assert_eq!(slow.budget, Some(Window::new(0.25, 1794000000)));
+        let grace = signals.grace.as_ref().unwrap();
+        assert_eq!(grace.weekly_used, Some(0.1));
+        assert_eq!(grace.session_used, None);
+
+        // The reading keeps them, and the weekly window still limits by its
+        // own numbers: grace and the slow lane are not room.
+        let reading = reading_of("a", 0, &Some(quota));
+        assert_eq!(reading.signals.claims.len(), 2);
+        assert_eq!(reading.session_limit, SessionLimit::Unknown);
+        assert!(
+            !reading.above(0.0, 0.0, None),
+            "the overall verdict is rejected"
+        );
+    }
+
+    #[test]
+    fn a_reported_5h_window_marks_the_limit_present() {
+        let quota = parse_quota(&headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.3"),
+            ("anthropic-ratelimit-unified-5h-reset", "100"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            reading_of("a", 0, &Some(quota)).session_limit,
+            SessionLimit::Present
+        );
+        let bare = parse_quota(&headers(&[(
+            "anthropic-ratelimit-unified-status",
+            "allowed",
+        )]));
+        assert!(bare.unwrap().signals.is_empty());
     }
 
     #[test]

@@ -2,9 +2,12 @@
 //! Claude Code reads them, behind an on-disk cache.
 //!
 //! The endpoint answers 429 under a 20-second probe cadence and the figures
-//! move over hours, so each account's answer is reused for [`MAX_AGE_SECS`]
-//! and a 429 backs the account off; while it lasts the last good answer is
-//! served. This module is the only writer of the cache file.
+//! move over hours, so each account's answer is reused for [`MAX_AGE_SECS`].
+//! A 429 backs off the account that drew it, and once two accounts have
+//! drawn one, the whole fleet: the budget is shared by every account from
+//! one address, but one account can also be refused on its own. While a
+//! backoff lasts, each held account's last good answer is served. This
+//! module is the only writer of the cache file.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,7 +19,7 @@ use super::{Client, describe, one_line, retry_after_secs};
 use crate::account::Account;
 use crate::fs::write_atomic;
 use crate::paths;
-use crate::quota::{Bucket, Family, ModelKey, Reading, Source, Window};
+use crate::quota::{Bucket, Family, ModelKey, Reading, SessionLimit, Source, Window};
 
 /// How long an answer is reused before the endpoint is asked again.
 pub const MAX_AGE_SECS: i64 = 300;
@@ -30,8 +33,11 @@ const ERROR_RETRY_SECS: i64 = 60;
 pub enum Endpoint {
     /// Windows and per-model limits.
     Usage,
-    /// The same, plus the reset programs, as Claude Code reads it at a limit.
+    /// The same, plus the session-reset program (`juniper_tide`), as Claude
+    /// Code reads it at a limit.
     AtWall,
+    /// The same, plus the granted-reset program (`cedar_ember`).
+    CedarEmber,
 }
 
 impl Endpoint {
@@ -39,6 +45,7 @@ impl Endpoint {
         match self {
             Self::Usage => "/api/oauth/usage",
             Self::AtWall => "/api/oauth/usage?at_wall=1&skip_spend=1",
+            Self::CedarEmber => "/api/oauth/usage?cedar_ember=1&skip_spend=1",
         }
     }
 
@@ -46,25 +53,86 @@ impl Endpoint {
         match self {
             Self::Usage => format!("{account}|usage"),
             Self::AtWall => format!("{account}|at_wall"),
+            Self::CedarEmber => format!("{account}|cedar_ember"),
         }
     }
 }
 
-/// One cached answer and the state of its backoff.
+/// One account's cached answer, and when a non-429 failure lets it be
+/// asked again.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Entry {
     #[serde(default)]
     fetched_at: i64,
     #[serde(default)]
     body: Option<serde_json::Value>,
-    /// Epoch seconds before which the endpoint is not asked again.
+    /// Epoch seconds before which this account is not asked again.
     #[serde(default)]
     retry_after: i64,
-    /// Consecutive 429s.
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+/// The fleet-wide 429 backoff.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Backoff {
+    /// Epoch seconds before which the accounts that drew a 429, and once
+    /// two have, every account, leave the endpoint alone.
+    #[serde(default)]
+    retry_after: i64,
+    /// Consecutive 429s, whichever account drew them.
     #[serde(default)]
     rate_limited: u32,
     #[serde(default)]
     last_error: Option<String>,
+    /// The accounts that drew a 429 within this backoff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    accounts: Vec<String>,
+}
+
+/// Distinct accounts whose 429s hold back the whole fleet. One account
+/// alone can be refused for its own sake (a paused organization answered
+/// 429 while another account read fine from the same address, 2026-11-11).
+const FLEET_429_ACCOUNTS: usize = 2;
+
+impl Backoff {
+    /// Whether `account` must not ask before `retry_after`.
+    fn holds(&self, account: &str, now: i64) -> bool {
+        now < self.retry_after
+            && (self.accounts.len() >= FLEET_429_ACCOUNTS
+                || self.accounts.iter().any(|held| held == account))
+    }
+
+    fn rate_limited(&mut self, account: &str, now: i64, retry_after: Option<i64>, message: &str) {
+        if now >= self.retry_after {
+            self.accounts.clear();
+        }
+        if !self.accounts.iter().any(|held| held == account) {
+            self.accounts.push(account.to_owned());
+        }
+        self.rate_limited = self.rate_limited.saturating_add(1);
+        self.retry_after = self
+            .retry_after
+            .max(now + backoff_secs(true, self.rate_limited, retry_after));
+        self.last_error = Some(message.to_owned());
+    }
+
+    /// A read succeeded. Reads run concurrently, so a success that was in
+    /// flight when another account drew a 429 must not lift that backoff:
+    /// only an expired one is cleared.
+    fn succeeded(&mut self, now: i64) {
+        if now >= self.retry_after {
+            *self = Self::default();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    backoff: Backoff,
+    #[serde(default)]
+    entries: BTreeMap<String, Entry>,
 }
 
 /// The cache file, shared by the daemon and every CLI command.
@@ -84,26 +152,27 @@ impl Cache {
         Self { path }
     }
 
-    fn load(&self) -> BTreeMap<String, Entry> {
+    /// The file as stored; a file in an older shape reads as empty.
+    fn load(&self) -> CacheFile {
         std::fs::read(&self.path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
-    /// Best-effort: a lost update costs one extra read later. The file holds
-    /// usage figures, never credentials.
-    fn store(&self, key: &str, entry: &Entry) {
-        let mut cache = self.load();
-        cache.insert(key.to_owned(), entry.clone());
-        if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
+    /// Best-effort read-modify-write: a lost update costs one extra read
+    /// later. The file holds usage figures, never credentials.
+    fn update(&self, change: impl FnOnce(&mut CacheFile)) {
+        let mut file = self.load();
+        change(&mut file);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&file) {
             let _ = write_atomic(&self.path, &bytes, 0o600);
         }
     }
 
     /// The endpoint's JSON for `account`: from the cache when younger than
-    /// [`MAX_AGE_SECS`] (unless `fresh`) or while the account is backed off,
-    /// otherwise fetched with `bearer`. `now` is epoch seconds.
+    /// [`MAX_AGE_SECS`] (unless `fresh`), or while this account or the fleet
+    /// is backed off; otherwise fetched with `bearer`. `now` is epoch seconds.
     pub async fn read(
         &self,
         client: &Client,
@@ -114,7 +183,8 @@ impl Cache {
         now: i64,
     ) -> Result<serde_json::Value> {
         let key = endpoint.key(account);
-        let mut entry = self.load().remove(&key).unwrap_or_default();
+        let file = self.load();
+        let entry = file.entries.get(&key).cloned().unwrap_or_default();
         let young = now - entry.fetched_at < MAX_AGE_SECS;
         if let Some(body) = &entry.body
             && young
@@ -122,38 +192,67 @@ impl Cache {
         {
             return Ok(body.clone());
         }
-        if now < entry.retry_after {
+        let fleet_held = file.backoff.holds(account, now);
+        let scope = if file.backoff.accounts.len() >= FLEET_429_ACCOUNTS {
+            " for every account"
+        } else {
+            ""
+        };
+        let held = [
+            (entry.retry_after, entry.last_error.as_deref(), ""),
+            (
+                if fleet_held {
+                    file.backoff.retry_after
+                } else {
+                    0
+                },
+                file.backoff.last_error.as_deref(),
+                scope,
+            ),
+        ]
+        .into_iter()
+        .filter(|(until, _, _)| now < *until)
+        .max_by_key(|(until, _, _)| *until);
+        if let Some((until, error, scope)) = held {
             return match &entry.body {
                 Some(body) if !fresh => Ok(body.clone()),
                 _ => bail!(
-                    "{} (backing off for {}s)",
-                    entry.last_error.as_deref().unwrap_or("recently refused"),
-                    entry.retry_after - now
+                    "{} (backing off{scope} for {}s)",
+                    error.unwrap_or("recently refused"),
+                    until - now
                 ),
             };
         }
         match fetch(client, bearer, endpoint).await {
             Ok(body) => {
-                entry = Entry {
-                    fetched_at: now,
-                    body: Some(body.clone()),
-                    ..Entry::default()
-                };
-                self.store(&key, &entry);
+                self.update(|file| {
+                    file.entries.insert(
+                        key,
+                        Entry {
+                            fetched_at: now,
+                            body: Some(body.clone()),
+                            ..Entry::default()
+                        },
+                    );
+                    file.backoff.succeeded(now);
+                });
                 Ok(body)
             }
             Err(failure) => {
-                if failure.rate_limited {
-                    entry.rate_limited = entry.rate_limited.saturating_add(1);
-                }
-                entry.retry_after = now
-                    + backoff_secs(
-                        failure.rate_limited,
-                        entry.rate_limited,
-                        failure.retry_after,
-                    );
-                entry.last_error = Some(failure.message.clone());
-                self.store(&key, &entry);
+                self.update(|file| {
+                    let entry = file.entries.entry(key).or_default();
+                    entry.last_error = Some(failure.message.clone());
+                    if failure.rate_limited {
+                        file.backoff.rate_limited(
+                            account,
+                            now,
+                            failure.retry_after,
+                            &failure.message,
+                        );
+                    } else {
+                        entry.retry_after = now + backoff_secs(false, 0, None);
+                    }
+                });
                 match entry.body {
                     Some(body) if !fresh => Ok(body),
                     _ => bail!("{}", failure.message),
@@ -209,9 +308,11 @@ async fn fetch(
         .map_err(|error| plain(format!("unreadable {path} response: {error}")))
 }
 
-// The response as Claude Code's own client reads it. Every window is
-// `{utilization: percent 0-100 | null, resets_at: ISO 8601 | null}`;
-// `limits` is the server's list of meters and is null from older servers.
+// The response as Claude Code's own client reads it. `limits[]` is the
+// server's list of meters and the primary source: classify a row on its
+// `kind` and `scope`, never on a label. The legacy per-window fields are
+// `{utilization: percent 0-100 | null, resets_at: ISO 8601 | null}` and are
+// read only when `limits` is absent (older servers send null).
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
@@ -222,19 +323,39 @@ pub struct UsageWindow {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_opus: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_sonnet: Option<UsageWindow>,
-    /// Raw rows: each parses on its own, so one odd row cannot hide the rest.
+    /// Raw rows: each parses on its own, so one odd row cannot hide the rest,
+    /// and `weekly_scoped_shares` indexes this raw list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_scoped_shares: Option<Vec<serde_json::Value>>,
+}
+
+/// What a `limits[]` row measures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// The 5-hour window.
+    Session,
+    /// The weekly limit across all models.
+    WeeklyAll,
+    /// A weekly limit scoped to one model or one surface.
+    WeeklyScoped,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimit {
-    /// `session`, `weekly_all`, `weekly_scoped`, ...
-    pub kind: String,
-    /// 0-100.
+    pub kind: LimitKind,
+    /// 0-100, sent as an integer or a float; may exceed 100.
     pub percent: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
@@ -245,12 +366,36 @@ pub struct UsageLimit {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<DisplayName>,
+    pub model: Option<ScopeName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ScopeName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DisplayName {
+pub struct ScopeName {
     pub display_name: String,
+    /// The model id; null for Fable as of 2026-11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// A scoped limit's size relative to the weekly limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedShare {
+    /// Index into the raw `limits[]`, unreadable rows included.
+    pub limit_index: usize,
+    pub allowance_percent_of_weekly: f64,
+    #[serde(default)]
+    pub used_percent_of_weekly: Option<f64>,
+}
+
+/// Everything the profile endpoint says about an account's room.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfileUsage {
+    pub session: Option<Window>,
+    pub weekly: Option<Window>,
+    pub session_limit: SessionLimit,
+    pub buckets: Vec<Bucket>,
 }
 
 fn parse_reset(resets_at: Option<&str>) -> i64 {
@@ -260,9 +405,9 @@ fn parse_reset(resets_at: Option<&str>) -> i64 {
         .map_or(0, |time| time.timestamp())
 }
 
-/// Percent to fraction, once, at the boundary.
+/// Percent to fraction, once, at the boundary. Over 100 stays over 1.0.
 fn fraction(percent: f64) -> f64 {
-    (percent / 100.0).clamp(0.0, 1.0)
+    percent.max(0.0) / 100.0
 }
 
 fn usage_window(window: &UsageWindow) -> Option<Window> {
@@ -272,33 +417,90 @@ fn usage_window(window: &UsageWindow) -> Option<Window> {
     ))
 }
 
-/// A per-model weekly row as Claude Code identifies it: a `weekly_scoped`
-/// meter whose scope names a model. Surface-scoped rows are not models.
-/// Idle rows count too; `is_active` only marks the server's headline row.
-fn scoped_model_bucket(row: &serde_json::Value) -> Option<Bucket> {
-    let row: UsageLimit = serde_json::from_value(row.clone()).ok()?;
-    if row.kind != "weekly_scoped" {
+fn limit_window(row: &UsageLimit) -> Window {
+    Window::new(fraction(row.percent), parse_reset(row.resets_at.as_deref()))
+}
+
+/// A per-model weekly row: a `weekly_scoped` meter whose scope names a
+/// model, keyed by its id when the server sends one. Surface-scoped rows are
+/// not models. Idle rows count too; `is_active` only marks the server's
+/// headline row.
+fn scoped_model_bucket(row: &UsageLimit, share: Option<f64>) -> Option<Bucket> {
+    if row.kind != LimitKind::WeeklyScoped {
         return None;
     }
-    let label = row.scope?.model?.display_name;
-    let key = ModelKey::new(&label);
+    let model = row.scope.as_ref()?.model.as_ref()?;
+    let key = model
+        .id
+        .as_deref()
+        .map(ModelKey::new)
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| ModelKey::new(&model.display_name));
     (!key.is_empty()).then(|| Bucket {
         key,
-        label,
-        window: Window::new(fraction(row.percent), parse_reset(row.resets_at.as_deref())),
+        label: model.display_name.clone(),
+        window: limit_window(row),
         source: Source::Profile,
+        share,
     })
 }
 
-/// Every model bucket in the response: the scoped rows, sorted by label and
-/// unique by key, then the legacy family-wide Opus and Sonnet windows when no
-/// scoped row already carries their key.
-pub fn buckets(usage: &UsageResponse) -> Vec<Bucket> {
-    let mut buckets: Vec<Bucket> = usage
+/// Allowances by raw `limits[]` index, as fractions of the weekly limit.
+fn shares(usage: &UsageResponse) -> BTreeMap<usize, f64> {
+    usage
+        .weekly_scoped_shares
+        .iter()
+        .flatten()
+        .filter_map(|row| serde_json::from_value::<ScopedShare>(row.clone()).ok())
+        .filter(|share| share.allowance_percent_of_weekly > 0.0)
+        .map(|share| (share.limit_index, share.allowance_percent_of_weekly / 100.0))
+        .collect()
+}
+
+/// Read the whole response: shared windows and the 5h state from
+/// `limits[]` (or the legacy fields when it is absent), the scoped model
+/// rows sorted by label and unique by key, then the legacy family-wide Opus
+/// and Sonnet windows when no scoped row already carries their key.
+pub fn usage_of(usage: &UsageResponse) -> ProfileUsage {
+    let shares = shares(usage);
+    let rows: Vec<(usize, UsageLimit)> = usage
         .limits
         .iter()
         .flatten()
-        .filter_map(scoped_model_bucket)
+        .enumerate()
+        .filter_map(|(index, row)| Some((index, serde_json::from_value(row.clone()).ok()?)))
+        .collect();
+    let first = |kind: LimitKind| {
+        rows.iter()
+            .find(|(_, row)| row.kind == kind)
+            .map(|(_, row)| limit_window(row))
+    };
+    let mut profile = ProfileUsage::default();
+    match &usage.limits {
+        Some(raw) => {
+            profile.session = first(LimitKind::Session);
+            profile.weekly = first(LimitKind::WeeklyAll);
+            // A row that names the session kind counts even if it is malformed.
+            let has_session = raw
+                .iter()
+                .any(|row| row.get("kind").and_then(|kind| kind.as_str()) == Some("session"));
+            profile.session_limit = if has_session {
+                SessionLimit::Present
+            } else {
+                SessionLimit::Absent
+            };
+        }
+        None => {
+            profile.session = usage.five_hour.as_ref().and_then(usage_window);
+            profile.weekly = usage.seven_day.as_ref().and_then(usage_window);
+            if profile.session.is_some() {
+                profile.session_limit = SessionLimit::Present;
+            }
+        }
+    }
+    let mut buckets: Vec<Bucket> = rows
+        .iter()
+        .filter_map(|(index, row)| scoped_model_bucket(row, shares.get(index).copied()))
         .collect();
     buckets.sort_by(|a, b| a.key.cmp(&b.key));
     buckets.dedup_by(|a, b| a.key == b.key);
@@ -316,24 +518,26 @@ pub fn buckets(usage: &UsageResponse) -> Vec<Bucket> {
                 label: family.label().to_owned(),
                 window,
                 source: Source::Profile,
+                share: None,
             });
         }
     }
-    buckets
+    profile.buckets = buckets;
+    profile
 }
 
-pub fn parse(body: &serde_json::Value) -> std::result::Result<Vec<Bucket>, serde_json::Error> {
-    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| buckets(&usage))
+pub fn parse(body: &serde_json::Value) -> std::result::Result<ProfileUsage, serde_json::Error> {
+    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| usage_of(&usage))
 }
 
-/// The account's profile buckets, through the cache. `None` when the account
-/// has no profile credential; otherwise the buckets or why there are none.
+/// The account's profile usage, through the cache. `None` when the account
+/// has no profile credential; otherwise the usage or why there is none.
 pub async fn usage(
     client: &Client,
     cache: &Cache,
     account: &Account,
     now: i64,
-) -> Option<std::result::Result<Vec<Bucket>, String>> {
+) -> Option<std::result::Result<ProfileUsage, String>> {
     let bearer = account.profile_token(now * 1000)?;
     let outcome = match cache
         .read(client, &account.name, bearer, Endpoint::Usage, false, now)
@@ -346,12 +550,31 @@ pub async fn usage(
 }
 
 /// Fold the profile's answer into a reading: its buckets replace any with the
-/// same key, or its failure is recorded.
-pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<Vec<Bucket>, String>>) {
+/// same key; its shared windows fill only what the headers did not report
+/// (the headers are fresher); its 5h state stands unless the headers saw a
+/// 5h window. A failure is recorded.
+pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<ProfileUsage, String>>) {
     match outcome {
-        Some(Ok(buckets)) => {
-            for bucket in buckets {
+        Some(Ok(profile)) => {
+            for bucket in profile.buckets {
                 reading.set_bucket(bucket);
+            }
+            // A cached answer can outlive its window; one past its reset says nothing.
+            let at = reading.at;
+            let current = |window: &Window| window.resets_at > at;
+            if reading.session.is_none() {
+                reading.session = profile.session.filter(current);
+            }
+            if reading.weekly.is_none() {
+                reading.weekly = profile.weekly.filter(current);
+            }
+            if reading.session_limit != SessionLimit::Present
+                && profile.session_limit != SessionLimit::Unknown
+            {
+                reading.session_limit = profile.session_limit;
+            }
+            if reading.session.is_some() {
+                reading.session_limit = SessionLimit::Present;
             }
         }
         Some(Err(error)) => reading.profile_error = Some(error),
@@ -412,7 +635,7 @@ mod tests {
         )
         .expect("usage response");
         assert!(usage.seven_day_sonnet.is_none());
-        let buckets = buckets(&usage);
+        let buckets = usage_of(&usage).buckets;
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].key, ModelKey::family_wide(Family::Opus));
         assert_eq!(buckets[0].label, "Opus");
@@ -469,7 +692,7 @@ mod tests {
             }"#,
         )
         .expect("dynamic usage response");
-        let buckets = buckets(&usage);
+        let buckets = usage_of(&usage).buckets;
         // The surface-scoped row is a meter, but not a model.
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "opus48");
@@ -495,7 +718,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let buckets = parse(&body).expect("a malformed row must not fail the whole response");
+        let buckets = parse(&body)
+            .expect("a malformed row must not fail the whole response")
+            .buckets;
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "fable");
         assert_eq!(buckets[0].window.resets_at, 0);
@@ -503,7 +728,106 @@ mod tests {
         assert_eq!(buckets[1].window.resets_at, 0);
 
         let older = parse(&serde_json::json!({"limits": null})).unwrap();
-        assert!(older.is_empty());
+        assert!(older.buckets.is_empty());
+        assert_eq!(older.session_limit, SessionLimit::Unknown);
+    }
+
+    /// The shape of a verified Ultra account's answer (2026-11): no session
+    /// row, the weekly limit, and Fable as a half-weekly scoped limit whose
+    /// share indexes the raw rows, an unreadable one included.
+    fn ultra_body() -> serde_json::Value {
+        serde_json::json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 80.0, "resets_at": "2026-11-13T09:00:00Z"},
+            "seven_day_opus": null,
+            "limits": [
+                {"kind": "weekly_all", "group": "weekly", "percent": 80,
+                 "severity": "warning", "resets_at": "2026-11-13T09:00:00Z",
+                 "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "percent": "garbled"},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 102,
+                 "severity": "critical", "resets_at": "2026-11-13T09:00:00Z",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                 "is_active": true},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 4,
+                 "resets_at": null, "scope": {"surface": {"display_name": "Cowork"}}}
+            ],
+            "weekly_scoped_shares": [
+                {"limit_index": 2, "used_percent_of_weekly": 51, "allowance_percent_of_weekly": 50},
+                {"limit_index": "bad"}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_body_without_a_session_row_has_no_5h_limit_and_fable_is_a_share_of_the_weekly() {
+        let usage = parse(&ultra_body()).unwrap();
+        assert_eq!(usage.session_limit, SessionLimit::Absent);
+        assert_eq!(usage.session, None);
+        assert_eq!(usage.weekly, Some(Window::new(0.8, 1_794_560_400)));
+        assert_eq!(usage.buckets.len(), 1, "the surface row is not a model");
+        let fable = &usage.buckets[0];
+        assert_eq!(fable.key, ModelKey::family_wide(Family::Fable));
+        assert_eq!(fable.window.used, 1.02, "over 100% is kept");
+        assert_eq!(fable.share, Some(0.5), "limit_index counts the garbled row");
+        // Room for Fable: none of its own, so none at all.
+        assert!(fable.room(usage.weekly.as_ref()) < 0.0);
+    }
+
+    #[test]
+    fn a_session_row_marks_the_5h_limit_present_and_a_model_id_keys_the_bucket() {
+        let usage = parse(&serde_json::json!({
+            "limits": [
+                {"kind": "session", "percent": 12.5, "resets_at": "2026-11-11T22:00:00Z"},
+                {"kind": "weekly_all", "percent": 30, "resets_at": "2026-11-13T09:00:00Z"},
+                {"kind": "weekly_scoped", "percent": 10,
+                 "scope": {"model": {"id": "claude-mythos-5", "display_name": "Mythos"}}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.session_limit, SessionLimit::Present);
+        assert_eq!(usage.session, Some(Window::new(0.125, 1_794_434_400)));
+        assert_eq!(usage.buckets[0].key.as_str(), "mythos5");
+        assert_eq!(usage.buckets[0].key.family(), Some(Family::Mythos));
+        assert_eq!(usage.buckets[0].share, None);
+        // Without limits[], the legacy fields fill the windows, and a missing
+        // five_hour proves nothing.
+        let legacy = parse(&serde_json::json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 40.0, "resets_at": null}
+        }))
+        .unwrap();
+        assert_eq!(legacy.session_limit, SessionLimit::Unknown);
+        assert_eq!(legacy.weekly, Some(Window::new(0.4, 0)));
+    }
+
+    #[test]
+    fn merging_fills_only_what_the_headers_left_out_and_keeps_a_seen_5h_window() {
+        let at = 1_794_400_000;
+        let profile = || parse(&ultra_body()).ok();
+        // Headers without a 5h window: the profile says there is none.
+        let mut weekly_only = crate::testing::reading("a", 0.0, 0.79);
+        weekly_only.at = at;
+        weekly_only.session = None;
+        weekly_only.session_limit = SessionLimit::Unknown;
+        merge(&mut weekly_only, profile().map(Ok));
+        assert_eq!(weekly_only.session_limit, SessionLimit::Absent);
+        assert_eq!(weekly_only.weekly.unwrap().used, 0.79, "headers win");
+
+        // Headers that saw a 5h window outrank the profile's Absent.
+        let mut both = crate::testing::reading("b", 0.2, 0.5);
+        both.at = at;
+        merge(&mut both, profile().map(Ok));
+        assert_eq!(both.session_limit, SessionLimit::Present);
+
+        // Nothing from the headers: the profile's weekly fills in, unless the
+        // cached answer is past its reset.
+        let mut bare = Reading::empty("c", at);
+        merge(&mut bare, profile().map(Ok));
+        assert_eq!(bare.weekly.unwrap().used, 0.8);
+        let mut later = Reading::empty("c", 1_794_560_400);
+        merge(&mut later, profile().map(Ok));
+        assert_eq!(later.weekly, None);
     }
 
     #[test]
@@ -517,7 +841,7 @@ mod tests {
                  "scope": {"model": {"display_name": "Opus"}}}
             ]
         });
-        let buckets = parse(&body).unwrap();
+        let buckets = parse(&body).unwrap().buckets;
         assert_eq!(buckets.len(), 1, "duplicate keys collapse to one");
         assert_eq!(buckets[0].window.used, 0.75);
     }
@@ -535,42 +859,51 @@ mod tests {
             }),
             limits: Some(vec![
                 serde_json::to_value(UsageLimit {
-                    kind: "weekly_scoped".into(),
+                    kind: LimitKind::WeeklyScoped,
                     percent: 3.0,
                     resets_at: None,
                     scope: Some(UsageScope {
-                        model: Some(DisplayName {
+                        model: Some(ScopeName {
                             display_name: "Fable".into(),
+                            id: None,
                         }),
+                        surface: None,
                     }),
                 })
                 .unwrap(),
             ]),
+            ..UsageResponse::default()
         };
         let json = serde_json::to_string(&response).unwrap();
         let back: UsageResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, response);
         let limit: UsageLimit = serde_json::from_value(back.limits.unwrap().remove(0)).unwrap();
         assert_eq!(limit.scope.unwrap().model.unwrap().display_name, "Fable");
-        let buckets = buckets(&response);
+        let buckets = usage_of(&response).buckets;
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "fable");
         assert_eq!(buckets[1].key.as_str(), "opus");
     }
 
     #[test]
-    fn cache_entries_round_trip_and_tolerate_missing_fields() {
-        let entry = Entry {
-            fetched_at: 5,
-            body: Some(serde_json::json!({"limits": []})),
-            retry_after: 9,
-            rate_limited: 2,
-            last_error: Some("x".into()),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert_eq!(serde_json::from_str::<Entry>(&json).unwrap(), entry);
-        let sparse: Entry = serde_json::from_str("{}").unwrap();
-        assert_eq!(sparse, Entry::default());
+    fn cache_files_round_trip_and_an_older_shape_reads_as_empty() {
+        let mut file = CacheFile::default();
+        file.backoff.rate_limited = 2;
+        file.entries.insert(
+            "a|usage".into(),
+            Entry {
+                fetched_at: 5,
+                body: Some(serde_json::json!({"limits": []})),
+                retry_after: 9,
+                last_error: Some("x".into()),
+            },
+        );
+        let json = serde_json::to_string(&file).unwrap();
+        assert_eq!(serde_json::from_str::<CacheFile>(&json).unwrap(), file);
+        // 0.3.x kept a bare map of entries; it starts fresh.
+        let older: CacheFile =
+            serde_json::from_str(r#"{"a|usage": {"fetched_at": 5, "rate_limited": 1}}"#).unwrap();
+        assert_eq!(older, CacheFile::default());
     }
 
     #[test]
@@ -581,7 +914,10 @@ mod tests {
             .push(bucket("Opus 5", "Opus 5", 0.1, Source::Carried));
         merge(
             &mut reading,
-            Some(Ok(vec![bucket("Opus 5", "Opus 5", 0.4, Source::Profile)])),
+            Some(Ok(ProfileUsage {
+                buckets: vec![bucket("Opus 5", "Opus 5", 0.4, Source::Profile)],
+                ..ProfileUsage::default()
+            })),
         );
         assert_eq!(reading.buckets.len(), 1);
         assert_eq!(reading.buckets[0].source, Source::Profile);
@@ -635,45 +971,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_young_answer_is_reused_and_a_429_serves_the_last_good_one() {
+    async fn a_young_answer_is_reused_and_a_second_accounts_429_holds_back_every_account() {
         let good = serde_json::json!({"seven_day_opus": {"utilization": 30.0, "resets_at": null}});
+        let refused = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(7200),
+            serde_json::json!({}),
+        );
         let (router, calls) = scripted(vec![
             (StatusCode::OK, None, good.clone()),
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Some(7200),
-                serde_json::json!({}),
-            ),
+            refused.clone(),
+            (StatusCode::OK, None, good.clone()),
+            refused,
+            (StatusCode::OK, None, good.clone()),
         ]);
         let client = serve(router).await;
         let (_dir, cache) = temp_cache();
-        let read = |now, fresh| cache.read(&client, "acct", "tok", Endpoint::Usage, fresh, now);
+        let read = |account, now, fresh| {
+            let cache = cache.clone();
+            let client = client.clone();
+            async move {
+                cache
+                    .read(&client, account, "tok", Endpoint::Usage, fresh, now)
+                    .await
+            }
+        };
 
-        assert_eq!(read(1000, false).await.unwrap(), good);
-        assert_eq!(read(1000 + MAX_AGE_SECS - 1, false).await.unwrap(), good);
+        assert_eq!(read("acct", 1000, false).await.unwrap(), good);
+        assert_eq!(
+            read("acct", 1000 + MAX_AGE_SECS - 1, false).await.unwrap(),
+            good
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a young answer is reused");
 
         // Stale: asked again, refused, last good answer served.
-        assert_eq!(read(1000 + MAX_AGE_SECS, false).await.unwrap(), good);
+        let refused_at = 1000 + MAX_AGE_SECS;
+        assert_eq!(read("acct", refused_at, false).await.unwrap(), good);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let entry = cache.load().remove("acct|usage").unwrap();
-        assert_eq!(entry.rate_limited, 1);
+        let file = cache.load();
+        assert_eq!(file.backoff.rate_limited, 1);
         assert_eq!(
-            entry.retry_after,
-            1000 + MAX_AGE_SECS + 7200,
+            file.backoff.retry_after,
+            refused_at + 7200,
             "Retry-After wins"
         );
-        assert!(entry.last_error.unwrap().contains("HTTP 429"));
+        assert_eq!(file.backoff.accounts, ["acct"]);
 
-        // Backed off: no request, the cache answers; a fresh read refuses.
-        assert_eq!(read(1000 + MAX_AGE_SECS + 10, false).await.unwrap(), good);
-        let refused = read(1000 + MAX_AGE_SECS + 10, true).await.unwrap_err();
-        assert!(refused.to_string().contains("backing off"), "{refused}");
+        // That account is held, and a fresh read of it refuses...
+        assert_eq!(read("acct", refused_at + 10, false).await.unwrap(), good);
+        let fresh = read("acct", refused_at + 10, true).await.unwrap_err();
+        assert!(fresh.to_string().contains("backing off"), "{fresh}");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // ...but one account's 429 does not hold back another, whose success
+        // leaves the live backoff alone.
+        assert_eq!(read("second", refused_at + 10, false).await.unwrap(), good);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.load().backoff.accounts, ["acct"]);
+
+        // A second account's 429 holds back every account, even a new one.
+        assert!(read("third", refused_at + 400, false).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let other = read("fourth", refused_at + 410, false).await.unwrap_err();
+        assert!(other.to_string().contains("for every account"), "{other}");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // After it, a success clears the backoff.
+        let after = cache.load().backoff.retry_after;
+        assert_eq!(read("fourth", after, false).await.unwrap(), good);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(cache.load().backoff, Backoff::default());
+    }
+
+    #[test]
+    fn a_success_in_flight_during_another_accounts_429_keeps_the_backoff() {
+        let mut backoff = Backoff {
+            retry_after: 1600,
+            rate_limited: 2,
+            last_error: Some("HTTP 429".into()),
+            accounts: vec!["a".into(), "b".into()],
+        };
+        let held = backoff.clone();
+        backoff.succeeded(1000);
+        assert_eq!(backoff, held);
+        backoff.succeeded(1600);
+        assert_eq!(backoff, Backoff::default());
     }
 
     #[tokio::test]
-    async fn first_failures_without_a_good_answer_are_errors_and_the_file_is_private() {
+    async fn other_failures_hold_back_only_their_account_and_the_file_is_private() {
         let (router, calls) = scripted(vec![
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -681,21 +1066,35 @@ mod tests {
                 serde_json::json!("boom"),
             ),
             (StatusCode::OK, None, serde_json::json!({"limits": []})),
+            (StatusCode::OK, None, serde_json::json!({"limits": []})),
         ]);
         let client = serve(router).await;
         let (dir, cache) = temp_cache();
-        let read = |now| cache.read(&client, "acct", "tok", Endpoint::Usage, false, now);
-        let error = read(100).await.unwrap_err();
+        let read = |account, now| {
+            let cache = cache.clone();
+            let client = client.clone();
+            async move {
+                cache
+                    .read(&client, account, "tok", Endpoint::Usage, false, now)
+                    .await
+            }
+        };
+        let error = read("acct", 100).await.unwrap_err();
         assert!(error.to_string().contains("HTTP 500"), "{error}");
-        let entry = cache.load().remove("acct|usage").unwrap();
-        assert_eq!(entry.retry_after, 100 + ERROR_RETRY_SECS);
-        assert_eq!(entry.rate_limited, 0);
-        // Still inside the minute: no request.
-        assert!(read(150).await.is_err());
+        let file = cache.load();
+        assert_eq!(
+            file.entries["acct|usage"].retry_after,
+            100 + ERROR_RETRY_SECS
+        );
+        assert_eq!(file.backoff, Backoff::default());
+        // Still inside the minute: no request for it, but another account asks.
+        assert!(read("acct", 150).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        read("other", 150).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         // After it: fetched, and the entry's backoff state is cleared.
-        read(161).await.unwrap();
-        let entry = cache.load().remove("acct|usage").unwrap();
+        read("acct", 161).await.unwrap();
+        let entry = cache.load().entries.remove("acct|usage").unwrap();
         assert_eq!(entry.retry_after, 0);
         assert!(entry.last_error.is_none());
         #[cfg(unix)]

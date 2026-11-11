@@ -121,16 +121,29 @@ pub async fn list_resets(only: Option<&str>) -> Result<()> {
         }
         println!("{}", account.name);
         match resets::status(Client::shared(), &cache, account, false, now).await {
-            Ok(status) => print_reset_status(&status),
+            Ok(status) => print_reset_status(
+                &status,
+                resets::Journal::default()
+                    .pending(&account.name)
+                    .ok()
+                    .flatten()
+                    .as_ref(),
+                now,
+            ),
             Err(error) => println!("  unavailable: {error:#}"),
         }
     }
     Ok(())
 }
 
-fn print_reset_status(status: &resets::ResetStatus) {
+fn print_reset_status(
+    status: &resets::ResetStatus,
+    pending: Option<&resets::PendingClaim>,
+    now: i64,
+) {
+    use resets::Standing;
     match &status.cedar_ember {
-        Some(program) if program.eligible => {
+        Some(program) if program.standing() == Standing::Eligible => {
             let grants = program.grants();
             if grants.is_empty() {
                 println!("  limit resets: none on offer");
@@ -140,21 +153,34 @@ fn print_reset_status(status: &resets::ResetStatus) {
                 println!(
                     "  {} {}",
                     if next { "*" } else { " " },
-                    resets::describe_grant(&grant)
+                    resets::describe_grant(&grant, now)
                 );
             }
             if let Some(until) = &program.cooldown_until {
                 println!("    cooling down until {until}");
             }
         }
-        Some(program) => println!(
+        Some(program) if program.standing() == Standing::Ineligible => println!(
             "  limit resets: not eligible ({})",
             program
                 .ineligible_reason
                 .as_deref()
                 .unwrap_or("no reason given")
         ),
-        None => println!("  limit resets: not offered"),
+        Some(program) => println!(
+            "  limit resets: unknown (the server did not evaluate this account: {})",
+            program
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
+        ),
+        None => println!("  limit resets: unknown (not reported)"),
+    }
+    if let Some(pending) = pending {
+        println!(
+            "  ! a claim of grant {} has no known outcome; see `tokeman resets clear --help`",
+            pending.grant_id
+        );
     }
     match &status.juniper_tide {
         Some(session) if session.available => {
@@ -163,6 +189,13 @@ fn print_reset_status(status: &resets::ResetStatus) {
                 session.resets_per_week.unwrap_or(1)
             )
         }
+        Some(session) if session.standing() == Standing::Unknown => println!(
+            "  session reset: unknown (the server did not evaluate this account: {})",
+            session
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
+        ),
         Some(session) => println!(
             "  session reset: not available ({}{})",
             session
@@ -175,8 +208,27 @@ fn print_reset_status(status: &resets::ResetStatus) {
                 .map(|at| format!("; next {at}"))
                 .unwrap_or_default()
         ),
-        None => println!("  session reset: not offered"),
+        None => println!("  session reset: unknown (not reported)"),
     }
+    for error in &status.errors {
+        println!("  unavailable: {error}");
+    }
+}
+
+/// Forget an account's pending grant claim.
+pub fn clear_pending_reset(name: &str) -> Result<()> {
+    let journal = resets::Journal::default();
+    match journal.pending(name)? {
+        Some(pending) => {
+            journal.clear(name)?;
+            println!(
+                "{name}: forgot the claim of grant {} (request {})",
+                pending.grant_id, pending.request_id
+            );
+        }
+        None => println!("{name}: no claim pending"),
+    }
+    Ok(())
 }
 
 /// Claim a reset after showing what it clears. Resets are scarce and cannot
@@ -219,14 +271,22 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
                     .unwrap_or("no reason given")
             );
         }
+        let pending = resets::Journal::default().pending(name)?;
         let wanted = grant
             .map(str::to_owned)
+            .or_else(|| pending.as_ref().map(|pending| pending.grant_id.clone()))
             .or_else(|| program.next_grant_id.clone());
         let chosen = program
             .grants()
             .into_iter()
             .find(|candidate| Some(&candidate.id) == wanted.as_ref())
             .context("no such grant on offer; see `tokeman resets list`")?;
+        if !chosen.is_usable(now) {
+            bail!(
+                "that grant cannot be used: {}",
+                resets::describe_grant(&chosen, now)
+            );
+        }
         if !chosen.usable_now {
             bail!(
                 "that grant is not usable right now{}",
@@ -237,7 +297,7 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
                 }
             );
         }
-        println!("{name}: {}", resets::describe_grant(&chosen));
+        println!("{name}: {}", resets::describe_grant(&chosen, now));
         Some(chosen.id)
     };
     if !yes {
@@ -250,7 +310,14 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
             return Ok(());
         }
     }
-    let outcome = resets::claim(client, account, grant_id.as_deref(), now).await?;
+    let outcome = resets::claim(
+        client,
+        account,
+        grant_id.as_deref(),
+        &resets::Journal::default(),
+        now,
+    )
+    .await?;
     let cleared: Vec<&str> = outcome
         .cleared
         .iter()

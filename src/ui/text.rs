@@ -6,7 +6,7 @@ use crate::account::Account;
 use crate::claude::sessions;
 use crate::daemon::status::Report;
 use crate::providers::{Balance, Meter, Usage};
-use crate::quota::{Level, Reading, Verdict};
+use crate::quota::{Bucket, Level, Reading, SessionLimit, Verdict};
 use crate::store::{Snapshot, Stats};
 
 const BAR_WIDTH: usize = 40;
@@ -187,13 +187,43 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
         Some(_) => "login, access token expired (refresh pending)".into(),
         None => "login, expiry unknown".into(),
     };
-    match login.age_days(now_ms) {
-        Some(days) if login.is_ageing(now_ms) => format!(
-            "{token}; logged in {days} days ago, and refresh tokens have lasted about a month: run `tokeman login {}` soon",
-            account.name
+    format!("{token}{}", login_lifetime(account, now_ms))
+}
+
+/// When the login's refresh token dies: the reported date when there is one,
+/// otherwise the login's age. Empty when neither is known.
+fn login_lifetime(account: &Account, now_ms: i64) -> String {
+    let Some(login) = account.login.as_ref() else {
+        return String::new();
+    };
+    let renew = format!("run `tokeman login {}`", account.name);
+    let day = |at: i64| {
+        DateTime::from_timestamp_millis(at)
+            .map(|at| at.with_timezone(&Local).format("%b %-d").to_string())
+            .unwrap_or_else(|| "--".into())
+    };
+    match (login.refresh_expires_at, login.age_days(now_ms)) {
+        (Some(expires_at), _) if expires_at <= now_ms => {
+            format!("; login ended {}: {renew}", day(expires_at))
+        }
+        (Some(expires_at), _) if login.is_ageing(now_ms) => {
+            let hours = (expires_at - now_ms) / 3_600_000;
+            format!(
+                "; login ends {} (in {}): {renew} soon",
+                day(expires_at),
+                if hours >= 24 {
+                    format!("{}d", hours / 24)
+                } else {
+                    format!("{hours}h")
+                }
+            )
+        }
+        (Some(expires_at), _) => format!("; login ends {}", day(expires_at)),
+        (None, Some(days)) if login.is_ageing(now_ms) => format!(
+            "; logged in {days} days ago, and refresh tokens have lasted 28 to 30 days: {renew} soon"
         ),
-        Some(days) => format!("{token}; logged in {days} days ago"),
-        None => token,
+        (None, Some(days)) => format!("; logged in {days} days ago"),
+        (None, None) => String::new(),
     }
 }
 
@@ -218,12 +248,16 @@ pub fn print_readings(readings: &[Reading], probe_model: &str) {
 }
 
 fn print_windows(reading: &Reading) {
-    if let Some(w) = reading.session {
-        println!(
+    match reading.session {
+        Some(w) => println!(
             "   Session (5h) {}  resets {}",
             bar(w.used),
             format_reset(w.resets_at)
-        );
+        ),
+        None if reading.session_limit == SessionLimit::Absent => {
+            println!("   Session (5h) {DIM}no 5h limit on this account{RESET}");
+        }
+        None => {}
     }
     if let Some(w) = reading.weekly {
         let warning = match w.remaining() {
@@ -259,6 +293,41 @@ fn print_windows(reading: &Reading) {
         .map(|claim| claim_label(claim).map_or(claim, |(long, _)| long))
         .unwrap_or("--");
     println!("   Status: {color}{word}{RESET}  (limit: {claim})");
+    for line in signal_lines(reading) {
+        println!("   {DIM}{line}{RESET}");
+    }
+}
+
+/// What the headers said beyond the windows: none of it is room.
+pub fn signal_lines(reading: &Reading) -> Vec<String> {
+    let signals = &reading.signals;
+    let mut lines = Vec::new();
+    if signals.claims.len() > 1 {
+        lines.push(format!("Exceeded: {}", signals.claims.join(", ")));
+    }
+    if let Some(slow) = &signals.slow {
+        let status = slow
+            .status
+            .and_then(|status| serde_json::to_value(status).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "offered".into());
+        let budget = slow
+            .budget
+            .map(|w| format!(", budget {:.0}% used", w.used * 100.0))
+            .unwrap_or_default();
+        lines.push(format!("Low-priority lane: {status}{budget}"));
+    }
+    if let Some(grace) = &signals.grace {
+        let parts: Vec<String> = [("5h", grace.session_used), ("7d", grace.weekly_used)]
+            .into_iter()
+            .filter_map(|(name, used)| used.map(|used| format!("{name} {:.0}%", used * 100.0)))
+            .collect();
+        lines.push(format!("Grace past the limit: {}", parts.join(", ")));
+    }
+    if !signals.upgrade_paths.is_empty() {
+        lines.push(format!("Could buy: {}", signals.upgrade_paths.join(", ")));
+    }
+    lines
 }
 
 fn print_buckets(reading: &Reading) {
@@ -271,11 +340,12 @@ fn print_buckets(reading: &Reading) {
     }
     for bucket in &reading.buckets {
         println!(
-            "   {:<12} {}  resets {}  {DIM}{}{RESET}",
+            "   {:<12} {}  resets {}  {DIM}{}{}{RESET}",
             format!("{} (7d)", bucket.label),
             bar(bucket.window.used),
             format_reset(bucket.window.resets_at),
             bucket.source.label(),
+            share_note(bucket, reading),
         );
     }
 }
@@ -432,6 +502,19 @@ pub fn print_usages(usages: &[Usage]) {
             println!("   {}", balance_text(balance));
         }
         println!();
+    }
+}
+
+/// For a limit that is a share of the weekly: how much of the weekly it
+/// still allows.
+fn share_note(bucket: &Bucket, reading: &Reading) -> String {
+    match bucket.share {
+        Some(share) => format!(
+            "; {:.0}% of the weekly, {:.0}% of the weekly left for it",
+            share * 100.0,
+            bucket.room(reading.weekly.as_ref()).max(0.0) * 100.0
+        ),
+        None => String::new(),
     }
 }
 
@@ -666,5 +749,65 @@ mod tests {
         assert_eq!(format_reset(0), "--");
         assert_eq!(format_reset(1), "now");
         assert_eq!(format_reset_compact(0), "--");
+    }
+
+    #[test]
+    fn signals_are_described_but_quiet_when_absent() {
+        let mut reading = crate::testing::reading("a", 0.1, 0.2);
+        assert!(signal_lines(&reading).is_empty());
+        reading.signals.claims = vec!["seven_day".into(), "seven_day_overage_included".into()];
+        reading.signals.slow = Some(crate::quota::SlowLane {
+            status: Some(crate::quota::SlowStatus::SlotBusy),
+            budget: Some(crate::quota::Window::new(0.25, 0)),
+            ..Default::default()
+        });
+        reading.signals.upgrade_paths = vec!["overage".into()];
+        let lines = signal_lines(&reading);
+        assert_eq!(
+            lines,
+            [
+                "Exceeded: seven_day, seven_day_overage_included",
+                "Low-priority lane: slot_busy, budget 25% used",
+                "Could buy: overage",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shared_limit_says_how_much_of_the_weekly_it_still_allows() {
+        let mut reading = crate::testing::reading("a", 0.0, 0.4);
+        let mut fable =
+            crate::testing::bucket("fable", "Fable", 0.5, crate::quota::Source::Profile);
+        assert_eq!(share_note(&fable, &reading), "");
+        fable.share = Some(0.5);
+        reading.buckets.push(fable.clone());
+        assert_eq!(
+            share_note(&fable, &reading),
+            "; 50% of the weekly, 25% of the weekly left for it"
+        );
+    }
+
+    #[test]
+    fn the_login_line_uses_the_reported_refresh_expiry_before_the_age() {
+        const DAY_MS: i64 = 86_400_000;
+        let mut account = crate::testing::login_account("acct", 40 * DAY_MS);
+        let login = account.login.as_mut().unwrap();
+        login.logged_in_at = Some(0);
+        login.refresh_expires_at = Some(30 * DAY_MS);
+        let line = describe_login(&account, 20 * DAY_MS);
+        assert!(line.contains("; login ends "), "{line}");
+        assert!(!line.contains("soon"), "{line}");
+        let line = describe_login(&account, 28 * DAY_MS);
+        assert!(
+            line.contains("(in 2d): run `tokeman login acct` soon"),
+            "{line}"
+        );
+        let line = describe_login(&account, 31 * DAY_MS);
+        assert!(line.contains("login ended"), "{line}");
+
+        account.login.as_mut().unwrap().refresh_expires_at = None;
+        let line = describe_login(&account, 22 * DAY_MS);
+        assert!(line.contains("logged in 22 days ago"), "{line}");
+        assert!(line.contains("soon"), "{line}");
     }
 }
