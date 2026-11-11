@@ -830,7 +830,10 @@ mod tests {
         assert_eq!(offers.len(), 1);
         assert!(offers[0].contains("usable now"), "{offers:?}");
         let expired = at("2026-10-23T00:00:00Z");
-        assert_eq!(stored_offers(&cache, "acct", expired), Some((1, Vec::new())));
+        assert_eq!(
+            stored_offers(&cache, "acct", expired),
+            Some((1, Vec::new()))
+        );
         assert_eq!(stored_offers(&cache, "never-read", then), None);
     }
 

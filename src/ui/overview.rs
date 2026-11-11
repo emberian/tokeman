@@ -47,6 +47,8 @@ pub struct ClaudeView {
     pub credential: String,
     /// The login's state and when it ends, as `tokeman list` words it.
     pub login: String,
+    /// The refusal or the end date alone, for a small surface.
+    pub login_note: Option<String>,
     /// The login is refused, ended, or close to ending.
     pub login_warning: bool,
     /// Epoch seconds when the refresh token dies, when reported.
@@ -271,7 +273,9 @@ impl Overview {
         self.claude
             .iter()
             .filter_map(|account| account.reading.as_ref())
-            .filter(|reading| reading.error.is_none() && reading.status.as_deref() != Some("rejected"))
+            .filter(|reading| {
+                reading.error.is_none() && reading.status.as_deref() != Some("rejected")
+            })
             .filter_map(|reading| reading.weekly)
             .map(|weekly| weekly.remaining())
             .reduce(f64::max)
@@ -290,15 +294,15 @@ fn claude_view(
         is_default,
         credential: claude_settings::describe_credential(account, now_ms),
         login: text::describe_login(account, now_ms),
-        login_warning: login
-            .is_some_and(|login| login.error.is_some() || login.is_ageing(now_ms)),
+        login_note: text::login_note(account, now_ms),
+        login_warning: login.is_some_and(|login| login.error.is_some() || login.is_ageing(now_ms)),
         login_ends_at: login
             .and_then(|login| login.refresh_expires_at)
             .map(|at| at / 1000),
         reading: snapshot.map(|snapshot| ClaudeReading {
             at: snapshot.at.timestamp(),
             status: snapshot.status.clone(),
-            error: snapshot.error.clone(),
+            error: snapshot.error.as_deref().map(brief_error),
             session: snapshot.session,
             session_limit: snapshot.session_limit,
             weekly: snapshot.weekly,
@@ -311,6 +315,17 @@ fn claude_view(
             notes: text::signal_lines(&snapshot.signals),
         }),
     }
+}
+
+/// `HTTP 403: OAuth authentication is currently not allowed ...` for an
+/// error that carries the API's JSON body; any other error as it is.
+fn brief_error(error: &str) -> String {
+    let message = error.find('{').and_then(|start| {
+        let body: serde_json::Value = serde_json::from_str(&error[start..]).ok()?;
+        let message = body["error"]["message"].as_str()?;
+        Some(format!("{}{message}", &error[..start]))
+    });
+    message.unwrap_or_else(|| text::one_line(error, 200))
 }
 
 pub fn bucket_view(bucket: &Bucket, weekly: Option<&Window>) -> BucketView {
@@ -463,10 +478,16 @@ mod tests {
         assert!(ultra.login_warning);
         assert_eq!(ultra.login_ends_at, Some(NOW + 2 * 86_400));
         assert!(ultra.login.contains("login ends"), "{}", ultra.login);
+        let note = ultra.login_note.as_deref().unwrap();
+        assert!(
+            note.starts_with("login ends") && note.ends_with("soon"),
+            "{note}"
+        );
         assert_eq!(ultra.reading, None);
         let plain = &view.claude[1];
         assert!(!plain.login_warning);
         assert_eq!(plain.login_ends_at, None);
+        assert_eq!(plain.login_note, None);
         assert_eq!(view.best_weekly_remaining(), None);
         assert_eq!(view.codex[0].reading, None);
         assert_eq!(view.services[0].usage, None);
@@ -474,6 +495,18 @@ mod tests {
             serde_json::to_value(&view).unwrap()["monitor"],
             "not-installed"
         );
+    }
+
+    #[test]
+    fn an_api_error_body_is_shown_as_its_message() {
+        assert_eq!(
+            brief_error(
+                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
+            ),
+            "HTTP 403: OAuth authentication is currently not allowed for this organization."
+        );
+        assert_eq!(brief_error("network: timed out"), "network: timed out");
+        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
     }
 
     #[test]
@@ -546,7 +579,11 @@ mod tests {
                 usage.clone(),
             ],
             offers: vec![
-                ("ultra".into(), NOW - 900, vec!["weekly reset, usable now".into()]),
+                (
+                    "ultra".into(),
+                    NOW - 900,
+                    vec!["weekly reset, usable now".into()],
+                ),
                 ("plain".into(), NOW - 900, Vec::new()),
             ],
             ..Stored::default()

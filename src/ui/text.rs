@@ -190,6 +190,20 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
     format!("{token}{}", login_lifetime(account, now_ms))
 }
 
+/// What a small surface says about the login: that it was refused, or when
+/// it ends. `None` when there is nothing to say.
+pub fn login_note(account: &Account, now_ms: i64) -> Option<String> {
+    let login = account.login.as_ref()?;
+    if login.error.is_some() {
+        return Some(format!(
+            "login refused: run `tokeman login {}`",
+            account.name
+        ));
+    }
+    let lifetime = login_lifetime(account, now_ms);
+    lifetime.strip_prefix("; ").map(str::to_owned)
+}
+
 /// When the login's refresh token dies: the reported date when there is one,
 /// otherwise the login's age. Empty when neither is known.
 fn login_lifetime(account: &Account, now_ms: i64) -> String {
@@ -464,7 +478,10 @@ pub fn codex_summary(reading: &crate::ui::overview::CodexReading) -> String {
             )
         })
         .collect();
-    if let Some(credits) = reading.reset_credits.filter(|credits| credits.available > 0) {
+    if let Some(credits) = reading
+        .reset_credits
+        .filter(|credits| credits.available > 0)
+    {
         let plural = if credits.available == 1 { "" } else { "s" };
         parts.push(match credits.applicable {
             Some(now) => format!(
@@ -799,6 +816,24 @@ mod tests {
         assert_eq!(usage_summary(&failed), "error: z.ai refused: bad key");
         assert_eq!(format_money(-5, "EUR"), "-0.05 EUR");
         assert_eq!(format_age(100, 100 + 7200), "2h ago");
+    }
+
+    #[test]
+    fn the_login_note_is_the_refusal_or_the_end_date_alone() {
+        const DAY_MS: i64 = 86_400_000;
+        assert_eq!(login_note(&crate::testing::setup_account("a"), 0), None);
+        let mut account = crate::testing::login_account("acct", 40 * DAY_MS);
+        let login = account.login.as_mut().unwrap();
+        login.logged_in_at = None;
+        assert_eq!(login_note(&account, DAY_MS), None);
+        account.login.as_mut().unwrap().refresh_expires_at = Some(30 * DAY_MS);
+        let note = login_note(&account, DAY_MS).unwrap();
+        assert!(note.starts_with("login ends "), "{note}");
+        account.login.as_mut().unwrap().error = Some("invalid_grant".into());
+        assert_eq!(
+            login_note(&account, DAY_MS).as_deref(),
+            Some("login refused: run `tokeman login acct`")
+        );
     }
 
     #[test]

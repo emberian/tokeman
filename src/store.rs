@@ -699,7 +699,10 @@ mod tests {
         let codex = store.latest_codex().unwrap();
         assert_eq!(codex.len(), 1);
         assert_eq!((codex[0].at, codex[0].email()), (9, Some("a@b.c")));
-        assert!(store.insert(&reading()).is_err(), "read-only refuses a write");
+        assert!(
+            store.insert(&reading()).is_err(),
+            "read-only refuses a write"
+        );
         drop(store);
         assert_eq!(files(dir.path()), ["s.db"], "no sidecar files appear");
 

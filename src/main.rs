@@ -87,10 +87,8 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::List { json } => {
             let fleet = Fleet::load()?;
-            let overview = tokeman::ui::overview::Overview::stored(
-                &fleet,
-                chrono::Utc::now().timestamp(),
-            );
+            let overview =
+                tokeman::ui::overview::Overview::stored(&fleet, chrono::Utc::now().timestamp());
             if json {
                 println!("{}", serde_json::to_string_pretty(&overview)?);
                 return Ok(());
@@ -102,8 +100,7 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
             for account in &fleet.accounts {
-                let marker = if overview.default_account.as_deref() == Some(account.name.as_str())
-                {
+                let marker = if overview.default_account.as_deref() == Some(account.name.as_str()) {
                     "*"
                 } else {
                     " "
@@ -143,17 +140,23 @@ async fn dispatch(command: Command) -> Result<()> {
             since,
             json,
         } => {
-            let store = Store::open()?;
-            let snapshots = match since {
+            let read = |store: &Store| match since {
                 Some(hours) => {
                     let cutoff = chrono::Utc::now()
                         - chrono::Duration::milliseconds((hours * 3_600_000.0) as i64);
                     match account.as_deref() {
-                        Some(name) => store.for_account_since(name, cutoff)?,
-                        None => store.all_since(cutoff)?,
+                        Some(name) => store.for_account_since(name, cutoff),
+                        None => store.all_since(cutoff),
                     }
                 }
-                None => store.recent(account.as_deref(), last)?,
+                None => store.recent(account.as_deref(), last),
+            };
+            // Reading history writes nothing. Only a database from an older
+            // tokeman, which lacks columns this one selects, is opened for
+            // writing so that it is migrated.
+            let snapshots = match Store::open_read_only().and_then(|store| read(&store)) {
+                Ok(snapshots) => snapshots,
+                Err(_) => read(&Store::open()?)?,
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshots)?);
