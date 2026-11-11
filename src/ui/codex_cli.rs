@@ -79,6 +79,8 @@ pub async fn run(action: CodexAction) -> Result<()> {
                 return Ok(());
             }
             let listed = commands::list_detailed(&Client::new()?, &fleet).await;
+            let probes: Vec<_> = listed.iter().map(|entry| entry.probe.clone()).collect();
+            commands::record(&probes);
             if json {
                 println!("{}", serde_json::to_string_pretty(&listed)?);
                 return Ok(());

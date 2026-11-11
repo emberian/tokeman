@@ -293,14 +293,13 @@ fn print_windows(reading: &Reading) {
         .map(|claim| claim_label(claim).map_or(claim, |(long, _)| long))
         .unwrap_or("--");
     println!("   Status: {color}{word}{RESET}  (limit: {claim})");
-    for line in signal_lines(reading) {
+    for line in signal_lines(&reading.signals) {
         println!("   {DIM}{line}{RESET}");
     }
 }
 
 /// What the headers said beyond the windows: none of it is room.
-pub fn signal_lines(reading: &Reading) -> Vec<String> {
-    let signals = &reading.signals;
+pub fn signal_lines(signals: &crate::quota::Signals) -> Vec<String> {
     let mut lines = Vec::new();
     if signals.claims.len() > 1 {
         lines.push(format!("Exceeded: {}", signals.claims.join(", ")));
@@ -447,6 +446,64 @@ pub fn print_service_list(
             "  {:<24} {:<12} {detail}",
             account.name,
             account.service.label()
+        );
+    }
+}
+
+/// `5H 90% · WEEKLY 58% · 2 reset credits (0 usable now)`, with the state
+/// when it is not `ok`: one stored Codex probe on one line.
+pub fn codex_summary(reading: &crate::ui::overview::CodexReading) -> String {
+    let mut parts: Vec<String> = reading
+        .windows
+        .iter()
+        .map(|named| {
+            format!(
+                "{} {:.0}%",
+                named.label,
+                (named.window.remaining().clamp(0.0, 1.0) * 100.0).round()
+            )
+        })
+        .collect();
+    if let Some(credits) = reading.reset_credits.filter(|credits| credits.available > 0) {
+        let plural = if credits.available == 1 { "" } else { "s" };
+        parts.push(match credits.applicable {
+            Some(now) => format!(
+                "{} reset credit{plural} ({now} usable now)",
+                credits.available
+            ),
+            None => format!("{} reset credit{plural}", credits.available),
+        });
+    }
+    if reading.state != "ok" {
+        parts.push(one_line(&reading.state, 80));
+    }
+    parts.join(" · ")
+}
+
+/// The Codex section of `tokeman list`: the last stored probe of each profile.
+pub fn print_codex_list(accounts: &[crate::ui::overview::CodexView], now: i64) {
+    if accounts.is_empty() {
+        return;
+    }
+    println!("\n {BOLD}codex{RESET}");
+    for account in accounts {
+        let detail = match &account.reading {
+            Some(reading) => format!(
+                "{}{}  {DIM}({}){RESET}",
+                reading
+                    .plan
+                    .as_deref()
+                    .map(|plan| format!("[{plan}] "))
+                    .unwrap_or_default(),
+                codex_summary(reading),
+                format_age(reading.at, now)
+            ),
+            None => format!("{DIM}not read yet (`tokeman codex list`){RESET}"),
+        };
+        println!(
+            "  {:<24} {:<12} {detail}",
+            account.name,
+            if account.parked { "parked" } else { "" }
         );
     }
 }
@@ -745,6 +802,48 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_probe_reads_as_named_windows_credits_and_trouble() {
+        use crate::codex::probe::ResetCreditCount;
+        use crate::quota::Window;
+        use crate::ui::overview::{CodexReading, NamedWindow};
+        let mut reading = CodexReading {
+            at: 0,
+            email: None,
+            plan: Some("pro".into()),
+            state: "ok".into(),
+            viable: true,
+            windows: vec![
+                NamedWindow {
+                    label: "5H".into(),
+                    window: Window::new(0.1, 0),
+                },
+                NamedWindow {
+                    label: "WEEKLY".into(),
+                    window: Window::new(0.42, 0),
+                },
+            ],
+            extra: Vec::new(),
+            reset_credits: Some(ResetCreditCount {
+                available: 2,
+                applicable: Some(0),
+            }),
+        };
+        assert_eq!(
+            codex_summary(&reading),
+            "5H 90% · WEEKLY 58% · 2 reset credits (0 usable now)"
+        );
+        reading.reset_credits = Some(ResetCreditCount {
+            available: 0,
+            applicable: None,
+        });
+        reading.state = "limited (weekly)".into();
+        assert_eq!(
+            codex_summary(&reading),
+            "5H 90% · WEEKLY 58% · limited (weekly)"
+        );
+    }
+
+    #[test]
     fn resets_in_the_past_or_absent_read_as_words() {
         assert_eq!(format_reset(0), "--");
         assert_eq!(format_reset(1), "now");
@@ -754,7 +853,7 @@ mod tests {
     #[test]
     fn signals_are_described_but_quiet_when_absent() {
         let mut reading = crate::testing::reading("a", 0.1, 0.2);
-        assert!(signal_lines(&reading).is_empty());
+        assert!(signal_lines(&reading.signals).is_empty());
         reading.signals.claims = vec!["seven_day".into(), "seven_day_overage_included".into()];
         reading.signals.slow = Some(crate::quota::SlowLane {
             status: Some(crate::quota::SlowStatus::SlotBusy),
@@ -762,7 +861,7 @@ mod tests {
             ..Default::default()
         });
         reading.signals.upgrade_paths = vec!["overage".into()];
-        let lines = signal_lines(&reading);
+        let lines = signal_lines(&reading.signals);
         assert_eq!(
             lines,
             [
