@@ -11,6 +11,7 @@ pub mod auth;
 pub mod commands;
 pub mod probe;
 pub mod refresh;
+pub mod resets;
 
 use anyhow::Result;
 use std::time::Duration;
@@ -18,6 +19,10 @@ use std::time::Duration;
 /// `GET` here answers the usage probe.
 pub const USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 pub const USAGE_URL_ENV: &str = "TOKEMAN_CODEX_USAGE_URL";
+/// `GET` here lists the account's rate-limit reset credits; `POST` to
+/// `{this}/consume` claims one.
+pub const CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+pub const CREDITS_URL_ENV: &str = "TOKEMAN_CODEX_CREDITS_URL";
 /// Codex's token endpoint and OAuth client id; tokeman and Codex refresh the
 /// same account interchangeably by using the same ones.
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -36,6 +41,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     http: reqwest::Client,
     usage_url: String,
+    credits_url: String,
     token_url: String,
     client_id: String,
 }
@@ -49,11 +55,12 @@ impl Client {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| default.to_owned())
         };
-        Self::with_endpoints(
+        Ok(Self::with_endpoints(
             env(USAGE_URL_ENV, USAGE_URL),
             env(TOKEN_URL_ENV, TOKEN_URL),
             env(CLIENT_ID_ENV, CLIENT_ID),
-        )
+        )?
+        .with_credits_url(env(CREDITS_URL_ENV, CREDITS_URL)))
     }
 
     pub fn with_endpoints(
@@ -69,9 +76,15 @@ impl Client {
         Ok(Self {
             http,
             usage_url: usage_url.into(),
+            credits_url: CREDITS_URL.to_owned(),
             token_url: token_url.into(),
             client_id: client_id.into(),
         })
+    }
+
+    pub fn with_credits_url(mut self, credits_url: impl Into<String>) -> Self {
+        self.credits_url = credits_url.into();
+        self
     }
 
     pub fn http(&self) -> &reqwest::Client {
@@ -80,6 +93,14 @@ impl Client {
 
     pub fn usage_url(&self) -> &str {
         &self.usage_url
+    }
+
+    pub fn credits_url(&self) -> &str {
+        &self.credits_url
+    }
+
+    pub fn consume_url(&self) -> String {
+        format!("{}/consume", self.credits_url.trim_end_matches('/'))
     }
 
     pub fn token_url(&self) -> &str {

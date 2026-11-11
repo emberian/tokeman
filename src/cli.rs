@@ -385,6 +385,16 @@ pub enum CodexAction {
         #[arg(long)]
         once: bool,
     },
+    /// Spend one rate-limit reset credit on an account at its limit (asks first)
+    Reset {
+        account: String,
+        /// Credit to spend (default: the backend's choice); see `tokeman codex list`
+        #[arg(long)]
+        credit: Option<String>,
+        /// Do not ask
+        #[arg(long)]
+        yes: bool,
+    },
     /// Print the CODEX_HOME of the account with the most headroom
     Best {
         /// Rank by a per-model bucket (e.g. "spark") instead of the account window

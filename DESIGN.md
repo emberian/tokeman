@@ -66,8 +66,9 @@ src/
     mod.rs       client (HTTP/1.1 + cookie jar), edge-challenge detection
     auth.rs      auth.json read/write, seating
     appserver.rs JSON-RPC over the app-server Unix socket
-    probe.rs     usage probe
+    probe.rs     usage probe: windows classified by length (Span), model_usage, spend_control, reset-credit count
     refresh.rs   token refresh
+    resets.rs    reset credits: list, claim, and the pending-claim journal (its only writer)
     commands.rs  add/discover/import/list/refresh/best/seat/reseat/watch
   providers/
     mod.rs       Service, ServiceAccount, Meter, Amount, Balance, Usage: read-only quota of services tokeman does not rotate;
@@ -160,7 +161,8 @@ Rules the types enforce:
   never reads the clock or a file; callers pass `now`.
 - Exactly one writer per file: `claude/settings.rs` for settings.json,
   `account.rs` for tokens.toml, `daemon/cadence.rs` for the cycle state,
-  `observe.rs` for the admission state, `history.rs` for the JSONL.
+  `observe.rs` for the admission state, `history.rs` for the JSONL,
+  `codex/resets.rs` for the Codex pending-claim journal.
 - Every subprocess wait has a timeout. Every lock acquire tries first and
   says when it waits.
 - Dry run means no write anywhere, and the cycle says what it would have done.
@@ -201,6 +203,9 @@ Each was measured; the commit that measured it is findable by its date.
   `__cf_bm` only across a shared cookie jar (2026-08).
 - Codex's 401 recovery refuses an `auth.json` whose account id changed; the
   app-server `reload` path does not (2026-08).
+- The Codex usage body puts whichever window exists first in
+  `primary_window`: a weekly-only account reports its 604800 s window there
+  and `secondary_window: null` (2026-11-11).
 - A Background-class LaunchAgent stretched a 20 s cycle to 10 to 24 minutes
   under a load average of 200 (2026-10-14).
 - A page in the user's browser can read a loopback HTTP server through DNS

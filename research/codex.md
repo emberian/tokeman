@@ -44,7 +44,10 @@ Changes against what tokeman assumes (its fixtures use primary = 18000 s, second
 
 - List: `GET /backend-api/wham/rate-limit-reset-credits` (or `/api/codex/rate-limit-reset-credits`) →
   `{available_count, credits: [{id, reset_type, status, granted_at, expires_at, title, description}]}`.
-  Live it answered **500** today. The CLI tolerates that ("failed to fetch rate limit reset credit
+  Live it answered **500** in the morning and **200** at 13:50 the same day, with fields beyond the
+  source's: per credit `is_supported_by_plan`, `redeem_started_at`, `redeemed_at`, `profile_image_url`,
+  `profile_user_id`; top level `total_earned_count`, `immediate_reset_purchase_eligible`, `history_enabled`.
+  Timestamps are RFC 3339 strings. The CLI tolerates a failing list ("failed to fetch rate limit reset credit
   details; falling back to the usage response").
 - Consume: `POST …/rate-limit-reset-credits/consume` `{redeem_request_id, credit_id?}` →
   `{code: reset|nothing_to_reset|no_credit|already_redeemed, windows_reset}`.

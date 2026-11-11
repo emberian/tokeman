@@ -217,13 +217,22 @@ moved between accounts without a restart:
 tokeman codex add <name> <codex-home>   # register a profile directory
 tokeman codex discover [--adopt]        # find profiles on disk
 tokeman codex import <file>             # seed profiles from `<name> <access-token>` lines
-tokeman codex list                      # probe every account's quota
+tokeman codex list                      # probe every account's quota (5h / weekly windows, reset credits)
 tokeman codex refresh                   # renew OAuth tokens before they rot into a 401
 tokeman codex best                      # the CODEX_HOME with the most headroom
 tokeman codex seat <account> --into <dir>
 tokeman codex reseat                    # move a running Codex onto another account
 tokeman codex watch                     # follow a running Codex and move it in time
+tokeman codex reset <account> [--credit <id>] [--yes]   # spend one reset credit on an account at its limit
 ```
+
+Windows are named by their length (`limit_window_seconds`), not by which
+field the backend put them in: an account whose only window is the weekly one
+shows `-` under 5H. `reset` refuses unless the account is at a limit and the
+backend counts a credit that applies now. Its request id is kept in
+`~/.config/tokeman/codex-reset-pending.json` until the backend answers, so
+re-running after a lost answer resends the same id and cannot spend a second
+credit.
 
 A migration is announced to the running Codex over its app-server socket,
 because Codex's own 401 recovery refuses a swapped account. The daemon
@@ -238,6 +247,7 @@ refreshes every registered profile on a half-hour sweep.
 | `~/.config/tokeman/claude-admission-state.json` | Session bindings and reset-bounded rejection quarantines |
 | `~/.config/tokeman/claude-rotate-state.json` | Cadence, mode, backoffs, carried samples |
 | `~/.config/tokeman/claude-rotate.log` | Rotation events (names and headroom only) |
+| `~/.config/tokeman/codex-reset-pending.json` | Codex reset-credit claims sent without a definite answer |
 | `~/.config/tokeman/claude-login-keychain-backup.json` | The `/login` Keychain record set aside while managed |
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.local/share/tokeman/snapshots.db` | Probe history (sqlite) |

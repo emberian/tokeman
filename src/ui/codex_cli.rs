@@ -1,11 +1,13 @@
 //! `tokeman codex ...`: printing for the Codex account commands.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::io::{BufRead, Write};
 
 use crate::account::Fleet;
 use crate::cli::CodexAction;
 use crate::codex::Client;
 use crate::codex::commands::{self, WatchEvent};
+use crate::codex::resets;
 use crate::paths::tilde;
 
 pub async fn run(action: CodexAction) -> Result<()> {
@@ -76,14 +78,14 @@ pub async fn run(action: CodexAction) -> Result<()> {
                 println!("no codex accounts configured — try `tokeman codex discover --adopt`");
                 return Ok(());
             }
-            let probes = commands::list(&Client::new()?, &fleet).await;
+            let listed = commands::list_detailed(&Client::new()?, &fleet).await;
             if json {
-                println!("{}", serde_json::to_string_pretty(&probes)?);
+                println!("{}", serde_json::to_string_pretty(&listed)?);
                 return Ok(());
             }
             println!("{}", commands::ROW_HEADER);
-            for probe in &probes {
-                for row in commands::rows(probe, now) {
+            for entry in &listed {
+                for row in commands::listed_rows(entry, now) {
                     println!("{row}");
                 }
             }
@@ -182,8 +184,8 @@ pub async fn run(action: CodexAction) -> Result<()> {
                             min_remaining * 100.0
                         )
                     }
-                    WatchEvent::Headroom { remaining } => {
-                        println!("{:.0}% left", remaining * 100.0)
+                    WatchEvent::Headroom { remaining, span } => {
+                        println!("{:.0}% left in the {span} window", remaining * 100.0)
                     }
                     WatchEvent::Migrating => println!("below the threshold; migrating"),
                     WatchEvent::Migrated(reseat) => println!("moved onto {}", reseat.account),
@@ -191,10 +193,93 @@ pub async fn run(action: CodexAction) -> Result<()> {
             )
             .await?;
         }
+        CodexAction::Reset {
+            account,
+            credit,
+            yes,
+        } => reset(&account, credit.as_deref(), yes).await?,
         CodexAction::Best { limit } => {
             let probe = commands::best(&Client::new()?, &Fleet::load()?, limit.as_deref()).await?;
             println!("{}", probe.codex_home.display());
         }
+    }
+    Ok(())
+}
+
+/// Spend a reset credit after showing what it would clear. Credits are
+/// scarce and cannot be taken back, so this asks unless `yes`.
+async fn reset(name: &str, credit: Option<&str>, yes: bool) -> Result<()> {
+    let fleet = Fleet::load()?;
+    let account = fleet
+        .codex_account(name)
+        .with_context(|| format!("no codex account named {name}"))?;
+    let client = Client::new()?;
+    let journal = resets::Journal::default();
+    let plan = resets::plan(&client, account, credit, &journal).await?;
+    let now = chrono::Utc::now().timestamp();
+    println!("{}", commands::ROW_HEADER);
+    for row in commands::rows(&plan.probe, now) {
+        println!("{row}");
+    }
+    match &plan.credits {
+        Ok(list) => {
+            for credit in &list.credits {
+                println!("  └ reset credit {}", resets::describe(credit));
+            }
+        }
+        Err(error) => println!("  └ reset credit details unavailable ({error})"),
+    }
+    if let Some(pending) = &plan.pending {
+        println!(
+            "an earlier claim (request {}, started {}) got no definite answer; this retries it with the same request id",
+            pending.redeem_request_id,
+            chrono::DateTime::from_timestamp(pending.started_at, 0)
+                .map(|at| at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string())
+                .unwrap_or_else(|| pending.started_at.to_string())
+        );
+    }
+    let which = match (plan.chosen(), &plan.credit_id) {
+        (Some(chosen), _) => resets::describe(chosen),
+        (None, Some(id)) => format!("credit {id}"),
+        (None, None) => "one reset credit (the backend's choice)".to_owned(),
+    };
+    if !yes {
+        print!("spend {which} on {name} now? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("kept.");
+            return Ok(());
+        }
+    }
+    match resets::claim(&client, &plan, &journal, now).await? {
+        resets::Claim::Answered {
+            consumed, retried, ..
+        } => {
+            use resets::ConsumeCode::*;
+            let text = match consumed.code {
+                Reset => format!("reset: {} window(s) cleared", consumed.windows_reset),
+                AlreadyRedeemed if retried => {
+                    "the earlier claim went through; nothing more was spent".to_owned()
+                }
+                AlreadyRedeemed => "already redeemed; nothing more was spent".to_owned(),
+                NothingToReset => "nothing to reset; no credit was spent".to_owned(),
+                NoCredit => "no credit to spend".to_owned(),
+            };
+            println!("{name}: {text}");
+        }
+        resets::Claim::Uncertain {
+            redeem_request_id,
+            error,
+        } => bail!(
+            "no definite answer ({error}); the claim may or may not have gone through. \
+             Run `tokeman codex reset {name}` again: it resends request {redeem_request_id}, \
+             which the backend redeems at most once"
+        ),
     }
     Ok(())
 }
