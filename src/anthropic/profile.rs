@@ -2,9 +2,10 @@
 //! Claude Code reads them, behind an on-disk cache.
 //!
 //! The endpoint answers 429 under a 20-second probe cadence and the figures
-//! move over hours, so each account's answer is reused for [`MAX_AGE_SECS`]
-//! and a 429 backs the account off; while it lasts the last good answer is
-//! served. This module is the only writer of the cache file.
+//! move over hours, so each account's answer is reused for [`MAX_AGE_SECS`].
+//! Its 429 budget is shared by every account from one address, so a 429 on
+//! any account backs off the whole fleet; while it lasts each account's last
+//! good answer is served. This module is the only writer of the cache file.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -50,21 +51,40 @@ impl Endpoint {
     }
 }
 
-/// One cached answer and the state of its backoff.
+/// One account's cached answer, and when a non-429 failure lets it be
+/// asked again.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Entry {
     #[serde(default)]
     fetched_at: i64,
     #[serde(default)]
     body: Option<serde_json::Value>,
-    /// Epoch seconds before which the endpoint is not asked again.
+    /// Epoch seconds before which this account is not asked again.
     #[serde(default)]
     retry_after: i64,
-    /// Consecutive 429s.
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+/// The fleet-wide 429 backoff.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Backoff {
+    /// Epoch seconds before which no account asks the endpoint.
+    #[serde(default)]
+    retry_after: i64,
+    /// Consecutive 429s, whichever account drew them.
     #[serde(default)]
     rate_limited: u32,
     #[serde(default)]
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    backoff: Backoff,
+    #[serde(default)]
+    entries: BTreeMap<String, Entry>,
 }
 
 /// The cache file, shared by the daemon and every CLI command.
@@ -84,26 +104,27 @@ impl Cache {
         Self { path }
     }
 
-    fn load(&self) -> BTreeMap<String, Entry> {
+    /// The file as stored; a file in an older shape reads as empty.
+    fn load(&self) -> CacheFile {
         std::fs::read(&self.path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
-    /// Best-effort: a lost update costs one extra read later. The file holds
-    /// usage figures, never credentials.
-    fn store(&self, key: &str, entry: &Entry) {
-        let mut cache = self.load();
-        cache.insert(key.to_owned(), entry.clone());
-        if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
+    /// Best-effort read-modify-write: a lost update costs one extra read
+    /// later. The file holds usage figures, never credentials.
+    fn update(&self, change: impl FnOnce(&mut CacheFile)) {
+        let mut file = self.load();
+        change(&mut file);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&file) {
             let _ = write_atomic(&self.path, &bytes, 0o600);
         }
     }
 
     /// The endpoint's JSON for `account`: from the cache when younger than
-    /// [`MAX_AGE_SECS`] (unless `fresh`) or while the account is backed off,
-    /// otherwise fetched with `bearer`. `now` is epoch seconds.
+    /// [`MAX_AGE_SECS`] (unless `fresh`), or while this account or the fleet
+    /// is backed off; otherwise fetched with `bearer`. `now` is epoch seconds.
     pub async fn read(
         &self,
         client: &Client,
@@ -114,7 +135,8 @@ impl Cache {
         now: i64,
     ) -> Result<serde_json::Value> {
         let key = endpoint.key(account);
-        let mut entry = self.load().remove(&key).unwrap_or_default();
+        let file = self.load();
+        let entry = file.entries.get(&key).cloned().unwrap_or_default();
         let young = now - entry.fetched_at < MAX_AGE_SECS;
         if let Some(body) = &entry.body
             && young
@@ -122,38 +144,57 @@ impl Cache {
         {
             return Ok(body.clone());
         }
-        if now < entry.retry_after {
+        let held = [
+            (entry.retry_after, entry.last_error.as_deref(), ""),
+            (
+                file.backoff.retry_after,
+                file.backoff.last_error.as_deref(),
+                " for every account",
+            ),
+        ]
+        .into_iter()
+        .filter(|(until, _, _)| now < *until)
+        .max_by_key(|(until, _, _)| *until);
+        if let Some((until, error, scope)) = held {
             return match &entry.body {
                 Some(body) if !fresh => Ok(body.clone()),
                 _ => bail!(
-                    "{} (backing off for {}s)",
-                    entry.last_error.as_deref().unwrap_or("recently refused"),
-                    entry.retry_after - now
+                    "{} (backing off{scope} for {}s)",
+                    error.unwrap_or("recently refused"),
+                    until - now
                 ),
             };
         }
         match fetch(client, bearer, endpoint).await {
             Ok(body) => {
-                entry = Entry {
-                    fetched_at: now,
-                    body: Some(body.clone()),
-                    ..Entry::default()
-                };
-                self.store(&key, &entry);
+                self.update(|file| {
+                    file.entries.insert(
+                        key,
+                        Entry {
+                            fetched_at: now,
+                            body: Some(body.clone()),
+                            ..Entry::default()
+                        },
+                    );
+                    file.backoff = Backoff::default();
+                });
                 Ok(body)
             }
             Err(failure) => {
-                if failure.rate_limited {
-                    entry.rate_limited = entry.rate_limited.saturating_add(1);
-                }
-                entry.retry_after = now
-                    + backoff_secs(
-                        failure.rate_limited,
-                        entry.rate_limited,
-                        failure.retry_after,
-                    );
-                entry.last_error = Some(failure.message.clone());
-                self.store(&key, &entry);
+                self.update(|file| {
+                    let entry = file.entries.entry(key).or_default();
+                    entry.last_error = Some(failure.message.clone());
+                    if failure.rate_limited {
+                        let backoff = &mut file.backoff;
+                        backoff.rate_limited = backoff.rate_limited.saturating_add(1);
+                        backoff.retry_after = backoff.retry_after.max(
+                            now + backoff_secs(true, backoff.rate_limited, failure.retry_after),
+                        );
+                        backoff.last_error = Some(failure.message.clone());
+                    } else {
+                        entry.retry_after = now + backoff_secs(false, 0, None);
+                    }
+                });
                 match entry.body {
                     Some(body) if !fresh => Ok(body),
                     _ => bail!("{}", failure.message),
@@ -790,18 +831,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_entries_round_trip_and_tolerate_missing_fields() {
-        let entry = Entry {
-            fetched_at: 5,
-            body: Some(serde_json::json!({"limits": []})),
-            retry_after: 9,
-            rate_limited: 2,
-            last_error: Some("x".into()),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert_eq!(serde_json::from_str::<Entry>(&json).unwrap(), entry);
-        let sparse: Entry = serde_json::from_str("{}").unwrap();
-        assert_eq!(sparse, Entry::default());
+    fn cache_files_round_trip_and_an_older_shape_reads_as_empty() {
+        let mut file = CacheFile::default();
+        file.backoff.rate_limited = 2;
+        file.entries.insert(
+            "a|usage".into(),
+            Entry {
+                fetched_at: 5,
+                body: Some(serde_json::json!({"limits": []})),
+                retry_after: 9,
+                last_error: Some("x".into()),
+            },
+        );
+        let json = serde_json::to_string(&file).unwrap();
+        assert_eq!(serde_json::from_str::<CacheFile>(&json).unwrap(), file);
+        // 0.3.x kept a bare map of entries; it starts fresh.
+        let older: CacheFile =
+            serde_json::from_str(r#"{"a|usage": {"fetched_at": 5, "rate_limited": 1}}"#).unwrap();
+        assert_eq!(older, CacheFile::default());
     }
 
     #[test]
@@ -869,7 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_young_answer_is_reused_and_a_429_serves_the_last_good_one() {
+    async fn a_young_answer_is_reused_and_a_429_holds_back_every_account() {
         let good = serde_json::json!({"seven_day_opus": {"utilization": 30.0, "resets_at": null}});
         let (router, calls) = scripted(vec![
             (StatusCode::OK, None, good.clone()),
@@ -878,36 +925,50 @@ mod tests {
                 Some(7200),
                 serde_json::json!({}),
             ),
+            (StatusCode::OK, None, good.clone()),
         ]);
         let client = serve(router).await;
         let (_dir, cache) = temp_cache();
-        let read = |now, fresh| cache.read(&client, "acct", "tok", Endpoint::Usage, fresh, now);
+        let read = |account, now, fresh| {
+            let cache = cache.clone();
+            let client = client.clone();
+            async move {
+                cache
+                    .read(&client, account, "tok", Endpoint::Usage, fresh, now)
+                    .await
+            }
+        };
 
-        assert_eq!(read(1000, false).await.unwrap(), good);
-        assert_eq!(read(1000 + MAX_AGE_SECS - 1, false).await.unwrap(), good);
+        assert_eq!(read("acct", 1000, false).await.unwrap(), good);
+        assert_eq!(read("acct", 1000 + MAX_AGE_SECS - 1, false).await.unwrap(), good);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a young answer is reused");
 
         // Stale: asked again, refused, last good answer served.
-        assert_eq!(read(1000 + MAX_AGE_SECS, false).await.unwrap(), good);
+        let refused_at = 1000 + MAX_AGE_SECS;
+        assert_eq!(read("acct", refused_at, false).await.unwrap(), good);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let entry = cache.load().remove("acct|usage").unwrap();
-        assert_eq!(entry.rate_limited, 1);
-        assert_eq!(
-            entry.retry_after,
-            1000 + MAX_AGE_SECS + 7200,
-            "Retry-After wins"
-        );
-        assert!(entry.last_error.unwrap().contains("HTTP 429"));
+        let file = cache.load();
+        assert_eq!(file.backoff.rate_limited, 1);
+        assert_eq!(file.backoff.retry_after, refused_at + 7200, "Retry-After wins");
+        assert!(file.entries["acct|usage"].last_error.as_deref().unwrap().contains("HTTP 429"));
 
-        // Backed off: no request, the cache answers; a fresh read refuses.
-        assert_eq!(read(1000 + MAX_AGE_SECS + 10, false).await.unwrap(), good);
-        let refused = read(1000 + MAX_AGE_SECS + 10, true).await.unwrap_err();
-        assert!(refused.to_string().contains("backing off"), "{refused}");
+        // Backed off: no request for this account, nor for another one that
+        // has never been read; a fresh read refuses.
+        assert_eq!(read("acct", refused_at + 10, false).await.unwrap(), good);
+        let other = read("other", refused_at + 10, false).await.unwrap_err();
+        assert!(other.to_string().contains("for every account"), "{other}");
+        let fresh = read("acct", refused_at + 10, true).await.unwrap_err();
+        assert!(fresh.to_string().contains("backing off"), "{fresh}");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // After it, a success clears the fleet backoff.
+        assert_eq!(read("other", refused_at + 7200, false).await.unwrap(), good);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.load().backoff, Backoff::default());
     }
 
     #[tokio::test]
-    async fn first_failures_without_a_good_answer_are_errors_and_the_file_is_private() {
+    async fn other_failures_hold_back_only_their_account_and_the_file_is_private() {
         let (router, calls) = scripted(vec![
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -915,21 +976,32 @@ mod tests {
                 serde_json::json!("boom"),
             ),
             (StatusCode::OK, None, serde_json::json!({"limits": []})),
+            (StatusCode::OK, None, serde_json::json!({"limits": []})),
         ]);
         let client = serve(router).await;
         let (dir, cache) = temp_cache();
-        let read = |now| cache.read(&client, "acct", "tok", Endpoint::Usage, false, now);
-        let error = read(100).await.unwrap_err();
+        let read = |account, now| {
+            let cache = cache.clone();
+            let client = client.clone();
+            async move {
+                cache
+                    .read(&client, account, "tok", Endpoint::Usage, false, now)
+                    .await
+            }
+        };
+        let error = read("acct", 100).await.unwrap_err();
         assert!(error.to_string().contains("HTTP 500"), "{error}");
-        let entry = cache.load().remove("acct|usage").unwrap();
-        assert_eq!(entry.retry_after, 100 + ERROR_RETRY_SECS);
-        assert_eq!(entry.rate_limited, 0);
-        // Still inside the minute: no request.
-        assert!(read(150).await.is_err());
+        let file = cache.load();
+        assert_eq!(file.entries["acct|usage"].retry_after, 100 + ERROR_RETRY_SECS);
+        assert_eq!(file.backoff, Backoff::default());
+        // Still inside the minute: no request for it, but another account asks.
+        assert!(read("acct", 150).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        read("other", 150).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         // After it: fetched, and the entry's backoff state is cleared.
-        read(161).await.unwrap();
-        let entry = cache.load().remove("acct|usage").unwrap();
+        read("acct", 161).await.unwrap();
+        let entry = cache.load().entries.remove("acct|usage").unwrap();
         assert_eq!(entry.retry_after, 0);
         assert!(entry.last_error.is_none());
         #[cfg(unix)]
