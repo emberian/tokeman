@@ -296,21 +296,31 @@ Findings:
 
 - **A newly started `agy` uses whatever the slot holds.** No restart of anything else, no
   re-login, no prompt.
-- **A running `agy` does not notice the swap.** A long-lived `agy acp` server signed in as
-  `second@example.com` kept that account for 90 s of idling and through a new session after the
-  slot went back to `first@example.com`; its log never printed `Stored token metadata changed
-  externally`. tokeman therefore counts running `agy` processes after a switch and says they
-  need a restart.
+- **A running `agy` does not notice the swap, and later undoes it.** A long-lived `agy acp`
+  server signed in as `second@example.com` kept that account for 90 s of idling and through new
+  sessions after the slot went back to `first@example.com`; its log never printed `Stored token
+  metadata changed externally`. Its access token expired at 15:40. When its refresh went through
+  at 15:54:19 (the network was down from about 15:32), it logged `token refreshed, new
+  expiry=…16:54:18` and the slot then held `second@example.com` with exactly that expiry, modified
+  at 15:54:19: the running process wrote its own account back over the other one. So a switch
+  made while an `agy` runs lasts at most until that process refreshes, within the hour. tokeman
+  counts running `agy` processes after a switch and says to quit them and switch again. After
+  the test server was stopped (by its PID) the original value was written back, and `agy models`
+  signed in as `first@example.com`.
 - **`agy` refreshes early and writes the slot when it does.** Started on an access token with
   143 s left, it refreshed at once (`token refreshed, new expiry=…`) and rewrote the item. So a
-  slot value with a stale access token is fine, and the item changes under tokeman whenever
-  `agy` refreshes; the backup is of the value at the moment of the switch.
-- **The fallback token file.** `~/.gemini/antigravity-cli/antigravity-oauth-token` held a copy
-  of the `cmrx64` grant from 2026-11-09. It was still there after the first swap and the first
-  `agy models`, and gone after the `agy acp` run that refreshed and saved the other account's
-  token; nothing in the log mentions it. It was put back from the backup. tokeman rewrites the
-  file with the seated account's JSON when it exists and does not create it when it does not;
-  with the file rewritten, `agy models` signed in from the Keychain as expected.
+  slot value with a stale access token is fine, and the item's bytes change whenever `agy`
+  refreshes; the backup is of the value at the moment of the switch. (Two `agy` runs that were
+  not part of this experiment, at 14:42 and 14:47, refreshed the original account's token the
+  same way.)
+- **The fallback token file is transient.** `~/.gemini/antigravity-cli/antigravity-oauth-token`
+  held a copy of the `cmrx64` grant from 2026-11-09. `agy` deletes it when it refreshes and saves
+  to the Keychain: it vanished after each of the three refreshes seen (14:40 and 15:54 by the
+  test server, 15:55 by `agy models` on the original account) and survived the runs that did not
+  refresh. Nothing in the log mentions it. It was put back from the backup twice; after the last
+  refresh, by `agy` itself on the original account, it was left absent, which is the state `agy`
+  chose. tokeman rewrites the file with the seated account's JSON when it exists and does not
+  create it when it does not; with the file rewritten, `agy models` signed in from the Keychain.
 - The client is shared and the refresh token does not rotate, so seating a grant never
   invalidates tokeman's copy, and seating the other one back restores the first account.
 - Not done, on purpose: running `agy` in file-storage mode (`SSH_TTY`). The binary contains

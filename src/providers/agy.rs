@@ -7,9 +7,12 @@
 //! the base64 of `{"token": <oauth2.Token>, "auth_method", "id_token_email"}`.
 //!
 //! A newly started `agy` signs in as whatever the slot holds. A running one
-//! keeps the account it started with until it is restarted. Google does not
-//! rotate the refresh token and both sign-ins use one OAuth client, so
-//! copying tokeman's grant into the slot leaves tokeman's copy valid.
+//! keeps the account it started with, and at its next token refresh (within
+//! the hour) writes that account back into the slot, undoing a seating made
+//! while it ran. `agy` also deletes its fallback token file whenever it saves
+//! to the Keychain. Google does not rotate the refresh token and both
+//! sign-ins use one OAuth client, so copying tokeman's grant into the slot
+//! leaves tokeman's copy valid.
 //!
 //! Seating is manual (`tokeman services use`); the daemon never does it.
 
@@ -396,8 +399,8 @@ fn install(
     })
 }
 
-/// How many `agy` processes are running; they keep the account they started
-/// with.
+/// How many `agy` processes are running. Each keeps the account it started
+/// with and writes it back into the slot when it next refreshes its token.
 pub async fn running() -> usize {
     crate::claude::sessions::ps(&["-axo", "comm="], PS_TIMEOUT)
         .await
