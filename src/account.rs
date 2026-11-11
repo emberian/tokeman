@@ -1,5 +1,6 @@
 //! The fleet: every account tokeman may hand to Claude, the Codex profiles it
-//! keeps alive, and the two settings tables, all in `tokens.toml`.
+//! keeps alive, the services it only reads quota from, and the two settings
+//! tables, all in `tokens.toml`.
 //!
 //! Every write is a locked read-modify-write through [`Fleet::update`]. A
 //! login's refresh token is single-use, so a save from a stale copy would lose
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::paths;
+use crate::providers::ServiceAccount;
 use crate::settings::{LaunchSettings, PolicySettings};
 
 /// Refresh this long before expiry. Claude keeps its cached token until it is
@@ -250,6 +252,8 @@ impl CodexAccount {
 pub struct Fleet {
     pub accounts: Vec<Account>,
     pub codex: Vec<CodexAccount>,
+    /// `[[services]]`: read-only quota (GLM, Kimi, Antigravity).
+    pub services: Vec<ServiceAccount>,
     pub launch: LaunchSettings,
     pub policy: PolicySettings,
 }
@@ -316,6 +320,28 @@ impl Fleet {
         self.codex.len() < before
     }
 
+    pub fn service_account(&self, name: &str) -> Option<&ServiceAccount> {
+        self.services.iter().find(|account| account.name == name)
+    }
+
+    /// Add a service account, or replace the one with the same name.
+    pub fn upsert_service(&mut self, account: ServiceAccount) {
+        match self
+            .services
+            .iter_mut()
+            .find(|existing| existing.name == account.name)
+        {
+            Some(existing) => *existing = account,
+            None => self.services.push(account),
+        }
+    }
+
+    pub fn remove_service(&mut self, name: &str) -> bool {
+        let before = self.services.len();
+        self.services.retain(|account| account.name != name);
+        self.services.len() < before
+    }
+
     pub fn load() -> Result<Self> {
         let path = paths::accounts_file();
         let Some(contents) = read_if_present(&path)? else {
@@ -355,6 +381,7 @@ impl Fleet {
         Ok(Self {
             accounts: file.tokens.into_iter().map(Account::from).collect(),
             codex: file.codex_accounts,
+            services: file.services,
             launch: file.settings,
             policy: file.policy,
         })
@@ -418,6 +445,30 @@ impl Fleet {
                     "access_only",
                     account.access_only.then(|| value(true)),
                 );
+            },
+        );
+        sync_tables(
+            &mut doc,
+            "services",
+            &self.services,
+            |account| &account.name,
+            |account, table| {
+                set(table, "name", value(&account.name));
+                set(table, "service", value(account.service.name()));
+                set_opt(table, "key", account.key.as_deref().map(value));
+                set_opt(table, "key_file", account.key_file.as_deref().map(value));
+                set_opt(
+                    table,
+                    "refresh_token",
+                    account.refresh_token.as_deref().map(value),
+                );
+                set_opt(
+                    table,
+                    "access_token",
+                    account.access_token.as_deref().map(value),
+                );
+                set_opt(table, "expires_at", account.expires_at.map(value));
+                set_opt(table, "label", account.label.as_deref().map(value));
             },
         );
         let settings = doc
@@ -498,6 +549,8 @@ struct File {
     policy: PolicySettings,
     #[serde(default)]
     codex_accounts: Vec<CodexAccount>,
+    #[serde(default)]
+    services: Vec<ServiceAccount>,
 }
 
 /// One `[[tokens]]` table: an account's fields, flat.
@@ -791,9 +844,52 @@ mod tests {
     }
 
     #[test]
+    fn services_keep_their_comments_and_replace_by_name() {
+        use crate::providers::Service;
+        let existing = "[[services]]\n# the GLM coding plan\nname = \"glm\"\nservice = \"zai\"\nkey_file = \"~/.zai-key\"\n";
+        let mut fleet = Fleet::parse(existing).unwrap();
+        assert_eq!(
+            fleet.services,
+            [ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key")]
+        );
+        fleet.upsert_service(ServiceAccount::with_key_file(
+            Service::Kimi,
+            "kimi",
+            "~/.kimikey",
+        ));
+        fleet.upsert_service(ServiceAccount {
+            label: Some("work".into()),
+            ..ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key-2")
+        });
+        let rendered = fleet.render(existing).unwrap();
+        assert!(rendered.contains("# the GLM coding plan"), "{rendered}");
+        let reparsed = Fleet::parse(&rendered).unwrap();
+        assert_eq!(reparsed.services, fleet.services);
+        assert_eq!(
+            reparsed.service_account("glm").unwrap().key_file.as_deref(),
+            Some("~/.zai-key-2")
+        );
+        assert!(fleet.remove_service("glm"));
+        assert!(!fleet.remove_service("glm"));
+        let rendered = fleet.render(&rendered).unwrap();
+        assert!(!rendered.contains("glm"), "{rendered}");
+        assert!(Fleet::parse("[[services]]\nname = \"x\"\nservice = \"openai\"\n").is_err());
+    }
+
+    #[test]
     fn render_round_trips_every_table() {
         let mut fleet = Fleet::default();
         fleet.accounts.push(login_account(HOUR_MS));
+        fleet.services.push(crate::providers::ServiceAccount {
+            refresh_token: Some("1//refresh".into()),
+            access_token: Some("ya29.access".into()),
+            expires_at: Some(HOUR_MS),
+            ..crate::providers::ServiceAccount::with_key_file(
+                crate::providers::Service::Antigravity,
+                "agy",
+                "unused",
+            )
+        });
         fleet.upsert_codex(CodexAccount {
             parked: true,
             ..codex_account("work", "~/.codex-homes/work")

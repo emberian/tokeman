@@ -1,7 +1,9 @@
 //! Probe history: one row per reading, in sqlite, for charts and stats.
 //!
 //! The schema is the one every row since 0.1.0 was written with; legacy
-//! Opus/Sonnet columns are read into buckets and no longer written.
+//! Opus/Sonnet columns are read into buckets and no longer written. Service
+//! reads (GLM, Kimi, Antigravity) live in their own table, one JSON
+//! [`Usage`] per row.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -10,6 +12,7 @@ use serde::Serialize;
 use std::time::Duration;
 
 use crate::paths;
+use crate::providers::{Service, Usage};
 use crate::quota::{Bucket, ModelKey, Reading, Source, Window};
 
 pub struct Store {
@@ -100,7 +103,16 @@ impl Store {
                 model_usage_buckets TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time
-                ON snapshots(token_name, probed_at);",
+                ON snapshots(token_name, probed_at);
+            CREATE TABLE IF NOT EXISTS service_readings (
+                id INTEGER PRIMARY KEY,
+                service TEXT NOT NULL,
+                account TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                usage TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_service_readings_account_time
+                ON service_readings(service, account, at);",
         )?;
         // Databases from 0.1.x predate these columns; ALTER fails harmlessly when present.
         for column in [
@@ -155,6 +167,65 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn insert_usage(&self, usage: &Usage) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO service_readings (service, account, at, usage) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                usage.service.name(),
+                usage.account,
+                usage.at,
+                serde_json::to_string(usage)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The newest reads, newest first, optionally of one service account.
+    pub fn recent_usage(
+        &self,
+        account: Option<(Service, &str)>,
+        limit: usize,
+    ) -> Result<Vec<Usage>> {
+        let limit = limit as i64;
+        match account {
+            Some((service, name)) => self.query_usage(
+                "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT ?3",
+                params![service.name(), name, limit],
+            ),
+            None => self.query_usage("ORDER BY at DESC, id DESC LIMIT ?1", params![limit]),
+        }
+    }
+
+    /// The newest read of each service account, in no particular order.
+    pub fn latest_usage(&self) -> Result<Vec<Usage>> {
+        self.query_usage(
+            "WHERE id IN (SELECT MAX(id) FROM service_readings GROUP BY service, account)",
+            [],
+        )
+    }
+
+    /// One service account's reads since `since` (epoch seconds), oldest first.
+    pub fn usage_since(&self, service: Service, account: &str, since: i64) -> Result<Vec<Usage>> {
+        self.query_usage(
+            "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
+            params![service.name(), account, since],
+        )
+    }
+
+    /// Rows that no longer parse (a field this build does not know) are skipped.
+    fn query_usage(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Usage>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT usage FROM service_readings {tail}"))?;
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect())
     }
 
     pub fn recent(&self, account: Option<&str>, limit: usize) -> Result<Vec<Snapshot>> {
@@ -372,6 +443,55 @@ mod tests {
             Some(Window::new(0.75, 30))
         );
         assert!(store.recent(Some("other"), 5).unwrap().is_empty());
+    }
+
+    fn usage(service: Service, account: &str, at: i64, used: f64) -> Usage {
+        Usage {
+            service,
+            account: account.into(),
+            at,
+            plan: Some("max".into()),
+            meters: vec![crate::providers::Meter {
+                group: None,
+                label: "5h".into(),
+                window: Window::new(used, at + 3600),
+                span_secs: Some(18_000),
+                amount: None,
+            }],
+            balances: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn service_reads_round_trip_and_the_latest_is_per_account() {
+        let (_dir, store) = open();
+        store.insert_usage(&usage(Service::Zai, "glm", 100, 0.1)).unwrap();
+        store.insert_usage(&usage(Service::Zai, "glm", 200, 0.2)).unwrap();
+        store.insert_usage(&usage(Service::Kimi, "glm", 150, 0.5)).unwrap();
+        store
+            .insert_usage(&Usage::failed(Service::Kimi, "kimi", 300, "HTTP 401"))
+            .unwrap();
+        let glm = store.usage_since(Service::Zai, "glm", 150).unwrap();
+        assert_eq!(glm, [usage(Service::Zai, "glm", 200, 0.2)]);
+        let recent = store.recent_usage(Some((Service::Zai, "glm")), 5).unwrap();
+        assert_eq!(recent.iter().map(|u| u.at).collect::<Vec<_>>(), [200, 100]);
+        let mut latest: Vec<_> = store
+            .latest_usage()
+            .unwrap()
+            .into_iter()
+            .map(|u| (u.service, u.account, u.at))
+            .collect();
+        latest.sort();
+        assert_eq!(
+            latest,
+            [
+                (Service::Zai, "glm".to_owned(), 200),
+                (Service::Kimi, "glm".to_owned(), 150),
+                (Service::Kimi, "kimi".to_owned(), 300)
+            ]
+        );
+        assert_eq!(store.recent_usage(None, 1).unwrap()[0].error.as_deref(), Some("HTTP 401"));
     }
 
     #[test]
