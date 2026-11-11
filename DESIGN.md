@@ -19,11 +19,13 @@ fact was learned is in git; the code states the fact and nothing more.
   The policy therefore stays on the default until the default itself is at
   its floor, and lands only on an account with real room.
 - **Readings are partial.** The response headers of a Haiku request describe
-  the 5h and 7d windows and that model's own weekly window (`7d_oi` for
-  Fable); per-model weekly limits come from the profile endpoint, which needs a
-  full-scope login and rate-limits aggressively; rejections seen in a
-  transcript are the only signal for some limits. A reading is a merge of
-  these sources, each tagged.
+  the 7d window, the 5h window when the account has one and has used it, and
+  that model's own weekly window (`7d_oi`, Fable only); the overall status
+  describes only the requested model. The profile endpoint's `limits[]` is the
+  full list of meters (session, weekly_all, weekly_scoped per model) and says
+  whether a 5h limit exists at all, but needs a full-scope login and
+  rate-limits per address; rejections seen in a transcript are the only
+  signal for some limits. A reading is a merge of these sources, each tagged.
 - **Credentials have two kinds.** A setup token (`claude setup-token`) is
   long-lived and inference-only. A browser login is full-scope and refreshable,
   and its refresh token is single-use: a save from a stale copy, or a
@@ -55,9 +57,9 @@ src/
   anthropic/
     mod.rs       the HTTP client that identifies as Claude Code; error classification
     probe.rs     the Haiku probe and the optional target-model sample -> Reading
-    profile.rs   /api/oauth/usage: parser, on-disk cache, 429 backoff
-    oauth.rs     PKCE login, code exchange with retry, refresh
-    resets.rs    cedar_ember / juniper_tide offers and claims
+    profile.rs   /api/oauth/usage: limits[] parser, on-disk cache, fleet-wide 429 backoff
+    oauth.rs     PKCE login, code exchange with retry, refresh (incl. refresh-token expiry)
+    resets.rs    cedar_ember / juniper_tide offers and claims; pending-claim journal
   claude/
     settings.rs  ~/.claude/settings.json env block: install, clear, inspect (the only writer, 0600)
     keychain.rs  macOS: capture, suppress and restore the /login Keychain record
@@ -97,28 +99,46 @@ columns in new readings (still read from old rows).
 pub struct Window { pub used: f64 /* 0..1 */, pub resets_at: i64 /* epoch s */ }
 pub struct ModelKey(String);                 // "opus48", "fable51", "fable" (family-wide)
 pub enum Source { Headers, Profile, Observed, Carried }
-pub struct Bucket { pub key: ModelKey, pub label: String, pub window: Window, pub source: Source }
-pub enum Verdict { Allowed, Rejected, Unknown }
+pub struct Bucket { pub key: ModelKey, pub label: String, pub window: Window, pub source: Source,
+                   pub share: Option<f64> /* of the weekly: Fable 0.5 */ }
+impl Bucket { fn room(&self, weekly: Option<&Window>) -> f64 }   // min(own room x share, weekly room)
+pub enum Family { Opus, Sonnet, Fable, Mythos }
+pub enum Verdict { Allowed, AllowedWarning, Rejected, Unknown }
+pub enum SessionLimit { Unknown, Present, Absent }   // Absent: limits[] has no session row (verified Ultra)
+pub struct Signals {                       // display and history; only the window statuses gate viability
+    session_status, weekly_status, model_weekly_status: Option<WindowStatus { verdict, surpassed_threshold }>,
+    claims: Vec<String>, fallback_available: bool, fallback_percentage: Option<f64>, upgrade_paths: Vec<String>,
+    slow: Option<SlowLane { offer: SlowOffer, status: SlowStatus, retry_after_secs, max_wait_secs, budget: Window }>,
+    grace: Option<Grace { status, session_used, weekly_used }>,
+}
 pub struct Reading {
     pub account: String,
     pub at: i64,
-    pub verdict: Verdict,
-    pub session: Option<Window>,            // 5h
+    pub verdict: Verdict,                   // for the requested model only
+    pub claim: Option<String>,
+    pub session: Option<Window>,            // 5h; utilization kept as reported, over 1.0 included
     pub weekly: Option<Window>,             // 7d
     pub buckets: Vec<Bucket>,               // per-model weekly, including Fable
     pub overage: Option<Overage>,
-    pub error: Option<ProbeError>,          // typed: Network, Auth(Refused|Revoked|Expired), RateLimited, Edge
+    pub error: Option<ProbeError>,
+    pub profile_error: Option<String>,
+    pub session_limit: SessionLimit,
+    pub signals: Signals,
 }
-impl Reading { fn remaining(&self, w: Which) -> Option<f64>; fn bucket(&self, key: &ModelKey) -> Option<&Bucket> }
+impl Reading { fn bucket(&self, key: &ModelKey) -> Option<&Bucket>; fn model_room(&self, model) -> Option<f64>;
+               fn above(&self, session_floor, weekly_floor, model) -> bool }
 
 // account.rs
 pub enum Credential<'a> { Setup(&'a str), Login { token: &'a str, expires_at: i64, scopes: &'a [String] } }
-pub struct Account { name, setup_key: Option<String>, login: Option<LoginGrant>, login_error: Option<String> }
+pub struct Login { access_token, refresh_token, expires_at, obtained_at, logged_in_at,
+                   refresh_expires_at /* reported; min kept across refreshes */, scopes, error }
+pub struct Account { name, setup_key: Option<String>, login: Option<Login> }
 impl Account { fn credential(&self, now: i64) -> Option<Credential> }   // login if live, else setup
 pub struct Fleet { pub accounts: Vec<Account>, pub codex: Vec<CodexAccount>, pub launch: LaunchSettings, pub policy: PolicySettings }
 impl Fleet { fn load() ; fn update(|&mut Fleet| -> T) -> T  /* locked RMW, comments kept */ }
 
-// policy.rs  (pure; the tests are the spec)
+// policy.rs  (pure; the tests are the spec). Landing is weekly-first: the
+// candidate whose weekly resets soonest, then room.
 pub enum Mode { Normal, Sip }
 pub struct Floors { pub session: f64, pub weekly: f64 }
 pub struct Policy { normal: Floors, sip: Floors, landing: Floors, intervals: Intervals, sample_secs: u64 }
@@ -132,7 +152,7 @@ pub struct Event { at: i64, account: Option<String>, fingerprint: Option<Fingerp
 pub fn account_at(events: &[Event], at: i64) -> Option<Option<String>>
 
 // observe.rs
-pub enum Family { Opus, Sonnet, Fable, General }
+pub enum Family { Opus, Sonnet, Fable, Mythos, General }
 pub enum LimitWindow { Session, Weekly }
 pub struct ObservedLimit { account, family, model: Option<ModelKey>, window, observed_at, resets_at, session: Option<String>, source: LimitSource }
 ```
@@ -153,16 +173,21 @@ Rules the types enforce:
 ## Compatibility kept
 
 - `tokens.toml`: same tables and keys (`[[tokens]]` with `name`, `key`,
-  `access_token`, `refresh_token`, `expires_at`, `obtained_at`, `scopes`,
-  `login_error`; `[settings]`; `[rotation]`; `[[codex_accounts]]`). Comments
-  survive every write.
+  `access_token`, `refresh_token`, `expires_at`, `obtained_at`,
+  `logged_in_at`, `refresh_expires_at`, `scopes`, `login_error`;
+  `[settings]`; `[rotation]`; `[[codex_accounts]]`). Comments survive every
+  write; keys added later are optional.
 - `~/.claude/settings.json` env keys: `CLAUDE_CODE_OAUTH_TOKEN`,
   `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_401_WAIT_MS`, `TOKEMAN_ACCOUNT`;
   the SessionStart hook command `tokeman rotate observe-session --pid "$PPID"`.
 - `claude-credential-history.jsonl` events, `claude-admission-state.json`,
-  `history.db` snapshots: read as they are; new rows use the same schema.
+  `history.db` snapshots: read as they are; new rows use the same schema
+  plus `session_limit` and `signals` columns appended (old rows read them as
+  Unknown and empty).
 - CLI commands and flags as documented in the README. `browse` is removed.
 - Cadence state and the profile-read cache are caches and start fresh.
+- `reset-claims/<account>.pending`: a grant claim sent without a known
+  outcome. It is never deleted except by a read answer or `tokeman resets clear`.
 
 ## Facts the design rests on
 
@@ -177,7 +202,18 @@ Each was measured; the commit that measured it is findable by its date.
 - Premium models refuse subscription tokens with a bare 429 and no quota
   headers unless the request carries Claude Code's identity (2026-09-25).
 - `/api/oauth/usage` answers 429 under a 20-second probe cadence; Claude Code
-  caches it for 60 seconds (2026-09-25).
+  caches it for 60 seconds (2026-09-25). Its 429 budget is per address, so a
+  429 backs off every account.
+- Verified Ultra accounts (Max 20x until 2026-10-30) have no 5h limit; their
+  `limits[]` has no session row. No account here sent a `5h-*` header on
+  2026-11-11. Fable's weekly limit is a 50% share of the weekly
+  (`weekly_scoped_shares`) and its `7d_oi` can read over 1.0.
+- The token endpoint reports `refresh_token_expires_in`; refreshes do not
+  extend it (Claude Code 2.1.322 keeps the earlier date). Logins have lasted
+  28 days (2026-08) and 30 (2026-11).
+- `cedar_ember` is read with `?cedar_ember=1&skip_spend=1`, `juniper_tide`
+  with `?at_wall=1&skip_spend=1` (Claude Code 2.1.322). A Fable grant
+  (`gives_back_weekly`) gives back only Fable's use of the weekly.
 - Reset programs (`cedar_ember`, `juniper_tide`) are eligible only for the
   Claude Code user agent (2026-09-25).
 - The ChatGPT edge challenges h2 requests with Codex's headers and replays
