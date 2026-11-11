@@ -114,9 +114,67 @@ pub enum Command {
         #[command(subcommand)]
         action: CodexAction,
     },
+    /// Read-only quota of other coding subscriptions (GLM, Kimi, Antigravity)
+    Services {
+        #[command(subcommand)]
+        action: Option<ServicesAction>,
+        /// Output the reads as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the tray application
     #[cfg(feature = "tray")]
     Tray,
+}
+
+#[derive(Subcommand)]
+pub enum ServicesAction {
+    /// Read every service account now and print the gauges
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register an API-key service account
+    Add {
+        #[arg(value_enum)]
+        service: KeyService,
+        /// Unique across services
+        name: String,
+        /// File holding the API key, e.g. ~/.zai-key; read on every poll
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Unregister a service account
+    Remove { name: String },
+    /// Register the accounts another app on this machine is signed in to
+    Import {
+        #[arg(value_enum)]
+        source: ImportSource,
+    },
+}
+
+/// The services whose accounts are an API key.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum KeyService {
+    Zai,
+    Kimi,
+}
+
+impl KeyService {
+    pub fn service(self) -> crate::providers::Service {
+        match self {
+            Self::Zai => crate::providers::Service::Zai,
+            Self::Kimi => crate::providers::Service::Kimi,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ImportSource {
+    /// Google Antigravity: the agy Keychain item and the IDE's state database
+    Antigravity,
 }
 
 #[derive(Subcommand)]

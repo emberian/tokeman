@@ -5,6 +5,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::account::Account;
 use crate::claude::sessions;
 use crate::daemon::status::Report;
+use crate::providers::{Balance, Meter, Usage};
 use crate::quota::{Level, Reading, Verdict};
 use crate::store::{Snapshot, Stats};
 
@@ -279,6 +280,153 @@ fn print_buckets(reading: &Reading) {
     }
 }
 
+/// `$21.96` for dollars, `21.96 EUR` for anything else.
+pub fn format_money(minor: i64, currency: &str) -> String {
+    let sign = if minor < 0 { "-" } else { "" };
+    let (whole, cents) = (minor.abs() / 100, minor.abs() % 100);
+    match currency {
+        "USD" | "" => format!("{sign}${whole}.{cents:02}"),
+        other => format!("{sign}{whole}.{cents:02} {other}"),
+    }
+}
+
+fn balance_text(balance: &Balance) -> String {
+    let left = format_money(balance.left_minor, &balance.currency);
+    match balance.total_minor {
+        Some(total) => format!(
+            "{} {left} of {} left",
+            balance.label,
+            format_money(total, &balance.currency)
+        ),
+        None => format!("{} {left} left", balance.label),
+    }
+}
+
+fn meter_name(meter: &Meter) -> String {
+    match &meter.group {
+        Some(group) => format!("{group} {}", meter.label),
+        None => meter.label.clone(),
+    }
+}
+
+/// `5h 99% · weekly 79% · extra usage $21.96 of $50.00 left`, or the error:
+/// one service account on one line, without colour.
+pub fn usage_summary(usage: &Usage) -> String {
+    if let Some(error) = &usage.error {
+        return format!("error: {}", one_line(error, 100));
+    }
+    let mut parts: Vec<String> = usage
+        .meters
+        .iter()
+        .map(|meter| {
+            format!(
+                "{} {:.0}%",
+                meter_name(meter),
+                (meter.window.remaining().max(0.0) * 100.0).round()
+            )
+        })
+        .collect();
+    parts.extend(usage.balances.iter().map(balance_text));
+    parts.join(" · ")
+}
+
+/// `3m ago`, `2h ago`, `Tue 4:00PM`: how old a read is.
+pub fn format_age(at: i64, now: i64) -> String {
+    let secs = (now - at).max(0);
+    match secs {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        _ => DateTime::from_timestamp(at, 0)
+            .unwrap_or_default()
+            .with_timezone(&Local)
+            .format("%a %-I:%M%p")
+            .to_string(),
+    }
+}
+
+/// The services section of `tokeman list`: the last stored read of each
+/// configured service account, without network.
+pub fn print_service_list(accounts: &[crate::providers::ServiceAccount], latest: &[Usage], now: i64) {
+    if accounts.is_empty() {
+        return;
+    }
+    println!("\n {BOLD}services{RESET}");
+    for account in accounts {
+        let read = latest
+            .iter()
+            .find(|usage| usage.service == account.service && usage.account == account.name);
+        let detail = match read {
+            Some(usage) => format!(
+                "{}{}  {DIM}({}){RESET}",
+                usage.plan.as_deref().map(|plan| format!("[{plan}] ")).unwrap_or_default(),
+                usage_summary(usage),
+                format_age(usage.at, now)
+            ),
+            None => format!("{DIM}not read yet (`tokeman services`){RESET}"),
+        };
+        println!(
+            "  {:<24} {:<12} {detail}",
+            account.name,
+            account.service.label()
+        );
+    }
+}
+
+/// `tokeman services`: every service account with its gauges.
+pub fn print_usages(usages: &[Usage]) {
+    if usages.is_empty() {
+        println!(
+            "No service accounts configured. Use `tokeman services add <zai|kimi> <name> --key-file <path>`."
+        );
+        return;
+    }
+    println!();
+    for usage in usages {
+        let plan = usage
+            .plan
+            .as_deref()
+            .map(|plan| format!("  {DIM}[{plan}]{RESET}"))
+            .unwrap_or_default();
+        println!(
+            " {BOLD}{}{RESET} — {}{plan}",
+            usage.account,
+            usage.service.label()
+        );
+        if let Some(error) = &usage.error {
+            println!("   {RED}error: {error}{RESET}");
+        }
+        let width = usage
+            .meters
+            .iter()
+            .map(|meter| meter_name(meter).chars().count())
+            .max()
+            .unwrap_or(0);
+        for meter in &usage.meters {
+            let amount = meter
+                .amount
+                .as_ref()
+                .map(|amount| {
+                    format!(
+                        "  {DIM}{:.0}/{:.0} {}{RESET}",
+                        amount.used, amount.limit, amount.unit
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "   {:<width$} {}  resets {}{amount}",
+                meter_name(meter),
+                bar(meter.window.used.clamp(0.0, 1.0)),
+                format_reset(meter.window.resets_at),
+            );
+        }
+        for balance in &usage.balances {
+            println!("   {}", balance_text(balance));
+        }
+        println!();
+    }
+}
+
 pub fn print_history(snapshots: &[Snapshot]) {
     if snapshots.is_empty() {
         println!("No snapshots recorded yet.");
@@ -468,6 +616,41 @@ mod tests {
         assert_eq!(truncate_chars("héllo", 2), "hé");
         assert!(mask_key("abcdefghijklmnop💥qrstuv").starts_with("abcdefghijklmnop..."));
         assert_eq!(mask_key("short"), "****");
+    }
+
+    #[test]
+    fn a_usage_reads_as_one_line_of_room_left() {
+        use crate::providers::{Meter, Service};
+        use crate::quota::Window;
+        let meter = |label: &str, used: f64| Meter {
+            group: None,
+            label: label.into(),
+            window: Window::new(used, 0),
+            span_secs: None,
+            amount: None,
+        };
+        let usage = Usage {
+            service: Service::Kimi,
+            account: "kimi".into(),
+            at: 0,
+            plan: Some("Vivace".into()),
+            meters: vec![meter("5h", 0.0057), meter("weekly", 1.2)],
+            balances: vec![Balance {
+                label: "extra usage".into(),
+                left_minor: 2196,
+                total_minor: Some(5000),
+                currency: "USD".into(),
+            }],
+            error: None,
+        };
+        assert_eq!(
+            usage_summary(&usage),
+            "5h 99% · weekly 0% · extra usage $21.96 of $50.00 left"
+        );
+        let failed = Usage::failed(Service::Zai, "glm", 0, "z.ai refused:\n bad key");
+        assert_eq!(usage_summary(&failed), "error: z.ai refused: bad key");
+        assert_eq!(format_money(-5, "EUR"), "-0.05 EUR");
+        assert_eq!(format_age(100, 100 + 7200), "2h ago");
     }
 
     #[test]

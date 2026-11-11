@@ -493,6 +493,11 @@ impl Fleet {
             "probe_interval_secs",
             value(self.launch.probe_interval_secs as i64),
         );
+        set(
+            settings,
+            "services_interval_secs",
+            value(self.launch.services_interval_secs as i64),
+        );
         set_opt(
             settings,
             "terminal",

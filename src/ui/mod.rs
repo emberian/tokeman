@@ -3,6 +3,7 @@
 pub mod chart;
 pub mod codex_cli;
 pub mod interactive;
+pub mod services_cli;
 pub mod text;
 #[cfg(feature = "tray")]
 pub mod tray;

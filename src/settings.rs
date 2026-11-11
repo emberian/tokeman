@@ -21,11 +21,21 @@ pub struct LaunchSettings {
     /// Probe interval for the trays and the TUI.
     #[serde(default = "default_probe_interval")]
     pub probe_interval_secs: u64,
+    /// How often the daemon and the TUI read the `[[services]]` quotas.
+    #[serde(default = "default_services_interval")]
+    pub services_interval_secs: u64,
 }
 
 fn default_probe_interval() -> u64 {
     30
 }
+
+fn default_services_interval() -> u64 {
+    300
+}
+
+/// Service usage endpoints are polled no faster than this.
+pub const MIN_SERVICES_INTERVAL_SECS: u64 = 60;
 
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -35,19 +45,27 @@ impl Default for LaunchSettings {
             terminal: None,
             claude_bin: None,
             probe_interval_secs: default_probe_interval(),
+            services_interval_secs: default_services_interval(),
         }
     }
 }
 
 impl LaunchSettings {
     /// Every key `tokeman settings set` accepts.
-    pub const KEYS: [&'static str; 5] = [
+    pub const KEYS: [&'static str; 6] = [
         "launch_args",
         "dangerous_mode",
         "terminal",
         "claude_bin",
         "probe_interval_secs",
+        "services_interval_secs",
     ];
+
+    /// The services poll interval, never below [`MIN_SERVICES_INTERVAL_SECS`]
+    /// whatever tokens.toml says.
+    pub fn services_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.services_interval_secs.max(MIN_SERVICES_INTERVAL_SECS))
+    }
 
     /// The binary and arguments to launch with. `TOKEMAN_CLAUDE_BIN` overrides
     /// the configured binary.
@@ -89,19 +107,31 @@ impl LaunchSettings {
                     _ => bail!("probe_interval_secs takes a whole number of seconds, at least 1"),
                 }
             }
+            "services_interval_secs" => {
+                self.services_interval_secs = match value.parse() {
+                    Ok(secs) if secs >= MIN_SERVICES_INTERVAL_SECS => secs,
+                    _ => bail!(
+                        "services_interval_secs takes a whole number of seconds, at least {MIN_SERVICES_INTERVAL_SECS}"
+                    ),
+                }
+            }
             _ => bail!("unknown setting {key:?}; one of {}", Self::KEYS.join(", ")),
         }
         Ok(())
     }
 
     /// `(key, value)` pairs in the order of [`Self::KEYS`], for display.
-    pub fn entries(&self) -> [(&'static str, String); 5] {
+    pub fn entries(&self) -> [(&'static str, String); 6] {
         [
             ("launch_args", self.launch_args.join(" ")),
             ("dangerous_mode", self.dangerous_mode.to_string()),
             ("terminal", self.terminal.clone().unwrap_or_default()),
             ("claude_bin", self.claude_bin.clone().unwrap_or_default()),
             ("probe_interval_secs", self.probe_interval_secs.to_string()),
+            (
+                "services_interval_secs",
+                self.services_interval_secs.to_string(),
+            ),
         ]
     }
 }
@@ -232,6 +262,11 @@ mod tests {
         settings.set("probe_interval_secs", "45").unwrap();
         assert_eq!(settings.probe_interval_secs, 45);
         assert!(settings.set("probe_interval_secs", "0").is_err());
+        settings.set("services_interval_secs", "600").unwrap();
+        assert_eq!(settings.services_interval().as_secs(), 600);
+        assert!(settings.set("services_interval_secs", "59").is_err());
+        settings.services_interval_secs = 1;
+        assert_eq!(settings.services_interval().as_secs(), MIN_SERVICES_INTERVAL_SECS);
         assert!(settings.set("colour", "red").is_err());
     }
 

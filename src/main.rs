@@ -87,7 +87,7 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::List => {
             let fleet = Fleet::load()?;
-            if fleet.accounts.is_empty() {
+            if fleet.accounts.is_empty() && fleet.services.is_empty() {
                 println!(
                     "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
                 );
@@ -111,6 +111,10 @@ async fn dispatch(command: Command) -> Result<()> {
                     text::describe_login(account, now_ms)
                 );
             }
+            let latest = Store::open()
+                .and_then(|store| store.latest_usage())
+                .unwrap_or_default();
+            text::print_service_list(&fleet.services, &latest, now_ms / 1000);
         }
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate(action).await?,
@@ -189,6 +193,9 @@ async fn dispatch(command: Command) -> Result<()> {
             }
         },
         Command::Codex { action } => tokeman::ui::codex_cli::run(action).await?,
+        Command::Services { action, json } => {
+            tokeman::ui::services_cli::run(action, json).await?
+        }
         #[cfg(feature = "tray")]
         Command::Tray => tokeman::ui::tray::run(Fleet::load()?)?,
     }
