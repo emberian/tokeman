@@ -6,10 +6,12 @@
 //! them. Every switch cold-starts the prompt cache of every live session, so
 //! switching rarely matters more than switching early.
 //!
-//! Where a switch lands is weekly-first: weekly quota left at its reset is
-//! lost, so among the candidates the one whose weekly window resets soonest
-//! is spent first, and room only breaks ties. That changes where a switch
-//! lands, never whether one happens.
+//! Where a switch lands spends expiring room first: weekly quota left at its
+//! reset is lost, so a candidate whose weekly window resets within
+//! [`EXPIRING_WITHIN_SECS`] is preferred, soonest first. Beyond that horizon
+//! the longest dwell lands, because room days from its reset can still be
+//! spent after a later switch. That changes where a switch lands, never
+//! whether one happens.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -168,8 +170,8 @@ pub fn choose_landing<'a>(
         .or_else(|| choose_above(readings, policy.floors(Mode::Sip), model))
 }
 
-/// The account above `floors` to land on: the soonest weekly reset first
-/// (an unreported one last), then the longest balanced dwell, then the
+/// The account above `floors` to land on: a weekly reset within
+/// [`EXPIRING_WITHIN_SECS`] first (soonest first), then the longest balanced dwell, then the
 /// soonest reset of its limiting window, then raw use, then name. An account
 /// without a 5h window is ranked on its weekly room alone.
 pub fn choose_above<'a>(
@@ -181,7 +183,7 @@ pub fn choose_above<'a>(
         .iter()
         .filter(|reading| above(reading, floors, model))
         .min_by(|a, b| {
-            compare_reset(weekly_reset(a), weekly_reset(b))
+            compare_reset(expiring_reset(a), expiring_reset(b))
                 .then_with(|| {
                     compare_f64(dwell_score(b, floors, model), dwell_score(a, floors, model))
                 })
@@ -194,12 +196,19 @@ pub fn choose_above<'a>(
         })
 }
 
-/// When the weekly window resets, epoch seconds; `None` when unreported.
-fn weekly_reset(reading: &Reading) -> Option<i64> {
+/// How close a weekly reset must be, measured from the reading, for the room
+/// before it to count as expiring. Room further out can still be spent after
+/// a later switch, so it does not justify landing on a tighter account.
+pub const EXPIRING_WITHIN_SECS: i64 = 24 * 3600;
+
+/// When the weekly window resets, epoch seconds, if that is within
+/// [`EXPIRING_WITHIN_SECS`] of the reading; `None` when further out or
+/// unreported.
+fn expiring_reset(reading: &Reading) -> Option<i64> {
     reading
         .weekly
         .map(|window| window.resets_at)
-        .filter(|&reset| reset > 0)
+        .filter(|&reset| reset > 0 && reset - reading.at <= EXPIRING_WITHIN_SECS)
 }
 
 /// Sooner first; unknown last.
@@ -631,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn landing_is_weekly_first_and_room_breaks_ties() {
+    fn landing_spends_expiring_weekly_room_first_and_otherwise_the_longest_dwell() {
         let policy = PolicySettings::default();
         let land = |readings: &[Reading]| {
             choose_landing(readings, &policy, opus().as_ref()).map(|r| r.account.clone())
@@ -653,13 +662,31 @@ mod tests {
             Some("roomy".into())
         );
         // An unreported weekly reset ranks after a known one.
+        // Neither weekly expires within a day: the longest dwell lands.
         assert_eq!(
             land(&[
                 reading_with_resets("unknown-reset", 0.0, 0.0, 0, 0),
                 reading_with_resets("known-reset", 0.3, 0.5, 0, 6 * 86_400),
             ]),
-            Some("known-reset".into())
+            Some("unknown-reset".into())
         );
+        // A tight account days from its reset is not worth a switch that
+        // ends soon after; its room can still be spent later.
+        assert_eq!(
+            land(&[
+                reading_with_resets("tight-in-five-days", 0.0, 0.85, 0, 5 * 86_400),
+                reading_with_resets("fresh-in-six-days", 0.0, 0.0, 0, 6 * 86_400),
+            ]),
+            Some("fresh-in-six-days".into())
+        );
+        // The horizon is measured from the reading, not from epoch zero.
+        let mut late = reading_with_resets("expiring-later-read", 0.0, 0.6, 0, 0);
+        late.at = 10 * 86_400;
+        late.weekly = Some(Window::new(0.6, late.at + 3_600));
+        let mut fresh = reading_with_resets("fresh-read-late", 0.0, 0.0, 0, 0);
+        fresh.at = late.at;
+        fresh.weekly = Some(Window::new(0.0, late.at + 6 * 86_400));
+        assert_eq!(land(&[fresh, late]), Some("expiring-later-read".into()));
         // Below the landing floors it still falls back to the sip floors.
         assert_eq!(
             land(&[
@@ -706,7 +733,7 @@ mod tests {
             decide(&situation(Some("cur")), &policy),
             Decision::Stay { healthy: true }
         );
-        // With no default, the switch lands on the soonest weekly reset.
+        // With no default, the switch lands on the room expiring within a day.
         assert_eq!(
             decide(&situation(None), &policy),
             Decision::Switch {

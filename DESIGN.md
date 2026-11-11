@@ -153,8 +153,9 @@ pub struct Meter { group: Option<String>, label: String, window: Window, span_se
 pub struct Usage { service, account, at, plan: Option<String>, meters: Vec<Meter>, balances: Vec<Balance>, error: Option<String> }
 impl Fleet { fn load() ; fn update(|&mut Fleet| -> T) -> T  /* locked RMW, comments kept */ }
 
-// policy.rs  (pure; the tests are the spec). Landing is weekly-first: the
-// candidate whose weekly resets soonest, then room.
+// policy.rs  (pure; the tests are the spec). Landing spends expiring room
+// first: a weekly reset within 24 h of the reading, soonest first; otherwise
+// the longest dwell.
 pub enum Mode { Normal, Sip }
 pub struct Floors { pub session: f64, pub weekly: f64 }
 pub struct Policy { normal: Floors, sip: Floors, landing: Floors, intervals: Intervals, sample_secs: u64 }
