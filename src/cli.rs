@@ -153,6 +153,25 @@ pub enum ServicesAction {
         #[arg(value_enum)]
         source: ImportSource,
     },
+    /// Sign the agy CLI in as an Antigravity account (macOS; manual, the
+    /// daemon never switches it). Running agy sessions keep their account
+    /// until restarted.
+    Use {
+        /// The Antigravity service account to seat
+        #[arg(required_unless_present = "previous")]
+        name: Option<String>,
+        /// Put back the login the last `use` replaced
+        #[arg(long, conflicts_with = "name")]
+        previous: bool,
+    },
+    /// Read a service's accounts now and rank them by room left
+    Best {
+        #[arg(value_enum)]
+        service: crate::providers::Service,
+        /// Count only the limits whose group contains this text, e.g. "claude"
+        #[arg(long)]
+        group: Option<String>,
+    },
 }
 
 /// The services whose accounts are an API key.

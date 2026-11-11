@@ -114,7 +114,8 @@ async fn dispatch(command: Command) -> Result<()> {
             let latest = Store::open()
                 .and_then(|store| store.latest_usage())
                 .unwrap_or_default();
-            text::print_service_list(&fleet.services, &latest, now_ms / 1000);
+            let seated = tokeman::ui::services_cli::seated(&fleet.services).await;
+            text::print_service_list(&fleet.services, &latest, seated.as_deref(), now_ms / 1000);
         }
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate(action).await?,

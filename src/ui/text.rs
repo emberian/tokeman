@@ -417,9 +417,13 @@ pub fn format_age(at: i64, now: i64) -> String {
 
 /// The services section of `tokeman list`: the last stored read of each
 /// configured service account, without network.
+///
+/// `seated` names the Antigravity account the agy CLI is signed in as; it is
+/// marked `*` like the Claude default.
 pub fn print_service_list(
     accounts: &[crate::providers::ServiceAccount],
     latest: &[Usage],
+    seated: Option<&str>,
     now: i64,
 ) {
     if accounts.is_empty() {
@@ -443,16 +447,22 @@ pub fn print_service_list(
             ),
             None => format!("{DIM}not read yet (`tokeman services`){RESET}"),
         };
+        let (marker, note) = if seated == Some(account.name.as_str()) {
+            ("*", format!("  {GREEN}agy's login{RESET}"))
+        } else {
+            (" ", String::new())
+        };
         println!(
-            "  {:<24} {:<12} {detail}",
+            "{marker} {:<24} {:<12} {detail}{note}",
             account.name,
             account.service.label()
         );
     }
 }
 
-/// `tokeman services`: every service account with its gauges.
-pub fn print_usages(usages: &[Usage]) {
+/// `tokeman services`: every service account with its gauges. `seated`
+/// names the Antigravity account the agy CLI is signed in as.
+pub fn print_usages(usages: &[Usage], seated: Option<&str>) {
     if usages.is_empty() {
         println!(
             "No service accounts configured. Use `tokeman services add <zai|kimi> <name> --key-file <path>`."
@@ -466,8 +476,13 @@ pub fn print_usages(usages: &[Usage]) {
             .as_deref()
             .map(|plan| format!("  {DIM}[{plan}]{RESET}"))
             .unwrap_or_default();
+        let note = if seated == Some(usage.account.as_str()) {
+            format!("  {GREEN}* agy's login{RESET}")
+        } else {
+            String::new()
+        };
         println!(
-            " {BOLD}{}{RESET} — {}{plan}",
+            " {BOLD}{}{RESET} — {}{plan}{note}",
             usage.account,
             usage.service.label()
         );
@@ -515,6 +530,24 @@ fn share_note(bucket: &Bucket, reading: &Reading) -> String {
             bucket.room(reading.weekly.as_ref()).max(0.0) * 100.0
         ),
         None => String::new(),
+    }
+}
+
+/// `tokeman services best`: accounts by room left, most first.
+pub fn print_ranking(ranked: &[(&Usage, f64)], seated: Option<&str>) {
+    for (place, (usage, room)) in ranked.iter().enumerate() {
+        let note = if seated == Some(usage.account.as_str()) {
+            format!("  {GREEN}* agy's login{RESET}")
+        } else {
+            String::new()
+        };
+        println!(
+            " {}. {BOLD}{:<24}{RESET} {:>3.0}% left  {DIM}{}{RESET}{note}",
+            place + 1,
+            usage.account,
+            (room.max(0.0) * 100.0).round(),
+            usage_summary(usage)
+        );
     }
 }
 
