@@ -1,5 +1,6 @@
 //! `tokeman --watch`: a ratatui dashboard that probes on an interval, shows
-//! a card per account, and charts the history over six ranges.
+//! a card per account, charts the history over six ranges, and keeps one
+//! line per service account (GLM, Kimi, Antigravity) on its own cadence.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,11 +26,13 @@ use crate::claude::settings as claude_settings;
 use crate::daemon;
 use crate::observe;
 use crate::policy::{self, Mode};
+use crate::providers::{self, Usage};
 use crate::quota::{Level, ModelKey, Reading, Source, Window};
 use crate::store::{Series, Snapshot, Store};
 use crate::ui::chart::{Point, format_duration_hours, known_buckets, points, segments};
 use crate::ui::text::{
-    claim_label, format_reset_compact, short_bucket_label, status_badge, truncate_chars,
+    claim_label, format_age, format_reset_compact, short_bucket_label, status_badge,
+    truncate_chars, usage_summary,
 };
 
 /// Chart ranges in days, cycled with `[` / `]`.
@@ -119,6 +122,9 @@ struct App {
     /// `None` until the first census, or when the census failed.
     live_sessions: Option<Vec<Session>>,
     mode: Mode,
+    /// The last read of each service account, seeded from the store.
+    services: Vec<Usage>,
+    last_services_read: Option<Instant>,
 }
 
 impl App {
@@ -141,6 +147,8 @@ impl App {
             target_model: target_model(),
             live_sessions: None,
             mode: Mode::Normal,
+            services: Vec::new(),
+            last_services_read: None,
             fleet,
         }
     }
@@ -186,6 +194,44 @@ impl App {
                 self.history.insert(account.name.clone(), snapshots);
             }
         }
+    }
+
+    fn services_due(&self) -> bool {
+        !self.fleet.services.is_empty()
+            && self
+                .last_services_read
+                .is_none_or(|at| at.elapsed() >= self.fleet.launch.services_interval())
+    }
+
+    fn spawn_services_read(&mut self) -> JoinHandle<Vec<Usage>> {
+        let accounts = self.fleet.services.clone();
+        tokio::spawn(async move {
+            providers::read_all(providers::client(), &accounts, Utc::now().timestamp()).await
+        })
+    }
+
+    fn apply_services(&mut self, usages: Vec<Usage>) {
+        for usage in &usages {
+            let _ = self.store.insert_usage(usage);
+        }
+        self.services = usages;
+        self.last_services_read = Some(Instant::now());
+    }
+
+    /// The stored reads of the configured service accounts, in fleet order.
+    fn seed_services(&mut self) {
+        let latest = self.store.latest_usage().unwrap_or_default();
+        self.services = self
+            .fleet
+            .services
+            .iter()
+            .filter_map(|account| {
+                latest
+                    .iter()
+                    .find(|usage| usage.service == account.service && usage.account == account.name)
+                    .cloned()
+            })
+            .collect();
     }
 
     fn range_days(&self) -> i64 {
@@ -271,12 +317,14 @@ impl Drop for TerminalSession {
 pub async fn run(fleet: Fleet) -> Result<()> {
     let store = Store::open()?;
     let mut app = App::new(fleet, store);
+    app.seed_services();
     app.live_sessions = sessions::live().await.ok();
     let started_as = daemon::executable_identity();
 
     let terminal_session = TerminalSession::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mut active_probe: Option<JoinHandle<Vec<Reading>>> = None;
+    let mut active_services: Option<JoinHandle<Vec<Usage>>> = None;
     let mut executable_replaced = false;
 
     loop {
@@ -294,6 +342,16 @@ pub async fn run(fleet: Fleet) -> Result<()> {
         if app.last_probe.elapsed() >= app.refresh_interval && active_probe.is_none() {
             active_probe = Some(app.spawn_probe());
         }
+        if let Some(read) = active_services.take_if(|read| read.is_finished()) {
+            match read.await {
+                Ok(usages) => app.apply_services(usages),
+                // Retried at the next interval rather than at once.
+                Err(_) => app.last_services_read = Some(Instant::now()),
+            }
+        }
+        if active_services.is_none() && app.services_due() {
+            active_services = Some(app.spawn_services_read());
+        }
 
         terminal.draw(|f| draw(f, &app))?;
 
@@ -308,6 +366,9 @@ pub async fn run(fleet: Fleet) -> Result<()> {
                 KeyCode::Char('r') => {
                     if active_probe.is_none() {
                         active_probe = Some(app.spawn_probe());
+                    }
+                    if active_services.is_none() && !app.fleet.services.is_empty() {
+                        active_services = Some(app.spawn_services_read());
                     }
                 }
                 KeyCode::Char('c') => {
@@ -345,6 +406,9 @@ pub async fn run(fleet: Fleet) -> Result<()> {
 
     if let Some(probe) = active_probe {
         probe.abort();
+    }
+    if let Some(read) = active_services {
+        read.abort();
     }
     drop(terminal);
     drop(terminal_session);
@@ -384,6 +448,21 @@ fn draw(f: &mut Frame, app: &App) {
         )
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, chunks[0]);
+
+    let main = if app.fleet.services.is_empty() {
+        chunks[1]
+    } else {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(4),
+                Constraint::Length(app.fleet.services.len() as u16 + 1),
+            ])
+            .split(chunks[1]);
+        draw_services(f, split[1], app);
+        split[0]
+    };
+    let chunks = [chunks[0], main, chunks[2]];
 
     if app.readings.is_empty() {
         let empty = Paragraph::new("  No results yet. Waiting for first probe...")
@@ -614,6 +693,50 @@ fn draw_card(
     }
 }
 
+/// One line per configured service account: its last read, or that none came yet.
+fn service_lines(app: &App, now: i64) -> Vec<Line<'static>> {
+    app.fleet
+        .services
+        .iter()
+        .map(|account| {
+            let read = app
+                .services
+                .iter()
+                .find(|usage| usage.service == account.service && usage.account == account.name);
+            let head = Span::raw(format!(
+                " {:<22} {:<11} ",
+                truncate_chars(&account.name, 22),
+                account.service.label()
+            ));
+            let Some(usage) = read else {
+                return Line::from(vec![
+                    head,
+                    Span::styled("reading...", Style::default().fg(Color::DarkGray)),
+                ]);
+            };
+            let color = match (&usage.error, usage.tightest()) {
+                (Some(_), _) => Color::Red,
+                (None, Some(meter)) => level_color(Level::of(meter.window.remaining())),
+                (None, None) => Color::DarkGray,
+            };
+            Line::from(vec![
+                head,
+                Span::styled(usage_summary(usage), Style::default().fg(color)),
+                Span::styled(
+                    format!("  {}", format_age(usage.at, now)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn draw_services(f: &mut Frame, area: Rect, app: &App) {
+    let services = Paragraph::new(service_lines(app, Utc::now().timestamp()))
+        .block(Block::default().borders(Borders::TOP).title(" services "));
+    f.render_widget(services, area);
+}
+
 fn level_color(level: Level) -> Color {
     match level {
         Level::Ok => Color::Green,
@@ -795,6 +918,42 @@ mod tests {
     use super::*;
     use crate::quota::ProbeError;
     use crate::testing::{bucket, point};
+
+    #[test]
+    fn each_service_account_gets_a_line_read_or_not() {
+        use crate::providers::{Meter, Service, ServiceAccount};
+        let dir = tempfile::tempdir().unwrap();
+        let mut fleet = Fleet::default();
+        fleet.services = vec![
+            ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key"),
+            ServiceAccount::with_key_file(Service::Kimi, "kimi", "~/.kimikey"),
+        ];
+        let mut app = App::new(fleet, Store::open_at(&dir.path().join("s.db")).unwrap());
+        app.services = vec![Usage {
+            service: Service::Kimi,
+            account: "kimi".into(),
+            at: 1_000,
+            plan: None,
+            meters: vec![Meter {
+                group: None,
+                label: "weekly".into(),
+                window: Window::new(0.9, 0),
+                span_secs: None,
+                amount: None,
+            }],
+            balances: Vec::new(),
+            error: None,
+        }];
+        let text: Vec<String> = service_lines(&app, 1_000 + 300)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text.len(), 2);
+        assert!(text[0].contains("glm") && text[0].contains("reading..."), "{text:?}");
+        assert!(text[1].contains("weekly 10%") && text[1].contains("5m ago"), "{text:?}");
+        let tight = service_lines(&app, 1_300)[1].spans[1].style.fg;
+        assert_eq!(tight, Some(Color::Red));
+    }
 
     fn reading() -> Reading {
         let mut r = crate::testing::reading("a", 0.2, 0.4);
