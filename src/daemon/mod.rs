@@ -1,5 +1,6 @@
 //! The rotation daemon: the loop, one cycle, its on-disk state, the lock,
-//! the launchd service, and the commands that change what it manages.
+//! the launchd service, the service-quota poll, and the commands that change
+//! what it manages.
 
 pub mod cadence;
 pub mod cycle;
@@ -7,6 +8,7 @@ pub mod lock;
 pub mod log;
 pub mod refresh;
 pub mod service;
+pub mod services;
 pub mod status;
 
 use std::path::PathBuf;
@@ -48,6 +50,7 @@ pub async fn run() -> Result<()> {
     let mut next_codex_sweep = Instant::now();
     let mut refresh_backoff = refresh::Backoff::default();
     let mut codex_state = crate::codex::commands::MaintenanceState::default();
+    let mut services_poller = services::Poller::default();
     loop {
         wake.tick().await;
         if started_as.is_some() && executable_identity().is_some_and(|now| Some(now) != started_as)
@@ -68,6 +71,10 @@ pub async fn run() -> Result<()> {
                 continue;
             }
         };
+        // Runs in its own task; the cycle below never waits on it.
+        for line in services_poller.tick(&fleet).await {
+            log(&line);
+        }
         let scheduled = cycle::Options {
             scheduled: true,
             ..cycle::Options::default()
