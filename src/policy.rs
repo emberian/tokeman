@@ -2,9 +2,14 @@
 //!
 //! The default stays until it reaches its own normal floors, and leaves only
 //! for an account above the landing floors. With nowhere worth landing it
-//! drains in place to the sip floors, then moves to the roomiest account that
-//! is above them. Every switch cold-starts the prompt cache of every live
-//! session, so switching rarely matters more than switching early.
+//! drains in place to the sip floors, then moves to an account that is above
+//! them. Every switch cold-starts the prompt cache of every live session, so
+//! switching rarely matters more than switching early.
+//!
+//! Where a switch lands is weekly-first: weekly quota left at its reset is
+//! lost, so among the candidates the one whose weekly window resets soonest
+//! is spent first, and room only breaks ties. That changes where a switch
+//! lands, never whether one happens.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -163,8 +168,10 @@ pub fn choose_landing<'a>(
         .or_else(|| choose_above(readings, policy.floors(Mode::Sip), model))
 }
 
-/// The roomiest account above `floors`: longest balanced dwell first, then
-/// the soonest reset of its limiting window, then raw use, then name.
+/// The account above `floors` to land on: the soonest weekly reset first
+/// (an unreported one last), then the longest balanced dwell, then the
+/// soonest reset of its limiting window, then raw use, then name. An account
+/// without a 5h window is ranked on its weekly room alone.
 pub fn choose_above<'a>(
     readings: &'a [Reading],
     floors: Floors,
@@ -174,14 +181,35 @@ pub fn choose_above<'a>(
         .iter()
         .filter(|reading| above(reading, floors, model))
         .min_by(|a, b| {
-            compare_f64(dwell_score(b, floors, model), dwell_score(a, floors, model))
+            compare_reset(weekly_reset(a), weekly_reset(b))
                 .then_with(|| {
-                    compare_delay(reset_delay(a, floors, model), reset_delay(b, floors, model))
+                    compare_f64(dwell_score(b, floors, model), dwell_score(a, floors, model))
+                })
+                .then_with(|| {
+                    compare_reset(reset_delay(a, floors, model), reset_delay(b, floors, model))
                 })
                 .then_with(|| compare_f64(used(a).0, used(b).0))
                 .then_with(|| compare_f64(used(a).1, used(b).1))
                 .then_with(|| a.account.cmp(&b.account))
         })
+}
+
+/// When the weekly window resets, epoch seconds; `None` when unreported.
+fn weekly_reset(reading: &Reading) -> Option<i64> {
+    reading
+        .weekly
+        .map(|window| window.resets_at)
+        .filter(|&reset| reset > 0)
+}
+
+/// Sooner first; unknown last.
+fn compare_reset(a: Option<i64>, b: Option<i64>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// Use of the shared windows; an unreported window has none.
@@ -253,15 +281,6 @@ fn reset_delay(reading: &Reading, floors: Floors, model: Option<&ModelKey>) -> O
     });
     let reset = windows.first().map(|(_, reset)| *reset).unwrap_or(0);
     (reset > 0).then(|| reset.saturating_sub(reading.at))
-}
-
-fn compare_delay(a: Option<i64>, b: Option<i64>) -> Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 fn compare_f64(a: f64, b: f64) -> Ordering {
@@ -568,17 +587,17 @@ mod tests {
                 "same-dwell-first",
             ),
             (
-                "headroom beats an earlier reset",
+                "the sooner weekly reset beats more room",
                 vec![
                     reading_with_resets("roomy", 0.08, 0.01, 3_600, 86_400),
                     reading_with_resets("soon-but-tight", 0.06, 0.54, 600, 600),
                 ],
-                "roomy",
+                "soon-but-tight",
             ),
             (
-                "only the limiting window's reset counts",
+                "with one weekly reset, only the limiting window's reset counts",
                 vec![
-                    reading_with_resets("non-limiting-reset", 0.00, 0.50, 60, 7_200),
+                    reading_with_resets("non-limiting-reset", 0.00, 0.50, 60, 9_000),
                     reading_with_resets("limiting-reset", 0.40, 0.10, 600, 9_000),
                 ],
                 "limiting-reset",
@@ -609,6 +628,92 @@ mod tests {
         assert_eq!(best(&fleet, Mode::Normal, Some(&fable)), Some("a"));
         // For any other model only the weekly counts.
         assert_eq!(best(&fleet, Mode::Normal, opus().as_ref()), Some("b"));
+    }
+
+    #[test]
+    fn landing_is_weekly_first_and_room_breaks_ties() {
+        let policy = PolicySettings::default();
+        let land = |readings: &[Reading]| {
+            choose_landing(readings, &policy, opus().as_ref()).map(|r| r.account.clone())
+        };
+        // Weekly quota left at its reset is lost: spend the one resetting soonest.
+        assert_eq!(
+            land(&[
+                reading_with_resets("fresh-next-week", 0.0, 0.0, 0, 6 * 86_400),
+                reading_with_resets("resets-in-an-hour", 0.2, 0.6, 0, 3_600),
+            ]),
+            Some("resets-in-an-hour".into())
+        );
+        // Same reset: the roomier one.
+        assert_eq!(
+            land(&[
+                reading_with_resets("tight", 0.2, 0.6, 0, 3_600),
+                reading_with_resets("roomy", 0.2, 0.3, 0, 3_600),
+            ]),
+            Some("roomy".into())
+        );
+        // An unreported weekly reset ranks after a known one.
+        assert_eq!(
+            land(&[
+                reading_with_resets("unknown-reset", 0.0, 0.0, 0, 0),
+                reading_with_resets("known-reset", 0.3, 0.5, 0, 6 * 86_400),
+            ]),
+            Some("known-reset".into())
+        );
+        // Below the landing floors it still falls back to the sip floors.
+        assert_eq!(
+            land(&[
+                reading_with_resets("scrap-late", 0.0, 0.94, 0, 6 * 86_400),
+                reading_with_resets("scrap-soon", 0.0, 0.95, 0, 3_600),
+            ]),
+            Some("scrap-soon".into())
+        );
+    }
+
+    #[test]
+    fn a_weekly_only_account_is_ranked_on_its_weekly_room_alone() {
+        let mut ultra = reading_with_resets("ultra", 0.0, 0.5, 0, 3_600);
+        ultra.session = None;
+        ultra.session_limit = crate::quota::SessionLimit::Absent;
+        let pro = reading_with_resets("pro", 0.85, 0.5, 600, 3_600);
+        assert_eq!(
+            best(&[pro.clone(), ultra.clone()], Mode::Normal, opus().as_ref()),
+            Some("ultra")
+        );
+        // Its weekly room is its only gate.
+        ultra.weekly = Some(Window::new(0.96, 3_600));
+        assert!(!viable_in(&ultra, Mode::Normal));
+    }
+
+    #[test]
+    fn weekly_first_moves_where_a_switch_lands_never_whether_it_happens() {
+        let policy = PolicySettings::default();
+        let model = opus();
+        let fleet: &'static [Reading] = Box::leak(Box::new([
+            reading_with_resets("cur", 0.30, 0.50, 0, 6 * 86_400),
+            reading_with_resets("soon", 0.10, 0.20, 0, 3_600),
+            reading_with_resets("later", 0.0, 0.0, 0, 5 * 86_400),
+        ]));
+        let situation = |current| Situation {
+            readings: fleet,
+            expected: fleet.len(),
+            current,
+            model: model.as_ref(),
+            force: false,
+        };
+        // A healthy default stays, however soon another account resets.
+        assert_eq!(
+            decide(&situation(Some("cur")), &policy),
+            Decision::Stay { healthy: true }
+        );
+        // With no default, the switch lands on the soonest weekly reset.
+        assert_eq!(
+            decide(&situation(None), &policy),
+            Decision::Switch {
+                to: &fleet[1],
+                trigger: Trigger::NoDefault
+            }
+        );
     }
 
     #[test]
