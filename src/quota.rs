@@ -251,6 +251,131 @@ impl Verdict {
     }
 }
 
+/// What a window's own `-status` and `-surpassed-threshold` headers said.
+/// The overall `unified-status` describes the requested model only; these
+/// describe each window whatever the model.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowStatus {
+    pub verdict: Verdict,
+    /// The warning threshold the window has crossed (0.25 .. 1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surpassed_threshold: Option<f64>,
+}
+
+/// The experiment arm of the low-priority lane offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlowOffer {
+    Treatment,
+    Control,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// The low-priority lane's state (`unified-slow-status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlowStatus {
+    Active,
+    NotNeeded,
+    SlotBusy,
+    WeeklyLimit,
+    BudgetExhausted,
+    Ineligible,
+    Off,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Parse a header value into a snake_case enum with an `Unrecognized` arm.
+pub fn parse_wire<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+}
+
+/// The low-priority lane past the 5h wall: requests sent with
+/// `anthropic-usage-limit: slow` are served when capacity allows, charged to
+/// the weekly limit. Never room: an account on it is walled.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SlowLane {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer: Option<SlowOffer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SlowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait_secs: Option<f64>,
+    /// The lane's own budget, as a fraction used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Window>,
+}
+
+/// A wrap-up allowance past a limit: 2xx responses keep arriving while a
+/// window reads at or over 1.0. Never room.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Grace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_used: Option<f64>,
+}
+
+/// Everything else the rate-limit headers said, for display and history.
+/// Only the per-window statuses take part in viability.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Signals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<WindowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_status: Option<WindowStatus>,
+    /// The requested model's own weekly window (`7d_oi`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_weekly_status: Option<WindowStatus>,
+    /// Every `unified-claim`: the windows the server counts as exceeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+    /// `unified-fallback: available`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_percentage: Option<f64>,
+    /// What the account could buy (`overage`, `upgrade_plan`, ...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upgrade_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow: Option<SlowLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace: Option<Grace>,
+}
+
+impl Signals {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Whether the account has a 5-hour limit at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionLimit {
+    /// Nothing says either way: headers that lack the 5h window prove nothing.
+    #[default]
+    Unknown,
+    /// The headers or the profile's `limits[]` reported a session window.
+    Present,
+    /// The profile's `limits[]` has no `session` row: a weekly-only account
+    /// (verified Ultra).
+    Absent,
+}
+
+impl SessionLimit {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
 /// Extra usage beyond the subscription, when the account has it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Overage {
@@ -347,6 +472,10 @@ pub struct Reading {
     /// Why the profile endpoint added nothing, when it was asked.
     #[serde(default)]
     pub profile_error: Option<String>,
+    #[serde(default, skip_serializing_if = "SessionLimit::is_unknown")]
+    pub session_limit: SessionLimit,
+    #[serde(default, skip_serializing_if = "Signals::is_empty")]
+    pub signals: Signals,
 }
 
 impl Reading {
@@ -363,6 +492,16 @@ impl Reading {
             overage: None,
             error: Some(error),
             profile_error: None,
+            session_limit: SessionLimit::Unknown,
+            signals: Signals::default(),
+        }
+    }
+
+    /// A reading of `account` that knows nothing yet.
+    pub fn empty(account: &str, at: i64) -> Self {
+        Self {
+            error: None,
+            ..Self::failed(account, at, ProbeError::NoCredential)
         }
     }
 
@@ -415,12 +554,21 @@ impl Reading {
             .map(|bucket| &bucket.window)
     }
 
-    /// Whether the account can take sessions on `model`: allowed, with every
-    /// reported shared window above its floor and every limiting model bucket
-    /// above the weekly floor.
+    /// Whether a shared window's own status header says it is rejected.
+    fn shared_window_rejected(&self) -> bool {
+        [self.signals.session_status, self.signals.weekly_status]
+            .into_iter()
+            .flatten()
+            .any(|status| status.verdict == Verdict::Rejected)
+    }
+
+    /// Whether the account can take sessions on `model`: allowed, no shared
+    /// window rejected by its own status, every reported shared window above
+    /// its floor and every limiting model bucket above the weekly floor.
     pub fn above(&self, session_floor: f64, weekly_floor: f64, model: Option<&ModelKey>) -> bool {
         self.has_quota()
             && self.verdict.allows()
+            && !self.shared_window_rejected()
             && self
                 .session
                 .is_none_or(|window| window.above(session_floor))
@@ -536,6 +684,47 @@ mod tests {
         assert!(!failed.has_quota());
         assert!(!failed.is_refused());
         assert!(Reading::failed("a", 0, ProbeError::NoCredential).is_refused());
+    }
+
+    #[test]
+    fn a_shared_window_rejected_by_its_own_status_is_not_above_any_floor() {
+        let mut r = reading(0.1, 0.5);
+        assert!(r.above(0.05, 0.05, None));
+        r.signals.weekly_status = Some(WindowStatus {
+            verdict: Verdict::AllowedWarning,
+            surpassed_threshold: Some(0.5),
+        });
+        assert!(r.above(0.05, 0.05, None));
+        r.signals.weekly_status = Some(WindowStatus {
+            verdict: Verdict::Rejected,
+            surpassed_threshold: Some(1.0),
+        });
+        assert!(!r.above(0.0, 0.0, None));
+        // A model's own window rejected says nothing about other models.
+        let mut fable_walled = reading(0.1, 0.5);
+        fable_walled.signals.model_weekly_status = Some(WindowStatus {
+            verdict: Verdict::Rejected,
+            surpassed_threshold: None,
+        });
+        assert!(fable_walled.above(0.05, 0.05, Some(&key("claude-opus-5-5"))));
+    }
+
+    #[test]
+    fn wire_enums_parse_known_values_and_keep_the_unknown_ones() {
+        assert_eq!(parse_wire::<SlowStatus>("not_needed"), Some(SlowStatus::NotNeeded));
+        assert_eq!(parse_wire::<SlowStatus>("budget_exhausted"), Some(SlowStatus::BudgetExhausted));
+        assert_eq!(parse_wire::<SlowStatus>("brand_new"), Some(SlowStatus::Unrecognized));
+        assert_eq!(parse_wire::<SlowOffer>("treatment"), Some(SlowOffer::Treatment));
+    }
+
+    #[test]
+    fn readings_without_the_new_fields_still_parse_and_do_not_grow_on_write() {
+        let old = r#"{"account":"a","at":1,"verdict":"allowed"}"#;
+        let parsed: Reading = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.session_limit, SessionLimit::Unknown);
+        assert!(parsed.signals.is_empty());
+        let written = serde_json::to_string(&parsed).unwrap();
+        assert!(!written.contains("signals") && !written.contains("session_limit"));
     }
 
     #[test]

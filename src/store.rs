@@ -347,6 +347,8 @@ mod tests {
             }),
             error: None,
             profile_error: None,
+            session_limit: crate::quota::SessionLimit::Present,
+            signals: crate::quota::Signals::default(),
         }
     }
 

@@ -288,6 +288,41 @@ fn print_windows(reading: &Reading) {
         .map(|claim| claim_label(claim).map_or(claim, |(long, _)| long))
         .unwrap_or("--");
     println!("   Status: {color}{word}{RESET}  (limit: {claim})");
+    for line in signal_lines(reading) {
+        println!("   {DIM}{line}{RESET}");
+    }
+}
+
+/// What the headers said beyond the windows: none of it is room.
+pub fn signal_lines(reading: &Reading) -> Vec<String> {
+    let signals = &reading.signals;
+    let mut lines = Vec::new();
+    if signals.claims.len() > 1 {
+        lines.push(format!("Exceeded: {}", signals.claims.join(", ")));
+    }
+    if let Some(slow) = &signals.slow {
+        let status = slow
+            .status
+            .and_then(|status| serde_json::to_value(status).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "offered".into());
+        let budget = slow
+            .budget
+            .map(|w| format!(", budget {:.0}% used", w.used * 100.0))
+            .unwrap_or_default();
+        lines.push(format!("Low-priority lane: {status}{budget}"));
+    }
+    if let Some(grace) = &signals.grace {
+        let parts: Vec<String> = [("5h", grace.session_used), ("7d", grace.weekly_used)]
+            .into_iter()
+            .filter_map(|(name, used)| used.map(|used| format!("{name} {:.0}%", used * 100.0)))
+            .collect();
+        lines.push(format!("Grace past the limit: {}", parts.join(", ")));
+    }
+    if !signals.upgrade_paths.is_empty() {
+        lines.push(format!("Could buy: {}", signals.upgrade_paths.join(", ")));
+    }
+    lines
 }
 
 fn print_buckets(reading: &Reading) {
@@ -505,6 +540,28 @@ mod tests {
         assert_eq!(format_reset(0), "--");
         assert_eq!(format_reset(1), "now");
         assert_eq!(format_reset_compact(0), "--");
+    }
+
+    #[test]
+    fn signals_are_described_but_quiet_when_absent() {
+        let mut reading = crate::testing::reading("a", 0.1, 0.2);
+        assert!(signal_lines(&reading).is_empty());
+        reading.signals.claims = vec!["seven_day".into(), "seven_day_overage_included".into()];
+        reading.signals.slow = Some(crate::quota::SlowLane {
+            status: Some(crate::quota::SlowStatus::SlotBusy),
+            budget: Some(crate::quota::Window::new(0.25, 0)),
+            ..Default::default()
+        });
+        reading.signals.upgrade_paths = vec!["overage".into()];
+        let lines = signal_lines(&reading);
+        assert_eq!(
+            lines,
+            [
+                "Exceeded: seven_day, seven_day_overage_included",
+                "Low-priority lane: slot_busy, budget 25% used",
+                "Could buy: overage",
+            ]
+        );
     }
 
     #[test]

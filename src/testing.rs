@@ -32,6 +32,8 @@ pub fn reading_with_resets(
         overage: None,
         error: None,
         profile_error: None,
+        session_limit: crate::quota::SessionLimit::Present,
+        signals: crate::quota::Signals::default(),
     }
 }
 
