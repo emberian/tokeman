@@ -62,7 +62,7 @@ impl Login {
 
 /// Without a reported expiry, warn this many days after a login; refresh
 /// tokens have lasted 28 to 30 days.
-const LOGIN_WARNING_DAYS: i64 = 21;
+pub const LOGIN_WARNING_DAYS: i64 = 21;
 /// With a reported expiry, warn this long before it, as Claude Code does.
 pub const REFRESH_WARNING_MS: i64 = 3 * 86_400_000;
 
