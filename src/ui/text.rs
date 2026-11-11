@@ -585,7 +585,8 @@ mod tests {
     #[test]
     fn a_shared_limit_says_how_much_of_the_weekly_it_still_allows() {
         let mut reading = crate::testing::reading("a", 0.0, 0.4);
-        let mut fable = crate::testing::bucket("fable", "Fable", 0.5, crate::quota::Source::Profile);
+        let mut fable =
+            crate::testing::bucket("fable", "Fable", 0.5, crate::quota::Source::Profile);
         assert_eq!(share_note(&fable, &reading), "");
         fable.share = Some(0.5);
         reading.buckets.push(fable.clone());
@@ -606,7 +607,10 @@ mod tests {
         assert!(line.contains("; login ends "), "{line}");
         assert!(!line.contains("soon"), "{line}");
         let line = describe_login(&account, 28 * DAY_MS);
-        assert!(line.contains("(in 2d): run `tokeman login acct` soon"), "{line}");
+        assert!(
+            line.contains("(in 2d): run `tokeman login acct` soon"),
+            "{line}"
+        );
         let line = describe_login(&account, 31 * DAY_MS);
         assert!(line.contains("login ended"), "{line}");
 

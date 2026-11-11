@@ -311,7 +311,9 @@ pub async fn status(
         let read: ResetStatus = match serde_json::from_value(body) {
             Ok(read) => read,
             Err(error) => {
-                status.errors.push(format!("unreadable reset status: {error}"));
+                status
+                    .errors
+                    .push(format!("unreadable reset status: {error}"));
                 continue;
             }
         };
@@ -372,7 +374,13 @@ impl Journal {
     fn path(&self, account: &str) -> PathBuf {
         let safe: String = account
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || "-_.@".contains(c) { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-_.@".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.join(format!("{safe}.pending"))
     }
@@ -625,7 +633,10 @@ mod tests {
         .unwrap();
         assert_eq!(grant.kind, Some(GrantType::Weekly));
         assert_eq!(grant.blocking, ["blocked_seven_day"]);
-        assert_eq!(grant.state(at("2026-11-08T00:00:00Z")), GrantState::NotStarted);
+        assert_eq!(
+            grant.state(at("2026-11-08T00:00:00Z")),
+            GrantState::NotStarted
+        );
         assert_eq!(grant.state(at("2026-11-11T00:00:00Z")), GrantState::Usable);
         assert_eq!(grant.state(at("2027-03-09T07:59:00Z")), GrantState::Expired);
         assert!(!grant.is_usable(at("2026-11-08T00:00:00Z")));
@@ -664,10 +675,9 @@ mod tests {
         let tier: GrantProgram =
             serde_json::from_str(r#"{"eligible": false, "ineligible_reason": "tier"}"#).unwrap();
         assert_eq!(tier.standing(), Standing::Ineligible);
-        let no_grant: GrantProgram = serde_json::from_str(
-            r#"{"eligible": false, "ineligible_reason": "no_grant"}"#,
-        )
-        .unwrap();
+        let no_grant: GrantProgram =
+            serde_json::from_str(r#"{"eligible": false, "ineligible_reason": "no_grant"}"#)
+                .unwrap();
         assert_eq!(no_grant.standing(), Standing::Ineligible);
         let session: SessionProgram =
             serde_json::from_str(r#"{"eligible": false, "ineligible_reason": "surface"}"#).unwrap();
@@ -801,7 +811,10 @@ mod tests {
     async fn an_uncertain_claim_is_resent_as_itself_and_blocks_any_other_grant() {
         let (router, sent) = fake_api(vec![
             (StatusCode::BAD_GATEWAY, "upstream timeout"),
-            (StatusCode::OK, r#"{"result": "reset", "cleared": ["five_hour"]}"#),
+            (
+                StatusCode::OK,
+                r#"{"result": "reset", "cleared": ["five_hour"]}"#,
+            ),
             (StatusCode::OK, r#"{"result": "not_limited"}"#),
         ]);
         let client = serve(router).await;
@@ -821,7 +834,10 @@ mod tests {
         let refused = claim(&client, &account, Some("g2"), &journal, 200)
             .await
             .unwrap_err();
-        assert!(refused.to_string().contains("no known outcome"), "{refused}");
+        assert!(
+            refused.to_string().contains("no known outcome"),
+            "{refused}"
+        );
         assert_eq!(sent.lock().unwrap().len(), 1);
 
         // The same grant is resent with the same request id; an answer clears it.
@@ -840,7 +856,10 @@ mod tests {
         // The session reset carries no grant and no journal entry.
         let session = claim(&client, &account, None, &journal, 400).await.unwrap();
         assert_eq!(session.result, ClaimResult::NotLimited);
-        assert_eq!(sent.lock().unwrap()[2], serde_json::json!({"program": "juniper_tide"}));
+        assert_eq!(
+            sent.lock().unwrap()[2],
+            serde_json::json!({"program": "juniper_tide"})
+        );
         assert_eq!(journal.pending("acct").unwrap(), None);
     }
 
@@ -850,7 +869,10 @@ mod tests {
         let journal = Journal::at(dir.path().to_owned());
         journal.clear("nobody").unwrap();
         std::fs::write(dir.path().join("a_b.pending"), "not json").unwrap();
-        assert!(journal.pending("a/b").is_err(), "a garbled entry still blocks");
+        assert!(
+            journal.pending("a/b").is_err(),
+            "a garbled entry still blocks"
+        );
         journal.clear("a/b").unwrap();
         assert_eq!(journal.pending("a/b").unwrap(), None);
     }

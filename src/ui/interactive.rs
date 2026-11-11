@@ -136,7 +136,11 @@ pub async fn list_resets(only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn print_reset_status(status: &resets::ResetStatus, pending: Option<&resets::PendingClaim>, now: i64) {
+fn print_reset_status(
+    status: &resets::ResetStatus,
+    pending: Option<&resets::PendingClaim>,
+    now: i64,
+) {
     use resets::Standing;
     match &status.cedar_ember {
         Some(program) if program.standing() == Standing::Eligible => {
@@ -158,11 +162,17 @@ fn print_reset_status(status: &resets::ResetStatus, pending: Option<&resets::Pen
         }
         Some(program) if program.standing() == Standing::Ineligible => println!(
             "  limit resets: not eligible ({})",
-            program.ineligible_reason.as_deref().unwrap_or("no reason given")
+            program
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
         ),
         Some(program) => println!(
             "  limit resets: unknown (the server did not evaluate this account: {})",
-            program.ineligible_reason.as_deref().unwrap_or("no reason given")
+            program
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
         ),
         None => println!("  limit resets: unknown (not reported)"),
     }
@@ -181,7 +191,10 @@ fn print_reset_status(status: &resets::ResetStatus, pending: Option<&resets::Pen
         }
         Some(session) if session.standing() == Standing::Unknown => println!(
             "  session reset: unknown (the server did not evaluate this account: {})",
-            session.ineligible_reason.as_deref().unwrap_or("no reason given")
+            session
+                .ineligible_reason
+                .as_deref()
+                .unwrap_or("no reason given")
         ),
         Some(session) => println!(
             "  session reset: not available ({}{})",

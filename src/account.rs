@@ -897,7 +897,11 @@ mod tests {
         assert!(rendered.contains("refresh_expires_at"));
         let reparsed = Fleet::parse(&rendered).unwrap();
         assert_eq!(
-            reparsed.accounts[0].login.as_ref().unwrap().refresh_expires_at,
+            reparsed.accounts[0]
+                .login
+                .as_ref()
+                .unwrap()
+                .refresh_expires_at,
             Some(60 * DAY_MS)
         );
     }

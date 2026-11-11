@@ -500,10 +500,7 @@ pub async fn usage(
 /// same key; its shared windows fill only what the headers did not report
 /// (the headers are fresher); its 5h state stands unless the headers saw a
 /// 5h window. A failure is recorded.
-pub fn merge(
-    reading: &mut Reading,
-    outcome: Option<std::result::Result<ProfileUsage, String>>,
-) {
+pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<ProfileUsage, String>>) {
     match outcome {
         Some(Ok(profile)) => {
             for bucket in profile.buckets {
@@ -945,7 +942,10 @@ mod tests {
         };
 
         assert_eq!(read("acct", 1000, false).await.unwrap(), good);
-        assert_eq!(read("acct", 1000 + MAX_AGE_SECS - 1, false).await.unwrap(), good);
+        assert_eq!(
+            read("acct", 1000 + MAX_AGE_SECS - 1, false).await.unwrap(),
+            good
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a young answer is reused");
 
         // Stale: asked again, refused, last good answer served.
@@ -954,8 +954,18 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let file = cache.load();
         assert_eq!(file.backoff.rate_limited, 1);
-        assert_eq!(file.backoff.retry_after, refused_at + 7200, "Retry-After wins");
-        assert!(file.entries["acct|usage"].last_error.as_deref().unwrap().contains("HTTP 429"));
+        assert_eq!(
+            file.backoff.retry_after,
+            refused_at + 7200,
+            "Retry-After wins"
+        );
+        assert!(
+            file.entries["acct|usage"]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("HTTP 429")
+        );
 
         // Backed off: no request for this account, nor for another one that
         // has never been read; a fresh read refuses.
@@ -997,7 +1007,10 @@ mod tests {
         let error = read("acct", 100).await.unwrap_err();
         assert!(error.to_string().contains("HTTP 500"), "{error}");
         let file = cache.load();
-        assert_eq!(file.entries["acct|usage"].retry_after, 100 + ERROR_RETRY_SECS);
+        assert_eq!(
+            file.entries["acct|usage"].retry_after,
+            100 + ERROR_RETRY_SECS
+        );
         assert_eq!(file.backoff, Backoff::default());
         // Still inside the minute: no request for it, but another account asks.
         assert!(read("acct", 150).await.is_err());

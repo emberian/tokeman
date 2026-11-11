@@ -13,8 +13,8 @@ use serde_json::json;
 use super::{CLAUDE_CODE_IDENTITY, Client, http_error, network_error, profile};
 use crate::account::{Account, Credential};
 use crate::quota::{
-    Bucket, Family, Grace, ModelKey, Overage, ProbeError, Reading, SessionLimit, Signals,
-    SlowLane, Source, Verdict, Window, WindowStatus, parse_wire,
+    Bucket, Family, Grace, ModelKey, Overage, ProbeError, Reading, SessionLimit, Signals, SlowLane,
+    Source, Verdict, Window, WindowStatus, parse_wire,
 };
 
 pub const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -473,13 +473,22 @@ mod tests {
             ("anthropic-ratelimit-unified-7d_oi-reset", "1794657600"),
             ("anthropic-ratelimit-unified-fallback", "available"),
             ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
-            ("anthropic-ratelimit-unified-upgrade-paths", "overage, upgrade_plan"),
+            (
+                "anthropic-ratelimit-unified-upgrade-paths",
+                "overage, upgrade_plan",
+            ),
             ("anthropic-ratelimit-unified-slow-offer", "treatment"),
             ("anthropic-ratelimit-unified-slow-status", "slot_busy"),
             ("anthropic-ratelimit-unified-slow-retry-after", "20"),
             ("anthropic-ratelimit-unified-slow-max-wait", "1200"),
-            ("anthropic-ratelimit-unified-slow-budget-utilization", "0.25"),
-            ("anthropic-ratelimit-unified-slow-budget-reset", "1794000000"),
+            (
+                "anthropic-ratelimit-unified-slow-budget-utilization",
+                "0.25",
+            ),
+            (
+                "anthropic-ratelimit-unified-slow-budget-reset",
+                "1794000000",
+            ),
             ("anthropic-ratelimit-unified-grace-7d-utilization", "0.1"),
         ]);
         map.append(
@@ -526,7 +535,10 @@ mod tests {
         let reading = reading_of("a", 0, &Some(quota));
         assert_eq!(reading.signals.claims.len(), 2);
         assert_eq!(reading.session_limit, SessionLimit::Unknown);
-        assert!(!reading.above(0.0, 0.0, None), "the overall verdict is rejected");
+        assert!(
+            !reading.above(0.0, 0.0, None),
+            "the overall verdict is rejected"
+        );
     }
 
     #[test]
@@ -541,7 +553,10 @@ mod tests {
             reading_of("a", 0, &Some(quota)).session_limit,
             SessionLimit::Present
         );
-        let bare = parse_quota(&headers(&[("anthropic-ratelimit-unified-status", "allowed")]));
+        let bare = parse_quota(&headers(&[(
+            "anthropic-ratelimit-unified-status",
+            "allowed",
+        )]));
         assert!(bare.unwrap().signals.is_empty());
     }
 

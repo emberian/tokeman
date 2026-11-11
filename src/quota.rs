@@ -798,10 +798,22 @@ mod tests {
 
     #[test]
     fn wire_enums_parse_known_values_and_keep_the_unknown_ones() {
-        assert_eq!(parse_wire::<SlowStatus>("not_needed"), Some(SlowStatus::NotNeeded));
-        assert_eq!(parse_wire::<SlowStatus>("budget_exhausted"), Some(SlowStatus::BudgetExhausted));
-        assert_eq!(parse_wire::<SlowStatus>("brand_new"), Some(SlowStatus::Unrecognized));
-        assert_eq!(parse_wire::<SlowOffer>("treatment"), Some(SlowOffer::Treatment));
+        assert_eq!(
+            parse_wire::<SlowStatus>("not_needed"),
+            Some(SlowStatus::NotNeeded)
+        );
+        assert_eq!(
+            parse_wire::<SlowStatus>("budget_exhausted"),
+            Some(SlowStatus::BudgetExhausted)
+        );
+        assert_eq!(
+            parse_wire::<SlowStatus>("brand_new"),
+            Some(SlowStatus::Unrecognized)
+        );
+        assert_eq!(
+            parse_wire::<SlowOffer>("treatment"),
+            Some(SlowOffer::Treatment)
+        );
     }
 
     #[test]
