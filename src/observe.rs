@@ -48,6 +48,7 @@ pub enum Family {
     Sonnet,
     /// Metered by its own weekly limit (`7d_oi`).
     Fable,
+    Mythos,
     General,
 }
 
@@ -61,6 +62,7 @@ impl Family {
             Self::Opus => "Opus",
             Self::Sonnet => "Sonnet",
             Self::Fable => "Fable",
+            Self::Mythos => "Mythos",
             Self::General => "general",
         }
     }
@@ -71,6 +73,7 @@ impl Family {
             Self::Opus => Some(quota::Family::Opus),
             Self::Sonnet => Some(quota::Family::Sonnet),
             Self::Fable => Some(quota::Family::Fable),
+            Self::Mythos => Some(quota::Family::Mythos),
             Self::General => None,
         }
     }
@@ -82,6 +85,7 @@ impl From<quota::Family> for Family {
             quota::Family::Opus => Self::Opus,
             quota::Family::Sonnet => Self::Sonnet,
             quota::Family::Fable => Self::Fable,
+            quota::Family::Mythos => Self::Mythos,
         }
     }
 }
@@ -690,6 +694,7 @@ fn reject_bucket(reading: &mut Reading, key: ModelKey, window: Window) {
         label,
         window,
         source: Source::Observed,
+        share: None,
     });
 }
 

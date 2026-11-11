@@ -185,6 +185,7 @@ pub fn attach_model_weekly(reading: &mut Reading, window: Option<Window>) {
         label: Family::Fable.label().to_owned(),
         window,
         source: Source::Headers,
+        share: None,
     });
 }
 

@@ -59,16 +59,18 @@ pub enum Family {
     Opus,
     Sonnet,
     Fable,
+    Mythos,
 }
 
 impl Family {
-    pub const ALL: [Family; 3] = [Family::Opus, Family::Sonnet, Family::Fable];
+    pub const ALL: [Family; 4] = [Family::Opus, Family::Sonnet, Family::Fable, Family::Mythos];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Opus => "opus",
             Self::Sonnet => "sonnet",
             Self::Fable => "fable",
+            Self::Mythos => "mythos",
         }
     }
 
@@ -77,6 +79,7 @@ impl Family {
             Self::Opus => "Opus",
             Self::Sonnet => "Sonnet",
             Self::Fable => "Fable",
+            Self::Mythos => "Mythos",
         }
     }
 
@@ -215,6 +218,25 @@ pub struct Bucket {
     pub label: String,
     pub window: Window,
     pub source: Source,
+    /// The limit's size as a fraction of the weekly limit, when the server
+    /// says (`weekly_scoped_shares`): Fable's is 0.5. Usage under it also
+    /// counts toward the weekly limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
+}
+
+impl Bucket {
+    /// Room left for this model as a fraction of the weekly limit: the
+    /// bucket's own room scaled by its share, never more than the weekly
+    /// limit has left. Without a share, the bucket's own room.
+    pub fn room(&self, weekly: Option<&Window>) -> f64 {
+        let own = self.window.remaining();
+        match (self.share, weekly) {
+            (Some(share), Some(weekly)) => (own * share).min(weekly.remaining()),
+            (Some(share), None) => own * share,
+            (None, _) => own,
+        }
+    }
 }
 
 /// What the probe's `unified-status` header said.
@@ -543,15 +565,35 @@ impl Reading {
         }
     }
 
-    /// The weekly windows that limit sessions on `model`.
-    pub fn windows_limiting<'a>(
+    /// The model buckets that limit sessions on `model`.
+    pub fn buckets_limiting<'a>(
         &'a self,
         model: Option<&'a ModelKey>,
-    ) -> impl Iterator<Item = &'a Window> + 'a {
+    ) -> impl Iterator<Item = &'a Bucket> + 'a {
         self.buckets
             .iter()
             .filter(move |bucket| model.is_some_and(|model| model.is_limited_by(&bucket.key)))
-            .map(|bucket| &bucket.window)
+    }
+
+    /// Whether a model bucket leaves more than `floor`. A bucket that is a
+    /// share of the weekly is judged on its room in weekly terms.
+    pub fn bucket_above(&self, bucket: &Bucket, floor: f64) -> bool {
+        match bucket.share {
+            None => bucket.window.above(floor),
+            Some(_) => bucket.room(self.weekly.as_ref()) > floor,
+        }
+    }
+
+    /// Room left for a session on `model`, as a fraction of the weekly
+    /// limit: the weekly window's, or less when a limiting model bucket has
+    /// less (a shared bucket counts at its share of the weekly). `None` when
+    /// nothing weekly is reported.
+    pub fn model_room(&self, model: Option<&ModelKey>) -> Option<f64> {
+        let weekly = self.weekly.as_ref();
+        self.buckets_limiting(model)
+            .map(|bucket| bucket.room(weekly))
+            .chain(weekly.map(Window::remaining))
+            .reduce(f64::min)
     }
 
     /// Whether a shared window's own status header says it is rejected.
@@ -574,8 +616,8 @@ impl Reading {
                 .is_none_or(|window| window.above(session_floor))
             && self.weekly.is_none_or(|window| window.above(weekly_floor))
             && self
-                .windows_limiting(model)
-                .all(|window| window.above(weekly_floor))
+                .buckets_limiting(model)
+                .all(|bucket| self.bucket_above(bucket, weekly_floor))
     }
 }
 
@@ -710,6 +752,51 @@ mod tests {
     }
 
     #[test]
+    fn fable_room_is_its_share_of_the_weekly_and_never_more_than_the_weekly_left() {
+        let fable = key("claude-fable-5-2");
+        let mut r = reading(0.0, 0.40);
+        let mut bucket = bucket("fable", "Fable", 0.37, Source::Profile);
+        bucket.share = Some(0.5);
+        r.buckets.push(bucket);
+        // 63% of a half-weekly allowance is 31.5% of the weekly; 60% is left.
+        assert!((r.model_room(Some(&fable)).unwrap() - 0.315).abs() < 1e-9);
+        // When the weekly has less left than that, the weekly binds.
+        r.weekly = Some(Window::new(0.80, 0));
+        assert!((r.model_room(Some(&fable)).unwrap() - 0.20).abs() < 1e-9);
+        // Other models see only the weekly; no weekly and no bucket is unknown.
+        assert!((r.model_room(Some(&key("claude-opus-5-5"))).unwrap() - 0.20).abs() < 1e-9);
+        r.weekly = None;
+        assert!((r.model_room(Some(&fable)).unwrap() - 0.315).abs() < 1e-9);
+        assert_eq!(r.model_room(None), None);
+        // A bucket without a share counts its own room.
+        let plain = crate::testing::reading_with_bucket("p", 0.0, 0.1, "opus48", "Opus 4.8", 0.7);
+        assert!((plain.model_room(Some(&key("claude-opus-4-8"))).unwrap() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_shared_bucket_is_viable_on_its_room_in_weekly_terms() {
+        let fable = key("claude-fable-5-2");
+        let mut r = reading(0.0, 0.2);
+        let mut bucket = bucket("fable", "Fable", 0.92, Source::Profile);
+        r.buckets.push(bucket.clone());
+        // Unshared: 8% of its own limit left clears a 5% floor.
+        assert!(r.above(0.05, 0.05, Some(&fable)));
+        // Half the weekly: 4% of the weekly left does not.
+        bucket.share = Some(0.5);
+        r.buckets[0] = bucket;
+        assert!(!r.above(0.05, 0.05, Some(&fable)));
+        assert!(r.above(0.05, 0.03, Some(&fable)));
+        assert!(r.above(0.05, 0.05, Some(&key("claude-opus-5-5"))));
+    }
+
+    #[test]
+    fn mythos_is_a_family() {
+        assert_eq!(key("claude-mythos-5").family(), Some(Family::Mythos));
+        assert!(key("claude-mythos-5").is_limited_by(&ModelKey::family_wide(Family::Mythos)));
+        assert!(!key("claude-mythos-5").is_limited_by(&key("fable")));
+    }
+
+    #[test]
     fn wire_enums_parse_known_values_and_keep_the_unknown_ones() {
         assert_eq!(parse_wire::<SlowStatus>("not_needed"), Some(SlowStatus::NotNeeded));
         assert_eq!(parse_wire::<SlowStatus>("budget_exhausted"), Some(SlowStatus::BudgetExhausted));
@@ -755,6 +842,7 @@ mod tests {
             label: "Opus 4.8".into(),
             window: Window::new(0.5, 7),
             source: Source::Observed,
+            share: None,
         };
         let json = serde_json::to_string(&bucket).unwrap();
         assert_eq!(

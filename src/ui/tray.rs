@@ -393,6 +393,13 @@ impl TrayApp {
             if reading.session.is_some() || reading.weekly.is_some() {
                 if let Some(window) = reading.session {
                     Self::draw_gauge(ui, "5h", window);
+                } else if reading.session_limit == crate::quota::SessionLimit::Absent {
+                    ui.label(
+                        egui::RichText::new("no 5h limit")
+                            .monospace()
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(110)),
+                    );
                 }
                 if let Some(window) = reading.weekly {
                     Self::draw_gauge(ui, "7d", window);

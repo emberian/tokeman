@@ -5,7 +5,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::account::Account;
 use crate::claude::sessions;
 use crate::daemon::status::Report;
-use crate::quota::{Level, Reading, Verdict};
+use crate::quota::{Bucket, Level, Reading, SessionLimit, Verdict};
 use crate::store::{Snapshot, Stats};
 
 const BAR_WIDTH: usize = 40;
@@ -247,12 +247,16 @@ pub fn print_readings(readings: &[Reading], probe_model: &str) {
 }
 
 fn print_windows(reading: &Reading) {
-    if let Some(w) = reading.session {
-        println!(
+    match reading.session {
+        Some(w) => println!(
             "   Session (5h) {}  resets {}",
             bar(w.used),
             format_reset(w.resets_at)
-        );
+        ),
+        None if reading.session_limit == SessionLimit::Absent => {
+            println!("   Session (5h) {DIM}no 5h limit on this account{RESET}");
+        }
+        None => {}
     }
     if let Some(w) = reading.weekly {
         let warning = match w.remaining() {
@@ -335,12 +339,26 @@ fn print_buckets(reading: &Reading) {
     }
     for bucket in &reading.buckets {
         println!(
-            "   {:<12} {}  resets {}  {DIM}{}{RESET}",
+            "   {:<12} {}  resets {}  {DIM}{}{}{RESET}",
             format!("{} (7d)", bucket.label),
             bar(bucket.window.used),
             format_reset(bucket.window.resets_at),
             bucket.source.label(),
+            share_note(bucket, reading),
         );
+    }
+}
+
+/// For a limit that is a share of the weekly: how much of the weekly it
+/// still allows.
+fn share_note(bucket: &Bucket, reading: &Reading) -> String {
+    match bucket.share {
+        Some(share) => format!(
+            "; {:.0}% of the weekly, {:.0}% of the weekly left for it",
+            share * 100.0,
+            bucket.room(reading.weekly.as_ref()).max(0.0) * 100.0
+        ),
+        None => String::new(),
     }
 }
 
@@ -561,6 +579,19 @@ mod tests {
                 "Low-priority lane: slot_busy, budget 25% used",
                 "Could buy: overage",
             ]
+        );
+    }
+
+    #[test]
+    fn a_shared_limit_says_how_much_of_the_weekly_it_still_allows() {
+        let mut reading = crate::testing::reading("a", 0.0, 0.4);
+        let mut fable = crate::testing::bucket("fable", "Fable", 0.5, crate::quota::Source::Profile);
+        assert_eq!(share_note(&fable, &reading), "");
+        fable.share = Some(0.5);
+        reading.buckets.push(fable.clone());
+        assert_eq!(
+            share_note(&fable, &reading),
+            "; 50% of the weekly, 25% of the weekly left for it"
         );
     }
 

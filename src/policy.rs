@@ -209,16 +209,21 @@ fn limiting_windows<'a>(
                 .iter()
                 .map(move |w| (margin(w, floors.weekly), w.resets_at)),
         )
-        .chain(
-            reading
-                .windows_limiting(model)
-                .map(move |w| (margin(w, floors.weekly), w.resets_at)),
-        )
+        .chain(reading.buckets_limiting(model).map(move |bucket| {
+            (
+                room_margin(bucket.room(reading.weekly.as_ref()), floors.weekly),
+                bucket.window.resets_at,
+            )
+        }))
 }
 
 /// Room above the floor, as a fraction of the room the floor leaves.
 fn margin(window: &Window, floor: f64) -> f64 {
-    (window.remaining() - floor) / (1.0 - floor)
+    room_margin(window.remaining(), floor)
+}
+
+fn room_margin(remaining: f64, floor: f64) -> f64 {
+    (remaining - floor) / (1.0 - floor)
 }
 
 /// The smallest normalized margin across every window that limits `model`.
@@ -586,6 +591,24 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    #[test]
+    fn fable_landing_ranks_on_fable_room_in_weekly_terms() {
+        let fable = key("claude-fable-5-2");
+        let with_fable = |name: &str, weekly_used: f64, fable_used: f64| {
+            let mut r = reading_with_bucket(name, 0.0, weekly_used, "fable", "Fable", fable_used);
+            r.session = None;
+            r.buckets[0].share = Some(0.5);
+            r
+        };
+        // a: Fable 80% of half the weekly = 40%, capped by the 30% weekly left.
+        // b: Fable 50% of half = 25%, the weekly has 90%. Unshared, b would
+        // look roomier (50% against 30%).
+        let fleet = [with_fable("a", 0.70, 0.20), with_fable("b", 0.10, 0.50)];
+        assert_eq!(best(&fleet, Mode::Normal, Some(&fable)), Some("a"));
+        // For any other model only the weekly counts.
+        assert_eq!(best(&fleet, Mode::Normal, opus().as_ref()), Some("b"));
     }
 
     #[test]

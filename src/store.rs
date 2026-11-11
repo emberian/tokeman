@@ -246,6 +246,7 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Snapshot> {
                 key,
                 window,
                 source: Source::Profile,
+                share: None,
             });
         }
     }
@@ -339,6 +340,7 @@ mod tests {
                 label: "Opus 4.8".into(),
                 window: Window::new(0.75, 30),
                 source: Source::Profile,
+                share: None,
             }],
             overage: Some(Overage {
                 status: Some("ok".into()),

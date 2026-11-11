@@ -44,6 +44,7 @@ pub fn bucket(model: &str, label: &str, used: f64, source: Source) -> Bucket {
         label: label.into(),
         window: Window::new(used, 0),
         source,
+        share: None,
     }
 }
 

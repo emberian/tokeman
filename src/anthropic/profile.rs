@@ -16,7 +16,7 @@ use super::{Client, describe, one_line, retry_after_secs};
 use crate::account::Account;
 use crate::fs::write_atomic;
 use crate::paths;
-use crate::quota::{Bucket, Family, ModelKey, Reading, Source, Window};
+use crate::quota::{Bucket, Family, ModelKey, Reading, SessionLimit, Source, Window};
 
 /// How long an answer is reused before the endpoint is asked again.
 pub const MAX_AGE_SECS: i64 = 300;
@@ -209,9 +209,11 @@ async fn fetch(
         .map_err(|error| plain(format!("unreadable {path} response: {error}")))
 }
 
-// The response as Claude Code's own client reads it. Every window is
-// `{utilization: percent 0-100 | null, resets_at: ISO 8601 | null}`;
-// `limits` is the server's list of meters and is null from older servers.
+// The response as Claude Code's own client reads it. `limits[]` is the
+// server's list of meters and the primary source: classify a row on its
+// `kind` and `scope`, never on a label. The legacy per-window fields are
+// `{utilization: percent 0-100 | null, resets_at: ISO 8601 | null}` and are
+// read only when `limits` is absent (older servers send null).
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
@@ -222,19 +224,39 @@ pub struct UsageWindow {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_opus: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_sonnet: Option<UsageWindow>,
-    /// Raw rows: each parses on its own, so one odd row cannot hide the rest.
+    /// Raw rows: each parses on its own, so one odd row cannot hide the rest,
+    /// and `weekly_scoped_shares` indexes this raw list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_scoped_shares: Option<Vec<serde_json::Value>>,
+}
+
+/// What a `limits[]` row measures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// The 5-hour window.
+    Session,
+    /// The weekly limit across all models.
+    WeeklyAll,
+    /// A weekly limit scoped to one model or one surface.
+    WeeklyScoped,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimit {
-    /// `session`, `weekly_all`, `weekly_scoped`, ...
-    pub kind: String,
-    /// 0-100.
+    pub kind: LimitKind,
+    /// 0-100, sent as an integer or a float; may exceed 100.
     pub percent: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
@@ -245,12 +267,36 @@ pub struct UsageLimit {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<DisplayName>,
+    pub model: Option<ScopeName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ScopeName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DisplayName {
+pub struct ScopeName {
     pub display_name: String,
+    /// The model id; null for Fable as of 2026-11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// A scoped limit's size relative to the weekly limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedShare {
+    /// Index into the raw `limits[]`, unreadable rows included.
+    pub limit_index: usize,
+    pub allowance_percent_of_weekly: f64,
+    #[serde(default)]
+    pub used_percent_of_weekly: Option<f64>,
+}
+
+/// Everything the profile endpoint says about an account's room.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfileUsage {
+    pub session: Option<Window>,
+    pub weekly: Option<Window>,
+    pub session_limit: SessionLimit,
+    pub buckets: Vec<Bucket>,
 }
 
 fn parse_reset(resets_at: Option<&str>) -> i64 {
@@ -260,9 +306,9 @@ fn parse_reset(resets_at: Option<&str>) -> i64 {
         .map_or(0, |time| time.timestamp())
 }
 
-/// Percent to fraction, once, at the boundary.
+/// Percent to fraction, once, at the boundary. Over 100 stays over 1.0.
 fn fraction(percent: f64) -> f64 {
-    (percent / 100.0).clamp(0.0, 1.0)
+    percent.max(0.0) / 100.0
 }
 
 fn usage_window(window: &UsageWindow) -> Option<Window> {
@@ -272,33 +318,90 @@ fn usage_window(window: &UsageWindow) -> Option<Window> {
     ))
 }
 
-/// A per-model weekly row as Claude Code identifies it: a `weekly_scoped`
-/// meter whose scope names a model. Surface-scoped rows are not models.
-/// Idle rows count too; `is_active` only marks the server's headline row.
-fn scoped_model_bucket(row: &serde_json::Value) -> Option<Bucket> {
-    let row: UsageLimit = serde_json::from_value(row.clone()).ok()?;
-    if row.kind != "weekly_scoped" {
+fn limit_window(row: &UsageLimit) -> Window {
+    Window::new(fraction(row.percent), parse_reset(row.resets_at.as_deref()))
+}
+
+/// A per-model weekly row: a `weekly_scoped` meter whose scope names a
+/// model, keyed by its id when the server sends one. Surface-scoped rows are
+/// not models. Idle rows count too; `is_active` only marks the server's
+/// headline row.
+fn scoped_model_bucket(row: &UsageLimit, share: Option<f64>) -> Option<Bucket> {
+    if row.kind != LimitKind::WeeklyScoped {
         return None;
     }
-    let label = row.scope?.model?.display_name;
-    let key = ModelKey::new(&label);
+    let model = row.scope.as_ref()?.model.as_ref()?;
+    let key = model
+        .id
+        .as_deref()
+        .map(ModelKey::new)
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| ModelKey::new(&model.display_name));
     (!key.is_empty()).then(|| Bucket {
         key,
-        label,
-        window: Window::new(fraction(row.percent), parse_reset(row.resets_at.as_deref())),
+        label: model.display_name.clone(),
+        window: limit_window(row),
         source: Source::Profile,
+        share,
     })
 }
 
-/// Every model bucket in the response: the scoped rows, sorted by label and
-/// unique by key, then the legacy family-wide Opus and Sonnet windows when no
-/// scoped row already carries their key.
-pub fn buckets(usage: &UsageResponse) -> Vec<Bucket> {
-    let mut buckets: Vec<Bucket> = usage
+/// Allowances by raw `limits[]` index, as fractions of the weekly limit.
+fn shares(usage: &UsageResponse) -> BTreeMap<usize, f64> {
+    usage
+        .weekly_scoped_shares
+        .iter()
+        .flatten()
+        .filter_map(|row| serde_json::from_value::<ScopedShare>(row.clone()).ok())
+        .filter(|share| share.allowance_percent_of_weekly > 0.0)
+        .map(|share| (share.limit_index, share.allowance_percent_of_weekly / 100.0))
+        .collect()
+}
+
+/// Read the whole response: shared windows and the 5h state from
+/// `limits[]` (or the legacy fields when it is absent), the scoped model
+/// rows sorted by label and unique by key, then the legacy family-wide Opus
+/// and Sonnet windows when no scoped row already carries their key.
+pub fn usage_of(usage: &UsageResponse) -> ProfileUsage {
+    let shares = shares(usage);
+    let rows: Vec<(usize, UsageLimit)> = usage
         .limits
         .iter()
         .flatten()
-        .filter_map(scoped_model_bucket)
+        .enumerate()
+        .filter_map(|(index, row)| Some((index, serde_json::from_value(row.clone()).ok()?)))
+        .collect();
+    let first = |kind: LimitKind| {
+        rows.iter()
+            .find(|(_, row)| row.kind == kind)
+            .map(|(_, row)| limit_window(row))
+    };
+    let mut profile = ProfileUsage::default();
+    match &usage.limits {
+        Some(raw) => {
+            profile.session = first(LimitKind::Session);
+            profile.weekly = first(LimitKind::WeeklyAll);
+            // A row that names the session kind counts even if it is malformed.
+            let has_session = raw
+                .iter()
+                .any(|row| row.get("kind").and_then(|kind| kind.as_str()) == Some("session"));
+            profile.session_limit = if has_session {
+                SessionLimit::Present
+            } else {
+                SessionLimit::Absent
+            };
+        }
+        None => {
+            profile.session = usage.five_hour.as_ref().and_then(usage_window);
+            profile.weekly = usage.seven_day.as_ref().and_then(usage_window);
+            if profile.session.is_some() {
+                profile.session_limit = SessionLimit::Present;
+            }
+        }
+    }
+    let mut buckets: Vec<Bucket> = rows
+        .iter()
+        .filter_map(|(index, row)| scoped_model_bucket(row, shares.get(index).copied()))
         .collect();
     buckets.sort_by(|a, b| a.key.cmp(&b.key));
     buckets.dedup_by(|a, b| a.key == b.key);
@@ -316,24 +419,26 @@ pub fn buckets(usage: &UsageResponse) -> Vec<Bucket> {
                 label: family.label().to_owned(),
                 window,
                 source: Source::Profile,
+                share: None,
             });
         }
     }
-    buckets
+    profile.buckets = buckets;
+    profile
 }
 
-pub fn parse(body: &serde_json::Value) -> std::result::Result<Vec<Bucket>, serde_json::Error> {
-    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| buckets(&usage))
+pub fn parse(body: &serde_json::Value) -> std::result::Result<ProfileUsage, serde_json::Error> {
+    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| usage_of(&usage))
 }
 
-/// The account's profile buckets, through the cache. `None` when the account
-/// has no profile credential; otherwise the buckets or why there are none.
+/// The account's profile usage, through the cache. `None` when the account
+/// has no profile credential; otherwise the usage or why there is none.
 pub async fn usage(
     client: &Client,
     cache: &Cache,
     account: &Account,
     now: i64,
-) -> Option<std::result::Result<Vec<Bucket>, String>> {
+) -> Option<std::result::Result<ProfileUsage, String>> {
     let bearer = account.profile_token(now * 1000)?;
     let outcome = match cache
         .read(client, &account.name, bearer, Endpoint::Usage, false, now)
@@ -346,12 +451,34 @@ pub async fn usage(
 }
 
 /// Fold the profile's answer into a reading: its buckets replace any with the
-/// same key, or its failure is recorded.
-pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<Vec<Bucket>, String>>) {
+/// same key; its shared windows fill only what the headers did not report
+/// (the headers are fresher); its 5h state stands unless the headers saw a
+/// 5h window. A failure is recorded.
+pub fn merge(
+    reading: &mut Reading,
+    outcome: Option<std::result::Result<ProfileUsage, String>>,
+) {
     match outcome {
-        Some(Ok(buckets)) => {
-            for bucket in buckets {
+        Some(Ok(profile)) => {
+            for bucket in profile.buckets {
                 reading.set_bucket(bucket);
+            }
+            // A cached answer can outlive its window; one past its reset says nothing.
+            let at = reading.at;
+            let current = |window: &Window| window.resets_at > at;
+            if reading.session.is_none() {
+                reading.session = profile.session.filter(current);
+            }
+            if reading.weekly.is_none() {
+                reading.weekly = profile.weekly.filter(current);
+            }
+            if reading.session_limit != SessionLimit::Present
+                && profile.session_limit != SessionLimit::Unknown
+            {
+                reading.session_limit = profile.session_limit;
+            }
+            if reading.session.is_some() {
+                reading.session_limit = SessionLimit::Present;
             }
         }
         Some(Err(error)) => reading.profile_error = Some(error),
@@ -412,7 +539,7 @@ mod tests {
         )
         .expect("usage response");
         assert!(usage.seven_day_sonnet.is_none());
-        let buckets = buckets(&usage);
+        let buckets = usage_of(&usage).buckets;
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].key, ModelKey::family_wide(Family::Opus));
         assert_eq!(buckets[0].label, "Opus");
@@ -469,7 +596,7 @@ mod tests {
             }"#,
         )
         .expect("dynamic usage response");
-        let buckets = buckets(&usage);
+        let buckets = usage_of(&usage).buckets;
         // The surface-scoped row is a meter, but not a model.
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "opus48");
@@ -495,7 +622,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let buckets = parse(&body).expect("a malformed row must not fail the whole response");
+        let buckets = parse(&body)
+            .expect("a malformed row must not fail the whole response")
+            .buckets;
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "fable");
         assert_eq!(buckets[0].window.resets_at, 0);
@@ -503,7 +632,106 @@ mod tests {
         assert_eq!(buckets[1].window.resets_at, 0);
 
         let older = parse(&serde_json::json!({"limits": null})).unwrap();
-        assert!(older.is_empty());
+        assert!(older.buckets.is_empty());
+        assert_eq!(older.session_limit, SessionLimit::Unknown);
+    }
+
+    /// The shape of a verified Ultra account's answer (2026-11): no session
+    /// row, the weekly limit, and Fable as a half-weekly scoped limit whose
+    /// share indexes the raw rows, an unreadable one included.
+    fn ultra_body() -> serde_json::Value {
+        serde_json::json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 80.0, "resets_at": "2026-11-13T09:00:00Z"},
+            "seven_day_opus": null,
+            "limits": [
+                {"kind": "weekly_all", "group": "weekly", "percent": 80,
+                 "severity": "warning", "resets_at": "2026-11-13T09:00:00Z",
+                 "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "percent": "garbled"},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 102,
+                 "severity": "critical", "resets_at": "2026-11-13T09:00:00Z",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                 "is_active": true},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 4,
+                 "resets_at": null, "scope": {"surface": {"display_name": "Cowork"}}}
+            ],
+            "weekly_scoped_shares": [
+                {"limit_index": 2, "used_percent_of_weekly": 51, "allowance_percent_of_weekly": 50},
+                {"limit_index": "bad"}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_body_without_a_session_row_has_no_5h_limit_and_fable_is_a_share_of_the_weekly() {
+        let usage = parse(&ultra_body()).unwrap();
+        assert_eq!(usage.session_limit, SessionLimit::Absent);
+        assert_eq!(usage.session, None);
+        assert_eq!(usage.weekly, Some(Window::new(0.8, 1_794_560_400)));
+        assert_eq!(usage.buckets.len(), 1, "the surface row is not a model");
+        let fable = &usage.buckets[0];
+        assert_eq!(fable.key, ModelKey::family_wide(Family::Fable));
+        assert_eq!(fable.window.used, 1.02, "over 100% is kept");
+        assert_eq!(fable.share, Some(0.5), "limit_index counts the garbled row");
+        // Room for Fable: none of its own, so none at all.
+        assert!(fable.room(usage.weekly.as_ref()) < 0.0);
+    }
+
+    #[test]
+    fn a_session_row_marks_the_5h_limit_present_and_a_model_id_keys_the_bucket() {
+        let usage = parse(&serde_json::json!({
+            "limits": [
+                {"kind": "session", "percent": 12.5, "resets_at": "2026-11-11T22:00:00Z"},
+                {"kind": "weekly_all", "percent": 30, "resets_at": "2026-11-13T09:00:00Z"},
+                {"kind": "weekly_scoped", "percent": 10,
+                 "scope": {"model": {"id": "claude-mythos-5", "display_name": "Mythos"}}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.session_limit, SessionLimit::Present);
+        assert_eq!(usage.session, Some(Window::new(0.125, 1_794_434_400)));
+        assert_eq!(usage.buckets[0].key.as_str(), "mythos5");
+        assert_eq!(usage.buckets[0].key.family(), Some(Family::Mythos));
+        assert_eq!(usage.buckets[0].share, None);
+        // Without limits[], the legacy fields fill the windows, and a missing
+        // five_hour proves nothing.
+        let legacy = parse(&serde_json::json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 40.0, "resets_at": null}
+        }))
+        .unwrap();
+        assert_eq!(legacy.session_limit, SessionLimit::Unknown);
+        assert_eq!(legacy.weekly, Some(Window::new(0.4, 0)));
+    }
+
+    #[test]
+    fn merging_fills_only_what_the_headers_left_out_and_keeps_a_seen_5h_window() {
+        let at = 1_794_400_000;
+        let profile = || parse(&ultra_body()).ok();
+        // Headers without a 5h window: the profile says there is none.
+        let mut weekly_only = crate::testing::reading("a", 0.0, 0.79);
+        weekly_only.at = at;
+        weekly_only.session = None;
+        weekly_only.session_limit = SessionLimit::Unknown;
+        merge(&mut weekly_only, profile().map(Ok));
+        assert_eq!(weekly_only.session_limit, SessionLimit::Absent);
+        assert_eq!(weekly_only.weekly.unwrap().used, 0.79, "headers win");
+
+        // Headers that saw a 5h window outrank the profile's Absent.
+        let mut both = crate::testing::reading("b", 0.2, 0.5);
+        both.at = at;
+        merge(&mut both, profile().map(Ok));
+        assert_eq!(both.session_limit, SessionLimit::Present);
+
+        // Nothing from the headers: the profile's weekly fills in, unless the
+        // cached answer is past its reset.
+        let mut bare = Reading::empty("c", at);
+        merge(&mut bare, profile().map(Ok));
+        assert_eq!(bare.weekly.unwrap().used, 0.8);
+        let mut later = Reading::empty("c", 1_794_560_400);
+        merge(&mut later, profile().map(Ok));
+        assert_eq!(later.weekly, None);
     }
 
     #[test]
@@ -517,7 +745,7 @@ mod tests {
                  "scope": {"model": {"display_name": "Opus"}}}
             ]
         });
-        let buckets = parse(&body).unwrap();
+        let buckets = parse(&body).unwrap().buckets;
         assert_eq!(buckets.len(), 1, "duplicate keys collapse to one");
         assert_eq!(buckets[0].window.used, 0.75);
     }
@@ -535,24 +763,27 @@ mod tests {
             }),
             limits: Some(vec![
                 serde_json::to_value(UsageLimit {
-                    kind: "weekly_scoped".into(),
+                    kind: LimitKind::WeeklyScoped,
                     percent: 3.0,
                     resets_at: None,
                     scope: Some(UsageScope {
-                        model: Some(DisplayName {
+                        model: Some(ScopeName {
                             display_name: "Fable".into(),
+                            id: None,
                         }),
+                        surface: None,
                     }),
                 })
                 .unwrap(),
             ]),
+            ..UsageResponse::default()
         };
         let json = serde_json::to_string(&response).unwrap();
         let back: UsageResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, response);
         let limit: UsageLimit = serde_json::from_value(back.limits.unwrap().remove(0)).unwrap();
         assert_eq!(limit.scope.unwrap().model.unwrap().display_name, "Fable");
-        let buckets = buckets(&response);
+        let buckets = usage_of(&response).buckets;
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].key.as_str(), "fable");
         assert_eq!(buckets[1].key.as_str(), "opus");
@@ -581,7 +812,10 @@ mod tests {
             .push(bucket("Opus 5", "Opus 5", 0.1, Source::Carried));
         merge(
             &mut reading,
-            Some(Ok(vec![bucket("Opus 5", "Opus 5", 0.4, Source::Profile)])),
+            Some(Ok(ProfileUsage {
+                buckets: vec![bucket("Opus 5", "Opus 5", 0.4, Source::Profile)],
+                ..ProfileUsage::default()
+            })),
         );
         assert_eq!(reading.buckets.len(), 1);
         assert_eq!(reading.buckets[0].source, Source::Profile);

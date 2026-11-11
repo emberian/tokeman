@@ -217,6 +217,7 @@ impl Cadence {
                     label: Family::Fable.label().to_owned(),
                     window,
                     source: Source::Carried,
+                    share: None,
                 });
             }
         }

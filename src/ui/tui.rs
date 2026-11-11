@@ -523,6 +523,11 @@ fn draw_card(
         .as_deref()
         .and_then(claim_label)
         .map_or(String::new(), |(_, short)| format!(" {short}"));
+    let claim = if reading.session_limit == crate::quota::SessionLimit::Absent {
+        format!("{claim} · no 5h limit")
+    } else {
+        claim
+    };
 
     let name_line = Line::from(vec![
         Span::styled(
