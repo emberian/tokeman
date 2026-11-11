@@ -3,9 +3,11 @@
 //!
 //! The endpoint answers 429 under a 20-second probe cadence and the figures
 //! move over hours, so each account's answer is reused for [`MAX_AGE_SECS`].
-//! Its 429 budget is shared by every account from one address, so a 429 on
-//! any account backs off the whole fleet; while it lasts each account's last
-//! good answer is served. This module is the only writer of the cache file.
+//! A 429 backs off the account that drew it, and once two accounts have
+//! drawn one, the whole fleet: the budget is shared by every account from
+//! one address, but one account can also be refused on its own. While a
+//! backoff lasts, each held account's last good answer is served. This
+//! module is the only writer of the cache file.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -74,7 +76,8 @@ struct Entry {
 /// The fleet-wide 429 backoff.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Backoff {
-    /// Epoch seconds before which no account asks the endpoint.
+    /// Epoch seconds before which the accounts that drew a 429, and once
+    /// two have, every account, leave the endpoint alone.
     #[serde(default)]
     retry_after: i64,
     /// Consecutive 429s, whichever account drew them.
@@ -82,6 +85,46 @@ struct Backoff {
     rate_limited: u32,
     #[serde(default)]
     last_error: Option<String>,
+    /// The accounts that drew a 429 within this backoff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    accounts: Vec<String>,
+}
+
+/// Distinct accounts whose 429s hold back the whole fleet. One account
+/// alone can be refused for its own sake (a paused organization answered
+/// 429 while another account read fine from the same address, 2026-11-11).
+const FLEET_429_ACCOUNTS: usize = 2;
+
+impl Backoff {
+    /// Whether `account` must not ask before `retry_after`.
+    fn holds(&self, account: &str, now: i64) -> bool {
+        now < self.retry_after
+            && (self.accounts.len() >= FLEET_429_ACCOUNTS
+                || self.accounts.iter().any(|held| held == account))
+    }
+
+    fn rate_limited(&mut self, account: &str, now: i64, retry_after: Option<i64>, message: &str) {
+        if now >= self.retry_after {
+            self.accounts.clear();
+        }
+        if !self.accounts.iter().any(|held| held == account) {
+            self.accounts.push(account.to_owned());
+        }
+        self.rate_limited = self.rate_limited.saturating_add(1);
+        self.retry_after = self
+            .retry_after
+            .max(now + backoff_secs(true, self.rate_limited, retry_after));
+        self.last_error = Some(message.to_owned());
+    }
+
+    /// A read succeeded. Reads run concurrently, so a success that was in
+    /// flight when another account drew a 429 must not lift that backoff:
+    /// only an expired one is cleared.
+    fn succeeded(&mut self, now: i64) {
+        if now >= self.retry_after {
+            *self = Self::default();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -149,12 +192,22 @@ impl Cache {
         {
             return Ok(body.clone());
         }
+        let fleet_held = file.backoff.holds(account, now);
+        let scope = if file.backoff.accounts.len() >= FLEET_429_ACCOUNTS {
+            " for every account"
+        } else {
+            ""
+        };
         let held = [
             (entry.retry_after, entry.last_error.as_deref(), ""),
             (
-                file.backoff.retry_after,
+                if fleet_held {
+                    file.backoff.retry_after
+                } else {
+                    0
+                },
                 file.backoff.last_error.as_deref(),
-                " for every account",
+                scope,
             ),
         ]
         .into_iter()
@@ -181,7 +234,7 @@ impl Cache {
                             ..Entry::default()
                         },
                     );
-                    file.backoff = Backoff::default();
+                    file.backoff.succeeded(now);
                 });
                 Ok(body)
             }
@@ -190,12 +243,12 @@ impl Cache {
                     let entry = file.entries.entry(key).or_default();
                     entry.last_error = Some(failure.message.clone());
                     if failure.rate_limited {
-                        let backoff = &mut file.backoff;
-                        backoff.rate_limited = backoff.rate_limited.saturating_add(1);
-                        backoff.retry_after = backoff.retry_after.max(
-                            now + backoff_secs(true, backoff.rate_limited, failure.retry_after),
+                        file.backoff.rate_limited(
+                            account,
+                            now,
+                            failure.retry_after,
+                            &failure.message,
                         );
-                        backoff.last_error = Some(failure.message.clone());
                     } else {
                         entry.retry_after = now + backoff_secs(false, 0, None);
                     }
@@ -918,15 +971,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_young_answer_is_reused_and_a_429_holds_back_every_account() {
+    async fn a_young_answer_is_reused_and_a_second_accounts_429_holds_back_every_account() {
         let good = serde_json::json!({"seven_day_opus": {"utilization": 30.0, "resets_at": null}});
+        let refused = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(7200),
+            serde_json::json!({}),
+        );
         let (router, calls) = scripted(vec![
             (StatusCode::OK, None, good.clone()),
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Some(7200),
-                serde_json::json!({}),
-            ),
+            refused.clone(),
+            (StatusCode::OK, None, good.clone()),
+            refused,
             (StatusCode::OK, None, good.clone()),
         ]);
         let client = serve(router).await;
@@ -959,27 +1015,46 @@ mod tests {
             refused_at + 7200,
             "Retry-After wins"
         );
-        assert!(
-            file.entries["acct|usage"]
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("HTTP 429")
-        );
+        assert_eq!(file.backoff.accounts, ["acct"]);
 
-        // Backed off: no request for this account, nor for another one that
-        // has never been read; a fresh read refuses.
+        // That account is held, and a fresh read of it refuses...
         assert_eq!(read("acct", refused_at + 10, false).await.unwrap(), good);
-        let other = read("other", refused_at + 10, false).await.unwrap_err();
-        assert!(other.to_string().contains("for every account"), "{other}");
         let fresh = read("acct", refused_at + 10, true).await.unwrap_err();
         assert!(fresh.to_string().contains("backing off"), "{fresh}");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        // After it, a success clears the fleet backoff.
-        assert_eq!(read("other", refused_at + 7200, false).await.unwrap(), good);
+        // ...but one account's 429 does not hold back another, whose success
+        // leaves the live backoff alone.
+        assert_eq!(read("second", refused_at + 10, false).await.unwrap(), good);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.load().backoff.accounts, ["acct"]);
+
+        // A second account's 429 holds back every account, even a new one.
+        assert!(read("third", refused_at + 400, false).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let other = read("fourth", refused_at + 410, false).await.unwrap_err();
+        assert!(other.to_string().contains("for every account"), "{other}");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // After it, a success clears the backoff.
+        let after = cache.load().backoff.retry_after;
+        assert_eq!(read("fourth", after, false).await.unwrap(), good);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert_eq!(cache.load().backoff, Backoff::default());
+    }
+
+    #[test]
+    fn a_success_in_flight_during_another_accounts_429_keeps_the_backoff() {
+        let mut backoff = Backoff {
+            retry_after: 1600,
+            rate_limited: 2,
+            last_error: Some("HTTP 429".into()),
+            accounts: vec!["a".into(), "b".into()],
+        };
+        let held = backoff.clone();
+        backoff.succeeded(1000);
+        assert_eq!(backoff, held);
+        backoff.succeeded(1600);
+        assert_eq!(backoff, Backoff::default());
     }
 
     #[tokio::test]

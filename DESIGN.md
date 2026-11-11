@@ -202,8 +202,10 @@ Each was measured; the commit that measured it is findable by its date.
 - Premium models refuse subscription tokens with a bare 429 and no quota
   headers unless the request carries Claude Code's identity (2026-09-25).
 - `/api/oauth/usage` answers 429 under a 20-second probe cadence; Claude Code
-  caches it for 60 seconds (2026-09-25). Its 429 budget is per address, so a
-  429 backs off every account.
+  caches it for 60 seconds (2026-09-25). A 429 holds back the account that
+  drew it, and every account once two have: the budget is shared per address,
+  yet a paused organization drew 429s while another account read fine from
+  the same address (2026-11-11).
 - Verified Ultra accounts (Max 20x until 2026-10-30) have no 5h limit; their
   `limits[]` has no session row. No account here sent a `5h-*` header on
   2026-11-11. Fable's weekly limit is a 50% share of the weekly
