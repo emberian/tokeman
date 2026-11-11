@@ -266,7 +266,10 @@ mod tests {
         assert_eq!(settings.services_interval().as_secs(), 600);
         assert!(settings.set("services_interval_secs", "59").is_err());
         settings.services_interval_secs = 1;
-        assert_eq!(settings.services_interval().as_secs(), MIN_SERVICES_INTERVAL_SECS);
+        assert_eq!(
+            settings.services_interval().as_secs(),
+            MIN_SERVICES_INTERVAL_SECS
+        );
         assert!(settings.set("colour", "red").is_err());
     }
 

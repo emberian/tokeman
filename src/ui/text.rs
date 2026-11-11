@@ -347,7 +347,11 @@ pub fn format_age(at: i64, now: i64) -> String {
 
 /// The services section of `tokeman list`: the last stored read of each
 /// configured service account, without network.
-pub fn print_service_list(accounts: &[crate::providers::ServiceAccount], latest: &[Usage], now: i64) {
+pub fn print_service_list(
+    accounts: &[crate::providers::ServiceAccount],
+    latest: &[Usage],
+    now: i64,
+) {
     if accounts.is_empty() {
         return;
     }
@@ -359,7 +363,11 @@ pub fn print_service_list(accounts: &[crate::providers::ServiceAccount], latest:
         let detail = match read {
             Some(usage) => format!(
                 "{}{}  {DIM}({}){RESET}",
-                usage.plan.as_deref().map(|plan| format!("[{plan}] ")).unwrap_or_default(),
+                usage
+                    .plan
+                    .as_deref()
+                    .map(|plan| format!("[{plan}] "))
+                    .unwrap_or_default(),
                 usage_summary(usage),
                 format_age(usage.at, now)
             ),

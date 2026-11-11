@@ -106,7 +106,6 @@ impl Poller {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,11 +118,13 @@ mod tests {
         let mut fleet = Fleet::default();
         assert!(poller.tick(&fleet).await.is_empty());
         assert!(poller.running.is_none(), "no services, no poll");
-        fleet.services.push(providers::ServiceAccount::with_key_file(
-            Service::Zai,
-            "glm",
-            "/nonexistent/zai-key",
-        ));
+        fleet
+            .services
+            .push(providers::ServiceAccount::with_key_file(
+                Service::Zai,
+                "glm",
+                "/nonexistent/zai-key",
+            ));
         assert!(poller.tick(&fleet).await.is_empty());
         let started = poller.next.unwrap();
         while !poller.running.as_ref().unwrap().is_finished() {
@@ -132,11 +133,20 @@ mod tests {
         let lines = poller.tick(&fleet).await;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("glm"), "{lines:?}");
-        assert!(poller.running.is_none(), "the next poll waits for its interval");
+        assert!(
+            poller.running.is_none(),
+            "the next poll waits for its interval"
+        );
         assert_eq!(poller.next, Some(started));
         let stored = Store::open_at(&db).unwrap().latest_usage().unwrap();
         assert_eq!(stored.len(), 1);
-        assert!(stored[0].error.as_deref().unwrap().contains("/nonexistent/zai-key"));
+        assert!(
+            stored[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("/nonexistent/zai-key")
+        );
     }
 
     #[test]

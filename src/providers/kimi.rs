@@ -46,10 +46,7 @@ pub(crate) async fn read_from(
     };
     let base = base.trim_end_matches('/');
     let (usages_url, me_url) = (format!("{base}/usages"), format!("{base}/me"));
-    let (usages, me) = futures::join!(
-        get(client, &usages_url, &key),
-        get(client, &me_url, &key),
-    );
+    let (usages, me) = futures::join!(get(client, &usages_url, &key), get(client, &me_url, &key),);
     let parsed = usages.and_then(|body| parse_usages(&body));
     match parsed {
         Ok((meters, balances)) => Usage {
@@ -337,7 +334,8 @@ mod tests {
     #[tokio::test]
     async fn read_sends_bearer_and_survives_a_failed_me() {
         fn authorized(headers: &HeaderMap) -> bool {
-            headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer sk-kimi-test")
+            headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some("Bearer sk-kimi-test")
         }
         let app = Router::new()
             .route(

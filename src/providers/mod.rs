@@ -144,7 +144,12 @@ impl ServiceAccount {
 
     /// The API key: inline, else the trimmed contents of `key_file`.
     pub fn api_key(&self) -> Result<String> {
-        if let Some(key) = self.key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+        if let Some(key) = self
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
             return Ok(key.to_owned());
         }
         let Some(file) = self.key_file.as_deref() else {

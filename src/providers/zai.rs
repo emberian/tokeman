@@ -186,12 +186,8 @@ impl Limit {
 
 /// The plan level and one meter per known limit, shortest window first.
 fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Meter>), String> {
-    let envelope: Envelope = serde_json::from_str(body).map_err(|error| {
-        format!(
-            "unreadable answer ({error}): {}",
-            super::snippet(body)
-        )
-    })?;
+    let envelope: Envelope = serde_json::from_str(body)
+        .map_err(|error| format!("unreadable answer ({error}): {}", super::snippet(body)))?;
     if !envelope.success || envelope.code != Some(200) {
         return Err(format!(
             "z.ai refused: {} (code {})",

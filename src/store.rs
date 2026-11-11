@@ -466,9 +466,15 @@ mod tests {
     #[test]
     fn service_reads_round_trip_and_the_latest_is_per_account() {
         let (_dir, store) = open();
-        store.insert_usage(&usage(Service::Zai, "glm", 100, 0.1)).unwrap();
-        store.insert_usage(&usage(Service::Zai, "glm", 200, 0.2)).unwrap();
-        store.insert_usage(&usage(Service::Kimi, "glm", 150, 0.5)).unwrap();
+        store
+            .insert_usage(&usage(Service::Zai, "glm", 100, 0.1))
+            .unwrap();
+        store
+            .insert_usage(&usage(Service::Zai, "glm", 200, 0.2))
+            .unwrap();
+        store
+            .insert_usage(&usage(Service::Kimi, "glm", 150, 0.5))
+            .unwrap();
         store
             .insert_usage(&Usage::failed(Service::Kimi, "kimi", 300, "HTTP 401"))
             .unwrap();
@@ -491,7 +497,10 @@ mod tests {
                 (Service::Kimi, "kimi".to_owned(), 300)
             ]
         );
-        assert_eq!(store.recent_usage(None, 1).unwrap()[0].error.as_deref(), Some("HTTP 401"));
+        assert_eq!(
+            store.recent_usage(None, 1).unwrap()[0].error.as_deref(),
+            Some("HTTP 401")
+        );
     }
 
     #[test]

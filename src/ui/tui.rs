@@ -923,11 +923,13 @@ mod tests {
     fn each_service_account_gets_a_line_read_or_not() {
         use crate::providers::{Meter, Service, ServiceAccount};
         let dir = tempfile::tempdir().unwrap();
-        let mut fleet = Fleet::default();
-        fleet.services = vec![
-            ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key"),
-            ServiceAccount::with_key_file(Service::Kimi, "kimi", "~/.kimikey"),
-        ];
+        let fleet = Fleet {
+            services: vec![
+                ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key"),
+                ServiceAccount::with_key_file(Service::Kimi, "kimi", "~/.kimikey"),
+            ],
+            ..Fleet::default()
+        };
         let mut app = App::new(fleet, Store::open_at(&dir.path().join("s.db")).unwrap());
         app.services = vec![Usage {
             service: Service::Kimi,
@@ -946,11 +948,22 @@ mod tests {
         }];
         let text: Vec<String> = service_lines(&app, 1_000 + 300)
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
         assert_eq!(text.len(), 2);
-        assert!(text[0].contains("glm") && text[0].contains("reading..."), "{text:?}");
-        assert!(text[1].contains("weekly 10%") && text[1].contains("5m ago"), "{text:?}");
+        assert!(
+            text[0].contains("glm") && text[0].contains("reading..."),
+            "{text:?}"
+        );
+        assert!(
+            text[1].contains("weekly 10%") && text[1].contains("5m ago"),
+            "{text:?}"
+        );
         let tight = service_lines(&app, 1_300)[1].spans[1].style.fg;
         assert_eq!(tight, Some(Color::Red));
     }

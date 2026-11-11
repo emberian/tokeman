@@ -193,9 +193,7 @@ async fn dispatch(command: Command) -> Result<()> {
             }
         },
         Command::Codex { action } => tokeman::ui::codex_cli::run(action).await?,
-        Command::Services { action, json } => {
-            tokeman::ui::services_cli::run(action, json).await?
-        }
+        Command::Services { action, json } => tokeman::ui::services_cli::run(action, json).await?,
         #[cfg(feature = "tray")]
         Command::Tray => tokeman::ui::tray::run(Fleet::load()?)?,
     }

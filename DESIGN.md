@@ -50,7 +50,7 @@ src/
   quota.rs       Window, Bucket, ModelKey, Source, Reading, Level: what is known about an account's room
   policy.rs      PURE. Mode, Floors, viability, landing choice, Decision. No IO, no clock, no strings.
   history.rs     credential history: Event, fingerprint, account_at (JSONL, same format as today)
-  store.rs       sqlite snapshot history (same schema as today), Snapshot, Series
+  store.rs       sqlite snapshot history (same schema as today), Snapshot, Series; service_readings (one Usage as JSON per row)
   observe.rs     ObservedLimit, SessionBinding, the SessionStart hook input, transcript scan
   anthropic/
     mod.rs       the HTTP client that identifies as Claude Code; error classification
@@ -70,7 +70,10 @@ src/
     refresh.rs   token refresh
     commands.rs  add/discover/import/list/refresh/best/seat/reseat/watch
   providers/
-    mod.rs       Service, ServiceAccount, Meter, Amount, Usage: read-only quota of services tokeman does not rotate
+    mod.rs       Service, ServiceAccount, Meter, Amount, Balance, Usage: read-only quota of services tokeman does not rotate;
+                 read (dispatch by service), read_all (concurrent, each read bounded), the shared client
+    zai.rs       GLM Coding Plan: /api/monitor/usage/quota/limit, raw key; errors arrive as HTTP 200 with the code in the body
+    kimi.rs      Kimi Code: /coding/v1/usages (Bearer) -> Meters + booster Balance; plan name from /coding/v1/me
     antigravity.rs  Google OAuth refresh (own access-token cache), retrieveUserQuotaSummary -> Meters,
                  discover() from agy's Keychain item / token file and the app's state.vscdb (read-only)
   daemon/
@@ -78,11 +81,13 @@ src/
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record
     cadence.rs   typed on-disk cycle state: last probe, mode, interval, backoff (keyed to the refused credential), samples
     lock.rs      the rotation lock
+    services.rs  the service-quota poll: its own task every services_interval_secs, recorded; rotation never waits on it
     service.rs   launchd plist, install/uninstall (macOS)
   ui/
     text.rs      gauges, tables, status (every println in one module)
     chart.rs     PNG + iTerm2 inline, shared segment logic
-    tui.rs       --watch
+    tui.rs       --watch (cards, chart, a services strip)
+    services_cli.rs  `tokeman services`: list, add, remove, import antigravity
     tray.rs      egui tray (feature "tray")
   cli.rs         clap definitions and dispatch; no logic
   launch.rs      the claude launch command and terminal handoff
@@ -119,7 +124,13 @@ impl Reading { fn remaining(&self, w: Which) -> Option<f64>; fn bucket(&self, ke
 pub enum Credential<'a> { Setup(&'a str), Login { token: &'a str, expires_at: i64, scopes: &'a [String] } }
 pub struct Account { name, setup_key: Option<String>, login: Option<LoginGrant>, login_error: Option<String> }
 impl Account { fn credential(&self, now: i64) -> Option<Credential> }   // login if live, else setup
-pub struct Fleet { pub accounts: Vec<Account>, pub codex: Vec<CodexAccount>, pub launch: LaunchSettings, pub policy: PolicySettings }
+pub struct Fleet { pub accounts: Vec<Account>, pub codex: Vec<CodexAccount>, pub services: Vec<ServiceAccount>, pub launch: LaunchSettings, pub policy: PolicySettings }
+
+// providers/mod.rs  (each service module: `pub async fn read(&reqwest::Client, &ServiceAccount, now) -> Usage`, never Err)
+pub enum Service { Antigravity, Zai, Kimi }                  // serde: lowercase
+pub struct ServiceAccount { name, service, key, key_file, refresh_token, access_token, expires_at, label }
+pub struct Meter { group: Option<String>, label: String, window: Window, span_secs: Option<i64>, amount: Option<Amount> }
+pub struct Usage { service, account, at, plan: Option<String>, meters: Vec<Meter>, balances: Vec<Balance>, error: Option<String> }
 impl Fleet { fn load() ; fn update(|&mut Fleet| -> T) -> T  /* locked RMW, comments kept */ }
 
 // policy.rs  (pure; the tests are the spec)
@@ -158,8 +169,10 @@ Rules the types enforce:
 
 - `tokens.toml`: same tables and keys (`[[tokens]]` with `name`, `key`,
   `access_token`, `refresh_token`, `expires_at`, `obtained_at`, `scopes`,
-  `login_error`; `[settings]`; `[rotation]`; `[[codex_accounts]]`). Comments
-  survive every write.
+  `login_error`; `[settings]`; `[rotation]`; `[[codex_accounts]]`), plus
+  `[[services]]` (`name`, `service`, `key` or `key_file`, Antigravity's grant,
+  `label`) and `services_interval_secs` in `[settings]`. Comments survive every
+  write.
 - `~/.claude/settings.json` env keys: `CLAUDE_CODE_OAUTH_TOKEN`,
   `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_401_WAIT_MS`, `TOKEMAN_ACCOUNT`;
   the SessionStart hook command `tokeman rotate observe-session --pid "$PPID"`.

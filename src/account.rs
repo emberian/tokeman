@@ -855,7 +855,11 @@ mod tests {
         let mut fleet = Fleet::parse(existing).unwrap();
         assert_eq!(
             fleet.services,
-            [ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key")]
+            [ServiceAccount::with_key_file(
+                Service::Zai,
+                "glm",
+                "~/.zai-key"
+            )]
         );
         fleet.upsert_service(ServiceAccount::with_key_file(
             Service::Kimi,
