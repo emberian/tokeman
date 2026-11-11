@@ -50,7 +50,10 @@ pub async fn run(action: Option<ServicesAction>, json: bool) -> Result<()> {
         }
         ServicesAction::Import { source } => {
             let found = match source {
-                ImportSource::Antigravity => providers::import_antigravity()?,
+                // Shells out to `security` with its own bound.
+                ImportSource::Antigravity => {
+                    tokio::task::spawn_blocking(providers::antigravity::discover).await??
+                }
             };
             if found.is_empty() {
                 println!("no signed-in accounts found");
@@ -83,8 +86,14 @@ fn add(account: ServiceAccount) -> Result<bool> {
                 existing.service.label()
             );
         }
-        let replaced = fleet.service_account(&account.name).is_some();
-        fleet.upsert_service(account);
+        let existing = fleet.service_account(&account.name);
+        let replaced = existing.is_some();
+        // A re-import or re-add brings fresh credentials, not a new label.
+        let label = account
+            .label
+            .clone()
+            .or_else(|| existing.and_then(|existing| existing.label.clone()));
+        fleet.upsert_service(ServiceAccount { label, ..account });
         Ok(replaced)
     })?;
     Ok(replaced)

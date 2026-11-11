@@ -69,6 +69,10 @@ src/
     probe.rs     usage probe
     refresh.rs   token refresh
     commands.rs  add/discover/import/list/refresh/best/seat/reseat/watch
+  providers/
+    mod.rs       Service, ServiceAccount, Meter, Amount, Usage: read-only quota of services tokeman does not rotate
+    antigravity.rs  Google OAuth refresh (own access-token cache), retrieveUserQuotaSummary -> Meters,
+                 discover() from agy's Keychain item / token file and the app's state.vscdb (read-only)
   daemon/
     mod.rs       the loop
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record

@@ -187,11 +187,15 @@ The same token and body against the same host:
 | `antigravity/1.5.5 (aidev_client; os_type=darwin; arch=arm64)` | Claude and GPT only |
 | `antigravity/hub/2.28.0 (aidev_client; os_type=darwin; arch=arm64; cl=1008300195)` | **Gemini Models + Claude and GPT** |
 
-So send an `antigravity/hub/<ver> (aidev_client; os_type=<os>; arch=<arch>; cl=<cl>)` UA. The
-format comes from Antigravity-Manager `src-tauri/src/constants.rs::build_official_upstream_user_agent`
-**[web]**; `agy` contains the `%s/%s (%s)`, `aidev_client`, `os_type=%s` pieces **[code]**. CodexBar
-uses `antigravity/hub/2.9.1 <darwin|linux>/<arm64|amd64>` **[web]**. The version needed to unlock
-the Gemini group was not bisected; pin a recent hub version and watch for drift.
+Bisected on 2026-11-11 with bare `antigravity/hub/<v>` agents **[live]**: 2.7.0 and below
+(and 2.0.1, the installed app's version, and `2.9` without a patch number) get only Claude/GPT;
+2.8.0, 2.8.9, 2.9.0, 2.9.1, 2.28.0, 3.0.0, 9.0.0 get both groups. The gate is a version
+comparison at hub ≥ 2.8.0. The suffix is not checked: `(aidev_client; os_type=…; arch=…)`, a
+`cl=` field, or `darwin/arm64` all work. The format comes from Antigravity-Manager
+`src-tauri/src/constants.rs::build_official_upstream_user_agent` **[web]**, and `agy` contains the
+`%s/%s (%s)`, `aidev_client`, `os_type=%s` pieces **[code]**. tokeman sends
+`antigravity/hub/2.28.0 (aidev_client; os_type=<os>; arch=<arch>)`, or the installed app's version
+when that is newer.
 
 ### 3. `POST /v1internal:fetchAvailableModels`: per-model view (fallback only) **[live]**
 
@@ -244,20 +248,49 @@ the transcript-rejection analogue for an account that tokeman is not polling.
 
 ## Account switching
 
-**CLI (`agy`): feasible by slot swap. [code, inferred; not executed]**
-- The slot is one Keychain item (`gemini`/`antigravity`, `go-keyring-base64:` + JSON above). The
-  file is a fallback. A switch writes the other account's `{"token":…, "auth_method":"consumer",
-  "id_token_email":…}` into the Keychain item, and into the file for consistency.
-- Because both accounts use the same client and Google does not rotate refresh tokens, tokeman
-  can keep both grants in its own store and copy either into the slot at any time. Copying never
-  invalidates tokeman's copy. **[live: no rotation, same client]**
-- `agy` contains `Stored token metadata changed externally; updating in-memory auth session`, so a
-  running `agy` probably picks up a swapped credential without a restart. Not tested. Expect the
-  same cold-start cost as tokeman's Claude switch: open conversations re-auth, and server-side
-  caching is per account.
-- Writing the Keychain item from Rust: the `security-framework` crate, or `security
-  add-generic-password -U -s gemini -a antigravity -w <value>`. The latter puts the secret on a
-  command line, so prefer the API.
+**CLI (`agy`): feasible by slot swap. Documented plan; not executed.**
+
+The slot is one Keychain generic password: service `gemini`, account `antigravity`, in the login
+keychain. `agy` writes it through go-keyring, which drives `/usr/bin/security`. The item's
+access list therefore trusts `/usr/bin/security` and not tokeman. A write from tokeman through
+security-framework would put tokeman on the list and could make `agy`'s next read prompt. The
+switch has to use the same tool. go-keyring keeps the secret off the command line by running
+`security -i` and writing the command to its stdin, and tokeman should do the same:
+
+```
+/usr/bin/security -i            (stdin, one line, then EOF; bounded wait)
+add-generic-password -U -s gemini -a antigravity -w go-keyring-base64:<base64(JSON)>
+```
+
+where JSON is exactly `agy`'s shape for the target account:
+
+```json
+{"token": {"access_token": "<ya29…>", "token_type": "Bearer", "refresh_token": "<1//…>",
+           "expiry": "<RFC 3339 with offset>", "expires_in": 3599},
+ "auth_method": "consumer",
+ "id_token_email": "<the account's email>"}
+```
+
+- A stale `access_token` and `expiry` are fine: `agy` refreshes with the refresh token and
+  rewrites the item. The client is shared and the refresh token does not rotate, so copying a
+  grant into the slot never invalidates tokeman's copy, and swapping back restores the old account
+  exactly. **[live: no rotation, same client]**
+- Also rewrite `~/.gemini/antigravity-cli/antigravity-oauth-token` (0600, same JSON without the
+  prefix). `agy` reads it when the Keychain times out. Otherwise a slow Keychain silently puts the
+  old account back.
+- Back up first: read the current item (`find-generic-password -s gemini -a antigravity -w`)
+  and keep the value byte-for-byte, so `pause`/`restore` can put it back the way
+  `claude/keychain.rs` does for Claude's login.
+- Does a running `agy` pick the switch up? The binary contains `Stored token metadata changed
+  externally; updating in-memory auth session` and `Rebinding LanguageServer backend for auth change`
+  **[code]**, so it probably notices without a restart. **Untested.** Testing it means
+  rewriting ember's live login while an `agy` runs. Running a throwaway `agy` against a private
+  `HOME` with `SSH_TTY` set (CodexBar's file-storage trick) is not safe either: `agy` contains
+  `Failed to clear stale keyring credential after file fallback`, so a file-mode run may delete
+  the login-keychain item, and that item is shared across `HOME`s. Test both when ember can
+  watch, with the original value saved.
+- Expect the cost of a Claude switch: open conversations re-authenticate and server-side caches
+  are per account.
 
 **IDE (Antigravity.app): possible but not worth it.** Swapping means rewriting the protobuf in
 `state.vscdb` while the app is closed, and the cached `userStatus` would still show the old email.

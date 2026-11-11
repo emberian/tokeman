@@ -7,6 +7,7 @@
 //! account: &ServiceAccount, now: i64) -> Usage` and never panics or returns
 //! `Err`: a failure is a `Usage` with `error` set.
 
+pub mod antigravity;
 pub mod kimi;
 pub mod zai;
 
@@ -42,12 +43,7 @@ pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) 
     match account.service {
         Service::Zai => zai::read(client, account, now).await,
         Service::Kimi => kimi::read(client, account, now).await,
-        Service::Antigravity => Usage::failed(
-            Service::Antigravity,
-            &account.name,
-            now,
-            "Antigravity support is not in this build yet",
-        ),
+        Service::Antigravity => antigravity::read(client, account, now).await,
     }
 }
 
@@ -72,11 +68,6 @@ pub async fn read_all(
         }
     }))
     .await
-}
-
-/// What `services import <source>` can import.
-pub fn import_antigravity() -> Result<Vec<ServiceAccount>> {
-    bail!("Antigravity import is not in this build yet")
 }
 
 /// A subscription service tokeman can read quota from.
@@ -306,7 +297,7 @@ mod tests {
     async fn read_all_keeps_order_and_answers_for_every_account() {
         let accounts = [
             ServiceAccount::with_key_file(Service::Zai, "glm", "/nonexistent/a"),
-            ServiceAccount::with_key_file(Service::Antigravity, "agy", "/nonexistent/b"),
+            ServiceAccount::with_key_file(Service::Kimi, "second", "/nonexistent/b"),
             ServiceAccount::with_key_file(Service::Kimi, "kimi", "/nonexistent/c"),
         ];
         let usages = read_all(&reqwest::Client::new(), &accounts, 7).await;
@@ -318,7 +309,7 @@ mod tests {
             names,
             [
                 (Service::Zai, "glm", 7),
-                (Service::Antigravity, "agy", 7),
+                (Service::Kimi, "second", 7),
                 (Service::Kimi, "kimi", 7)
             ]
         );
