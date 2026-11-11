@@ -84,23 +84,98 @@ impl fmt::Display for Plan {
     }
 }
 
-/// One metered limit: a short window and a long one.
+/// How long a window lasts, which is what names it. The backend moves
+/// windows between `primary_window` and `secondary_window` (an account
+/// whose only window is the weekly one reports it as primary), so position
+/// says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Span {
+    FiveHour,
+    Weekly,
+    /// Any other length, in seconds.
+    Seconds(i64),
+    /// The backend did not say.
+    Unknown,
+}
+
+impl Span {
+    pub const FIVE_HOUR_SECS: i64 = 5 * 3_600;
+    pub const WEEK_SECS: i64 = 7 * 86_400;
+
+    pub fn from_seconds(seconds: Option<i64>) -> Self {
+        match seconds {
+            Some(Self::FIVE_HOUR_SECS) => Self::FiveHour,
+            Some(Self::WEEK_SECS) => Self::Weekly,
+            Some(seconds) if seconds > 0 => Self::Seconds(seconds),
+            _ => Self::Unknown,
+        }
+    }
+
+    /// `5h`, `weekly`, or the span in its largest whole unit (`1d`, `90m`).
+    pub fn label(&self) -> String {
+        match *self {
+            Self::FiveHour => "5h".to_owned(),
+            Self::Weekly => "weekly".to_owned(),
+            Self::Seconds(seconds) => {
+                let unit = [(86_400, "d"), (3_600, "h"), (60, "m")]
+                    .into_iter()
+                    .find(|(size, _)| seconds % size == 0);
+                match unit {
+                    Some((size, suffix)) => format!("{}{suffix}", seconds / size),
+                    None => format!("{seconds}s"),
+                }
+            }
+            Self::Unknown => "window".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+/// One window of a limit, named by its length.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpanWindow {
+    pub span: Span,
+    #[serde(flatten)]
+    pub window: Window,
+}
+
+/// One metered limit and the windows it is measured over, in the order the
+/// backend sent them.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RateLimit {
     pub allowed: Option<bool>,
     pub limit_reached: Option<bool>,
-    pub primary: Option<Window>,
-    pub secondary: Option<Window>,
+    pub windows: Vec<SpanWindow>,
 }
 
 impl RateLimit {
-    /// The smaller remaining fraction of the two windows: whichever bites first.
+    /// The window of this length, if the limit has one.
+    pub fn window(&self, span: Span) -> Option<Window> {
+        self.windows
+            .iter()
+            .find(|window| window.span == span)
+            .map(|window| window.window)
+    }
+
+    /// The smallest remaining fraction over every window: whichever bites first.
     pub fn remaining(&self) -> Option<f64> {
-        [self.primary, self.secondary]
-            .into_iter()
-            .flatten()
-            .map(|window| window.remaining().clamp(0.0, 1.0))
+        self.windows
+            .iter()
+            .map(|window| window.window.remaining().clamp(0.0, 1.0))
             .reduce(f64::min)
+    }
+
+    /// The window with the least left.
+    pub fn tightest(&self) -> Option<&SpanWindow> {
+        self.windows
+            .iter()
+            .min_by(|a, b| a.window.remaining().total_cmp(&b.window.remaining()))
     }
 
     /// `allowed` is authoritative when present; absence is not a rejection.
@@ -109,30 +184,30 @@ impl RateLimit {
     }
 }
 
-/// A per-model limit (e.g. a separate weekly bucket for Codex-Spark), metered
-/// apart from the account-wide windows.
+/// A per-feature or per-model limit (e.g. a separate bucket for
+/// Codex-Spark), metered apart from the account-wide windows.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExtraLimit {
     pub name: Option<String>,
     pub feature: Option<String>,
+    /// The model whose ordinary limit this one stands in for.
+    pub model: Option<String>,
     pub limit: Option<RateLimit>,
 }
 
 impl ExtraLimit {
-    /// Loose match on either the name or the metered feature, so a caller
-    /// can say "spark".
+    /// Loose match on the name, the metered feature or the model, so a
+    /// caller can say "spark".
     pub fn matches(&self, needle: &str) -> bool {
         let needle = needle.to_ascii_lowercase();
-        [&self.name, &self.feature]
+        [&self.name, &self.feature, &self.model]
             .into_iter()
             .flatten()
             .any(|text| text.to_ascii_lowercase().contains(&needle))
     }
 
     pub fn is_limited(&self) -> bool {
-        self.limit
-            .as_ref()
-            .is_some_and(|limit| limit.limit_reached == Some(true))
+        self.limit.as_ref().is_some_and(|limit| !limit.allows())
     }
 }
 
@@ -143,6 +218,50 @@ pub struct Credits {
     pub overage_limit_reached: Option<bool>,
     /// The backend sends `null`, `"0"` or a number here; kept as text.
     pub balance: Option<String>,
+}
+
+/// Whether the account may use one model right now (`model_usage`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub slug: String,
+    pub available: Option<bool>,
+    /// Epoch seconds when the model becomes available again.
+    pub available_at: Option<i64>,
+    /// Buying credits would make the model available.
+    pub credits_would_enable: Option<bool>,
+}
+
+impl ModelUsage {
+    pub fn is_unavailable(&self) -> bool {
+        self.available == Some(false)
+    }
+}
+
+/// The workspace's cap on credit spending (`spend_control`). The amounts are
+/// decimal strings, kept as sent.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SpendControl {
+    pub reached: Option<bool>,
+    pub limit: Option<SpendLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SpendLimit {
+    pub limit: Option<String>,
+    pub used: Option<String>,
+    pub remaining: Option<String>,
+    pub used_percent: Option<f64>,
+    /// Epoch seconds.
+    pub reset_at: Option<i64>,
+    pub source: Option<String>,
+}
+
+/// Reset credits held by the account, as the usage body counts them.
+/// `applicable` is how many would clear a limit the account is at now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResetCreditCount {
+    pub available: i64,
+    pub applicable: Option<i64>,
 }
 
 /// What the usage endpoint said about an account.
@@ -157,6 +276,10 @@ pub struct Usage {
     /// The backend's name for the limit it is enforcing, when it is.
     pub limit_reason: Option<String>,
     pub extra: Vec<ExtraLimit>,
+    /// Per-model availability, by slug.
+    pub models: Vec<ModelUsage>,
+    pub spend_control: Option<SpendControl>,
+    pub reset_credits: Option<ResetCreditCount>,
 }
 
 /// Why a probe produced no usage.
@@ -270,16 +393,21 @@ impl Probe {
         }
     }
 
-    fn limit(&self) -> Option<&RateLimit> {
+    pub fn limit(&self) -> Option<&RateLimit> {
         self.usage.as_ref()?.limit.as_ref()
     }
 
-    pub fn primary(&self) -> Option<Window> {
-        self.limit()?.primary
+    /// The account-wide window of this length.
+    pub fn window(&self, span: Span) -> Option<Window> {
+        self.limit()?.window(span)
     }
 
-    pub fn secondary(&self) -> Option<Window> {
-        self.limit()?.secondary
+    /// Account-wide windows of a length other than 5h or weekly.
+    pub fn other_windows(&self) -> impl Iterator<Item = &SpanWindow> {
+        self.limit()
+            .into_iter()
+            .flat_map(|limit| &limit.windows)
+            .filter(|window| !matches!(window.span, Span::FiveHour | Span::Weekly))
     }
 
     /// Least remaining across the reported windows. `None` is no reading,
@@ -303,6 +431,21 @@ impl Probe {
             .as_ref()
             .map(|usage| usage.extra.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn models(&self) -> &[ModelUsage] {
+        self.usage
+            .as_ref()
+            .map(|usage| usage.models.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn spend_control(&self) -> Option<&SpendControl> {
+        self.usage.as_ref()?.spend_control.as_ref()
+    }
+
+    pub fn reset_credits(&self) -> Option<ResetCreditCount> {
+        self.usage.as_ref()?.reset_credits
     }
 
     /// Whether the backend would accept work on this account. A 200 with no
@@ -356,18 +499,22 @@ impl Probe {
 #[derive(Deserialize, Default)]
 struct RawWindow {
     used_percent: Option<f64>,
+    limit_window_seconds: Option<i64>,
     reset_after_seconds: Option<i64>,
     reset_at: Option<i64>,
 }
 
 impl RawWindow {
-    fn window(&self, at: DateTime<Utc>) -> Option<Window> {
+    fn window(&self, at: DateTime<Utc>) -> Option<SpanWindow> {
         let used = self.used_percent? / 100.0;
         let resets_at = self
             .reset_at
             .or_else(|| self.reset_after_seconds.map(|after| at.timestamp() + after))
             .unwrap_or(0);
-        Some(Window::new(used, resets_at))
+        Some(SpanWindow {
+            span: Span::from_seconds(self.limit_window_seconds),
+            window: Window::new(used, resets_at),
+        })
     }
 }
 
@@ -384,8 +531,11 @@ impl RawRateLimit {
         RateLimit {
             allowed: self.allowed,
             limit_reached: self.limit_reached,
-            primary: self.primary_window.as_ref().and_then(|w| w.window(at)),
-            secondary: self.secondary_window.as_ref().and_then(|w| w.window(at)),
+            windows: [&self.primary_window, &self.secondary_window]
+                .into_iter()
+                .flatten()
+                .filter_map(|window| window.window(at))
+                .collect(),
         }
     }
 }
@@ -402,6 +552,7 @@ struct RawCredits {
 struct RawExtraLimit {
     limit_name: Option<String>,
     metered_feature: Option<String>,
+    normal_model_slug: Option<String>,
     rate_limit: Option<RawRateLimit>,
 }
 
@@ -412,93 +563,152 @@ struct RawReachedType {
 }
 
 #[derive(Deserialize, Default)]
-struct RawUsage {
-    user_id: Option<String>,
-    account_id: Option<String>,
-    email: Option<String>,
-    plan_type: Option<String>,
-    rate_limit: Option<RawRateLimit>,
-    credits: Option<RawCredits>,
-    rate_limit_reached_type: Option<RawReachedType>,
-    #[serde(default)]
-    additional_rate_limits: Vec<RawExtraLimit>,
+struct RawModelUsage {
+    available: Option<bool>,
+    available_at: Option<Value>,
+    credits_would_enable: Option<bool>,
 }
 
-impl RawUsage {
-    fn usage(self, at: DateTime<Utc>) -> Usage {
-        Usage {
-            user_id: self.user_id,
-            account_id: self.account_id,
-            email: self.email,
-            plan: self.plan_type.as_deref().map(Plan::parse),
-            limit: self.rate_limit.as_ref().map(|limit| limit.limit(at)),
-            credits: self.credits.map(|credits| Credits {
-                has_credits: credits.has_credits,
-                unlimited: credits.unlimited,
-                overage_limit_reached: credits.overage_limit_reached,
-                balance: match credits.balance {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(text)) => Some(text),
-                    Some(other) => Some(other.to_string()),
-                },
-            }),
-            limit_reason: self
-                .rate_limit_reached_type
-                .and_then(|reached| reached.kind),
-            extra: self
-                .additional_rate_limits
-                .into_iter()
-                .map(|extra| ExtraLimit {
-                    name: extra.limit_name,
-                    feature: extra.metered_feature,
-                    limit: extra.rate_limit.as_ref().map(|limit| limit.limit(at)),
-                })
-                .collect(),
-        }
+#[derive(Deserialize, Default)]
+struct RawSpendLimit {
+    source: Option<String>,
+    limit: Option<Value>,
+    used: Option<Value>,
+    remaining: Option<Value>,
+    used_percent: Option<f64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawSpendControl {
+    reached: Option<bool>,
+    individual_limit: Option<RawSpendLimit>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawResetCredits {
+    available_count: Option<i64>,
+    applicable_available_count: Option<i64>,
+}
+
+/// A number or string the backend may send either way, as text.
+fn text_of(value: Option<Value>) -> Option<String> {
+    match value? {
+        Value::Null => None,
+        Value::String(text) => Some(text),
+        other => Some(other.to_string()),
     }
 }
 
-/// Decode a usage body. On a strict failure, retry on just the subtree
-/// rotation depends on, so a cosmetic field changing shape does not park a
-/// working account.
+/// Epoch seconds from a number or an RFC 3339 string.
+pub(crate) fn epoch_of(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|at| at.timestamp()),
+        _ => None,
+    }
+}
+
+/// Decode a usage body field by field. `rate_limit` is what rotation rests
+/// on, so a malformed one fails the decode; any other field that changed
+/// shape is dropped alone, so a cosmetic change does not park a working
+/// account or hide the rest of the body.
 pub fn decode_usage(body: &str, at: DateTime<Utc>) -> Result<Usage, ProbeError> {
-    let strict_error = match serde_json::from_str::<RawUsage>(body) {
-        Ok(raw) => return Ok(raw.usage(at)),
-        Err(error) => error,
-    };
     let value: Value = serde_json::from_str(body).map_err(|error| ProbeError::Decode {
         message: format!("failed to parse usage response as JSON: {error}"),
     })?;
-    let rate_limit: Option<RawRateLimit> = value
-        .get("rate_limit")
-        .and_then(|limit| serde_json::from_value(limit.clone()).ok());
-    if rate_limit.is_none() {
+    let Some(object) = value.as_object() else {
         return Err(ProbeError::Decode {
-            message: format!("failed to decode usage response: {strict_error}"),
+            message: "usage response is not a JSON object".to_owned(),
         });
+    };
+    fn field<T: serde::de::DeserializeOwned>(
+        object: &serde_json::Map<String, Value>,
+        key: &str,
+    ) -> Option<T> {
+        serde_json::from_value(object.get(key)?.clone()).ok()
     }
-    let text = |key: &str| value.get(key)?.as_str().map(str::to_owned);
-    Ok(RawUsage {
-        user_id: text("user_id"),
-        account_id: text("account_id"),
-        email: text("email"),
-        plan_type: text("plan_type"),
-        rate_limit,
-        credits: None,
-        rate_limit_reached_type: value
-            .get("rate_limit_reached_type")
-            .and_then(|reached| serde_json::from_value(reached.clone()).ok()),
-        additional_rate_limits: Vec::new(),
-    }
-    .usage(at))
+    let rate_limit = match object.get("rate_limit") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(serde_json::from_value::<RawRateLimit>(raw.clone()).map_err(
+            |error| ProbeError::Decode {
+                message: format!("failed to decode usage rate_limit: {error}"),
+            },
+        )?),
+    };
+    let credits: Option<RawCredits> = field(object, "credits");
+    let extra: Vec<RawExtraLimit> = field(object, "additional_rate_limits").unwrap_or_default();
+    let models: std::collections::BTreeMap<String, RawModelUsage> =
+        field(object, "model_usage").unwrap_or_default();
+    let spend: Option<RawSpendControl> = field(object, "spend_control");
+    let resets: Option<RawResetCredits> = field(object, "rate_limit_reset_credits");
+    let reached: Option<RawReachedType> = field(object, "rate_limit_reached_type");
+    Ok(Usage {
+        user_id: field(object, "user_id"),
+        account_id: field(object, "account_id"),
+        email: field(object, "email"),
+        plan: field::<String>(object, "plan_type")
+            .as_deref()
+            .map(Plan::parse),
+        limit: rate_limit.as_ref().map(|limit| limit.limit(at)),
+        credits: credits.map(|credits| Credits {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            overage_limit_reached: credits.overage_limit_reached,
+            balance: text_of(credits.balance),
+        }),
+        limit_reason: reached.and_then(|reached| reached.kind),
+        extra: extra
+            .into_iter()
+            .map(|extra| ExtraLimit {
+                name: extra.limit_name,
+                feature: extra.metered_feature,
+                model: extra.normal_model_slug,
+                limit: extra.rate_limit.as_ref().map(|limit| limit.limit(at)),
+            })
+            .collect(),
+        models: models
+            .into_iter()
+            .map(|(slug, model)| ModelUsage {
+                slug,
+                available: model.available,
+                available_at: epoch_of(model.available_at.as_ref()),
+                credits_would_enable: model.credits_would_enable,
+            })
+            .collect(),
+        spend_control: spend.map(|spend| SpendControl {
+            reached: spend.reached,
+            limit: spend.individual_limit.map(|limit| SpendLimit {
+                limit: text_of(limit.limit),
+                used: text_of(limit.used),
+                remaining: text_of(limit.remaining),
+                used_percent: limit.used_percent,
+                reset_at: limit.reset_at,
+                source: limit.source,
+            }),
+        }),
+        reset_credits: resets.and_then(|resets| {
+            Some(ResetCreditCount {
+                available: resets.available_count?,
+                applicable: resets.applicable_available_count,
+            })
+        }),
+    })
 }
 
-async fn fetch_usage(
+/// One request to the ChatGPT backend as Codex makes it, retried through
+/// edge challenges; the body of a 2xx answer. A POST is retried too, so a
+/// caller sending one must make it idempotent.
+pub(crate) async fn call(
     client: &Client,
     account: &str,
     auth: &AuthFile,
-    at: DateTime<Utc>,
-) -> Result<Usage, ProbeError> {
+    method: reqwest::Method,
+    url: &str,
+    json: Option<&Value>,
+) -> Result<String, ProbeError> {
     let access_token = auth
         .access_token()
         .ok_or(ProbeError::AuthFileHasNoAccessToken)?;
@@ -507,12 +717,15 @@ async fn fetch_usage(
     let response = loop {
         let mut request = client
             .http()
-            .get(client.usage_url())
+            .request(method.clone(), url)
             .bearer_auth(access_token)
             .header("originator", ORIGINATOR)
             .header("User-Agent", "codex-cli");
         if let Some(account_id) = &account_id {
             request = request.header("chatgpt-account-id", account_id);
+        }
+        if let Some(json) = json {
+            request = request.json(json);
         }
         let response = request.send().await.map_err(|error| ProbeError::Network {
             message: error.to_string(),
@@ -530,7 +743,7 @@ async fn fetch_usage(
         let challenged = is_edge_challenge(&response);
         if std::env::var_os("TOKEMAN_CODEX_DEBUG").is_some() {
             eprintln!(
-                "--- {account} {status} {:?} (attempts: {})",
+                "--- {account} {method} {url} {status} {:?} (attempts: {})",
                 response.version(),
                 attempt + 1
             );
@@ -551,9 +764,26 @@ async fn fetch_usage(
             }
         });
     }
-    let body = response.text().await.map_err(|error| ProbeError::Network {
+    response.text().await.map_err(|error| ProbeError::Network {
         message: error.to_string(),
-    })?;
+    })
+}
+
+async fn fetch_usage(
+    client: &Client,
+    account: &str,
+    auth: &AuthFile,
+    at: DateTime<Utc>,
+) -> Result<Usage, ProbeError> {
+    let body = call(
+        client,
+        account,
+        auth,
+        reqwest::Method::GET,
+        client.usage_url(),
+        None,
+    )
+    .await?;
     decode_usage(&body, at)
 }
 
@@ -618,6 +848,8 @@ pub(crate) mod tests {
     pub(crate) struct Backend {
         pub usage: Arc<Mutex<Vec<(StatusCode, HeaderMap, String)>>>,
         pub token: Arc<Mutex<Vec<(StatusCode, String)>>>,
+        pub credits: Arc<Mutex<Vec<(StatusCode, String)>>>,
+        pub consume: Arc<Mutex<Vec<(StatusCode, String)>>>,
         pub seen: Arc<Mutex<Vec<Seen>>>,
     }
 
@@ -629,6 +861,16 @@ pub(crate) mod tests {
 
         pub fn token_answers(self, answers: Vec<(StatusCode, String)>) -> Self {
             *self.token.lock().unwrap() = answers;
+            self
+        }
+
+        pub fn credit_answers(self, answers: Vec<(StatusCode, String)>) -> Self {
+            *self.credits.lock().unwrap() = answers;
+            self
+        }
+
+        pub fn consume_answers(self, answers: Vec<(StatusCode, String)>) -> Self {
+            *self.consume.lock().unwrap() = answers;
             self
         }
 
@@ -647,6 +889,8 @@ pub(crate) mod tests {
             let app = Router::new()
                 .route("/usage", get(usage_handler))
                 .route("/token", post(token_handler))
+                .route("/credits", get(credits_handler))
+                .route("/credits/consume", post(consume_handler))
                 .with_state(self.clone());
             let base = serve(app).await;
             Client::with_endpoints(
@@ -655,6 +899,7 @@ pub(crate) mod tests {
                 "test-client",
             )
             .unwrap()
+            .with_credits_url(format!("{base}/credits"))
         }
     }
 
@@ -682,20 +927,57 @@ pub(crate) mod tests {
         }
     }
 
+    fn answer(
+        backend: &Backend,
+        path: &str,
+        queue: &Mutex<Vec<(StatusCode, String)>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        backend.seen.lock().unwrap().push(Seen {
+            path: path.into(),
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+        match take(queue) {
+            Some((status, body)) => (status, body).into_response(),
+            None => StatusCode::NOT_IMPLEMENTED.into_response(),
+        }
+    }
+
     async fn token_handler(
         AxumState(backend): AxumState<Backend>,
         headers: HeaderMap,
         body: Bytes,
     ) -> axum::response::Response {
-        backend.seen.lock().unwrap().push(Seen {
-            path: "/token".into(),
+        answer(&backend, "/token", &backend.token, headers, body)
+    }
+
+    async fn credits_handler(
+        AxumState(backend): AxumState<Backend>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        answer(
+            &backend,
+            "/credits",
+            &backend.credits,
             headers,
-            body: String::from_utf8_lossy(&body).into_owned(),
-        });
-        match take(&backend.token) {
-            Some((status, body)) => (status, body).into_response(),
-            None => StatusCode::NOT_IMPLEMENTED.into_response(),
-        }
+            Bytes::new(),
+        )
+    }
+
+    async fn consume_handler(
+        AxumState(backend): AxumState<Backend>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        answer(
+            &backend,
+            "/credits/consume",
+            &backend.consume,
+            headers,
+            body,
+        )
     }
 
     pub(crate) fn ok(body: Value) -> (StatusCode, HeaderMap, String) {
@@ -742,6 +1024,43 @@ pub(crate) mod tests {
         })
     }
 
+    /// The body `/wham/usage` sent on 2026-11-11 (ids changed): the weekly
+    /// window as `primary_window`, no 5h window, and the newer fields.
+    pub(crate) fn weekly_only_body(used: f64) -> Value {
+        json!({
+            "user_id": "u1",
+            "account_id": "acct-1",
+            "email": "a@b.c",
+            "plan_type": "promax",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": used, "limit_window_seconds": 604800,
+                                   "reset_after_seconds": 172920, "reset_at": 1_794_607_293},
+                "secondary_window": null
+            },
+            "code_review_rate_limit": null,
+            "additional_rate_limits": null,
+            "model_usage": {"gpt-6-astra": {"available": true, "available_at": null, "credits_would_enable": false}},
+            "credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false, "balance": "0",
+                        "approx_local_messages": [0, 0], "approx_cloud_messages": [0, 0]},
+            "spend_control": {"reached": false, "individual_limit": null},
+            "rate_limit_reached_type": null,
+            "promo": null,
+            "rate_limit_reset_credits": {"available_count": 2, "applicable_available_count": 0}
+        })
+    }
+
+    /// The weekly-only shape at its limit, with one reset credit that applies.
+    pub(crate) fn limited_body() -> Value {
+        let mut body = weekly_only_body(100.0);
+        body["rate_limit"]["allowed"] = json!(false);
+        body["rate_limit"]["limit_reached"] = json!(true);
+        body["rate_limit_reached_type"] = json!({"type": "rate_limit_reached"});
+        body["rate_limit_reset_credits"]["applicable_available_count"] = json!(1);
+        body
+    }
+
     /// A profile directory with a seated bundle; returns the account.
     pub(crate) fn profile(dir: &std::path::Path, name: &str, refresh_token: &str) -> CodexAccount {
         let home = CodexHome::new(dir.join(name));
@@ -763,9 +1082,13 @@ pub(crate) mod tests {
         let usage = decode_usage(&usage_body(40.0, 75.0).to_string(), at).unwrap();
         assert_eq!(usage.plan, Some(Plan::Plus));
         let limit = usage.limit.as_ref().unwrap();
-        assert_eq!(limit.primary, Some(Window::new(0.4, 4_600)));
-        assert_eq!(limit.secondary, Some(Window::new(0.75, 1_800_000_000)));
+        assert_eq!(limit.window(Span::FiveHour), Some(Window::new(0.4, 4_600)));
+        assert_eq!(
+            limit.window(Span::Weekly),
+            Some(Window::new(0.75, 1_800_000_000))
+        );
         assert_eq!(limit.remaining(), Some(0.25));
+        assert_eq!(limit.tightest().unwrap().span, Span::Weekly);
         assert!(limit.allows());
         assert_eq!(
             usage.credits.as_ref().unwrap().balance.as_deref(),
@@ -779,6 +1102,126 @@ pub(crate) mod tests {
             usage.extra[0].limit.as_ref().unwrap().remaining(),
             Some(0.0)
         );
+        assert_eq!(
+            usage.extra[0].limit.as_ref().unwrap().windows[0].span,
+            Span::Unknown,
+            "a window without limit_window_seconds is not guessed from its position"
+        );
+        assert!(usage.models.is_empty());
+        assert_eq!(usage.reset_credits, None);
+    }
+
+    #[test]
+    fn todays_weekly_only_body_names_its_one_window_weekly() {
+        let at = DateTime::from_timestamp(1_000, 0).unwrap();
+        let usage = decode_usage(&weekly_only_body(42.0).to_string(), at).unwrap();
+        assert_eq!(usage.plan, Some(Plan::Other("promax".into())));
+        let limit = usage.limit.as_ref().unwrap();
+        assert_eq!(limit.window(Span::FiveHour), None);
+        assert_eq!(
+            limit.window(Span::Weekly),
+            Some(Window::new(0.42, 1_794_607_293))
+        );
+        assert_eq!(limit.windows.len(), 1);
+        assert!((limit.remaining().unwrap() - 0.58).abs() < 1e-9);
+        assert!(usage.extra.is_empty(), "additional_rate_limits: null");
+        assert_eq!(
+            usage.models,
+            vec![ModelUsage {
+                slug: "gpt-6-astra".into(),
+                available: Some(true),
+                available_at: None,
+                credits_would_enable: Some(false),
+            }]
+        );
+        assert_eq!(
+            usage.spend_control,
+            Some(SpendControl {
+                reached: Some(false),
+                limit: None
+            })
+        );
+        assert_eq!(
+            usage.reset_credits,
+            Some(ResetCreditCount {
+                available: 2,
+                applicable: Some(0)
+            })
+        );
+        assert_eq!(
+            usage.credits.as_ref().unwrap().balance.as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn newer_fields_decode_with_their_alternative_spellings() {
+        let at = DateTime::from_timestamp(0, 0).unwrap();
+        let mut body = weekly_only_body(10.0);
+        body["rate_limit"]["secondary_window"] =
+            json!({"used_percent": 50, "limit_window_seconds": 86400, "reset_at": 99});
+        body["model_usage"] = json!({
+            "b-model": {"available": false, "available_at": "2026-11-12T00:00:00Z", "credits_would_enable": true},
+            "a-model": {"available": false, "available_at": 1_794_000_000},
+        });
+        body["spend_control"] = json!({"reached": true, "individual_limit": {
+            "source": "workspace", "limit": "50.00", "used": 50, "remaining": "0",
+            "used_percent": 100, "remaining_percent": 0, "reset_after_seconds": 10, "reset_at": 1_794_000_000}});
+        body["additional_rate_limits"] = json!([{"limit_name": "spark", "metered_feature": "codex_spark",
+            "normal_model_slug": "gpt-6-astra-spark",
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                           "primary_window": {"used_percent": 20, "limit_window_seconds": 18000}}}]);
+        let usage = decode_usage(&body.to_string(), at).unwrap();
+        let limit = usage.limit.as_ref().unwrap();
+        assert_eq!(
+            limit.windows.iter().map(|w| w.span).collect::<Vec<_>>(),
+            vec![Span::Weekly, Span::Seconds(86_400)]
+        );
+        assert_eq!(limit.tightest().unwrap().span, Span::Seconds(86_400));
+        assert_eq!(
+            usage
+                .models
+                .iter()
+                .map(|m| (m.slug.as_str(), m.available_at))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a-model", Some(1_794_000_000)),
+                ("b-model", Some(1_794_441_600))
+            ]
+        );
+        assert!(usage.models.iter().all(ModelUsage::is_unavailable));
+        let spend = usage.spend_control.unwrap();
+        assert_eq!(spend.reached, Some(true));
+        let cap = spend.limit.unwrap();
+        assert_eq!(cap.limit.as_deref(), Some("50.00"));
+        assert_eq!(cap.used.as_deref(), Some("50"));
+        assert_eq!(cap.used_percent, Some(100.0));
+        assert_eq!(usage.extra[0].model.as_deref(), Some("gpt-6-astra-spark"));
+        assert!(usage.extra[0].matches("astra-spark"));
+        assert_eq!(
+            usage.extra[0]
+                .limit
+                .as_ref()
+                .unwrap()
+                .window(Span::FiveHour),
+            Some(Window::new(0.2, 0))
+        );
+    }
+
+    #[test]
+    fn spans_are_named_by_length() {
+        assert_eq!(Span::from_seconds(Some(18_000)), Span::FiveHour);
+        assert_eq!(Span::from_seconds(Some(604_800)), Span::Weekly);
+        assert_eq!(Span::from_seconds(None), Span::Unknown);
+        assert_eq!(Span::from_seconds(Some(0)), Span::Unknown);
+        assert_eq!(Span::FiveHour.label(), "5h");
+        assert_eq!(Span::Weekly.label(), "weekly");
+        assert_eq!(Span::Seconds(86_400).label(), "1d");
+        assert_eq!(Span::Seconds(2_592_000).label(), "30d");
+        assert_eq!(Span::Seconds(5_400).label(), "90m");
+        assert_eq!(Span::Seconds(3_600).label(), "1h");
+        assert_eq!(Span::Seconds(61).label(), "61s");
+        assert_eq!(Span::Unknown.to_string(), "window");
     }
 
     #[test]
@@ -792,7 +1235,15 @@ pub(crate) mod tests {
         assert_eq!(usage.limit.as_ref().unwrap().remaining(), Some(0.8));
         assert_eq!(usage.limit_reason.as_deref(), Some("secondary_window"));
         assert!(usage.extra.is_empty());
-        assert!(usage.credits.is_none());
+        assert_eq!(
+            usage.credits.as_ref().unwrap().balance.as_deref(),
+            Some("0"),
+            "a broken field does not take its neighbours with it"
+        );
+        assert!(matches!(
+            decode_usage("[1, 2]", at),
+            Err(ProbeError::Decode { .. })
+        ));
         assert!(matches!(
             decode_usage(r#"{"rate_limit": 5}"#, at),
             Err(ProbeError::Decode { .. })

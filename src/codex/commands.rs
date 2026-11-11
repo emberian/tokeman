@@ -3,16 +3,18 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::Client;
-use super::appserver::{self, AccountInfo, AppServer, remaining_from_rate_limits};
+use super::appserver::{self, AccountInfo, AppServer, tightest_from_rate_limits};
 use super::auth::{self, CodexHome, IdClaims};
-use super::probe::{self, Probe, State};
+use super::probe::{self, Probe, ProbeError, RateLimit, ResetCreditCount, Span, State};
 use super::refresh::{self, DEFAULT_MAX_AGE_DAYS, Failure, RefreshError};
+use super::resets::{self, CreditList};
 use crate::account::{CodexAccount, Fleet};
 use crate::paths::{expand_tilde, tilde};
 use crate::quota::Window;
@@ -240,8 +242,51 @@ pub async fn list(client: &Client, fleet: &Fleet) -> Vec<Probe> {
     probe::probe_all(client, &fleet.codex).await
 }
 
-pub const ROW_HEADER: &str =
-    "ACCOUNT      EMAIL                      PLAN    PRIMARY          SECONDARY        STATE";
+/// A probe and, for an account holding reset credits, the credit list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub probe: Probe,
+    /// Read only for an account the usage body says holds credits.
+    pub reset_credit_list: Option<CreditList>,
+    /// Why the credit list could not be read; the usage body's count stands.
+    pub reset_credit_error: Option<ProbeError>,
+}
+
+/// [`list`], then the credit list of each account the usage body says holds
+/// credits. A failed list leaves the usage body's count standing.
+pub async fn list_detailed(client: &Client, fleet: &Fleet) -> Vec<Listed> {
+    let probes = list(client, fleet).await;
+    let lists = futures::future::join_all(probes.iter().map(|probe| async {
+        let holds = probe
+            .reset_credits()
+            .is_some_and(|count| count.available > 0);
+        let account = fleet.codex_account(&probe.account)?;
+        if !holds {
+            return None;
+        }
+        Some(resets::list(client, account).await)
+    }))
+    .await;
+    probes
+        .into_iter()
+        .zip(lists)
+        .map(|(probe, list)| {
+            let (reset_credit_list, reset_credit_error) = match list {
+                None => (None, None),
+                Some(Ok(list)) => (Some(list), None),
+                Some(Err(error)) => (None, Some(error)),
+            };
+            Listed {
+                probe,
+                reset_credit_list,
+                reset_credit_error,
+            }
+        })
+        .collect()
+}
+
+pub const ROW_HEADER: &str = "ACCOUNT      EMAIL                      PLAN    5H               WEEKLY           RESETS     STATE";
 
 /// `45% (2h10m)`, or `-` for no window.
 pub fn window_cell(window: Option<Window>, now: i64) -> String {
@@ -270,24 +315,118 @@ pub fn duration_cell(seconds: i64) -> String {
     }
 }
 
+/// Reset credits held, and how many would clear a limit now: `2 (0 now)`.
+pub fn resets_cell(count: Option<ResetCreditCount>) -> String {
+    match count {
+        None => "-".to_owned(),
+        Some(ResetCreditCount {
+            available,
+            applicable: Some(applicable),
+        }) => format!("{available} ({applicable} now)"),
+        Some(ResetCreditCount { available, .. }) => available.to_string(),
+    }
+}
+
+/// Every window of a limit, each named: `weekly 40% (3d2h)  5h 10%`.
+fn windows_cell(limit: Option<&RateLimit>, now: i64) -> String {
+    let cells: Vec<String> = limit
+        .into_iter()
+        .flat_map(|limit| &limit.windows)
+        .map(|window| format!("{} {}", window.span, window_cell(Some(window.window), now)))
+        .collect();
+    if cells.is_empty() {
+        "-".to_owned()
+    } else {
+        cells.join("  ")
+    }
+}
+
 /// A probe as one table row under [`ROW_HEADER`], then one indented line
-/// per per-model bucket.
+/// for each window of another length, per-model bucket, unavailable model
+/// and spending cap.
 pub fn rows(probe: &Probe, now: i64) -> Vec<String> {
     let mut lines = vec![format!(
-        "{:<12} {:<26} {:<7} {:<16} {:<16} {}",
+        "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} {}",
         probe.account,
         probe.email().unwrap_or("-"),
         probe.plan().map(|plan| plan.as_str()).unwrap_or("-"),
-        window_cell(probe.primary(), now),
-        window_cell(probe.secondary(), now),
+        window_cell(probe.window(Span::FiveHour), now),
+        window_cell(probe.window(Span::Weekly), now),
+        resets_cell(probe.reset_credits()),
         probe.state(),
     )];
-    for extra in probe.extra() {
+    for window in probe.other_windows() {
         lines.push(format!(
-            "  └ {:<24} {:<16} {}",
-            extra.name.as_deref().unwrap_or("?"),
-            window_cell(extra.limit.as_ref().and_then(|limit| limit.primary), now),
+            "  └ {:<24} {}",
+            format!("{} window", window.span),
+            window_cell(Some(window.window), now),
+        ));
+    }
+    for extra in probe.extra() {
+        let name = extra.name.as_deref().unwrap_or("?");
+        let name = match &extra.model {
+            Some(model) => format!("{name} ({model})"),
+            None => name.to_owned(),
+        };
+        lines.push(format!(
+            "  └ {:<24} {}  {}",
+            name,
+            windows_cell(extra.limit.as_ref(), now),
             if extra.is_limited() { "limited" } else { "ok" },
+        ));
+    }
+    for model in probe.models().iter().filter(|model| model.is_unavailable()) {
+        let mut line = format!("  └ model {} unavailable", model.slug);
+        if let Some(at) = model.available_at {
+            line.push_str(&format!(" until {}", fmt_epoch(at)));
+        }
+        if model.credits_would_enable == Some(true) {
+            line.push_str(", credits would enable it");
+        }
+        lines.push(line);
+    }
+    if let Some(spend) = probe.spend_control()
+        && (spend.reached == Some(true) || spend.limit.is_some())
+    {
+        let mut line = format!(
+            "  └ spend control {}",
+            if spend.reached == Some(true) {
+                "reached"
+            } else {
+                "ok"
+            }
+        );
+        if let Some(cap) = &spend.limit {
+            line.push_str(&format!(
+                ", used {} of {}",
+                cap.used.as_deref().unwrap_or("?"),
+                cap.limit.as_deref().unwrap_or("?")
+            ));
+            if let Some(percent) = cap.used_percent {
+                line.push_str(&format!(" ({percent:.0}%)"));
+            }
+            if let Some(at) = cap.reset_at.filter(|at| *at > now) {
+                line.push_str(&format!(", resets in {}", duration_cell(at - now)));
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// [`rows`], then one line per reset credit, or why the list is missing.
+pub fn listed_rows(listed: &Listed, now: i64) -> Vec<String> {
+    let mut lines = rows(&listed.probe, now);
+    if let Some(list) = &listed.reset_credit_list {
+        lines.extend(
+            list.credits
+                .iter()
+                .map(|credit| format!("  └ reset credit {}", resets::describe(credit))),
+        );
+    }
+    if let Some(error) = &listed.reset_credit_error {
+        lines.push(format!(
+            "  └ reset credit details unavailable ({error}); counts above are from the usage body"
         ));
     }
     lines
@@ -601,8 +740,10 @@ pub enum WatchEvent {
         target: PathBuf,
         min_remaining: f64,
     },
+    /// The tightest window the running Codex reports, and what is left in it.
     Headroom {
         remaining: f64,
+        span: Span,
     },
     /// Below the threshold; a migration follows.
     Migrating,
@@ -636,8 +777,8 @@ pub async fn watch(
     // Evaluate the current limits before waiting for a push.
     let mut pending = server.rate_limits().await.ok();
     loop {
-        if let Some(remaining) = pending.as_ref().and_then(remaining_from_rate_limits) {
-            on_event(WatchEvent::Headroom { remaining });
+        if let Some((remaining, span)) = pending.as_ref().and_then(tightest_from_rate_limits) {
+            on_event(WatchEvent::Headroom { remaining, span });
             if remaining < min_remaining {
                 on_event(WatchEvent::Migrating);
                 server.close().await;
@@ -821,7 +962,9 @@ pub async fn sweep(
 mod tests {
     use super::*;
     use crate::codex::auth::tests::{bundle, id_token, jwt};
-    use crate::codex::probe::tests::{Backend, challenge, ok, profile, status, usage_body};
+    use crate::codex::probe::tests::{
+        Backend, challenge, limited_body, ok, profile, status, usage_body, weekly_only_body,
+    };
     use crate::testing::codex_account;
     use axum::http::StatusCode;
     use serde_json::json;
@@ -919,20 +1062,112 @@ mod tests {
         let lines = rows(&probes[0], now);
         assert_eq!(lines.len(), 2);
         assert!(
-            lines[0].starts_with("one          a@b.c                      plus    30% (1h0m)"),
+            lines[0].starts_with(
+                "one          a@b.c                      plus    30% (1h0m)       60% ("
+            ),
             "{}",
             lines[0]
         );
-        assert!(lines[0].ends_with(" ok"));
-        assert!(lines[1].contains("codex_spark"));
+        assert!(lines[0].ends_with(" -          ok"), "{}", lines[0]);
+        assert!(lines[1].starts_with("  └ codex_spark "), "{}", lines[1]);
+        assert!(lines[1].contains("window 100%"), "{}", lines[1]);
         assert!(lines[1].ends_with("limited"));
         assert_eq!(
             ROW_HEADER,
             format!(
-                "{:<12} {:<26} {:<7} {:<16} {:<16} STATE",
-                "ACCOUNT", "EMAIL", "PLAN", "PRIMARY", "SECONDARY"
+                "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} STATE",
+                "ACCOUNT", "EMAIL", "PLAN", "5H", "WEEKLY", "RESETS"
             )
         );
+    }
+
+    #[test]
+    fn a_weekly_only_account_fills_the_weekly_column_not_the_first() {
+        let at = DateTime::from_timestamp(1_000, 0).unwrap();
+        let mut body = weekly_only_body(42.0);
+        body["rate_limit"]["primary_window"]["reset_at"] = json!(1_000 + 2 * 86_400 + 3_600);
+        let probe = probe_from(&body, "one", at);
+        let lines = rows(&probe, 1_000);
+        assert_eq!(
+            lines,
+            vec![format!(
+                "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} ok",
+                "one", "a@b.c", "promax", "-", "42% (2d1h)", "2 (0 now)"
+            )]
+        );
+    }
+
+    #[test]
+    fn other_windows_unavailable_models_and_spend_caps_get_their_own_lines() {
+        let at = DateTime::from_timestamp(0, 0).unwrap();
+        let mut body = weekly_only_body(10.0);
+        body["rate_limit"]["secondary_window"] =
+            json!({"used_percent": 70, "limit_window_seconds": 86400});
+        body["model_usage"]["gpt-7"] =
+            json!({"available": false, "available_at": 7_200, "credits_would_enable": true});
+        body["spend_control"] = json!({"reached": true, "individual_limit": {
+            "limit": "50.00", "used": "50.00", "remaining": "0", "used_percent": 100, "reset_at": 3_600}});
+        body["rate_limit_reset_credits"] = json!({"available_count": 1});
+        let probe = probe_from(&body, "one", at);
+        let lines = rows(&probe, 0);
+        assert!(lines[0].contains(" 1          ok"), "{}", lines[0]);
+        assert_eq!(
+            &lines[1..],
+            &[
+                format!("  └ {:<24} 70%", "1d window"),
+                "  └ model gpt-7 unavailable until 1970-01-01 02:00Z, credits would enable it"
+                    .to_owned(),
+                "  └ spend control reached, used 50.00 of 50.00 (100%), resets in 1h0m".to_owned(),
+            ]
+        );
+        assert_eq!(resets_cell(None), "-");
+    }
+
+    #[tokio::test]
+    async fn the_detailed_list_reads_credits_only_where_the_usage_body_counts_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = profile(dir.path(), "holder", "r1");
+        let none = profile(dir.path(), "none", "r2");
+        let mut empty = weekly_only_body(5.0);
+        empty["rate_limit_reset_credits"]["available_count"] = json!(0);
+        let backend = Backend::default()
+            .usage_answers(vec![ok(weekly_only_body(5.0)), ok(empty)])
+            .credit_answers(vec![(StatusCode::INTERNAL_SERVER_ERROR, "oops".into())]);
+        let client = backend.client().await;
+        let listed = list_detailed(&client, &fleet_of(vec![holder, none])).await;
+        assert_eq!(backend.requests("/credits").len(), 1);
+        assert_eq!(listed[0].reset_credit_list, None);
+        assert_eq!(
+            listed[0].reset_credit_error,
+            Some(ProbeError::Http {
+                status: 500,
+                body: "oops".into()
+            })
+        );
+        assert_eq!(listed[1].reset_credit_list, None);
+        assert_eq!(listed[1].reset_credit_error, None);
+        let lines = listed_rows(&listed[0], listed[0].probe.at);
+        assert!(lines[0].contains("2 (0 now)"), "{}", lines[0]);
+        assert_eq!(
+            lines.last().unwrap(),
+            "  └ reset credit details unavailable (HTTP 500: oops); counts above are from the usage body"
+        );
+        let json = serde_json::to_value(&listed[1]).unwrap();
+        assert_eq!(json["account"], "none");
+        assert_eq!(json["usage"]["reset_credits"]["available"], 0);
+        assert_eq!(json["usage"]["limit"]["windows"][0]["span"], "weekly");
+    }
+
+    fn probe_from(body: &serde_json::Value, name: &str, at: DateTime<Utc>) -> Probe {
+        Probe {
+            account: name.to_owned(),
+            codex_home: PathBuf::from(format!("/homes/{name}")),
+            at: at.timestamp(),
+            usage: Some(probe::decode_usage(&body.to_string(), at).unwrap()),
+            error: None,
+            last_refresh: None,
+            email_hint: None,
+        }
     }
 
     fn probe_with(name: &str, remaining: f64, spark: Option<f64>) -> Probe {
@@ -995,6 +1230,30 @@ mod tests {
         // Ties go to the later account.
         let tied = vec![probe_with("a", 0.5, None), probe_with("b", 0.5, None)];
         assert_eq!(best_of(&tied, &fleet, None).unwrap().account, "b");
+    }
+
+    #[test]
+    fn a_weekly_only_account_is_ranked_on_its_weekly_window() {
+        let at = DateTime::from_timestamp(0, 0).unwrap();
+        let fleet = Fleet::default();
+        // 5h nearly empty but weekly 80% used: 20% left.
+        let both = probe_from(&usage_body(5.0, 80.0), "both", at);
+        // Only a weekly window, 42% used: 58% left, in `primary_window`.
+        let weekly = probe_from(&weekly_only_body(42.0), "weekly", at);
+        assert!((weekly.remaining().unwrap() - 0.58).abs() < 1e-9);
+        assert_eq!(
+            best_of(&[weekly.clone(), both.clone()], &fleet, None)
+                .unwrap()
+                .account,
+            "weekly"
+        );
+        let fuller = probe_from(&weekly_only_body(90.0), "fuller", at);
+        assert_eq!(
+            best_of(&[fuller, both], &fleet, None).unwrap().account,
+            "both"
+        );
+        let limited = probe_from(&limited_body(), "limited", at);
+        assert_eq!(best_of(&[limited], &fleet, None), None);
     }
 
     #[tokio::test]

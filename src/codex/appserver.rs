@@ -12,6 +12,8 @@ use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
+use super::probe::Span;
+
 const CONTROL_SOCKET_DIR: &str = "app-server-control";
 const CONTROL_SOCKET_FILE: &str = "app-server-control.sock";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,16 +219,45 @@ pub fn json_values<'a>(value: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
-/// The remaining fraction of the fullest window in a rate-limits payload,
-/// whatever its nesting; `None` when it reports no `usedPercent`.
-pub fn remaining_from_rate_limits(value: &Value) -> Option<f64> {
-    let mut used = Vec::new();
-    json_values(value, "usedPercent", &mut used);
-    json_values(value, "used_percent", &mut used);
-    used.into_iter()
-        .filter_map(Value::as_f64)
-        .reduce(f64::max)
-        .map(|worst| (1.0 - worst / 100.0).clamp(0.0, 1.0))
+/// The fullest window in a rate-limits payload, whatever its nesting: what
+/// is left in it and its length (`windowDurationMins`, else unknown); `None`
+/// when no window reports a used percentage.
+pub fn tightest_from_rate_limits(value: &Value) -> Option<(f64, Span)> {
+    let mut windows = Vec::new();
+    collect_windows(value, &mut windows);
+    windows
+        .into_iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(used, span)| ((1.0 - used / 100.0).clamp(0.0, 1.0), span))
+}
+
+fn collect_windows(value: &Value, out: &mut Vec<(f64, Span)>) {
+    match value {
+        Value::Object(map) => {
+            let used = map
+                .get("usedPercent")
+                .or_else(|| map.get("used_percent"))
+                .and_then(Value::as_f64);
+            if let Some(used) = used {
+                let seconds = map
+                    .get("windowDurationMins")
+                    .or_else(|| map.get("window_minutes"))
+                    .and_then(Value::as_i64)
+                    .map(|minutes| minutes * 60)
+                    .or_else(|| map.get("limit_window_seconds").and_then(Value::as_i64));
+                out.push((used, Span::from_seconds(seconds)));
+            }
+            for nested in map.values() {
+                collect_windows(nested, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_windows(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -234,19 +265,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remaining_is_the_fullest_window_at_any_depth() {
+    fn the_tightest_window_is_found_at_any_depth_and_named_by_length() {
         let limits = json!({
             "rateLimits": {
-                "primary": {"usedPercent": 30.0},
-                "secondary": {"used_percent": 75},
+                "primary": {"usedPercent": 30.0, "windowDurationMins": 300},
+                "secondary": {"used_percent": 75, "windowDurationMins": 10080},
                 "extra": [{"rateLimit": {"primary": {"usedPercent": 10}}}],
             }
         });
-        assert_eq!(remaining_from_rate_limits(&limits), Some(0.25));
-        assert_eq!(remaining_from_rate_limits(&json!({"other": 1})), None);
         assert_eq!(
-            remaining_from_rate_limits(&json!({"usedPercent": 150})),
-            Some(0.0)
+            tightest_from_rate_limits(&limits),
+            Some((0.25, Span::Weekly))
+        );
+        // Weekly-only: the weekly window arrives as `primary`.
+        let weekly_only = json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1},
+                "secondary": null,
+            }
+        });
+        let (remaining, span) = tightest_from_rate_limits(&weekly_only).unwrap();
+        assert!((remaining - 0.58).abs() < 1e-9);
+        assert_eq!(span, Span::Weekly);
+        assert_eq!(tightest_from_rate_limits(&json!({"other": 1})), None);
+        assert_eq!(
+            tightest_from_rate_limits(&json!({"usedPercent": 150})),
+            Some((0.0, Span::Unknown))
         );
     }
 
