@@ -35,9 +35,11 @@ pub struct Login {
     /// Epoch milliseconds when the access token was minted.
     pub obtained_at: Option<i64>,
     /// Epoch milliseconds of the browser login this grant descends from.
-    /// Refresh tokens have lasted about a month from it, however often the
-    /// access token was renewed.
     pub logged_in_at: Option<i64>,
+    /// Epoch milliseconds when the refresh token dies, from the token
+    /// endpoint's `refresh_token_expires_in`. Fixed at login: refreshes do
+    /// not extend it.
+    pub refresh_expires_at: Option<i64>,
     pub scopes: Vec<String>,
     /// Why the refresh token was refused for good. While set, the account
     /// falls back to its setup key until `tokeman login` runs again.
@@ -56,13 +58,23 @@ impl Login {
     }
 }
 
-/// Warn this many days after a login; refresh tokens have expired at about 28.
+/// Without a reported expiry, warn this many days after a login; refresh
+/// tokens have lasted 28 to 30 days.
 const LOGIN_WARNING_DAYS: i64 = 21;
+/// With a reported expiry, warn this long before it, as Claude Code does.
+pub const REFRESH_WARNING_MS: i64 = 3 * 86_400_000;
 
 impl Login {
+    /// Whether the login should be renewed soon: within
+    /// [`REFRESH_WARNING_MS`] of its reported expiry, or, when none was
+    /// reported, [`LOGIN_WARNING_DAYS`] after the browser login.
     pub fn is_ageing(&self, now_ms: i64) -> bool {
-        self.age_days(now_ms)
-            .is_some_and(|days| days >= LOGIN_WARNING_DAYS)
+        match self.refresh_expires_at {
+            Some(expires_at) => now_ms >= expires_at - REFRESH_WARNING_MS,
+            None => self
+                .age_days(now_ms)
+                .is_some_and(|days| days >= LOGIN_WARNING_DAYS),
+        }
     }
 }
 
@@ -72,6 +84,8 @@ pub struct Grant {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    /// Epoch milliseconds when the refresh token dies, when reported.
+    pub refresh_expires_at: Option<i64>,
     pub scopes: Vec<String>,
 }
 
@@ -196,9 +210,14 @@ impl Account {
     }
 
     /// Store a grant. The provider may or may not rotate the refresh token;
-    /// the old one is kept only when no new one came.
+    /// the old one is kept only when no new one came. The refresh-token
+    /// expiry keeps the earlier of the stored and reported dates.
     pub fn apply_grant(&mut self, grant: Grant, now_ms: i64) {
         let login = self.login.get_or_insert_with(Login::default);
+        login.refresh_expires_at = match (login.refresh_expires_at, grant.refresh_expires_at) {
+            (Some(stored), Some(reported)) => Some(stored.min(reported)),
+            (stored, reported) => reported.or(stored),
+        };
         login.access_token = Some(grant.access_token);
         if grant.refresh_token.is_some() {
             login.refresh_token = grant.refresh_token;
@@ -211,11 +230,14 @@ impl Account {
         login.error = None;
     }
 
-    /// Store the grant of a fresh browser login and remember when it was made.
+    /// Store the grant of a fresh browser login and remember when it was
+    /// made. A new login starts a new refresh-token lifetime.
     pub fn record_login(&mut self, grant: Grant, now_ms: i64) {
+        let refresh_expires_at = grant.refresh_expires_at;
         self.apply_grant(grant, now_ms);
         if let Some(login) = self.login.as_mut() {
             login.logged_in_at = Some(now_ms);
+            login.refresh_expires_at = refresh_expires_at;
         }
     }
 }
@@ -389,6 +411,11 @@ impl Fleet {
                 set_opt(table, "logged_in_at", record.logged_in_at.map(value));
                 set_opt(
                     table,
+                    "refresh_expires_at",
+                    record.refresh_expires_at.map(value),
+                );
+                set_opt(
+                    table,
                     "scopes",
                     record.scopes.as_ref().map(|scopes| {
                         value(toml_edit::Array::from_iter(
@@ -517,6 +544,8 @@ struct Record {
     #[serde(default)]
     logged_in_at: Option<i64>,
     #[serde(default)]
+    refresh_expires_at: Option<i64>,
+    #[serde(default)]
     scopes: Option<Vec<String>>,
     #[serde(default)]
     login_error: Option<String>,
@@ -536,6 +565,7 @@ impl From<Record> for Account {
                 expires_at: record.expires_at,
                 obtained_at: record.obtained_at,
                 logged_in_at: record.logged_in_at,
+                refresh_expires_at: record.refresh_expires_at,
                 scopes: record.scopes.unwrap_or_default(),
                 error: record.login_error,
             }),
@@ -554,6 +584,7 @@ impl From<Account> for Record {
             expires_at: login.expires_at,
             obtained_at: login.obtained_at,
             logged_in_at: login.logged_in_at,
+            refresh_expires_at: login.refresh_expires_at,
             scopes: (!login.scopes.is_empty()).then_some(login.scopes),
             login_error: login.error,
         }
@@ -692,6 +723,7 @@ mod tests {
                 access_token: "new-access".into(),
                 refresh_token: None,
                 expires_at: Some(9 * HOUR_MS),
+                refresh_expires_at: None,
                 scopes: Vec::new(),
             },
             HOUR_MS,
@@ -763,6 +795,7 @@ mod tests {
                 access_token: "a".into(),
                 refresh_token: Some("r".into()),
                 expires_at: Some(9 * HOUR_MS),
+                refresh_expires_at: None,
                 scopes: Vec::new(),
             },
             HOUR_MS,
@@ -787,6 +820,85 @@ mod tests {
         assert_eq!(
             reparsed.accounts[0].login.as_ref().unwrap().logged_in_at,
             Some(HOUR_MS)
+        );
+    }
+
+    #[test]
+    fn a_reported_refresh_expiry_wins_over_the_login_age_and_never_slides() {
+        const DAY_MS: i64 = 24 * HOUR_MS;
+        let mut account = Account::new("acct");
+        account.record_login(
+            Grant {
+                access_token: "a".into(),
+                refresh_token: Some("r".into()),
+                refresh_expires_at: Some(30 * DAY_MS),
+                ..Grant::default()
+            },
+            0,
+        );
+        let login = account.login.as_ref().unwrap();
+        // Day 25 is past the 21-day heuristic but not within 3 days of the date.
+        assert!(!login.is_ageing(25 * DAY_MS));
+        assert!(!login.is_ageing(27 * DAY_MS - 1));
+        assert!(login.is_ageing(27 * DAY_MS));
+
+        // A refresh reporting a later date keeps the earlier one...
+        account.apply_grant(
+            Grant {
+                access_token: "b".into(),
+                refresh_expires_at: Some(40 * DAY_MS),
+                ..Grant::default()
+            },
+            DAY_MS,
+        );
+        assert_eq!(
+            account.login.as_ref().unwrap().refresh_expires_at,
+            Some(30 * DAY_MS)
+        );
+        // ...and an earlier one replaces it; a refresh without one keeps it.
+        account.apply_grant(
+            Grant {
+                access_token: "c".into(),
+                refresh_expires_at: Some(29 * DAY_MS),
+                ..Grant::default()
+            },
+            2 * DAY_MS,
+        );
+        account.apply_grant(
+            Grant {
+                access_token: "d".into(),
+                ..Grant::default()
+            },
+            3 * DAY_MS,
+        );
+        assert_eq!(
+            account.login.as_ref().unwrap().refresh_expires_at,
+            Some(29 * DAY_MS)
+        );
+
+        // A new browser login starts a new lifetime, even a later one.
+        account.record_login(
+            Grant {
+                access_token: "e".into(),
+                refresh_token: Some("r2".into()),
+                refresh_expires_at: Some(60 * DAY_MS),
+                ..Grant::default()
+            },
+            30 * DAY_MS,
+        );
+        assert_eq!(
+            account.login.as_ref().unwrap().refresh_expires_at,
+            Some(60 * DAY_MS)
+        );
+
+        let mut fleet = Fleet::default();
+        fleet.accounts.push(account);
+        let rendered = fleet.render("").unwrap();
+        assert!(rendered.contains("refresh_expires_at"));
+        let reparsed = Fleet::parse(&rendered).unwrap();
+        assert_eq!(
+            reparsed.accounts[0].login.as_ref().unwrap().refresh_expires_at,
+            Some(60 * DAY_MS)
         );
     }
 

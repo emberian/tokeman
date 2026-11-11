@@ -186,13 +186,43 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
         Some(_) => "login, access token expired (refresh pending)".into(),
         None => "login, expiry unknown".into(),
     };
-    match login.age_days(now_ms) {
-        Some(days) if login.is_ageing(now_ms) => format!(
-            "{token}; logged in {days} days ago, and refresh tokens have lasted about a month: run `tokeman login {}` soon",
-            account.name
+    format!("{token}{}", login_lifetime(account, now_ms))
+}
+
+/// When the login's refresh token dies: the reported date when there is one,
+/// otherwise the login's age. Empty when neither is known.
+fn login_lifetime(account: &Account, now_ms: i64) -> String {
+    let Some(login) = account.login.as_ref() else {
+        return String::new();
+    };
+    let renew = format!("run `tokeman login {}`", account.name);
+    let day = |at: i64| {
+        DateTime::from_timestamp_millis(at)
+            .map(|at| at.with_timezone(&Local).format("%b %-d").to_string())
+            .unwrap_or_else(|| "--".into())
+    };
+    match (login.refresh_expires_at, login.age_days(now_ms)) {
+        (Some(expires_at), _) if expires_at <= now_ms => {
+            format!("; login ended {}: {renew}", day(expires_at))
+        }
+        (Some(expires_at), _) if login.is_ageing(now_ms) => {
+            let hours = (expires_at - now_ms) / 3_600_000;
+            format!(
+                "; login ends {} (in {}): {renew} soon",
+                day(expires_at),
+                if hours >= 24 {
+                    format!("{}d", hours / 24)
+                } else {
+                    format!("{hours}h")
+                }
+            )
+        }
+        (Some(expires_at), _) => format!("; login ends {}", day(expires_at)),
+        (None, Some(days)) if login.is_ageing(now_ms) => format!(
+            "; logged in {days} days ago, and refresh tokens have lasted 28 to 30 days: {renew} soon"
         ),
-        Some(days) => format!("{token}; logged in {days} days ago"),
-        None => token,
+        (None, Some(days)) => format!("; logged in {days} days ago"),
+        (None, None) => String::new(),
     }
 }
 
@@ -475,5 +505,26 @@ mod tests {
         assert_eq!(format_reset(0), "--");
         assert_eq!(format_reset(1), "now");
         assert_eq!(format_reset_compact(0), "--");
+    }
+
+    #[test]
+    fn the_login_line_uses_the_reported_refresh_expiry_before_the_age() {
+        const DAY_MS: i64 = 86_400_000;
+        let mut account = crate::testing::login_account("acct", 40 * DAY_MS);
+        let login = account.login.as_mut().unwrap();
+        login.logged_in_at = Some(0);
+        login.refresh_expires_at = Some(30 * DAY_MS);
+        let line = describe_login(&account, 20 * DAY_MS);
+        assert!(line.contains("; login ends "), "{line}");
+        assert!(!line.contains("soon"), "{line}");
+        let line = describe_login(&account, 28 * DAY_MS);
+        assert!(line.contains("(in 2d): run `tokeman login acct` soon"), "{line}");
+        let line = describe_login(&account, 31 * DAY_MS);
+        assert!(line.contains("login ended"), "{line}");
+
+        account.login.as_mut().unwrap().refresh_expires_at = None;
+        let line = describe_login(&account, 22 * DAY_MS);
+        assert!(line.contains("logged in 22 days ago"), "{line}");
+        assert!(line.contains("soon"), "{line}");
     }
 }
