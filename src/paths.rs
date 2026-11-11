@@ -88,6 +88,12 @@ pub fn profile_cache() -> PathBuf {
     config_dir().join("claude-profile-reads.json")
 }
 
+/// Antigravity access tokens tokeman minted from its own refresh tokens;
+/// written only by `providers::antigravity`.
+pub fn antigravity_tokens() -> PathBuf {
+    config_dir().join("antigravity-access-tokens.json")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }

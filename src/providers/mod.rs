@@ -9,6 +9,7 @@
 
 // Service modules (`antigravity`, `kimi`, `zai`) are declared here by the
 // change that adds each one.
+pub mod antigravity;
 
 use serde::{Deserialize, Serialize};
 
