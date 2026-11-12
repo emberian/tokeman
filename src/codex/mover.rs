@@ -509,7 +509,7 @@ pub fn homes(fleet: &Fleet) -> Vec<CodexHome> {
 }
 
 /// [`homes`], with `default` as Codex's own fallback home.
-fn homes_after(default: Option<CodexHome>, fleet: &Fleet) -> Vec<CodexHome> {
+pub(crate) fn homes_after(default: Option<CodexHome>, fleet: &Fleet) -> Vec<CodexHome> {
     let mut homes: Vec<CodexHome> = default.into_iter().collect();
     for account in &fleet.codex {
         let home = CodexHome::new(account.home());

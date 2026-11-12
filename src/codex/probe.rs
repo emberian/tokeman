@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
-use std::time::Duration;
 
 use super::auth::{AuthFile, CodexHome};
 use super::{Client, is_edge_challenge};
@@ -610,6 +609,7 @@ pub(crate) mod tests {
     use axum::routing::{get, post};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// One request as the fake backend saw it.
     #[derive(Debug, Clone)]

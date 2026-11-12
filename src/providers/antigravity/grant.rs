@@ -194,7 +194,7 @@ fn cli_keychain_grant() -> Result<Option<ServiceAccount>> {
 
 /// The Antigravity app's (VS Code fork) global state database.
 fn app_state_db() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("Antigravity/User/globalStorage/state.vscdb"))
+    Some(crate::paths::platform_config_dir()?.join("Antigravity/User/globalStorage/state.vscdb"))
 }
 
 fn app_grant() -> Result<Option<ServiceAccount>> {

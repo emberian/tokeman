@@ -138,7 +138,10 @@ struct Place {
 
 impl Place {
     fn live() -> Result<Self> {
-        let real_home = dirs::home_dir().context("no home directory")?;
+        let real_home = paths::home();
+        if !real_home.is_absolute() {
+            bail!("no home directory");
+        }
         let homes = paths::agy_homes();
         if real_home.starts_with(&homes) {
             bail!(

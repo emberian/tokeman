@@ -25,7 +25,10 @@ impl CodexHome {
 
     /// `~/.codex`, Codex's own fallback.
     pub fn default_home() -> Result<Self> {
-        let home = dirs::home_dir().context("could not determine home directory")?;
+        let home = crate::paths::home();
+        if !home.is_absolute() {
+            bail!("could not determine home directory");
+        }
         Ok(Self::new(home.join(".codex")))
     }
 
