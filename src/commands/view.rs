@@ -11,11 +11,12 @@ use crate::account::Fleet;
 use crate::anthropic;
 use crate::claude::settings as claude_settings;
 use crate::codex;
+use crate::daemon::notify::{self, Delivery};
 use crate::policy::{self, Floors};
 use crate::providers::{self, ServiceAccount};
 use crate::quota::{ModelKey, Reading, Service};
 use crate::store::{Stats, Store};
-use crate::ui::overview::{Facts, Monitor, Overview};
+use crate::ui::overview::{Facts, ForecastView, Monitor, Overview};
 
 /// No floor: any counted window with something left can take work.
 pub const ANY_ROOM: Floors = Floors {
@@ -52,7 +53,11 @@ pub async fn probe(fleet: &Fleet, only: Option<Service>) -> Vec<Reading> {
             return Vec::new();
         }
         match codex::Client::new() {
-            Ok(client) => codex::probe::probe_all(&client, &fleet.codex).await,
+            Ok(client) => {
+                let mut probes = codex::probe::probe_all(&client, &fleet.codex).await;
+                codex::resets::with_expiry(&client, &fleet.codex, &mut probes).await;
+                probes
+            }
             Err(error) => fleet
                 .codex
                 .iter()
@@ -360,6 +365,24 @@ pub fn stats(fleet: &Fleet, service: Service) -> Vec<Stats> {
             Some(Stats::compute(account, &readings))
         })
         .collect()
+}
+
+/// When `service`'s accounts run dry at the recent rate, from what is
+/// stored; `None` when the history cannot support a forecast.
+pub fn forecast(fleet: &Fleet, service: Service) -> Option<ForecastView> {
+    let at = now();
+    Overview::build(fleet, Facts::on_disk(fleet, at), Some(service), at)
+        .forecasts
+        .pop()
+}
+
+/// `tokeman notify --test`: one desktop notification, sent now.
+pub async fn notify_test() -> Delivery {
+    notify::deliver(
+        notify::TITLE,
+        "This is a test. What needs you will arrive like this.",
+    )
+    .await
 }
 
 /// The launch settings, as `key = value` pairs.

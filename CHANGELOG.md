@@ -89,6 +89,34 @@ rewrites the plist, launcher and hook for the new binary.
   weekly room expiring within 24 hours first, and an account with a spent
   limit is left out.
 
+### What needs you, and a forecast
+
+- tokeman says what needs you: a Claude login that ends within three days
+  (and again within one), a login that was refused, a reset on offer (a
+  Claude grant, a Codex credit) that expires within three days (and one), a
+  service none of whose accounts is above its floor, a fleet forecast to
+  run dry within 12 hours, and a background service that is installed but
+  not running. The list opens `tokeman`, `tokeman list` and the macOS tray,
+  each item with the command that deals with it, and is `attention` in the
+  fleet view's JSON.
+- The background service sends each item once as a desktop notification
+  (macOS `osascript`; `notify-send` elsewhere when installed; otherwise the
+  rotation log alone), and again only at its nearer threshold or after it
+  has been gone for six hours. `tokeman notify --test` sends one so it can
+  be seen and allowed; `tokeman notify` lists what stands.
+  `tokeman settings set notifications false` keeps them to the log.
+- A forecast per service: when its accounts run dry for the startup model
+  at the rate of the last 6 hours, counting each account's weekly room
+  above the floor and the resets of windows inside the next week, with what
+  the unused resets on offer would add stated apart. tokeman never spends a
+  reset for it. It is shown by `tokeman`, `tokeman list`, `tokeman stats`
+  and the tray's header, and is `forecasts` in the JSON. A service whose
+  history does not cover an hour of one reset window has no forecast.
+- The fleet view carries each limit's display name and note (`limits` on an
+  account); the macOS tray draws those and no longer derives its own.
+- `tokeman codex list --json` and every Codex reading name when the first
+  available reset credit expires (`reset_credits.expires_at`).
+
 ### Noticing when a service changes
 
 - Every parser reports what it did not recognise: a rate-limit header, a

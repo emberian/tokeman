@@ -543,6 +543,7 @@ impl Fleet {
             "services_interval_secs",
             value(self.launch.services_interval_secs as i64),
         );
+        set(settings, "notifications", value(self.launch.notifications));
         set_opt(
             settings,
             "terminal",

@@ -12,13 +12,15 @@ use serde::Serialize;
 use crate::account::{Account, Fleet};
 use crate::anthropic::profile::Cache;
 use crate::anthropic::resets;
+use crate::attention::{self, Attention};
 use crate::claude::sessions::Session;
 use crate::claude::settings as claude_settings;
 use crate::daemon::cadence::Cadence;
 use crate::daemon::{lock, service};
+use crate::forecast::{self, Forecast};
 use crate::observe::{self, ObservedLimit};
 use crate::policy::{self, Mode};
-use crate::quota::{Level, ModelKey, Reading, Service, Verdict};
+use crate::quota::{Level, Limit, ModelKey, Reading, Service, Verdict};
 use crate::store::Store;
 use crate::ui::text;
 
@@ -92,6 +94,69 @@ pub struct Overview {
     /// services, each in configured order.
     pub accounts: Vec<AccountView>,
     pub resets_on_offer: Vec<ResetOffer>,
+    /// Per service, when its accounts run dry at the recent rate; a service
+    /// whose history cannot support a forecast has none.
+    pub forecasts: Vec<ForecastView>,
+    /// What needs the user, the critical items first.
+    pub attention: Vec<AttentionView>,
+}
+
+/// One thing that needs the user: what it is, and how the surfaces say it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AttentionView {
+    /// Stable for as long as the item stands; what a notification is
+    /// remembered by.
+    pub key: String,
+    pub level: Level,
+    pub text: String,
+    /// The command that deals with it, when there is one.
+    pub fix: Option<String>,
+    #[serde(flatten)]
+    pub item: Attention,
+}
+
+impl AttentionView {
+    pub fn of(item: Attention, now: i64) -> Self {
+        Self {
+            key: item.key(),
+            level: item.level(),
+            text: text::attention_text(&item, now),
+            fix: text::attention_fix(&item),
+            item,
+        }
+    }
+}
+
+/// A service's forecast, and how the surfaces say it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ForecastView {
+    #[serde(flatten)]
+    pub forecast: Forecast,
+    /// One line: the outlook, its basis and what resets on offer would add.
+    pub text: String,
+    /// A few words, for a header.
+    pub brief: String,
+}
+
+impl ForecastView {
+    pub fn of(forecast: Forecast, now: i64) -> Self {
+        Self {
+            text: text::forecast_text(&forecast, now),
+            brief: text::forecast_brief(&forecast, now),
+            forecast,
+        }
+    }
+}
+
+/// One limit as every surface shows it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LimitView {
+    /// What the limit is called (`ui::text::limit_name`).
+    pub name: String,
+    /// What is said after its gauge (`ui::text::limit_note`).
+    pub note: Option<String>,
+    #[serde(flatten)]
+    pub limit: Limit,
 }
 
 /// The state of Claude's rotation.
@@ -133,12 +198,17 @@ pub struct AccountView {
     /// The reading's state in a word, and the level to colour it with.
     pub state: Option<State>,
     /// Claude: whether the account is above the rotation's floors for the
-    /// startup model. Codex: whether the backend accepts work on it.
+    /// startup model. Codex: whether the backend accepts work on it. The
+    /// others: whether no account-wide window is spent, or, with none, some
+    /// group has room.
     pub viable: Option<bool>,
     /// Why the last read produced no quota, on one line.
     pub error: Option<String>,
     /// What the reading says beyond its limits, one line each.
     pub notes: Vec<String>,
+    /// The reading's limits in the order every surface shows them, each
+    /// with its name and note.
+    pub limits: Vec<LimitView>,
     /// The last reading, stored or fresh; `None` for an account never read.
     pub reading: Option<Reading>,
 }
@@ -159,6 +229,8 @@ pub struct LoginView {
     pub note: Option<String>,
     /// The login is refused, ended, or close to ending.
     pub warning: bool,
+    /// The refresh token was refused for good.
+    pub refused: bool,
     /// Epoch seconds when the refresh token dies, when reported.
     pub ends_at: Option<i64>,
 }
@@ -169,6 +241,30 @@ pub struct ResetOffer {
     pub offer: String,
     /// Epoch seconds of the read the offer comes from.
     pub read_at: i64,
+    /// Epoch seconds after which the grant cannot be used, when it has an end.
+    pub expires_at: Option<i64>,
+    /// How many times it would refill the weekly window for sessions on the
+    /// startup model.
+    pub weekly_refills: u32,
+}
+
+impl ResetOffer {
+    /// A usable grant of `account`, as a read at `read_at` reported it.
+    pub fn of(
+        account: &str,
+        grant: &resets::ResetGrant,
+        read_at: i64,
+        now: i64,
+        model: Option<&ModelKey>,
+    ) -> Self {
+        Self {
+            account: account.to_owned(),
+            offer: resets::describe_grant(grant, now),
+            read_at,
+            expires_at: grant.expires_at(),
+            weekly_refills: grant.weekly_refills(model),
+        }
+    }
 }
 
 /// What a view is built from.
@@ -178,6 +274,9 @@ pub struct Facts {
     pub monitor: Monitor,
     /// The newest reading of each account.
     pub readings: Vec<Reading>,
+    /// Every account's readings of the last [`forecast::BURN_HOURS`] hours,
+    /// each account's oldest first: what a forecast takes its rate from.
+    pub recent: Vec<Reading>,
     pub offers: Vec<ResetOffer>,
     pub default_account: Option<String>,
     pub default_is_unmanaged: bool,
@@ -199,6 +298,7 @@ impl Default for Facts {
             origin: Origin::Stored,
             monitor: Monitor::NotInstalled,
             readings: Vec::new(),
+            recent: Vec::new(),
             offers: Vec::new(),
             default_account: None,
             default_is_unmanaged: false,
@@ -229,31 +329,46 @@ impl Facts {
             .and_then(|value| fleet.account_holding(value))
             .map(|account| account.name.clone());
         let cadence = Cadence::load();
+        let target_model = settings
+            .as_ref()
+            .and_then(claude_settings::target_model)
+            .map(str::to_owned);
+        let model = target_model.as_deref().map(ModelKey::new);
+        let store = Store::open_read_only().ok();
+        let keys = fleet.account_keys();
         Self {
             origin: Origin::Stored,
             monitor: Monitor::now(),
-            readings: Store::open_read_only()
-                .and_then(|store| store.latest(&fleet.account_keys()))
+            readings: store
+                .as_ref()
+                .and_then(|store| store.latest(&keys).ok())
                 .unwrap_or_default(),
+            recent: store
+                .iter()
+                .flat_map(|store| {
+                    let since = now - forecast::BURN_HOURS * 3_600;
+                    keys.iter().flat_map(move |(service, account)| {
+                        store
+                            .since(*service, Some(account), since)
+                            .unwrap_or_default()
+                    })
+                })
+                .collect(),
             offers: fleet
                 .accounts
                 .iter()
                 .filter_map(|account| {
-                    let (read_at, offers) = resets::stored_offers(&cache, &account.name, now)?;
-                    Some(offers.into_iter().map(move |offer| ResetOffer {
-                        account: account.name.clone(),
-                        offer,
-                        read_at,
+                    let (read_at, grants) = resets::stored_grants(&cache, &account.name, now)?;
+                    let model = model.as_ref();
+                    Some(grants.into_iter().map(move |grant| {
+                        ResetOffer::of(&account.name, &grant, read_at, now, model)
                     }))
                 })
                 .flatten()
                 .collect(),
             default_is_unmanaged: token.is_some() && default_account.is_none(),
             default_account,
-            target_model: settings
-                .as_ref()
-                .and_then(claude_settings::target_model)
-                .map(str::to_owned),
+            target_model,
             agy_account: None,
             mode: cadence.mode.unwrap_or(Mode::Normal),
             probe_interval_secs: cadence.probe_interval_secs,
@@ -327,10 +442,66 @@ impl Overview {
             view.label = account.label.clone();
             view.held = account.service == Service::Antigravity
                 && facts.agy_account.as_deref() == Some(account.name.as_str());
+            view.viable = reading.map(has_room);
             accounts.push(view);
         }
         let floors = fleet.policy.floors(facts.mode);
-        Self {
+        let mut services = Vec::new();
+        for account in &accounts {
+            if !services.contains(&account.service) {
+                services.push(account.service);
+            }
+        }
+        let forecasts = services
+            .into_iter()
+            .filter_map(|service| {
+                let inputs: Vec<forecast::Input<'_>> = accounts
+                    .iter()
+                    .filter(|account| account.service == service && !account.parked)
+                    .filter_map(|account| {
+                        let latest = account.reading.as_ref()?;
+                        let first = facts.recent.iter().position(|reading| {
+                            reading.service == service && reading.account == account.name
+                        });
+                        let recent = first.map_or(&[][..], |first| {
+                            let len = facts.recent[first..]
+                                .iter()
+                                .take_while(|reading| {
+                                    reading.service == service && reading.account == account.name
+                                })
+                                .count();
+                            &facts.recent[first..first + len]
+                        });
+                        let refills = match service {
+                            Service::Claude => facts
+                                .offers
+                                .iter()
+                                .filter(|offer| offer.account == account.name)
+                                .map(|offer| offer.weekly_refills)
+                                .sum(),
+                            _ => latest
+                                .codex()
+                                .and_then(|codex| codex.reset_credits)
+                                .map_or(0, |credits| credits.available.max(0) as u32),
+                        };
+                        Some(forecast::Input {
+                            latest,
+                            recent,
+                            refills,
+                        })
+                    })
+                    .collect();
+                // Claude's last accounts drain in place to the sip floor;
+                // no other service has a floor.
+                let (model, floor) = match service {
+                    Service::Claude => (model.as_ref(), fleet.policy.sip_min_7d_remaining),
+                    _ => (None, 0.0),
+                };
+                forecast::forecast(service, &inputs, model, floor, now)
+            })
+            .map(|forecast| ForecastView::of(forecast, now))
+            .collect();
+        let mut overview = Self {
             at: now,
             origin: facts.origin,
             read_at: accounts
@@ -366,7 +537,14 @@ impl Overview {
                 .collect(),
             default_account: facts.default_account,
             target_model: facts.target_model,
-        }
+            forecasts,
+            attention: Vec::new(),
+        };
+        overview.attention = attention::find(&overview, now)
+            .into_iter()
+            .map(|item| AttentionView::of(item, now))
+            .collect();
+        overview
     }
 
     /// The accounts of one service, in configured order.
@@ -423,9 +601,34 @@ impl AccountView {
             viable: None,
             error: reading.and_then(text::error_text),
             notes: reading.map(text::notes).unwrap_or_default(),
+            limits: reading
+                .map(|reading| {
+                    text::limits_in_order(reading)
+                        .into_iter()
+                        .map(|limit| LimitView {
+                            name: text::limit_name(limit),
+                            note: text::limit_note(limit, reading),
+                            limit: limit.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             reading: reading.cloned(),
         }
     }
+}
+
+/// Whether an account of a service without floors can take work: the read
+/// succeeded, no account-wide window is spent or rejected, and when it has
+/// no account-wide window some other limit has room.
+fn has_room(reading: &Reading) -> bool {
+    reading.accepts_work()
+        && reading
+            .shared()
+            .all(|limit| !limit.is_rejected() && limit.window.above(0.0))
+        && (reading.shared().next().is_some()
+            || reading.limits.is_empty()
+            || reading.limits.iter().any(|limit| limit.window.above(0.0)))
 }
 
 fn login_view(account: &Account, now_ms: i64) -> LoginView {
@@ -435,6 +638,7 @@ fn login_view(account: &Account, now_ms: i64) -> LoginView {
         text: text::describe_login(account, now_ms),
         note: text::login_note(account, now_ms),
         warning: login.is_some_and(|login| login.error.is_some() || login.is_ageing(now_ms)),
+        refused: login.is_some_and(|login| login.error.is_some()),
         ends_at: login
             .and_then(|login| login.refresh_expires_at)
             .map(|at| at / 1000),
@@ -444,6 +648,7 @@ fn login_view(account: &Account, now_ms: i64) -> LoginView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forecast::Outlook;
     use crate::providers::ServiceAccount;
     use crate::quota::{
         CodexDetail, Detail, Limit, ResetCreditCount, Scope, SessionLimit, Source, Span, Window,
@@ -522,6 +727,7 @@ mod tests {
             reset_credits: Some(ResetCreditCount {
                 available: 2,
                 applicable: Some(0),
+                expires_at: None,
             }),
             ..Default::default()
         });
@@ -702,6 +908,8 @@ mod tests {
             account: "ultra".into(),
             offer: "weekly reset, usable now".into(),
             read_at: NOW - 900,
+            expires_at: Some(NOW + 2 * 86_400),
+            weekly_refills: 1,
         };
         let rejection = ObservedLimit {
             account: "plain".into(),
@@ -735,8 +943,154 @@ mod tests {
         assert_eq!(view.rotation.mode, Mode::Sip);
         let floors = fleet().policy.floors(Mode::Sip);
         assert_eq!(view.rotation.min_weekly_remaining, floors.weekly);
+        // An offer about to lapse needs the user, and says how to use it.
+        let lapsing = view
+            .attention
+            .iter()
+            .find(|item| item.key.starts_with("reset-expires:claude:ultra:"))
+            .expect("the offer ends in two days");
+        assert_eq!(lapsing.level, Level::Low);
+        assert_eq!(lapsing.fix.as_deref(), Some("tokeman claude reset ultra"));
+        assert!(lapsing.text.contains("expires"), "{}", lapsing.text);
+        let json = serde_json::to_value(lapsing).unwrap();
+        assert_eq!(json["kind"], "reset-expires");
+        assert_eq!(json["within"], "3d");
         // Offers are Claude's: another service's view has none.
         let codex = Overview::build(&fleet(), facts, Some(Service::Codex), NOW);
         assert!(codex.resets_on_offer.is_empty());
+        assert!(codex.attention.is_empty(), "{:?}", codex.attention);
+    }
+
+    #[test]
+    fn every_limit_carries_the_name_and_note_the_surfaces_show() {
+        let mut reading = claude("ultra", 0.4);
+        let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
+        fable.share = Some(0.5);
+        // Reported before the account-wide window; shown after it.
+        reading.limits.insert(0, fable);
+        let agy = Reading {
+            limits: vec![crate::providers::limit(
+                Some("Gemini Models".to_owned()),
+                "5h",
+                Some(Span::FIVE_HOUR_SECS),
+                Window::new(1.0, NOW + 600),
+                None,
+            )],
+            ..Reading::empty(Service::Antigravity, "g@x.y", NOW)
+        };
+        let view = build(Facts {
+            readings: vec![reading.clone(), agy.clone()],
+            ..Facts::default()
+        });
+        let limits = &view.accounts[0].limits;
+        let names: Vec<&str> = limits.iter().map(|limit| limit.name.as_str()).collect();
+        assert_eq!(names, ["weekly", "Fable weekly"]);
+        for (shown, limit) in limits.iter().zip(text::limits_in_order(&reading)) {
+            assert_eq!(&shown.limit, limit);
+            assert_eq!(shown.name, text::limit_name(limit));
+            assert_eq!(shown.note, text::limit_note(limit, &reading));
+        }
+        assert_eq!(limits[0].note, None);
+        assert_eq!(
+            limits[1].note.as_deref(),
+            Some("profile; 50% of the weekly, 25% of the weekly left for it")
+        );
+        let json = serde_json::to_value(&view.accounts[0]).unwrap();
+        assert_eq!(json["limits"][1]["name"], "Fable weekly");
+        assert_eq!(json["limits"][1]["scope"]["model"], "fable");
+        assert_eq!(json["limits"][1]["window"]["utilization"], 0.5);
+        assert_eq!(json["limits"][0]["note"], serde_json::Value::Null);
+
+        let group = &view.accounts[4];
+        assert_eq!(group.limits[0].name, "Gemini Models 5h");
+        // Its only group is spent, so the account has no room; an account
+        // never read says nothing either way.
+        assert_eq!(group.viable, Some(false));
+        assert_eq!(view.accounts[3].viable, None);
+        assert!(view.accounts[3].limits.is_empty());
+    }
+
+    #[test]
+    fn a_service_with_a_measured_rate_has_a_forecast_and_the_rest_have_none() {
+        // Ultra went from 30% to 60% of its weekly in six hours; plain was
+        // read once. 5%/h over what is left above the sip floor.
+        let recent: Vec<Reading> = (0..=6)
+            .map(|hour| {
+                let mut reading = claude("ultra", 0.30 + 0.05 * hour as f64);
+                reading.at = NOW - (6 - hour) * 3_600;
+                reading.set_weekly(Some(Window::new(
+                    0.30 + 0.05 * hour as f64,
+                    NOW + 5 * 86_400,
+                )));
+                reading
+            })
+            .collect();
+        let latest = recent.last().unwrap().clone();
+        let mut plain = claude("plain", 0.5);
+        plain.set_weekly(Some(Window::new(0.5, NOW + 5 * 86_400)));
+        let facts = Facts {
+            readings: vec![latest, plain.clone()],
+            recent: recent.into_iter().chain([plain]).collect(),
+            offers: vec![ResetOffer {
+                account: "plain".into(),
+                offer: "launch reset".into(),
+                read_at: NOW,
+                expires_at: None,
+                weekly_refills: 1,
+            }],
+            ..Facts::default()
+        };
+        let view = build(facts.clone());
+        assert_eq!(view.forecasts.len(), 1, "{:?}", view.forecasts);
+        let shown = &view.forecasts[0];
+        let forecast = &shown.forecast;
+        assert_eq!(forecast.service, Service::Claude);
+        assert_eq!((forecast.accounts, forecast.measured), (2, 1));
+        let floor = fleet().policy.sip_min_7d_remaining;
+        let room = (0.40 - floor) + (0.50 - floor);
+        assert!((forecast.room - room).abs() < 1e-9, "{}", forecast.room);
+        let hours = room / 0.05;
+        let Outlook::Dry { at } = forecast.outlook else {
+            panic!("{forecast:?}");
+        };
+        assert!((at - NOW - (hours * 3_600.0) as i64).abs() <= 1);
+        // The offer on plain is counted apart: one more full window.
+        assert_eq!(forecast.refills, 1);
+        let more = (1.0 - floor) / 0.05;
+        assert_eq!(
+            forecast.with_resets,
+            Some(Outlook::Dry {
+                at: at + (more * 3_600.0).round() as i64
+            })
+        );
+        assert!(
+            shown.text.starts_with("Claude runs dry in 16h")
+                && shown.text.contains("at the last 6 h rate")
+                && shown.text.contains("measured on 1")
+                && shown.text.contains("; with the 1 reset on offer, "),
+            "{}",
+            shown.text
+        );
+        assert!(
+            shown.brief.starts_with("Claude dry in 16h"),
+            "{}",
+            shown.brief
+        );
+        // Under a day and over twelve hours: no one is called yet.
+        assert!(
+            view.attention
+                .iter()
+                .all(|item| !item.key.starts_with("runs-dry")),
+            "{:?}",
+            view.attention
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["forecasts"][0]["outlook"]["state"], "dry");
+        assert_eq!(json["forecasts"][0]["burn_hours"], 6);
+        assert_eq!(json["forecasts"][0]["span"], "weekly");
+
+        // The view of another service has no forecast of Claude's.
+        let kimi = Overview::build(&fleet(), facts, Some(Service::Kimi), NOW);
+        assert!(kimi.forecasts.is_empty());
     }
 }

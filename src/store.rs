@@ -878,7 +878,8 @@ mod tests {
             codex.reset_credits,
             Some(ResetCreditCount {
                 available: 2,
-                applicable: Some(0)
+                applicable: Some(0),
+                expires_at: None,
             })
         );
         assert!(read.above(0.0, 0.0, None));

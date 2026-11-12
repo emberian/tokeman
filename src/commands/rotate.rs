@@ -87,7 +87,7 @@ pub async fn status(fleet: &Fleet) -> Result<Overview> {
         target_model.as_deref(),
         now,
     ));
-    facts.offers = resets_on_offer(fleet, at).await;
+    facts.offers = resets_on_offer(fleet, at, model.as_ref()).await;
     facts.live_sessions = live_sessions;
     Ok(Overview::build(
         fleet,
@@ -137,7 +137,7 @@ fn describe_sampling(
 }
 
 /// The usable reset grants of every logged-in account, read now.
-async fn resets_on_offer(fleet: &Fleet, now: i64) -> Vec<ResetOffer> {
+async fn resets_on_offer(fleet: &Fleet, now: i64, model: Option<&ModelKey>) -> Vec<ResetOffer> {
     let cache = Cache::default();
     let client = Client::shared();
     let accounts: Vec<_> = fleet
@@ -161,11 +161,7 @@ async fn resets_on_offer(fleet: &Fleet, now: i64) -> Vec<ResetOffer> {
                 .grants()
                 .iter()
                 .filter(|grant| grant.is_usable(now))
-                .map(|grant| ResetOffer {
-                    account: account.name.clone(),
-                    offer: resets::describe_grant(grant, now),
-                    read_at: now,
-                }),
+                .map(|grant| ResetOffer::of(&account.name, grant, now, now, model)),
         );
     }
     offers

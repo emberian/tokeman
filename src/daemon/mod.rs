@@ -1,11 +1,12 @@
 //! The rotation daemon: the loop, one cycle, its on-disk state, the lock,
-//! the launchd service, the service-quota poll, and the commands that change
-//! what it manages.
+//! the launchd service, the service-quota poll, the notifications, and the
+//! commands that change what it manages.
 
 pub mod cadence;
 pub mod cycle;
 pub mod lock;
 pub mod log;
+pub mod notify;
 pub mod refresh;
 pub mod service;
 pub mod services;
@@ -53,6 +54,7 @@ pub async fn run() -> Result<()> {
     let mut refresh_backoff = refresh::Backoff::default();
     let mut codex_state = crate::codex::maintenance::MaintenanceState::default();
     let mut services_poller = services::Poller::default();
+    let mut notifier = notify::Notifier::default();
     loop {
         wake.tick().await;
         if started_as.is_some() && executable_identity().is_some_and(|now| Some(now) != started_as)
@@ -75,6 +77,10 @@ pub async fn run() -> Result<()> {
         };
         // Runs in its own task; the cycle below never waits on it.
         for line in services_poller.tick(&fleet).await {
+            log(&line);
+        }
+        // Likewise: a round of notifications is a task of its own.
+        for line in notifier.tick(&fleet).await {
             log(&line);
         }
         let scheduled = cycle::Options {

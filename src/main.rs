@@ -70,7 +70,23 @@ async fn dispatch(command: Command) -> Result<()> {
             }
         }
         Command::Stats { service } => {
-            text::print_stats(&view::stats(&Fleet::load()?, service.into()))
+            let fleet = Fleet::load()?;
+            let service = service.into();
+            text::print_stats(
+                &view::stats(&fleet, service),
+                view::forecast(&fleet, service).as_ref(),
+            )
+        }
+        Command::Notify { test: true } => {
+            let delivery = view::notify_test().await;
+            text::print_notify_test(&delivery);
+            if let tokeman::daemon::notify::Delivery::Failed { reason, .. } = delivery {
+                bail!("the notification was not delivered: {reason}");
+            }
+        }
+        Command::Notify { test: false } => {
+            let fleet = Fleet::load()?;
+            text::print_attention_report(&view::stored(&fleet).await, fleet.launch.notifications)
         }
         Command::Chart {
             service,

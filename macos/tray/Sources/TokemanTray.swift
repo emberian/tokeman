@@ -21,134 +21,52 @@ struct Window: Decodable, Equatable {
     var remaining: Double { max(0, min(1, 1.0 - utilization)) }
 }
 
-/// One limit of one account, as tokeman's `quota::Limit` serializes: a
-/// window of some length (`span`) over the whole account, one model or one
-/// named group (`scope`). Every gauge in the app is drawn from one of these.
+/// One limit of one account. In the fleet view it is tokeman's
+/// `ui::overview::LimitView`: a `quota::Limit` with the name and the note
+/// every surface shows, in the order they are shown. In the history it is
+/// the `quota::Limit` alone. Every gauge in the app is drawn from one.
 struct Limit: Decodable {
-    /// `5h`, `weekly`, `monthly`, or another length in words; `nil` when the
-    /// server did not say.
-    let span: String?
-    /// The group the limit is scoped to (Antigravity's model families).
-    let group: String?
-    /// The model the limit is scoped to.
-    let model: String?
-    /// The server's name for the limit; empty when it has none.
-    let label: String
+    /// Which limit this is, the same across reads: its length and what it
+    /// covers, as tokeman serializes them. Matches a limit of the fleet
+    /// view to its history; never shown.
+    let series: String
     let window: Window
-    let amount: Amount?
-    /// The limit's size as a fraction of the weekly limit, when it is one.
-    let share: Double?
-    let source: String
-    /// The server's own status for this window is a rejection.
-    let rejected: Bool
+    /// What the limit is called. The history carries no names.
+    let name: String?
+    /// What follows the gauge, when there is something to say.
+    let note: String?
 
-    /// Whether the limit covers the whole account.
-    var isShared: Bool { group == nil && model == nil }
+    /// The account-wide weekly window.
+    static let weekly = "weekly/all"
 
-    struct Amount: Decodable {
-        let used: Double
-        let limit: Double
-        let unit: String
-    }
-
-    private struct Status: Decodable { let verdict: String }
-    private enum Keys: String, CodingKey { case span, scope, label, window, amount, share, source, status }
+    private enum Keys: String, CodingKey { case span, scope, window, name, note }
     private enum ScopeKeys: String, CodingKey { case model, group }
     private enum SpanKeys: String, CodingKey { case other }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
+        let span: String
         if let named = try? c.decode(String.self, forKey: .span) {
-            switch named {
-            case "five_hour": span = "5h"
-            case "unknown": span = nil
-            default: span = named
-            }
+            span = named
         } else {
             let other = try c.nestedContainer(keyedBy: SpanKeys.self, forKey: .span)
-            span = Limit.spanText(try other.decode(Int64.self, forKey: .other))
+            span = "other:\(try other.decode(Int64.self, forKey: .other))"
         }
-        if let scope = try? c.nestedContainer(keyedBy: ScopeKeys.self, forKey: .scope) {
-            group = try scope.decodeIfPresent(String.self, forKey: .group)
-            model = try scope.decodeIfPresent(String.self, forKey: .model)
+        let scope: String
+        if let whole = try? c.decode(String.self, forKey: .scope) {
+            scope = whole
         } else {
-            group = nil
-            model = nil
-        }
-        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
-        window = try c.decode(Window.self, forKey: .window)
-        amount = try c.decodeIfPresent(Amount.self, forKey: .amount)
-        share = try c.decodeIfPresent(Double.self, forKey: .share)
-        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
-        rejected = (try c.decodeIfPresent(Status.self, forKey: .status))?.verdict == "rejected"
-    }
-
-    /// `daily`, `2d`, `90m`: a length in its largest whole unit.
-    private static func spanText(_ seconds: Int64) -> String {
-        if seconds == 86_400 { return "daily" }
-        for (size, suffix) in [(Int64(86_400), "d"), (3_600, "h"), (60, "m")] where seconds % size == 0 {
-            return "\(seconds / size)\(suffix)"
-        }
-        return "\(seconds)s"
-    }
-
-    /// What the limit covers, then its length: `5h`, `weekly`, `Fable
-    /// weekly`, `Gemini Models 5h`, `codex_spark weekly`. The same rule as
-    /// tokeman's `ui::text::limit_name`.
-    var name: String {
-        let length = span ?? "window"
-        if isShared { return label.isEmpty ? length : label }
-        let isLength = label == length || ["5h", "weekly", "monthly", "daily"].contains(label)
-        let head: String
-        if let group {
-            if label.isEmpty {
-                head = group
-            } else if isLength {
-                return "\(group) \(label)"
+            let part = try c.nestedContainer(keyedBy: ScopeKeys.self, forKey: .scope)
+            if let model = try part.decodeIfPresent(String.self, forKey: .model) {
+                scope = "model:\(model)"
             } else {
-                head = label
+                scope = "group:\(try part.decode(String.self, forKey: .group))"
             }
-        } else {
-            head = label.isEmpty ? (model ?? "") : label
         }
-        return span == nil || head.hasSuffix(length) ? head : "\(head) \(length)"
-    }
-
-    /// The order every surface shows limits in: account-wide, models, groups.
-    var rank: Int { isShared ? 0 : (model != nil ? 1 : 2) }
-
-    private var sourceLabel: String? {
-        guard model != nil else { return nil }
-        switch source {
-        case "profile": return "profile"
-        case "headers": return "rate-limit headers"
-        case "observed-rejection": return "observed Claude rejection"
-        case "carried": return "carried sample"
-        default: return nil
-        }
-    }
-
-    /// What follows the gauge: that the server refuses on the limit, the
-    /// absolute amount, where a model's reading came from, its share of the
-    /// weekly, why extra usage is off. The same rule as tokeman's
-    /// `ui::text::limit_note`.
-    func note(in reading: Reading) -> String? {
-        var parts: [String] = []
-        if rejected { parts.append("limited") }
-        if let amount {
-            parts.append("\(Int(amount.used.rounded()))/\(Int(amount.limit.rounded())) \(amount.unit)")
-        }
-        if let sourceLabel { parts.append(sourceLabel) }
-        if let share {
-            let own = (1.0 - window.utilization) * share
-            let room = reading.weekly.map { min(own, 1.0 - $0.utilization) } ?? own
-            parts.append("\(Int((share * 100).rounded()))% of the weekly, "
-                + "\(Int((max(0, room) * 100).rounded()))% of the weekly left for it")
-        }
-        if group == "extra usage", let reason = reading.detail?.claude?.overage?.disabled_reason {
-            parts.append(reason == "out_of_credits" ? "no credits" : reason)
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+        series = "\(span)/\(scope)"
+        window = try c.decode(Window.self, forKey: .window)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
     }
 }
 
@@ -161,29 +79,12 @@ struct Reading: Decodable, Identifiable {
     let at: Int64
     let plan: String?
     let limits: [Limit]
-    let detail: Detail?
-
-    struct Detail: Decodable { let claude: Claude? }
-    struct Claude: Decodable { let overage: Overage? }
-    struct Overage: Decodable { let disabled_reason: String? }
 
     var date: Date { Date(timeIntervalSince1970: TimeInterval(at)) }
 
-    /// The account-wide weekly window.
-    var weekly: Window? {
-        limits.first(where: { $0.isShared && $0.span == "weekly" })?.window
-    }
-
-    /// The limits in the order they are shown.
-    var ordered: [Limit] {
-        limits.enumerated()
-            .sorted { ($0.element.rank, $0.offset) < ($1.element.rank, $1.offset) }
-            .map(\.element)
-    }
-
-    /// Percent left on the limit of this name.
-    func remaining(for name: String) -> Double? {
-        limits.first(where: { $0.name == name }).map { $0.window.remaining * 100 }
+    /// Percent left on one limit.
+    func remaining(for series: String) -> Double? {
+        limits.first(where: { $0.series == series }).map { $0.window.remaining * 100 }
     }
 }
 
@@ -201,6 +102,8 @@ struct Account: Decodable, Identifiable {
     let state: State?
     let error: String?
     let notes: [String]
+    /// The reading's limits as they are shown: in order, named, noted.
+    let limits: [Limit]
     let reading: Reading?
 
     struct Login: Decodable {
@@ -215,6 +118,38 @@ struct Account: Decodable, Identifiable {
     }
 
     var isClaude: Bool { service == "claude" }
+
+    /// The limit a small chart follows: the weekly window when the account
+    /// has one, else its first limit.
+    var mainSeries: String? {
+        (limits.first(where: { $0.series == Limit.weekly }) ?? limits.first)?.series
+    }
+}
+
+/// One thing that needs the user: tokeman's `ui::overview::AttentionView`.
+struct Attention: Decodable, Identifiable {
+    var id: String { key }
+    let key: String
+    /// `critical` or `low`.
+    let level: String
+    let text: String
+    /// The command that deals with it, when there is one.
+    let fix: String?
+}
+
+/// When a service's accounts run dry at the recent rate: tokeman's
+/// `ui::overview::ForecastView`.
+struct Forecast: Decodable, Identifiable {
+    var id: String { service }
+    let service: String
+    let outlook: Outlook
+    /// The forecast in a few words.
+    let brief: String
+
+    struct Outlook: Decodable {
+        /// `dry`, `beyond` or `idle`.
+        let state: String
+    }
 }
 
 struct ResetOffer: Decodable, Identifiable {
@@ -239,6 +174,15 @@ struct Overview: Decodable {
     let best_weekly_remaining: Double?
     let accounts: [Account]
     let resets_on_offer: [ResetOffer]
+    let forecasts: [Forecast]
+    /// What needs the user, the critical items first.
+    let attention: [Attention]
+
+    /// The forecasts of the services in use, in a few words each.
+    var forecastLine: String? {
+        let briefs = forecasts.filter { $0.outlook.state != "idle" }.map(\.brief)
+        return briefs.isEmpty ? nil : briefs.joined(separator: " · ")
+    }
 
     /// The services that have an account, in the view's order.
     var services: [(key: String, label: String)] {
@@ -380,13 +324,20 @@ class TokemanViewModel: ObservableObject {
         }
     }
 
+    /// Something critical needs the user.
+    private var needsUser: Bool {
+        overview?.attention.contains(where: { $0.level == "critical" }) ?? false
+    }
+
     var statusIcon: String {
         guard let overview else { return loadError == nil ? "bolt.fill" : "bolt.slash.fill" }
+        if needsUser { return "bolt.trianglebadge.exclamationmark.fill" }
         guard let best = overview.best_weekly_remaining else { return "bolt.slash.fill" }
         return best > 0.2 ? "bolt.fill" : "bolt.trianglebadge.exclamationmark.fill"
     }
 
     var statusColor: Color {
+        if needsUser { return .red }
         guard let best = overview?.best_weekly_remaining else { return .gray }
         return levelColor(best)
     }
@@ -646,18 +597,17 @@ func runTokeman(_ path: String, args: [String]) async -> String {
 /// say. The only gauge in the app.
 struct LimitRow: View {
     let limit: Limit
-    let reading: Reading
     var nameWidth: CGFloat = 34
 
     private var caption: String {
         let reset = resetText(limit.window.reset).map { "resets \($0)" } ?? "no reset pending"
-        return limit.note(in: reading).map { "\(reset) · \($0)" } ?? reset
+        return limit.note.map { "\(reset) · \($0)" } ?? reset
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Text(limit.name)
+                Text(limit.name ?? "")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -734,14 +684,6 @@ struct SectionTitle: View {
     }
 }
 
-/// The limit a small chart follows for an account: its weekly window when
-/// it has one, else its first limit.
-func mainLimit(_ readings: [Reading]) -> String? {
-    guard let latest = readings.last else { return nil }
-    if latest.weekly != nil { return "weekly" }
-    return latest.ordered.first?.name
-}
-
 struct MiniUtilizationChart: View {
     let snapshots: [Reading]
     let series: String
@@ -772,29 +714,21 @@ struct MiniUtilizationChart: View {
 
 struct AccountDetailChart: View {
     let snapshots: [Reading]
+    /// The account's limits as the fleet view names them.
+    let limits: [Limit]
     @State private var series: String
 
-    init(snapshots: [Reading]) {
+    init(snapshots: [Reading], account: Account) {
         self.snapshots = snapshots
-        _series = State(initialValue: mainLimit(snapshots) ?? "weekly")
-    }
-
-    /// Every limit the history holds, by name.
-    private var seriesNames: [String] {
-        var names: [String] = []
-        for snapshot in snapshots.reversed() {
-            for limit in snapshot.ordered where !names.contains(limit.name) {
-                names.append(limit.name)
-            }
-        }
-        return names
+        self.limits = account.limits
+        _series = State(initialValue: account.mainSeries ?? Limit.weekly)
     }
 
     var body: some View {
         VStack(spacing: 6) {
             Picker("Limit", selection: $series) {
-                ForEach(seriesNames, id: \.self) { name in
-                    Text(name).tag(name)
+                ForEach(limits, id: \.series) { limit in
+                    Text(limit.name ?? limit.series).tag(limit.series)
                 }
             }
             .pickerStyle(.menu)
@@ -845,7 +779,7 @@ struct ComparisonChart: View {
         Chart {
             ForEach(history, id: \.name) { entry in
                 ForEach(entry.readings) { snap in
-                    if let rem = snap.remaining(for: "weekly") {
+                    if let rem = snap.remaining(for: Limit.weekly) {
                         LineMark(
                             x: .value("Time", snap.date),
                             y: .value("Remaining %", rem)
@@ -897,14 +831,14 @@ struct AccountCard: View {
 
     /// The series the small chart follows, when the history can draw it.
     private var sparkSeries: String? {
-        guard let history, let series = mainLimit(history),
+        guard let history, let series = account.mainSeries,
               history.filter({ $0.remaining(for: series) != nil }).count >= 2 else { return nil }
         return series
     }
 
     /// Wide enough for the longest limit name on the card.
     private func nameWidth(_ limits: [Limit]) -> CGFloat {
-        let longest = limits.map { $0.name.count }.max() ?? 3
+        let longest = limits.map { ($0.name ?? "").count }.max() ?? 3
         return min(190, CGFloat(max(3, longest)) * 6.8)
     }
 
@@ -936,11 +870,10 @@ struct AccountCard: View {
                 }
             }
 
-            if let reading = account.reading {
+            if account.reading != nil {
                 if let error = account.error { Caption(error, color: .red, lines: 3) }
-                let limits = reading.ordered
-                ForEach(Array(limits.enumerated()), id: \.offset) { _, limit in
-                    LimitRow(limit: limit, reading: reading, nameWidth: nameWidth(limits))
+                ForEach(Array(account.limits.enumerated()), id: \.offset) { _, limit in
+                    LimitRow(limit: limit, nameWidth: nameWidth(account.limits))
                 }
                 ForEach(account.notes, id: \.self) { note in
                     Caption(note, color: note.hasPrefix("!") ? .orange : .secondary)
@@ -960,7 +893,7 @@ struct AccountCard: View {
             }
 
             if showDetail, let history, history.count >= 2 {
-                AccountDetailChart(snapshots: history).padding(.top, 4)
+                AccountDetailChart(snapshots: history, account: account).padding(.top, 4)
             }
         }
         .contentShape(Rectangle())
@@ -1043,14 +976,32 @@ struct SettingsSection: View {
     }
 }
 
-/// Every account of the fleet view as a card, under its service's name,
-/// then the reset offers.
+/// What needs the user, then every account of the fleet view as a card
+/// under its service's name, then the reset offers.
 struct OverviewCards: View {
     let overview: Overview
     @ObservedObject var vm: TokemanViewModel
 
     var body: some View {
         VStack(spacing: 6) {
+            if !overview.attention.isEmpty {
+                SectionTitle(title: "Needs attention")
+                Card {
+                    ForEach(overview.attention) { item in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Caption("! \(item.text)", color: item.level == "critical" ? .red : .orange)
+                            if let fix = item.fix {
+                                Text(fix)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .padding(.leading, 9)
+                            }
+                        }
+                    }
+                }
+            }
+
             ForEach(overview.services, id: \.key) { service in
                 SectionTitle(title: service.label)
                 ForEach(overview.accounts.filter { $0.service == service.key }) { account in
@@ -1097,19 +1048,28 @@ struct PopoverContent: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Tokeman").font(.headline)
-                Text(vm.isReading ? "reading every account…" : vm.caption)
-                    .font(.caption2)
-                    .foregroundStyle(vm.isStale ? .orange : .secondary)
-                    .lineLimit(1)
-                Spacer()
-                Button(action: { vm.readNow() }) {
-                    Image(systemName: "arrow.clockwise")
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Tokeman").font(.headline)
+                    Text(vm.isReading ? "reading every account…" : vm.caption)
+                        .font(.caption2)
+                        .foregroundStyle(vm.isStale ? .orange : .secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button(action: { vm.readNow() }) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(vm.isLoading || vm.isReading)
+                    .help("Read every account now (tokeman --fresh)")
                 }
-                .buttonStyle(.borderless)
-                .disabled(vm.isLoading || vm.isReading)
-                .help("Read every account now (tokeman --fresh)")
+                if let forecast = vm.overview?.forecastLine {
+                    Text(forecast)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help("When each service's accounts run dry at the rate of the last hours (tokeman stats)")
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)

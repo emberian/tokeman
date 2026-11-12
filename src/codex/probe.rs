@@ -460,6 +460,7 @@ pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Read
                 Some(ResetCreditCount {
                     available: resets.available_count?,
                     applicable: resets.applicable_available_count,
+                    expires_at: None,
                 })
             }),
         }),
@@ -938,7 +939,8 @@ pub(crate) mod tests {
             codex.reset_credits,
             Some(ResetCreditCount {
                 available: 2,
-                applicable: Some(0)
+                applicable: Some(0),
+                expires_at: None,
             })
         );
         assert_eq!(
