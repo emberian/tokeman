@@ -520,6 +520,8 @@ mod tests {
             "bare"
         );
         assert_eq!(winner(&[bare], &fleet, Some("spark")), None);
+        // A refused account reports no window either, and is no resort at all.
+        assert_eq!(winner(&probes[3..], &fleet, None), None);
     }
 
     #[test]

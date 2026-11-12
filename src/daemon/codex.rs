@@ -258,6 +258,8 @@ mod tests {
         fleet.codex[1].parked = false;
         fleet.policy.codex_auto_move = false;
         assert_eq!(Standing::with_pause(&fleet, false), Standing::Off);
+        // Paused is said first: it also stops the tending of pushed seats.
+        assert_eq!(Standing::with_pause(&fleet, true), Standing::Paused);
     }
 
     #[test]
@@ -329,7 +331,7 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert!(fake.logins().is_empty() || mover.running.is_some());
+        assert!(mover.running.is_some(), "the look is a task of its own");
         finished(&mover).await;
         let lines = mover
             .tick_with(&fleet, Standing::On, Some(client.clone()))
@@ -375,6 +377,9 @@ mod tests {
         let lines = mover.tick_with(&fleet, Standing::On, Some(client)).await;
         assert!(lines.is_empty(), "{lines:?}");
         assert_eq!(fake.logins().len(), 1);
+        // The daemon chose among accounts; it listed and spent no reset credit.
+        assert!(backend.requests("/credits").is_empty());
+        assert!(backend.requests("/credits/consume").is_empty());
     }
 
     #[tokio::test]

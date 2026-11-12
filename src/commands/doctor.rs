@@ -1040,10 +1040,22 @@ mod tests {
         findings.hook = Hook::Missing;
         findings.daemon = Monitor::NotInstalled;
         assert!(Report::assemble(findings.clone()).healthy);
-        findings.daemon = Monitor::Paused;
-        let report = Report::assemble(findings);
-        assert_eq!(report.problems.len(), 1);
-        assert_eq!(report.problems[0].fix, "tokeman rotate install");
+        for (daemon, problems) in [
+            (Monitor::Running, 1),
+            (Monitor::Paused, 1),
+            // A stopped service is a problem of its own.
+            (Monitor::Stopped, 2),
+        ] {
+            findings.daemon = daemon;
+            let report = Report::assemble(findings.clone());
+            assert_eq!(report.problems.len(), problems, "{daemon:?}");
+            assert!(
+                report.problems[0].what.contains("SessionStart hook"),
+                "{daemon:?}: {:?}",
+                report.problems
+            );
+            assert_eq!(report.problems[0].fix, "tokeman rotate install");
+        }
     }
 
     #[test]

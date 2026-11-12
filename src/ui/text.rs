@@ -2610,6 +2610,14 @@ mod tests {
             say(&Attention::DaemonStopped).1.as_deref(),
             Some("tokeman rotate install")
         );
+        let (_, fix) = say(&Attention::CodexSeatExpires {
+            home: "~/.codex".into(),
+            account: "work".into(),
+            profile_home: Some("~/.codex-homes/work".into()),
+            expires_at: Some(NOW + 3_600),
+            why: crate::attention::Unkept::Paused,
+        });
+        assert_eq!(fix.as_deref(), Some("tokeman rotate resume"));
         assert_eq!(format_until(NOW, NOW), "now");
         assert_eq!(format_until(NOW + 20, NOW), "in 1m");
     }
@@ -2705,6 +2713,38 @@ mod tests {
         );
         assert_eq!(lines[3], "");
         assert_eq!(lines.len(), 4);
+        // A service nobody used in the burn window has no forecast line.
+        let flat: Vec<Reading> = (0..=6)
+            .map(|hour| {
+                let mut reading = crate::testing::reading("first@example.com", 0.0, 0.0);
+                reading.at = NOW - (6 - hour) * 3_600;
+                reading.set_weekly(Some(Window::new(0.10, NOW + 6 * 86_400)));
+                reading
+            })
+            .collect();
+        let idle = Overview::build(
+            &fleet,
+            Facts {
+                readings: vec![flat.last().unwrap().clone()],
+                recent: flat,
+                ..Facts::default()
+            },
+            None,
+            NOW,
+        );
+        assert_eq!(
+            idle.forecasts[0].forecast.outlook,
+            Outlook::Idle,
+            "{:?}",
+            idle.forecasts
+        );
+        assert!(
+            plain(headlines(&idle))
+                .iter()
+                .all(|line| !line.contains("forecast")),
+            "{:?}",
+            headlines(&idle)
+        );
         // Nothing to say is no section at all.
         let quiet = Overview::build(&Fleet::default(), Facts::default(), None, NOW);
         assert!(headlines(&quiet).is_empty());
@@ -2781,6 +2821,10 @@ mod tests {
             view_caption(&view(Monitor::Running, 1_000 + 7_200)),
             "stored view, STALE: the background service last read 2h ago"
         );
+        // Stale from the first second past the ten minutes.
+        assert!(!view_caption(&view(Monitor::Running, 1_000 + STALE_SECS)).contains("STALE"));
+        assert!(view_caption(&view(Monitor::Running, 1_001 + STALE_SECS)).contains("STALE"));
+        assert_eq!(STALE_SECS, 600);
         assert_eq!(
             view_caption(&view(Monitor::Paused, 1_030)),
             "stored view, last read just now; rotation is paused"

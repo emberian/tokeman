@@ -848,6 +848,17 @@ mod tests {
                 "{line} still parses"
             );
         }
+        // Every row of the table is refused by clap and found by `removed`.
+        for (old, new) in REMOVED {
+            let line = old.join(" ");
+            assert!(parse(&format!("tokeman {line}")).is_err(), "{line} parses");
+            let args: Vec<String> = old.iter().map(|word| (*word).to_owned()).collect();
+            assert_eq!(
+                removed(&args),
+                Some((format!("tokeman {line}"), *new)),
+                "{line}"
+            );
+        }
         // The new tree is never mistaken for an old spelling.
         for line in [
             "claude login",

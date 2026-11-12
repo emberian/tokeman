@@ -994,6 +994,13 @@ mod tests {
             look.moved(By::Watch, 1).unwrap().span,
             Some(crate::quota::Span::Weekly)
         );
+        // The landing has reset credits on offer; moving listed and spent none.
+        assert_eq!(
+            look.probed[0].codex().unwrap().reset_credits.unwrap().available,
+            2
+        );
+        assert!(backend.requests("/credits").is_empty());
+        assert!(backend.requests("/credits/consume").is_empty());
     }
 
     #[tokio::test]
