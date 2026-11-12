@@ -282,7 +282,7 @@ mod tests {
             expires_at: Some(5),
             ..ServiceAccount::with_key_file(Service::Antigravity, "first@example.com", "~/.key")
         };
-        let shown = format!("{account:?} {:?}", [account.clone()]);
+        let shown = format!("{account:?} {:?}", Some(&account));
         assert!(!shown.contains("secret"), "{shown}");
         assert!(
             shown.contains(r#"name: "first@example.com""#)
