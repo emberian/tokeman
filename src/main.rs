@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     tokeman::notice::set_sink(text::notice);
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some((old, new)) = cli::removed(&args) {
-        bail!("`{old}` was removed in 0.4; run `{new}`");
+        bail!("`{old}` was removed in 0.4. Use: {new}");
     }
     let cli = Cli::parse();
     match cli.command {

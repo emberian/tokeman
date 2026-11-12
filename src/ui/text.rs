@@ -1542,7 +1542,11 @@ pub fn print_best(best: &crate::commands::view::Best) {
     }
     for reading in &best.readings {
         if let Some(error) = &reading.error {
-            println!(" -  {} could not be read: {error}", reading.account);
+            println!(
+                " -  {} could not be read: {}",
+                reading.account,
+                one_line(&error.to_string(), 120)
+            );
         }
     }
     let Some(winner) = best.winner() else {
