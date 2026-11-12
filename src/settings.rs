@@ -430,6 +430,34 @@ mod tests {
             ..PolicySettings::default()
         };
         assert!(policy.validate().is_err());
+        // A floor is a fraction remaining: all of it, or less than none, is
+        // refused although the nesting holds.
+        let refused = |policy: PolicySettings, what: &str| {
+            let error = policy.validate().unwrap_err().to_string();
+            assert!(error.contains(what), "{error}");
+        };
+        refused(
+            PolicySettings {
+                land_min_5h_remaining: 1.0,
+                ..PolicySettings::default()
+            },
+            "land_min_5h_remaining must be at least 0 and less than 1",
+        );
+        refused(
+            PolicySettings {
+                sip_min_7d_remaining: -0.1,
+                ..PolicySettings::default()
+            },
+            "sip_min_7d_remaining must be at least 0 and less than 1",
+        );
+        // A zero interval would probe in a tight loop.
+        refused(
+            PolicySettings {
+                sip_probe_interval_secs: 0,
+                ..PolicySettings::default()
+            },
+            "at least one second",
+        );
     }
 
     #[test]
@@ -458,5 +486,8 @@ mod tests {
         // A file written before these keys existed reads as the defaults.
         let old: PolicySettings = toml::from_str("normal_min_5h_remaining = 0.07\n").unwrap();
         assert_eq!(old, PolicySettings::default());
+        let old: LaunchSettings = toml::from_str("dangerous_mode = false\n").unwrap();
+        assert_eq!(old, LaunchSettings::default());
+        assert!(old.notifications, "on in a file that does not say");
     }
 }

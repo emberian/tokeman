@@ -1275,6 +1275,17 @@ mod tests {
         assert!(!failed.has_quota());
         assert!(!failed.is_refused());
         assert!(Reading::failed(Service::Claude, "a", 0, ReadError::NoCredential).is_refused());
+        let unreadable = ReadError::Credential {
+            message: "auth.json has no access token".into(),
+        };
+        assert!(Reading::failed(Service::Codex, "a", 0, unreadable).is_refused());
+        // Windows beside an error are not a reading: the error stands.
+        let mut stale = reading(0.1, 0.1);
+        stale.error = Some(ReadError::Network {
+            message: "timed out".into(),
+        });
+        assert!(!stale.has_quota());
+        assert!(!stale.above(0.0, 0.0, None));
     }
 
     #[test]
@@ -1322,7 +1333,11 @@ mod tests {
         let mut r = reading(0.0, 0.40);
         let mut limit = model_limit("fable", "Fable", 0.37, Source::Profile);
         limit.share = Some(0.5);
-        r.limits.push(limit);
+        r.limits.push(limit.clone());
+        // The limit's own room: scaled by its share, capped by the weekly.
+        assert!((limit.room(Some(&Window::new(0.40, 0))) - 0.315).abs() < 1e-9);
+        assert!((limit.room(Some(&Window::new(0.80, 0))) - 0.20).abs() < 1e-9);
+        assert!((limit.room(None) - 0.315).abs() < 1e-9);
         // 63% of a half-weekly allowance is 31.5% of the weekly; 60% is left.
         assert!((r.model_room(Some(&fable)).unwrap() - 0.315).abs() < 1e-9);
         // When the weekly has less left than that, the weekly binds.
@@ -1353,6 +1368,37 @@ mod tests {
         assert!(!r.above(0.05, 0.05, Some(&fable)));
         assert!(r.above(0.05, 0.03, Some(&fable)));
         assert!(r.above(0.05, 0.05, Some(&key("claude-opus-5-5"))));
+        // Exactly the floor is not above it: half of a half is a quarter.
+        let mut half = model_limit("fable", "Fable", 0.5, Source::Profile);
+        half.share = Some(0.5);
+        r.set_limit(half);
+        assert!(!r.above(0.05, 0.25, Some(&fable)));
+        assert!(r.above(0.05, 0.24, Some(&fable)));
+    }
+
+    #[test]
+    fn a_window_past_its_limit_has_no_room_rather_than_negative_room() {
+        // Fable's header window reads over 1.0 (research/anthropic.md).
+        let mut over = reading(1.2, 0.4);
+        assert_eq!(over.least_remaining(), Some(0.0));
+        assert!(!over.above(0.0, 0.0, None));
+        over.set_session(None);
+        assert_eq!(over.least_remaining(), Some(0.6));
+        over.set_weekly(None);
+        assert_eq!(over.least_remaining(), None, "no window is not no room");
+        // More than half left is fine, a fifth or less is critical.
+        let levels = [0.51, 0.50, 0.21, 0.20, 0.0, -0.2].map(Level::of);
+        assert_eq!(
+            levels,
+            [
+                Level::Ok,
+                Level::Low,
+                Level::Low,
+                Level::Critical,
+                Level::Critical,
+                Level::Critical
+            ]
+        );
     }
 
     #[test]
@@ -1410,6 +1456,18 @@ mod tests {
             "401 revoked"
         );
         assert_eq!(http(529, "overloaded_error").reason(), "529 overloaded");
+        assert_eq!(
+            http(401, "OAuth token has expired. Please obtain a new token.").reason(),
+            "401 expired"
+        );
+        assert_eq!(
+            http(
+                403,
+                "OAuth authentication is not allowed for this organization."
+            )
+            .reason(),
+            "403 org disallows OAuth"
+        );
         assert_eq!(http(500, "boom").reason(), "HTTP 500");
         assert_eq!(
             ReadError::Network {
@@ -1468,6 +1526,15 @@ mod tests {
         assert_eq!(Span::from_seconds(Some(604_800)), Span::Weekly);
         assert_eq!(Span::from_seconds(Some(30 * 86_400)), Span::Monthly);
         assert_eq!(Span::from_seconds(Some(28 * 86_400)), Span::Monthly);
+        assert_eq!(Span::from_seconds(Some(31 * 86_400)), Span::Monthly);
+        assert_eq!(
+            Span::from_seconds(Some(27 * 86_400)),
+            Span::Other(27 * 86_400)
+        );
+        assert_eq!(
+            Span::from_seconds(Some(32 * 86_400)),
+            Span::Other(32 * 86_400)
+        );
         assert_eq!(Span::from_seconds(None), Span::Unknown);
         assert_eq!(Span::from_seconds(Some(0)), Span::Unknown);
         assert_eq!(Span::FiveHour.label(), "5h");
@@ -1575,6 +1642,11 @@ mod tests {
         );
         assert_eq!(r.tightest().unwrap().span, Span::Weekly);
         assert_eq!(r.scoped().len(), 2);
+        // Ranked on no scope in particular, a model's limit does not join
+        // the account-wide ones: it limits that model alone.
+        let unscoped = r.scoped_to(None).unwrap();
+        assert_eq!(unscoped.limits.len(), 2);
+        assert!(unscoped.above(0.05, 0.05, Some(&key("claude-opus-4-8"))));
         assert_eq!(
             r.model_limit(&key("fable")).map(|limit| limit.share),
             Some(Some(0.5))
@@ -1617,6 +1689,11 @@ mod tests {
         assert!(spark.has_quota());
         assert!(!spark.above(0.0, 0.0, None));
         assert_eq!(r.scoped_to(Some("nothing-like-it")), None);
+        // An account-wide limit is never what a scope names, whatever its label.
+        let mut labelled = r.clone();
+        labelled.limits[0].label = "weekly".into();
+        assert!(!labelled.limits[0].matches("weekly"));
+        assert_eq!(labelled.scoped_to(Some("weekly")), None);
         // No limit block at all: allowed, but nothing to rank on.
         let mut bare = Reading::empty(Service::Codex, "bare", 0);
         assert!(bare.allows() && !bare.has_quota());
