@@ -96,8 +96,6 @@ async fn dispatch(command: Command) -> Result<()> {
                 text::print_setting_set(&key, &value);
             }
         },
-        #[cfg(feature = "tray")]
-        Command::Tray => tokeman::ui::tray::run(Fleet::load()?)?,
     }
     Ok(())
 }

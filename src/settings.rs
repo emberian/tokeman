@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// How `tokeman launch` and the trays start Claude.
+/// How `tokeman launch` and the tray start Claude.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchSettings {
     /// Extra arguments for claude, e.g. `["--model", "opus"]`.
@@ -18,7 +18,7 @@ pub struct LaunchSettings {
     /// Path to the claude binary; `claude` on PATH when unset.
     #[serde(default)]
     pub claude_bin: Option<String>,
-    /// Probe interval for the trays and the TUI.
+    /// Probe interval for the tray and the TUI.
     #[serde(default = "default_probe_interval")]
     pub probe_interval_secs: u64,
     /// How often the daemon and the TUI read the `[[services]]` quotas.

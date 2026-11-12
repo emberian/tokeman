@@ -1,13 +1,10 @@
-//! `tokeman launch`: pick the default, then start claude, in this terminal
-//! or a new one.
+//! `tokeman launch`: pick the default, then start claude in this terminal.
 
 use anyhow::{Context, Result, bail};
-use std::process::Command;
 
 use crate::account::Fleet;
 use crate::daemon::cycle::{self, Options};
 use crate::notice::notice;
-use crate::util::shell_quote;
 
 const TAG: &str = " \x1b[1mtokeman:\x1b[0m";
 
@@ -79,110 +76,4 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
-}
-
-/// Open a new terminal window running claude (the trays use this).
-pub fn in_terminal(binary: &str, args: &[String], terminal: Option<&str>) -> Result<()> {
-    let mut command = shell_quote(binary);
-    for arg in args {
-        command.push(' ');
-        command.push_str(&shell_quote(arg));
-    }
-    open_terminal(&command, terminal)
-}
-
-/// Run `command` in a new terminal window: AppleScript on macOS, the first
-/// terminal emulator that starts on Linux, `cmd` elsewhere.
-fn open_terminal(command: &str, terminal: Option<&str>) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let script = apple_script(terminal.unwrap_or("Terminal"), command);
-        let status = Command::new("osascript").arg("-e").arg(&script).status()?;
-        if !status.success() {
-            bail!("osascript exited with {status}");
-        }
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let shell_command = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
-        let preferred = terminal.map(|pref| [pref]);
-        let terminals: &[&str] = match &preferred {
-            Some(pref) => pref,
-            None => &[
-                "x-terminal-emulator",
-                "gnome-terminal",
-                "konsole",
-                "xfce4-terminal",
-                "alacritty",
-                "kitty",
-                "wezterm",
-                "xterm",
-            ],
-        };
-        for &terminal in terminals {
-            let exec_flag = if terminal == "gnome-terminal" {
-                "--"
-            } else {
-                "-e"
-            };
-            if Command::new(terminal)
-                .args([exec_flag, "bash", "-c", shell_command.as_str()])
-                .spawn()
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        bail!("No terminal emulator found. Set terminal in settings.")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = terminal;
-        Command::new("cmd")
-            .args(["/c", "start", "cmd", "/k", command])
-            .spawn()?;
-        Ok(())
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-const ITERM_BADGE: &str = "printf '\\033]1337;SetBadgeFormat=dG9rZW1hbiDCtyBtYW5hZ2Vk\\007'; ";
-
-/// The badge is part of the shell line, escaped once with the command.
-#[cfg(any(target_os = "macos", test))]
-fn apple_script(app: &str, command: &str) -> String {
-    match app {
-        "iTerm2" | "iTerm" | "iterm2" | "iterm" => {
-            let command = apple_script_escape(&format!("{ITERM_BADGE}{command}"));
-            format!(
-                "tell application \"iTerm2\"\n    activate\n    create window with default profile\n    tell current session of current window\n        set name to \"Claude · tokeman\"\n        write text \"{command}\"\n    end tell\nend tell"
-            )
-        }
-        _ => {
-            let command = apple_script_escape(command);
-            format!(
-                "tell application \"Terminal\"\n    activate\n    do script \"{command}\"\nend tell"
-            )
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn apple_script_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn iterm_script_sets_the_badge_once_and_escaped() {
-        let script = apple_script("iTerm2", "'claude' '--model' \"x\"");
-        assert_eq!(script.matches("SetBadgeFormat").count(), 1);
-        assert!(script.contains("write text \"printf '\\\\033]1337;SetBadgeFormat="));
-        assert!(script.contains("\\\"x\\\""));
-        assert!(apple_script("Terminal", "'claude'").contains("do script \"'claude'\""));
-    }
 }

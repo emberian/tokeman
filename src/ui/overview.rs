@@ -1,6 +1,6 @@
 //! The fleet view: everything known about every account of every service,
 //! in one structure. `tokeman list --json` is its serialization, and every
-//! surface (the text reports, `--watch`, both trays) draws it.
+//! surface (the text reports, `--watch`, the tray) draws it.
 //!
 //! A view is built from [`Facts`]. [`Facts::on_disk`] gathers them without
 //! a request or a write, which is what a surface shows while the background

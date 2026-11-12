@@ -130,10 +130,9 @@ src/
     prompt.rs    the only reader of the terminal: confirmations, the hook's stdin, the browser-login conversation
     chart.rs     PNG charts of any limit, the --metric resolver, the segment logic the TUI chart shares
     tui.rs       --watch: a card per account, a chart of any limit
-    tray.rs      the egui tray (feature "tray")
   cli.rs         clap definitions, and REMOVED: the 0.3 spellings and what replaced each
   main.rs        dispatch: parse, call commands/, hand the result to ui/text
-  launch.rs      the claude launch command and terminal handoff
+  launch.rs      the claude launch command
 macos/tray/      the Swift menu-bar app: a viewer of `tokeman list --json`
 ```
 
@@ -268,11 +267,11 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   server's own shape is a private struct in the module that parses it; a
   shape an earlier build stored is a private struct in `store/legacy.rs`.
 - **One renderer per surface.** Each surface draws a limit in one place,
-  from a `Limit`: `text::account_lines`, `tui::gauge_line`,
-  `tray::draw_limit`, the Swift `LimitRow`. What a limit is called
-  (`limit_name`), what is said after it (`limit_note`), a reading's state
-  word (`badge`), its one-line form (`summary`) and how a view describes
-  itself (`view_caption`) are each one function in `ui/text.rs`.
+  from a `Limit`: `text::account_lines`, `tui::gauge_line`, the Swift
+  `LimitRow`. What a limit is called (`limit_name`), what is said after it
+  (`limit_note`), a reading's state word (`badge`), its one-line form
+  (`summary`) and how a view describes itself (`view_caption`) are each one
+  function in `ui/text.rs`.
 - **Who sends a quota request.** The service's loop (the rotation cycle,
   the services poll, the Codex sweep); `commands::view::probe`, behind every
   `<service> list` and `best`, `--fresh`, and the surfaces when no service

@@ -96,13 +96,13 @@ rewrites the plist, launcher and hook for the new binary.
   `reset`). `<service> list` reads that service now.
 - `tokeman list` shows every account of every service from stored reads,
   with no request and no write; `tokeman list --json` is the fleet view the
-  trays read.
-- Bare `tokeman`, `tokeman --watch` and both trays are viewers while the
+  tray reads.
+- Bare `tokeman`, `tokeman --watch` and the tray are viewers while the
   background service runs: they show the stored view and send no request.
   The service counts as running while its daemon holds `daemon.lock`, on
   macOS and under any other supervisor; a second daemon refuses to start.
   Without a running service they read every account themselves. `tokeman
-  --fresh`, `r` in `--watch` and the trays' reload button read now. Every
+  --fresh`, `r` in `--watch` and the tray's reload button read now. Every
   view says whether it is stored and how old it is, and says STALE when the
   service has not read for ten minutes.
 - `tokeman history`, `stats` and `chart` take `--service`. `chart --metric`
@@ -153,6 +153,8 @@ rewrites the plist, launcher and hook for the new binary.
 - Chart lines from before 0.3 (the Opus/Sonnet columns) and credential
   events reconstructed from the old rotation log are no longer read, and
   the `usage_key` spelling in tokens.toml is no longer accepted.
+- The egui tray (the `tray` cargo feature and `tokeman tray`) is removed.
+  The macOS menu-bar app in `macos/tray` is the tray.
 
 ### Internals
 

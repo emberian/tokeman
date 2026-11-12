@@ -59,22 +59,22 @@ tokeman                  # the fleet view: every account of every service
 tokeman --fresh          # read every account now, then show it
 tokeman --watch          # the same as a live dashboard
 tokeman list             # one line per account, from stored reads
-tokeman list --json      # the fleet view as JSON (what the trays read)
+tokeman list --json      # the fleet view as JSON (what the tray reads)
 tokeman history [--service S] [--last N | --since HOURS] [--account NAME] [--json]
 tokeman stats   [--service S]             # burn rate and time to depletion, per limit
 tokeman chart   [--service S] [--metric M] [--hours N]   # PNG, inline in iTerm2
-tokeman settings [set <key> <value>]      # launch settings; the trays write through this
+tokeman settings [set <key> <value>]      # launch settings; the tray writes through this
 ```
 
 **Who reads the accounts.** While the background service runs
 (`tokeman rotate install`), it is the only reader: bare `tokeman`,
-`tokeman --watch` and both trays show the stored view and send no request.
+`tokeman --watch` and the tray show the stored view and send no request.
 Every view says that it is stored and how old it is, and says STALE when the
 service has not read for ten minutes. The service counts as running while its
 daemon holds `daemon.lock`, however it was started; an installed service whose
 daemon has died shows as not running. Without a running service (or while
 rotation is paused) those surfaces read every account themselves. `--fresh`, `r` in
-`--watch` and the trays' reload button read now either way. `tokeman list`
+`--watch` and the tray's reload button read now either way. `tokeman list`
 never sends a request; `tokeman <service> list` always reads that service.
 
 `--service` takes `claude` (the default), `codex`, `agy`, `glm` or `kimi`.
@@ -296,7 +296,7 @@ launchd starts the new one.
 configured arguments and without a token in its environment or command line.
 `--auto` keeps rotating on the fast cadence while claude runs.
 
-## Trays
+## Tray
 
 The macOS menu-bar app is a separate Swift package:
 
@@ -304,20 +304,13 @@ The macOS menu-bar app is a separate Swift package:
 cd macos/tray && bash build.sh && open Tokeman.app
 ```
 
-The cross-platform tray is the `tray` feature:
-
-```sh
-cargo install --path . --features tray
-tokeman tray
-```
-
-Both draw the fleet view: a card per account of every service with a gauge
+It draws the fleet view: a card per account of every service with a gauge
 per limit, each login's end date, the resets on offer, and whether the view
-is stored and how old it is. Both launch claude in a new terminal on a chosen
-or the best account and expose the launch settings and the dangerous-mode
+is stored and how old it is. It launches claude in a new terminal on a chosen
+or the best account and exposes the launch settings and the dangerous-mode
 toggle.
 
-The macOS app runs `tokeman list --json`, `tokeman history --json` and
+It runs `tokeman list --json`, `tokeman history --json` and
 `tokeman settings show`, none of which sends a request; it never opens
 tokens.toml. Its reload button, and its timer when no service is running, run
 `tokeman --fresh --json`. Its settings go through `tokeman settings set` and
@@ -350,12 +343,11 @@ single-use and a save from a stale copy would lose the account.
 
 ## Development
 
-The gates CI runs, plus the tray feature:
+The gates CI runs, plus the tray:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo clippy --all-targets --locked --features tray -- -D warnings
 cargo test --locked                      # unit tests, all in-process (loopback servers, temp dirs)
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 macos/tray/build.sh                      # the Swift tray

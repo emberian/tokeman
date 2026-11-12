@@ -34,7 +34,7 @@ pub enum Command {
     ///
     /// Makes no request and writes nothing.
     List {
-        /// The fleet view as JSON (what the trays read)
+        /// The fleet view as JSON (what the tray reads)
         #[arg(long)]
         json: bool,
     },
@@ -130,9 +130,6 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<SettingsAction>,
     },
-    /// Run the tray application
-    #[cfg(feature = "tray")]
-    Tray,
 }
 
 #[derive(Subcommand)]
