@@ -61,7 +61,8 @@ tokeman --watch          # the same as a live dashboard
 tokeman list             # one line per account, from stored reads
 tokeman list --json      # the fleet view as JSON (what the trays read)
 tokeman history [--service S] [--last N | --since HOURS] [--account NAME] [--json]
-tokeman stats   [--service S]             # burn rate and time to depletion, per limit
+tokeman stats   [--service S]             # burn rate and time to depletion, per limit; the forecast
+tokeman notify  [--test]                  # what needs you now; --test sends one notification
 tokeman chart   [--service S] [--metric M] [--hours N]   # PNG, inline in iTerm2
 tokeman settings [set <key> <value>]      # launch settings; the trays write through this
 ```
@@ -76,6 +77,22 @@ daemon has died shows as not running. Without a running service (or while
 rotation is paused) those surfaces read every account themselves. `--fresh`, `r` in
 `--watch` and the trays' reload button read now either way. `tokeman list`
 never sends a request; `tokeman <service> list` always reads that service.
+
+**What needs you.** `tokeman`, `tokeman list` and the macOS tray open with a
+"needs attention" section, each item with the command that deals with it: a
+Claude login that ends within three days (and again within one) or was
+refused, a reset on offer that expires within three days (and one), a service
+none of whose accounts is above its floor, a fleet forecast to run dry within
+12 hours, a background service that is installed but not running. The running
+service sends each item once as a desktop notification (below).
+
+**The forecast.** For each service in use, one line says when its accounts
+run dry at the rate of the last 6 hours: every account's weekly room for the
+startup model above the floor, spent soonest-reset first, each window refilled
+at its reset if that falls inside the next week. What the unused resets on
+offer would add is stated apart; tokeman never spends a reset by itself. The
+accounts are added as if they were the same size. With less than an hour of
+readings of one reset window there is no forecast, and `tokeman stats` says so.
 
 `--service` takes `claude` (the default), `codex`, `agy`, `glm` or `kimi`.
 `chart --metric` names the limit to draw: a window by length (`5h`, `weekly`,
@@ -292,6 +309,15 @@ sweep that also refreshes tokens. It renews Claude logins before they expire
 and keeps every read in the history. It exits when its binary is replaced, so
 launchd starts the new one.
 
+Every two minutes the service looks at what needs you and sends each new item
+as a desktop notification titled "tokeman": through `osascript` on macOS
+(where it appears under Script Editor's name and needs that allowed once),
+through `notify-send` elsewhere when it is installed. An item is sent once,
+again when it reaches its nearer threshold, and again if it comes back after
+six hours away; `notified.json` remembers what was sent. `tokeman notify
+--test` sends one now. `tokeman settings set notifications false` keeps the
+items to the rotation log.
+
 `tokeman launch` runs one rotation cycle, then starts claude with the
 configured arguments and without a token in its environment or command line.
 `--auto` keeps rotating on the fast cadence while claude runs.
@@ -323,7 +349,9 @@ tokens.toml. Its reload button, and its timer when no service is running, run
 `tokeman --fresh --json`. Its settings go through `tokeman settings set` and
 its Launch buttons through `tokeman claude use`.
 `Tokeman.app/Contents/MacOS/TokemanTray --render out.png` draws the popover
-once into a PNG.
+once into a PNG. The app opens with what needs attention, carries the
+forecasts in its header, and shows each limit under the name and note the
+fleet view gives it.
 
 ## Files
 
@@ -335,6 +363,7 @@ once into a PNG.
 | `~/.config/tokeman/claude-rotate-state.json` | Cadence, mode, backoffs, carried samples |
 | `~/.config/tokeman/claude-rotate.log` | Rotation events (names and headroom only) |
 | `~/.config/tokeman/claims.json` | Reset claims (Claude grants, Codex credits) sent without a definite answer |
+| `~/.config/tokeman/notified.json` | Which attention items the service has sent as notifications |
 | `~/.config/tokeman/claude-login-keychain-backup.json` | The `/login` Keychain record set aside while managed |
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.config/tokeman/antigravity-access-tokens.json` | Access tokens minted from the Antigravity grants |

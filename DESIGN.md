@@ -64,6 +64,8 @@ src/
   history.rs     credential history: Event, Fingerprint, account_at (JSONL)
   claims.rs      the claim journal: reset claims (Claude grants, Codex credits) sent without a definite answer, keyed
                  by (Service, account); one request id per claim, resent verbatim; the only writer of claims.json
+  attention.rs   PURE. Attention: what needs the user, found in the fleet view at a given time, each with a stable key
+  forecast.rs    PURE. Forecast, Outlook: when a service's accounts run dry at the rate of the last BURN_HOURS
   notice.rs      progress lines (a lock being waited on, a retry sleeping, dry-run narration) go to a sink the binary
                  installs; the library never writes to the terminal
   util.rs        pure helpers shared across domains, once each: one_line, shell_quote, parse_reset, backoff_secs
@@ -114,6 +116,8 @@ src/
     log.rs       the rotation log
     refresh.rs   the login refresh sweep
     services.rs  the service-quota poll: its own task every services_interval_secs; rotation never waits on it
+    notify.rs    the notification round: its own task every two minutes; the ledger of what was told (the only writer
+                 of notified.json); the bounded osascript / notify-send delivery
     service.rs   the launchd plist, install/uninstall (macOS)
   commands/      what each command does, returning data; nothing here prints or reads the terminal
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
@@ -239,18 +243,39 @@ pub struct Overview {
     rotation: Rotation { mode, probe_interval_secs, min_session_remaining, min_weekly_remaining,
                          default_is_unmanaged, coverage, sampling, live_sessions },
     accounts: Vec<AccountView>,          // Claude, Codex, then the others, in configured order
-    resets_on_offer: Vec<ResetOffer>,
+    resets_on_offer: Vec<ResetOffer { account, offer, read_at, expires_at, weekly_refills }>,
+    forecasts: Vec<ForecastView { ..Forecast, text, brief }>,      // per service; none where the history is too thin
+    attention: Vec<AttentionView { key, level, text, fix, ..Attention }>,   // critical first
 }
 pub struct AccountView {
     service, service_label, name, label,
     held,                                // Claude Code's default, agy's login
     parked, login: Option<LoginView>,
     state: Option<State { word, level }>, viable: Option<bool>, error: Option<String>, notes: Vec<String>,
+    limits: Vec<LimitView { name, note, ..Limit }>,   // in display order, as every surface names them
     reading: Option<Reading>,            // stored or fresh
 }
-pub struct Facts { origin, monitor, readings, offers, default_account, target_model, agy_account, mode, .. }
+pub struct Facts { origin, monitor, readings, recent /* the last BURN_HOURS */, offers, default_account, target_model,
+                   agy_account, mode, .. }
 impl Facts { fn on_disk(&Fleet, now) -> Self   /* no request, no write */ ; fn with_fresh(self, Vec<Reading>) -> Self }
 impl Overview { fn build(&Fleet, Facts, only: Option<Service>, now) -> Self }
+
+// attention.rs  (pure). The daemon notifies a key once, so what is said again when it gets closer has its
+// threshold in the key.
+pub enum Within { OneDay, ThreeDays }
+pub enum Attention { DaemonStopped, BelowFloor { service }, RunsDry { service, at },
+                     LoginRefused { account }, LoginEnds { account, ends_at, within }, LoginAgeing { account },
+                     ResetExpires { service, account, expires_at, within } }   // serde: tag "kind"
+impl Attention { fn key(&self) -> String ; fn level(&self) -> Level }
+pub fn find(&Overview, now: i64) -> Vec<Attention>
+
+// forecast.rs  (pure). An account counts through its longest account-wide window; rooms and rates are added as
+// fractions of one window. The walk spends the account that resets soonest first and refills at each reset.
+pub struct Input<'a> { latest: &'a Reading, recent: &'a [Reading], refills: u32 /* resets on offer */ }
+pub enum Outlook { Dry { at }, Beyond /* past HORIZON_SECS */, Idle }
+pub struct Forecast { service, outlook, burn_hours, rate, room, span, accounts, measured, refills,
+                      with_resets: Option<Outlook> }
+pub fn forecast(Service, &[Input], model, floor, now) -> Option<Forecast>   // None: the data cannot support one
 
 // commands/view.rs
 pub async fn probe(&Fleet, only: Option<Service>) -> Vec<Reading>          // read now, record
@@ -272,7 +297,10 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   `tray::draw_limit`, the Swift `LimitRow`. What a limit is called
   (`limit_name`), what is said after it (`limit_note`), a reading's state
   word (`badge`), its one-line form (`summary`) and how a view describes
-  itself (`view_caption`) are each one function in `ui/text.rs`.
+  itself (`view_caption`) are each one function in `ui/text.rs`. The fleet
+  view carries the name and the note of every limit, the sentence and the
+  remedy of every attention item and the line of every forecast, so a
+  surface outside the crate (the Swift app) shows them and derives none.
 - **Who sends a quota request.** The service's loop (the rotation cycle,
   the services poll, the Codex sweep); `commands::view::probe`, behind every
   `<service> list` and `best`, `--fresh`, and the surfaces when no service
@@ -288,11 +316,19 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   verdicts, modes and sources are enums with fixed serde names.
 - **The policy is pure.** `policy.rs` imports only `quota.rs` and the
   settings struct that carries the floors. It never reads the clock or a
-  file, and never matches on `Service`.
+  file, and never matches on `Service`. `attention.rs` and `forecast.rs` are
+  pure the same way: the time is an argument.
+- **tokeman never spends a reset by itself.** A reset on offer is shown,
+  counted apart in a forecast and named in a notification; only
+  `tokeman <service> reset` claims one.
+- **No forecast is better than an invented one.** `forecast` returns
+  `None` unless some account's history covers an hour of one reset window
+  and every counted account's longest window has the same length.
 - **One writer per file.** `claude/settings.rs` for settings.json,
   `account.rs` for tokens.toml, `daemon/cadence.rs` for the cycle state,
   `observe.rs` for the admission state, `history.rs` for the JSONL,
-  `claims.rs` for claims.json, `store.rs` for snapshots.db.
+  `claims.rs` for claims.json, `daemon/notify.rs` for notified.json,
+  `store.rs` for snapshots.db.
 - **Printing and reading the terminal.** Nothing outside `ui/text.rs`
   prints, and nothing outside `ui/prompt.rs` reads the terminal.
   `commands/` and the domain modules return data; a long operation reports
@@ -318,7 +354,7 @@ owner-only.
 - `tokens.toml`: `[[tokens]]` (`name`, `key`, `access_token`,
   `refresh_token`, `expires_at`, `obtained_at`, `logged_in_at`,
   `refresh_expires_at`, `scopes`, `login_error`), `[settings]` (the launch
-  settings and `services_interval_secs`), `[rotation]` (the floors and
+  settings, `services_interval_secs` and `notifications`), `[rotation]` (the floors and
   intervals), `[[codex_accounts]]`, `[[services]]` (`name`, `service`, `key`
   or `key_file`, Antigravity's grant, `label`). Comments survive every
   write; keys added later are optional.
@@ -352,6 +388,10 @@ owner-only.
 - `daemon.lock`: held exclusively by the daemon while it runs. A surface
   tests it with a shared, read-only, non-creating try-lock to decide
   whether to show the stored view or read for itself.
+- `notified.json`: the attention keys the daemon has told, each with when
+  it was told and when it last stood. A key is told once and forgotten six
+  hours after it stops standing; the file is written before a notification
+  is sent.
 - `claims.json`: reset claims sent without a known outcome. An entry is
   dropped only by a read answer or `reset <account> --clear`.
   `reset-claims/<account>.pending` and `codex-reset-pending.json` from 0.3
@@ -396,3 +436,9 @@ owner-only.
   login when asked over its loopback port.
 - A Background-class LaunchAgent is scheduled below every normal process, so
   the agent is Standard.
+- `osascript -e 'display notification'` run from a LaunchAgent posts under
+  Script Editor's name and is subject to that app's notification permission.
+- A Claude grant that clears `seven_day` and a Codex reset credit each
+  refill an account's weekly window once per reset left; a grant with
+  `gives_back_weekly` does so for Fable work alone. Accounts of one service
+  are near enough the same size to add their windows.
