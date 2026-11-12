@@ -665,7 +665,7 @@ mod tests {
                 // The 5h window is the tighter one of both; neither weekly
                 // expires within a day.
                 vec![
-                    reading_with_resets("same-dwell-later", 0.60, 0.20, 3_600, 5 * 86_400),
+                    reading_with_resets("a-same-dwell-later", 0.60, 0.20, 3_600, 5 * 86_400),
                     reading_with_resets("same-dwell-first", 0.60, 0.20, 600, 5 * 86_400),
                 ],
                 "same-dwell-first",
@@ -682,7 +682,7 @@ mod tests {
                 "only the limiting window's reset counts",
                 // The roomy weekly of the first resets sooner; its tight 5h later.
                 vec![
-                    reading_with_resets("non-limiting-reset", 0.60, 0.20, 3_600, 5 * 86_400),
+                    reading_with_resets("a-non-limiting-reset", 0.60, 0.20, 3_600, 5 * 86_400),
                     reading_with_resets("limiting-reset", 0.60, 0.20, 600, 6 * 86_400),
                 ],
                 "limiting-reset",

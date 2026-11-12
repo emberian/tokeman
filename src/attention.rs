@@ -576,11 +576,13 @@ mod tests {
             ],
             "the one within a day first"
         );
-        // No credit left, or no known end, is nothing to say.
+        // No credit left, no known end, or an end far off or past, is nothing to say.
         for reading in [
             credits(0, Some(NOW + HOUR)),
             credits(2, None),
             credits(2, Some(NOW + 30 * DAY_SECS)),
+            // Already expired: nothing is left to lose.
+            credits(2, Some(NOW - HOUR)),
         ] {
             let facts = Facts {
                 readings: vec![reading],
