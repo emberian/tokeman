@@ -423,20 +423,8 @@ pub async fn probe_with(
     reading
 }
 
-/// Probe one account with the default cache and timeout.
-pub async fn probe(client: &Client, account: &Account, model: &str, now: i64) -> Reading {
-    probe_with(
-        client,
-        &profile::Cache::default(),
-        account,
-        model,
-        PROBE_TIMEOUT,
-        now,
-    )
-    .await
-}
-
-/// Probe every account concurrently with `model`, each bounded by `timeout`.
+/// Probe every account concurrently with `model`, each bounded by `timeout`,
+/// through the profile cache in the config directory.
 pub async fn probe_all<'a>(
     client: &Client,
     accounts: impl IntoIterator<Item = &'a Account>,
@@ -444,11 +432,30 @@ pub async fn probe_all<'a>(
     timeout: Duration,
     now: i64,
 ) -> Vec<Reading> {
-    let cache = profile::Cache::default();
+    probe_all_with(
+        client,
+        &profile::Cache::default(),
+        accounts,
+        model,
+        timeout,
+        now,
+    )
+    .await
+}
+
+/// [`probe_all`] through `cache`.
+pub async fn probe_all_with<'a>(
+    client: &Client,
+    cache: &profile::Cache,
+    accounts: impl IntoIterator<Item = &'a Account>,
+    model: &str,
+    timeout: Duration,
+    now: i64,
+) -> Vec<Reading> {
     futures::future::join_all(
         accounts
             .into_iter()
-            .map(|account| probe_with(client, &cache, account, model, timeout, now)),
+            .map(|account| probe_with(client, cache, account, model, timeout, now)),
     )
     .await
 }
@@ -768,7 +775,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_account_without_a_credential_is_refused_without_a_request() {
-        let reading = probe(&dead_client(), &Account::new("empty"), PROBE_MODEL, 7).await;
+        let (_dir, cache) = temp_cache();
+        let reading = probe_with(
+            &dead_client(),
+            &cache,
+            &Account::new("empty"),
+            PROBE_MODEL,
+            PROBE_TIMEOUT,
+            7,
+        )
+        .await;
         assert_eq!(reading.error, Some(ReadError::NoCredential));
         assert!(reading.is_refused());
         assert_eq!(reading.at, 7);
@@ -904,8 +920,9 @@ mod tests {
         assert_eq!(models[0].source, Source::Profile);
         assert_eq!(models[0].window.used, 0.9);
 
-        let all = probe_all(
+        let all = probe_all_with(
             &client,
+            &cache,
             &[login.clone(), Account::new("none")],
             PROBE_MODEL,
             PROBE_TIMEOUT,
