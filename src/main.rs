@@ -6,7 +6,7 @@ use tokeman::cli::{
     self, AgyAction, ClaudeAction, Cli, CodexAction, Command, KeyAction, RotateAction,
     SettingsAction,
 };
-use tokeman::commands::{claude, codex, rotate, services, view};
+use tokeman::commands::{claude, codex, doctor, rotate, services, view};
 use tokeman::daemon::cycle;
 use tokeman::quota::Service;
 use tokeman::ui::{prompt, text};
@@ -89,6 +89,17 @@ async fn dispatch(command: Command) -> Result<()> {
             width,
             height,
         })?),
+        Command::Doctor { json } => {
+            let report = doctor::run(&Fleet::load()?).await;
+            if json {
+                text::print_json(&report)?;
+            } else {
+                text::print_doctor(&report);
+            }
+            if !report.healthy {
+                std::process::exit(1);
+            }
+        }
         Command::Settings { action } => match action.unwrap_or(SettingsAction::Show) {
             SettingsAction::Show => text::print_settings(&view::settings()?),
             SettingsAction::Set { key, value } => {
