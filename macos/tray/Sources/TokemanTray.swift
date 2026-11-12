@@ -2,37 +2,45 @@ import SwiftUI
 import Foundation
 import Charts
 
-// This app is a viewer. It reads through `tokeman list --json` (everything
-// tokeman has stored, read without a request or a write), `tokeman history
-// --json` and `tokeman settings show`, and never opens tokens.toml itself.
-// The background service keeps those stores fresh; only when no service is
-// installed does the app probe on its own interval, as `tokeman` would.
-// It changes things only through `tokeman settings set` and, for a Launch
-// button, `tokeman claude use`.
+// This app is a viewer of tokeman's fleet view. It reads `tokeman list --json`
+// (everything tokeman has stored, read without a request or a write),
+// `tokeman history --json` and `tokeman settings show`, and never opens
+// tokens.toml itself. The background service keeps the stores fresh; only
+// when it is not running, or when the reload button asks, does the app have
+// tokeman read the accounts (`tokeman --fresh --json`, which prints the same
+// view). It changes things only through `tokeman settings set` and, for a
+// Launch button, `tokeman claude use`.
 
 // MARK: - JSON models (match `tokeman list --json`)
 
-struct Window: Codable, Equatable {
+struct Window: Decodable, Equatable {
     let utilization: Double
     let reset: Int64
 
+    /// Fraction left, for a gauge.
     var remaining: Double { max(0, min(1, 1.0 - utilization)) }
 }
 
 /// One limit of one account, as tokeman's `quota::Limit` serializes: a
 /// window of some length (`span`) over the whole account, one model or one
-/// named group (`scope`).
+/// named group (`scope`). Every gauge in the app is drawn from one of these.
 struct Limit: Decodable {
-    /// `5h`, `weekly`, `monthly`, or another length in words.
-    let span: String
+    /// `5h`, `weekly`, `monthly`, or another length in words; `nil` when the
+    /// server did not say.
+    let span: String?
     /// The group the limit is scoped to (Antigravity's model families).
     let group: String?
     /// The model the limit is scoped to.
     let model: String?
-    /// The server's name for the limit, or the span's when it gave none.
+    /// The server's name for the limit; empty when it has none.
     let label: String
     let window: Window
     let amount: Amount?
+    /// The limit's size as a fraction of the weekly limit, when it is one.
+    let share: Double?
+    let source: String
+    /// The server's own status for this window is a rejection.
+    let rejected: Bool
 
     /// Whether the limit covers the whole account.
     var isShared: Bool { group == nil && model == nil }
@@ -43,7 +51,8 @@ struct Limit: Decodable {
         let unit: String
     }
 
-    private enum Keys: String, CodingKey { case span, scope, label, window, amount }
+    private struct Status: Decodable { let verdict: String }
+    private enum Keys: String, CodingKey { case span, scope, label, window, amount, share, source, status }
     private enum ScopeKeys: String, CodingKey { case model, group }
     private enum SpanKeys: String, CodingKey { case other }
 
@@ -52,7 +61,7 @@ struct Limit: Decodable {
         if let named = try? c.decode(String.self, forKey: .span) {
             switch named {
             case "five_hour": span = "5h"
-            case "unknown": span = "window"
+            case "unknown": span = nil
             default: span = named
             }
         } else {
@@ -66,10 +75,12 @@ struct Limit: Decodable {
             group = nil
             model = nil
         }
-        let given = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
-        label = given.isEmpty ? span : given
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
         window = try c.decode(Window.self, forKey: .window)
         amount = try c.decodeIfPresent(Amount.self, forKey: .amount)
+        share = try c.decodeIfPresent(Double.self, forKey: .share)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        rejected = (try c.decodeIfPresent(Status.self, forKey: .status))?.verdict == "rejected"
     }
 
     /// `daily`, `2d`, `90m`: a length in its largest whole unit.
@@ -80,194 +91,162 @@ struct Limit: Decodable {
         }
         return "\(seconds)s"
     }
-}
 
-/// Why a read produced no quota, as tokeman's `quota::ReadError` serializes,
-/// in words.
-struct ReadFailure: Decodable {
-    let text: String
+    /// What the limit covers, then its length: `5h`, `weekly`, `Fable
+    /// weekly`, `Gemini Models 5h`, `codex_spark weekly`. The same rule as
+    /// tokeman's `ui::text::limit_name`.
+    var name: String {
+        let length = span ?? "window"
+        if isShared { return label.isEmpty ? length : label }
+        let isLength = label == length || ["5h", "weekly", "monthly", "daily"].contains(label)
+        let head: String
+        if let group {
+            if label.isEmpty {
+                head = group
+            } else if isLength {
+                return "\(group) \(label)"
+            } else {
+                head = label
+            }
+        } else {
+            head = label.isEmpty ? (model ?? "") : label
+        }
+        return span == nil || head.hasSuffix(length) ? head : "\(head) \(length)"
+    }
 
-    private enum Keys: String, CodingKey { case kind, message, status, body, attempts }
+    /// The order every surface shows limits in: account-wide, models, groups.
+    var rank: Int { isShared ? 0 : (model != nil ? 1 : 2) }
 
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: Keys.self)
-        let kind = try c.decode(String.self, forKey: .kind)
-        let message = try c.decodeIfPresent(String.self, forKey: .message)
-        let status = try c.decodeIfPresent(Int.self, forKey: .status)
-        switch kind {
-        case "no_credential": text = "no usable credential"
-        case "network": text = "network: \(message ?? "")"
-        case "http":
-            text = "HTTP \(status ?? 0): \(try c.decodeIfPresent(String.self, forKey: .body) ?? "")"
-        case "edge": text = "HTTP \(status ?? 0): Cloudflare challenge, not an auth failure"
-        default: text = message ?? kind
+    private var sourceLabel: String? {
+        guard model != nil else { return nil }
+        switch source {
+        case "profile": return "profile"
+        case "headers": return "rate-limit headers"
+        case "observed-rejection": return "observed Claude rejection"
+        case "carried": return "carried sample"
+        default: return nil
         }
     }
+
+    /// What follows the gauge: that the server refuses on the limit, the
+    /// absolute amount, where a model's reading came from, its share of the
+    /// weekly, why extra usage is off. The same rule as tokeman's
+    /// `ui::text::limit_note`.
+    func note(in reading: Reading) -> String? {
+        var parts: [String] = []
+        if rejected { parts.append("limited") }
+        if let amount {
+            parts.append("\(Int(amount.used.rounded()))/\(Int(amount.limit.rounded())) \(amount.unit)")
+        }
+        if let sourceLabel { parts.append(sourceLabel) }
+        if let share {
+            let own = (1.0 - window.utilization) * share
+            let room = reading.weekly.map { min(own, 1.0 - $0.utilization) } ?? own
+            parts.append("\(Int((share * 100).rounded()))% of the weekly, "
+                + "\(Int((max(0, room) * 100).rounded()))% of the weekly left for it")
+        }
+        if group == "extra usage", let reason = reading.detail?.claude?.overage?.disabled_reason {
+            parts.append(reason == "out_of_credits" ? "no credits" : reason)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    }
 }
 
-struct Overview: Decodable {
+/// One read of one account, as tokeman's `quota::Reading` serializes. The
+/// fleet view and the history hold the same thing.
+struct Reading: Decodable, Identifiable {
+    var id: String { "\(account)-\(at)" }
+    let account: String
+    /// Epoch seconds.
     let at: Int64
-    /// `running`, `paused` or `not-installed`.
-    let monitor: String
-    let default_account: String?
-    let target_model: String?
-    let claude: [ClaudeAccount]
-    let resets_on_offer: [ResetOffer]
-    let codex: [CodexAccount]
-    let services: [ServiceAccount]
+    let plan: String?
+    let limits: [Limit]
+    let detail: Detail?
+
+    struct Detail: Decodable { let claude: Claude? }
+    struct Claude: Decodable { let overage: Overage? }
+    struct Overage: Decodable { let disabled_reason: String? }
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(at)) }
+
+    /// The account-wide weekly window.
+    var weekly: Window? {
+        limits.first(where: { $0.isShared && $0.span == "weekly" })?.window
+    }
+
+    /// The limits in the order they are shown.
+    var ordered: [Limit] {
+        limits.enumerated()
+            .sorted { ($0.element.rank, $0.offset) < ($1.element.rank, $1.offset) }
+            .map(\.element)
+    }
+
+    /// Percent left on the limit of this name.
+    func remaining(for name: String) -> Double? {
+        limits.first(where: { $0.name == name }).map { $0.window.remaining * 100 }
+    }
 }
 
-struct ClaudeAccount: Codable, Identifiable {
-    var id: String { name }
+/// One account of one service: tokeman's `ui::overview::AccountView`.
+struct Account: Decodable, Identifiable {
+    var id: String { "\(service)-\(name)" }
+    let service: String
+    let service_label: String
     let name: String
-    let is_default: Bool
-    let credential: String
-    let login: String
-    let login_note: String?
-    let login_warning: Bool
-    let login_ends_at: Int64?
+    let label: String?
+    /// The tool holds this account now: Claude Code's default, agy's login.
+    let held: Bool
+    let parked: Bool
+    let login: Login?
+    let state: State?
+    let error: String?
+    let notes: [String]
     let reading: Reading?
 
-    struct Reading: Codable {
-        let at: Int64
-        let status: String?
-        let error: String?
-        let session: Window?
-        /// `present`, `absent` (the account has no 5h limit) or `unknown`.
-        let session_limit: String
-        let weekly: Window?
-        let overage: Window?
-        let buckets: [Bucket]
-        let notes: [String]
+    struct Login: Decodable {
+        let note: String?
+        let warning: Bool
     }
 
-    struct Bucket: Codable, Identifiable {
-        var id: String { label }
-        let label: String
-        let short: String
-        let window: Window
-        let source: String
-        /// The limit's size as a fraction of the weekly limit, when it is one.
-        let share: Double?
-        /// Room for the model as a fraction of the weekly limit.
-        let room: Double
+    struct State: Decodable {
+        let word: String
+        /// `ok`, `low` or `critical`.
+        let level: String?
     }
+
+    var isClaude: Bool { service == "claude" }
 }
 
-struct ResetOffer: Codable, Identifiable {
+struct ResetOffer: Decodable, Identifiable {
     var id: String { "\(account)-\(offer)" }
     let account: String
     let offer: String
     let read_at: Int64
 }
 
-struct NamedWindow: Codable, Identifiable {
-    var id: String { label }
-    let label: String
-    let window: Window
-}
-
-struct CodexAccount: Codable, Identifiable {
-    var id: String { name }
-    let name: String
-    let label: String?
-    let parked: Bool
-    let reading: Reading?
-
-    struct Reading: Codable {
-        let at: Int64
-        let email: String?
-        let plan: String?
-        let state: String
-        let viable: Bool
-        let windows: [NamedWindow]
-        let extra: [Extra]
-        let reset_credits: ResetCredits?
-    }
-
-    struct Extra: Codable, Identifiable {
-        var id: String { name }
-        let name: String
-        let limited: Bool
-        let windows: [NamedWindow]
-    }
-
-    struct ResetCredits: Codable {
-        let available: Int
-        let applicable: Int?
-    }
-}
-
-struct ServiceAccount: Decodable, Identifiable {
-    var id: String { "\(service)-\(name)" }
-    let name: String
-    let service: String
-    let service_label: String
-    let summary: String?
-    /// The stored reading, as tokeman's `quota::Reading` serializes.
-    let usage: Usage?
-
-    struct Usage: Decodable {
-        let at: Int64
-        let plan: String?
-        let limits: [Limit]
-        let balances: [Balance]?
-        let error: ReadFailure?
-    }
-
-    struct Balance: Decodable {
-        let label: String
-        let left_minor: Int64
-        let total_minor: Int64?
-        let currency: String
-    }
-}
-
-// MARK: - History model (matches `tokeman history --json`)
-
-/// One stored Claude reading (`quota::Reading`), read for its windows.
-struct HistorySnapshot: Decodable, Identifiable {
-    var id: String { "\(account)-\(at)" }
-    let account: String
-    /// Epoch seconds.
+/// The fleet view: tokeman's `ui::overview::Overview`.
+struct Overview: Decodable {
+    /// Epoch seconds when the view was put together.
     let at: Int64
-    let limits: [Limit]
-    let detail: Detail?
+    /// `stored` (the last reads, each as old as its `at`) or `fresh`.
+    let origin: String
+    /// Epoch seconds of the newest reading in the view.
+    let read_at: Int64?
+    /// `running`, `paused` or `not-installed`.
+    let monitor: String
+    let default_account: String?
+    let target_model: String?
+    let best_weekly_remaining: Double?
+    let accounts: [Account]
+    let resets_on_offer: [ResetOffer]
 
-    struct Detail: Decodable {
-        let claude: Claude?
-    }
-
-    struct Claude: Decodable {
-        let overage: Overage?
-    }
-
-    struct Overage: Decodable {
-        let window: Window?
-    }
-
-    var date: Date { Date(timeIntervalSince1970: TimeInterval(at)) }
-
-    private func shared(_ span: String) -> Window? {
-        limits.first(where: { $0.isShared && $0.span == span })?.window
-    }
-
-    var session: Window? { shared("5h") }
-    var weekly: Window? { shared("weekly") }
-    var overage: Window? { detail?.claude?.overage?.window }
-    /// The per-model limits.
-    var buckets: [Limit] { limits.filter { $0.model != nil } }
-
-    /// Percent left in the named series: `7d`, `5h`, `$$` or a bucket label.
-    func remaining(for series: String) -> Double? {
-        let window: Window?
-        switch series {
-        case "7d": window = weekly
-        case "5h": window = session
-        case "$$": window = overage
-        default: window = buckets.first(where: { $0.label == series })?.window
+    /// The services that have an account, in the view's order.
+    var services: [(key: String, label: String)] {
+        var seen: [(key: String, label: String)] = []
+        for account in accounts where !seen.contains(where: { $0.key == account.service }) {
+            seen.append((account.service, account.service_label))
         }
-        return window.map { $0.remaining * 100 }
+        return seen
     }
 }
 
@@ -309,6 +288,16 @@ func levelColor(_ remaining: Double) -> Color {
     return .red
 }
 
+/// The colour of a state's level, as tokeman names it.
+func levelColor(_ level: String?) -> Color {
+    switch level {
+    case "ok": return .green
+    case "low": return .orange
+    case "critical": return .red
+    default: return .secondary
+    }
+}
+
 /// `3h20m`, `Tue 4:00PM`, `now`, or `nil` for a window with no reset pending.
 func resetText(_ reset: Int64) -> String? {
     if reset == 0 { return nil }
@@ -332,32 +321,29 @@ func ageText(_ at: Int64) -> String {
     return "\(secs / 86_400)d ago"
 }
 
-func moneyText(_ minor: Int64, _ currency: String) -> String {
-    let amount = String(format: "%lld.%02lld", abs(minor) / 100, abs(minor) % 100)
-    let sign = minor < 0 ? "-" : ""
-    return currency == "USD" || currency.isEmpty ? "\(sign)$\(amount)" : "\(sign)\(amount) \(currency)"
-}
-
 // MARK: - View model
 
 @MainActor
 class TokemanViewModel: ObservableObject {
     @Published var overview: Overview?
     @Published var isLoading = false
-    @Published var isProbing = false
+    @Published var isReading = false
     @Published var lastLoad: Date?
     @Published var loadError: String?
     @Published var settings = LaunchSettings()
     @Published var showSettings = false
-    @Published var history: [String: [HistorySnapshot]] = [:]
+    /// Stored readings of the last 24 hours, by service and account.
+    @Published var history: [String: [Reading]] = [:]
 
     private var timer: Timer?
-    private var lastProbe: Date?
+    private var lastRead: Date?
     private var lastHistoryLoad: Date?
     /// A day of history is megabytes of JSON; the charts move slowly.
     private let historyInterval: TimeInterval = 300
     /// The stored view is local and cheap to read.
     private let reloadInterval: TimeInterval = 15
+    /// A stored view older than this, with the service running, is stale.
+    private let staleAfter: Int64 = 600
 
     /// `polls: false` is for drawing one picture of the stored view.
     let polls: Bool
@@ -368,27 +354,44 @@ class TokemanViewModel: ObservableObject {
         if polls { Task { @MainActor in self.start() } }
     }
 
-    /// Whether anything else keeps the stored reads fresh.
-    var serviceInstalled: Bool { overview?.monitor != "not-installed" }
+    /// Whether the background service reads the accounts by itself.
+    var serviceReads: Bool { overview?.monitor == "running" }
 
-    /// Weekly room of the best Claude account whose last reading allows work.
-    var bestWeeklyRemaining: Double? {
-        overview?.claude.compactMap { account -> Double? in
-            guard let reading = account.reading, reading.error == nil,
-                  reading.status != "rejected" else { return nil }
-            return reading.weekly?.remaining
-        }.max()
+    /// The stored view is older than the service would leave it.
+    var isStale: Bool {
+        guard let overview, overview.origin == "stored", serviceReads else { return false }
+        guard let read = overview.read_at else { return true }
+        return overview.at - read > staleAfter
+    }
+
+    /// Where the view's readings come from and how old they are.
+    var caption: String {
+        guard let overview else { return "" }
+        if overview.origin == "fresh" { return "read \(ageText(overview.at))" }
+        guard let read = overview.read_at else { return "stored view · nothing read yet" }
+        let age = ageText(read)
+        switch overview.monitor {
+        case "running":
+            return isStale ? "stored view · STALE, service last read \(age)"
+                           : "stored view · read \(age) by the service"
+        case "paused": return "stored view · read \(age) · rotation paused"
+        default: return "stored view · read \(age) · no service"
+        }
     }
 
     var statusIcon: String {
-        guard overview != nil else { return loadError == nil ? "bolt.fill" : "bolt.slash.fill" }
-        guard let best = bestWeeklyRemaining else { return "bolt.slash.fill" }
+        guard let overview else { return loadError == nil ? "bolt.fill" : "bolt.slash.fill" }
+        guard let best = overview.best_weekly_remaining else { return "bolt.slash.fill" }
         return best > 0.2 ? "bolt.fill" : "bolt.trianglebadge.exclamationmark.fill"
     }
 
     var statusColor: Color {
-        guard let best = bestWeeklyRemaining else { return .gray }
+        guard let best = overview?.best_weekly_remaining else { return .gray }
         return levelColor(best)
+    }
+
+    func history(for account: Account) -> [Reading]? {
+        history["\(account.service)-\(account.name)"]
     }
 
     func start() {
@@ -402,69 +405,75 @@ class TokemanViewModel: ObservableObject {
     /// Read the stored view, the history and the settings. No request is
     /// made and nothing is written.
     func reload() {
-        guard !isLoading else { return }
+        guard !isLoading, !isReading else { return }
         isLoading = true
         Task {
             await load()
             isLoading = false
-            probeIfNobodyElseDoes()
+            readIfNobodyElseDoes()
+        }
+    }
+
+    private func decode(_ output: String, from command: String) {
+        guard let data = output.data(using: .utf8), !output.isEmpty else {
+            loadError = "Could not run tokeman (looked at \(findTokeman())). Install it with: cargo install --path ."
+            return
+        }
+        do {
+            overview = try JSONDecoder().decode(Overview.self, from: data)
+            lastLoad = Date()
+            loadError = nil
+        } catch {
+            loadError = "This tokeman does not print the fleet view (`tokeman \(command)`): \(error)"
         }
     }
 
     func load() async {
         let bin = findTokeman()
-        let output = await shell(bin, args: ["list", "--json"])
-        if output.isEmpty {
-            loadError = "Could not run tokeman (looked at \(bin)). Install it with: cargo install --path ."
-        } else if let data = output.data(using: .utf8) {
-            do {
-                overview = try JSONDecoder().decode(Overview.self, from: data)
-                lastLoad = Date()
-                loadError = nil
-            } catch {
-                loadError = "This tokeman does not print the stored view (`tokeman list --json`): \(error)"
-            }
-        }
+        decode(await shell(bin, args: ["list", "--json"]), from: "list --json")
         settings = LaunchSettings.parse(await shell(bin, args: ["settings", "show"]))
         await loadHistory(bin)
     }
 
     private func loadHistory(_ bin: String) async {
         if let last = lastHistoryLoad, Date().timeIntervalSince(last) < historyInterval { return }
+        guard let overview else { return }
         lastHistoryLoad = Date()
-        let output = await shell(bin, args: ["history", "--json", "--since", "24"])
-        guard let data = output.data(using: .utf8),
-              let snapshots = try? JSONDecoder().decode([HistorySnapshot].self, from: data) else {
-            return
-        }
-        var grouped: [String: [HistorySnapshot]] = [:]
-        for snapshot in snapshots {
-            grouped[snapshot.account, default: []].append(snapshot)
+        var grouped: [String: [Reading]] = [:]
+        for service in overview.services {
+            let output = await shell(bin, args: ["history", "--service", service.key, "--json", "--since", "24"])
+            guard let data = output.data(using: .utf8),
+                  let readings = try? JSONDecoder().decode([Reading].self, from: data) else {
+                continue
+            }
+            for reading in readings {
+                grouped["\(service.key)-\(reading.account)", default: []].append(reading)
+            }
         }
         for key in grouped.keys {
-            grouped[key]?.sort { $0.date < $1.date }
+            grouped[key]?.sort { $0.at < $1.at }
         }
         history = grouped
     }
 
-    /// With no background service nothing refreshes the stores, so the app
-    /// probes on the configured interval, exactly as running `tokeman` does.
-    private func probeIfNobodyElseDoes() {
-        guard overview != nil, !serviceInstalled, !isProbing else { return }
+    /// With no background service reading, nothing refreshes the stores, so
+    /// the app has tokeman read on the configured interval.
+    private func readIfNobodyElseDoes() {
+        guard polls, overview != nil, !serviceReads, !isReading else { return }
         let interval = TimeInterval(max(15, settings.probeIntervalSecs))
-        if let last = lastProbe, Date().timeIntervalSince(last) < interval { return }
-        probe()
+        if let last = lastRead, Date().timeIntervalSince(last) < interval { return }
+        readNow()
     }
 
-    /// Probe every Claude account now (`tokeman --json`), then show the result.
-    func probe() {
-        guard !isProbing else { return }
-        isProbing = true
-        lastProbe = Date()
+    /// Have tokeman read every account now (`tokeman --fresh --json`) and
+    /// show the view it prints.
+    func readNow() {
+        guard !isReading else { return }
+        isReading = true
+        lastRead = Date()
         Task {
-            _ = await shell(findTokeman(), args: ["--json"])
-            isProbing = false
-            reload()
+            decode(await shell(findTokeman(), args: ["--fresh", "--json"]), from: "--fresh --json")
+            isReading = false
         }
     }
 
@@ -508,7 +517,7 @@ class TokemanViewModel: ObservableObject {
 
     /// Make `name` the default, then open Claude in a terminal.
     func launchAccount(_ name: String) {
-        guard overview?.claude.contains(where: { $0.name == name }) == true else { return }
+        guard overview?.accounts.contains(where: { $0.isClaude && $0.name == name }) == true else { return }
         let cmd = claudeCommand
         Task {
             let result = await shell(findTokeman(), args: ["claude", "use", name])
@@ -631,37 +640,41 @@ func runTokeman(_ path: String, args: [String]) async -> String {
 
 // MARK: - Views
 
-struct GaugeRow: View {
-    let label: String
-    var labelWidth: CGFloat = 34
-    let window: Window
-    var note: String? = nil
+/// One limit of any account of any service: its name, a bar of what is
+/// left, the percentage, and under it the reset and what else there is to
+/// say. The only gauge in the app.
+struct LimitRow: View {
+    let limit: Limit
+    let reading: Reading
+    var nameWidth: CGFloat = 34
 
     private var caption: String {
-        let reset = resetText(window.reset).map { "resets \($0)" } ?? "no reset pending"
-        return note.map { "\(reset) · \($0)" } ?? reset
+        let reset = resetText(limit.window.reset).map { "resets \($0)" } ?? "no reset pending"
+        return limit.note(in: reading).map { "\(reset) · \($0)" } ?? reset
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Text(label)
+                Text(limit.name)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: labelWidth, alignment: .trailing)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: nameWidth, alignment: .trailing)
 
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(.quaternary)
                         RoundedRectangle(cornerRadius: 3)
-                            .fill(levelColor(window.remaining))
-                            .frame(width: geo.size.width * window.remaining)
+                            .fill(levelColor(limit.window.remaining))
+                            .frame(width: geo.size.width * limit.window.remaining)
                     }
                 }
                 .frame(height: 12)
 
-                Text("\(Int((window.remaining * 100).rounded()))%")
+                Text("\(Int((limit.window.remaining * 100).rounded()))%")
                     .font(.system(size: 11, design: .monospaced))
                     .frame(width: 36, alignment: .trailing)
             }
@@ -669,7 +682,7 @@ struct GaugeRow: View {
             Text(caption)
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
-                .padding(.leading, labelWidth + 6)
+                .padding(.leading, nameWidth + 6)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -720,18 +733,27 @@ struct SectionTitle: View {
     }
 }
 
+/// The limit a small chart follows for an account: its weekly window when
+/// it has one, else its first limit.
+func mainLimit(_ readings: [Reading]) -> String? {
+    guard let latest = readings.last else { return nil }
+    if latest.weekly != nil { return "weekly" }
+    return latest.ordered.first?.name
+}
+
 struct MiniUtilizationChart: View {
-    let snapshots: [HistorySnapshot]
+    let snapshots: [Reading]
+    let series: String
 
     private var chartColor: Color {
-        guard let rem = snapshots.last?.remaining(for: "7d") else { return .green }
+        guard let rem = snapshots.last?.remaining(for: series) else { return .green }
         return levelColor(rem / 100)
     }
 
     var body: some View {
         Chart {
             ForEach(snapshots) { snap in
-                if let rem = snap.remaining(for: "7d") {
+                if let rem = snap.remaining(for: series) {
                     AreaMark(x: .value("Time", snap.date), y: .value("Remaining", rem))
                         .foregroundStyle(chartColor.opacity(0.15))
                     LineMark(x: .value("Time", snap.date), y: .value("Remaining", rem))
@@ -748,28 +770,33 @@ struct MiniUtilizationChart: View {
 }
 
 struct AccountDetailChart: View {
-    let snapshots: [HistorySnapshot]
-    @State private var series = "7d"
+    let snapshots: [Reading]
+    @State private var series: String
 
-    /// The weekly and 5h windows, each per-model limit seen, and extra usage.
+    init(snapshots: [Reading]) {
+        self.snapshots = snapshots
+        _series = State(initialValue: mainLimit(snapshots) ?? "weekly")
+    }
+
+    /// Every limit the history holds, by name.
     private var seriesNames: [String] {
-        var names = ["7d", "5h"]
-        for snapshot in snapshots {
-            for bucket in snapshot.buckets where !names.contains(bucket.label) {
-                names.append(bucket.label)
+        var names: [String] = []
+        for snapshot in snapshots.reversed() {
+            for limit in snapshot.ordered where !names.contains(limit.name) {
+                names.append(limit.name)
             }
         }
-        return names + ["$$"]
+        return names
     }
 
     var body: some View {
         VStack(spacing: 6) {
-            Picker("Window", selection: $series) {
+            Picker("Limit", selection: $series) {
                 ForEach(seriesNames, id: \.self) { name in
                     Text(name).tag(name)
                 }
             }
-            .pickerStyle(.segmented)
+            .pickerStyle(.menu)
             .labelsHidden()
 
             Chart {
@@ -785,7 +812,7 @@ struct AccountDetailChart: View {
                         LineMark(x: .value("Time", snap.date), y: .value("Remaining %", rem))
                             .foregroundStyle(.blue)
                             .lineStyle(StrokeStyle(lineWidth: 2))
-                            .interpolationMethod(.monotone)
+                            .interpolationMethod(.stepEnd)
                     }
                 }
             }
@@ -809,23 +836,22 @@ struct AccountDetailChart: View {
     }
 }
 
+/// The weekly window of every Claude account over the last day.
 struct ComparisonChart: View {
-    let history: [String: [HistorySnapshot]]
+    let history: [(name: String, readings: [Reading])]
 
     var body: some View {
         Chart {
-            ForEach(Array(history.keys.sorted()), id: \.self) { name in
-                if let snaps = history[name] {
-                    ForEach(snaps) { snap in
-                        if let rem = snap.remaining(for: "7d") {
-                            LineMark(
-                                x: .value("Time", snap.date),
-                                y: .value("Remaining %", rem)
-                            )
-                            .foregroundStyle(by: .value("Account", name))
-                            .lineStyle(StrokeStyle(lineWidth: 1.5))
-                            .interpolationMethod(.monotone)
-                        }
+            ForEach(history, id: \.name) { entry in
+                ForEach(entry.readings) { snap in
+                    if let rem = snap.remaining(for: "weekly") {
+                        LineMark(
+                            x: .value("Time", snap.date),
+                            y: .value("Remaining %", rem)
+                        )
+                        .foregroundStyle(by: .value("Account", entry.name))
+                        .lineStyle(StrokeStyle(lineWidth: 1.5))
+                        .interpolationMethod(.stepEnd)
                     }
                 }
             }
@@ -850,213 +876,96 @@ struct ComparisonChart: View {
     }
 }
 
-struct ClaudeCard: View {
-    let account: ClaudeAccount
-    let history: [HistorySnapshot]?
+/// One account of any service: who it is and its state, a gauge per limit,
+/// then what else its reading says. A Claude account can be launched.
+struct AccountCard: View {
+    let account: Account
+    let history: [Reading]?
+    /// Whether the view's readings are stored ones, each with its own age.
+    let stored: Bool
     let onLaunch: () -> Void
     @State private var showDetail = false
 
-    private func statusColor(_ status: String) -> Color {
-        switch status {
-        case "allowed": return .green
-        case "allowed_warning": return .orange
-        case "rejected": return .red
-        default: return .secondary
+    private var heldWord: String {
+        switch account.service {
+        case "claude": return "default"
+        case "antigravity": return "agy's login"
+        default: return "in use"
         }
     }
 
-    /// How many stored readings have a weekly window to chart.
-    private var weeklyPoints: Int {
-        (history ?? []).filter { $0.weekly != nil }.count
+    /// The series the small chart follows, when the history can draw it.
+    private var sparkSeries: String? {
+        guard let history, let series = mainLimit(history),
+              history.filter({ $0.remaining(for: series) != nil }).count >= 2 else { return nil }
+        return series
     }
 
-    /// `50% of the weekly, 25% of the weekly left for it`, for a limit that
-    /// is a share of the weekly one.
-    private func shareNote(_ bucket: ClaudeAccount.Bucket) -> String? {
-        guard let share = bucket.share else { return nil }
-        let size = Int((share * 100).rounded())
-        let room = Int((max(0, bucket.room) * 100).rounded())
-        return "\(size)% of the weekly, \(room)% of the weekly left for it"
+    /// Wide enough for the longest limit name on the card.
+    private func nameWidth(_ limits: [Limit]) -> CGFloat {
+        let longest = limits.map { $0.name.count }.max() ?? 3
+        return min(190, CGFloat(max(3, longest)) * 6.8)
     }
 
     var body: some View {
         Card {
             HStack {
                 Text(account.name).font(.headline).lineLimit(1)
-                if account.is_default {
-                    Text("default")
+                if let plan = account.reading?.plan { Caption("[\(plan)]") }
+                if account.parked { Caption("parked") }
+                if account.held {
+                    Text(heldWord)
                         .font(.system(size: 9, weight: .semibold))
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(Color.accentColor.opacity(0.25))
                         .clipShape(Capsule())
                 }
-                if let status = account.reading?.status {
-                    Text(status).font(.caption).foregroundStyle(statusColor(status))
+                if let state = account.state {
+                    Text(state.word)
+                        .font(.caption)
+                        .foregroundStyle(levelColor(state.level))
+                        .lineLimit(1)
                 }
                 Spacer()
-                Button("Launch") { onLaunch() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                if account.isClaude {
+                    Button("Launch") { onLaunch() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
             }
 
             if let reading = account.reading {
-                if let session = reading.session {
-                    GaugeRow(label: "5h", window: session)
-                } else if reading.session_limit == "absent" {
-                    Caption("5h  no 5h limit on this account")
-                } else if reading.weekly != nil {
-                    Caption("5h  not reported", color: .secondary.opacity(0.6))
+                if let error = account.error { Caption(error, color: .red, lines: 3) }
+                let limits = reading.ordered
+                ForEach(Array(limits.enumerated()), id: \.offset) { _, limit in
+                    LimitRow(limit: limit, reading: reading, nameWidth: nameWidth(limits))
                 }
-                if let weekly = reading.weekly { GaugeRow(label: "7d", window: weekly) }
-                ForEach(reading.buckets) { bucket in
-                    GaugeRow(
-                        label: bucket.source == "observed-rejection" ? "\(bucket.short)!" : bucket.short,
-                        window: bucket.window,
-                        note: shareNote(bucket)
-                    )
+                ForEach(account.notes, id: \.self) { note in
+                    Caption(note, color: note.hasPrefix("!") ? .orange : .secondary)
                 }
-                if let overage = reading.overage { GaugeRow(label: "$$", window: overage) }
-                if let error = reading.error {
-                    Caption(error, color: .red, lines: 3)
-                }
-                ForEach(reading.notes, id: \.self) { note in Caption(note) }
-
-                if let snaps = history, weeklyPoints >= 2 {
-                    MiniUtilizationChart(snapshots: snaps).padding(.top, 2)
+                if let history, let series = sparkSeries {
+                    MiniUtilizationChart(snapshots: history, series: series).padding(.top, 2)
                 }
             } else {
                 Caption("not read yet")
             }
 
-            if let note = account.login_note {
-                Caption(note, color: account.login_warning ? .orange : .secondary)
+            if let login = account.login, let note = login.note {
+                Caption(note, color: login.warning ? .orange : .secondary)
             }
-            if let reading = account.reading {
+            if stored, let reading = account.reading {
                 Caption("read \(ageText(reading.at))", color: .secondary.opacity(0.6))
             }
 
-            if showDetail, let snaps = history, snaps.count >= 2 {
-                AccountDetailChart(snapshots: snaps).padding(.top, 4)
+            if showDetail, let history, history.count >= 2 {
+                AccountDetailChart(snapshots: history).padding(.top, 4)
             }
         }
         .contentShape(Rectangle())
         .onTapGesture {
             if (history?.count ?? 0) >= 2 {
                 withAnimation(.easeInOut(duration: 0.2)) { showDetail.toggle() }
-            }
-        }
-    }
-}
-
-struct CodexCard: View {
-    let account: CodexAccount
-
-    private func creditsText(_ credits: CodexAccount.ResetCredits) -> String {
-        let noun = credits.available == 1 ? "reset credit" : "reset credits"
-        if let now = credits.applicable {
-            return "\(credits.available) \(noun) (\(now) usable now)"
-        }
-        return "\(credits.available) \(noun)"
-    }
-
-    var body: some View {
-        Card {
-            HStack {
-                Text(account.name).font(.headline).lineLimit(1)
-                if let plan = account.reading?.plan { Caption(plan) }
-                if account.parked { Caption("parked") }
-                Spacer()
-                if let reading = account.reading {
-                    Text(reading.state)
-                        .font(.caption)
-                        .foregroundStyle(reading.viable ? .green : .orange)
-                        .lineLimit(2)
-                }
-            }
-            if let reading = account.reading {
-                ForEach(reading.windows) { named in
-                    GaugeRow(label: named.label, labelWidth: 50, window: named.window)
-                }
-                ForEach(reading.extra) { extra in
-                    ForEach(extra.windows) { named in
-                        GaugeRow(
-                            label: named.label,
-                            labelWidth: 50,
-                            window: named.window,
-                            note: extra.limited ? "\(extra.name), limited" : extra.name
-                        )
-                    }
-                }
-                if let credits = reading.reset_credits, credits.available > 0 {
-                    Caption(creditsText(credits), color: .green)
-                }
-                Caption("read \(ageText(reading.at))", color: .secondary.opacity(0.6))
-            } else {
-                Caption("not read yet (`tokeman codex list`)")
-            }
-        }
-    }
-}
-
-struct ServiceCard: View {
-    let account: ServiceAccount
-
-    /// The meters in the service's order, split where the group changes.
-    private var groups: [(name: String?, meters: [Limit])] {
-        var result: [(name: String?, meters: [Limit])] = []
-        for meter in account.usage?.limits ?? [] {
-            if let last = result.indices.last, result[last].name == meter.group {
-                result[last].meters.append(meter)
-            } else {
-                result.append((meter.group, [meter]))
-            }
-        }
-        return result
-    }
-
-    private func amountNote(_ meter: Limit) -> String? {
-        guard let amount = meter.amount else { return nil }
-        return "\(Int(amount.used.rounded()))/\(Int(amount.limit.rounded())) \(amount.unit)"
-    }
-
-    private func balanceText(_ balance: ServiceAccount.Balance) -> String {
-        let left = moneyText(balance.left_minor, balance.currency)
-        if let total = balance.total_minor {
-            return "\(balance.label) \(left) of \(moneyText(total, balance.currency)) left"
-        }
-        return "\(balance.label) \(left) left"
-    }
-
-    var body: some View {
-        Card {
-            HStack {
-                Text(account.name).font(.headline).lineLimit(1)
-                Caption(account.service_label)
-                if let plan = account.usage?.plan { Caption("[\(plan)]") }
-                Spacer()
-            }
-            if let usage = account.usage {
-                if let error = usage.error { Caption(error.text, color: .red, lines: 3) }
-                ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
-                    if let name = group.name {
-                        Text(name).font(.system(size: 10, weight: .medium))
-                    }
-                    ForEach(Array(group.meters.enumerated()), id: \.offset) { _, meter in
-                        GaugeRow(
-                            label: meter.label,
-                            labelWidth: 50,
-                            window: meter.window,
-                            note: amountNote(meter)
-                        )
-                    }
-                }
-                ForEach(Array((usage.balances ?? []).enumerated()), id: \.offset) { _, balance in
-                    Caption(balanceText(balance), color: .primary)
-                }
-                Caption("read \(ageText(usage.at))", color: .secondary.opacity(0.6))
-            } else {
-                Caption("not read yet (run `tokeman`)")
             }
         }
     }
@@ -1133,17 +1042,24 @@ struct SettingsSection: View {
     }
 }
 
-/// Everything the stored view holds, as cards.
+/// Every account of the fleet view as a card, under its service's name,
+/// then the reset offers.
 struct OverviewCards: View {
     let overview: Overview
-    let history: [String: [HistorySnapshot]]
-    let onLaunch: (String) -> Void
+    @ObservedObject var vm: TokemanViewModel
 
     var body: some View {
         VStack(spacing: 6) {
-            ForEach(overview.claude) { account in
-                ClaudeCard(account: account, history: history[account.name]) {
-                    onLaunch(account.name)
+            ForEach(overview.services, id: \.key) { service in
+                SectionTitle(title: service.label)
+                ForEach(overview.accounts.filter { $0.service == service.key }) { account in
+                    AccountCard(
+                        account: account,
+                        history: vm.history(for: account),
+                        stored: overview.origin == "stored"
+                    ) {
+                        vm.launchAccount(account.name)
+                    }
                 }
             }
 
@@ -1157,16 +1073,6 @@ struct OverviewCards: View {
                     }
                 }
             }
-
-            if !overview.codex.isEmpty {
-                SectionTitle(title: "Codex")
-                ForEach(overview.codex) { account in CodexCard(account: account) }
-            }
-
-            if !overview.services.isEmpty {
-                SectionTitle(title: "Services")
-                ForEach(overview.services) { account in ServiceCard(account: account) }
-            }
         }
         .padding(10)
     }
@@ -1178,35 +1084,31 @@ struct PopoverContent: View {
     /// at full height, for a picture.
     var maxCardsHeight: CGFloat? = 560
 
-    private var monitorText: String {
-        switch vm.overview?.monitor {
-        case "running": return "stored reads · service running"
-        case "paused": return "stored reads · rotation paused"
-        case "not-installed": return "no service · probing here"
-        default: return ""
-        }
+    /// The weekly history of every Claude account that has enough to draw.
+    private var claudeHistory: [(name: String, readings: [Reading])] {
+        (vm.overview?.accounts ?? [])
+            .filter { $0.isClaude }
+            .compactMap { account in
+                guard let readings = vm.history(for: account), readings.count >= 2 else { return nil }
+                return (account.name, readings)
+            }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text("Tokeman").font(.headline)
-                Text(monitorText).font(.caption2).foregroundStyle(.secondary)
+                Text(vm.isReading ? "reading every account…" : vm.caption)
+                    .font(.caption2)
+                    .foregroundStyle(vm.isStale ? .orange : .secondary)
+                    .lineLimit(1)
                 Spacer()
-                if vm.isProbing {
-                    Text("probing…").font(.caption2).foregroundStyle(.secondary)
-                } else if let last = vm.lastLoad {
-                    Text("\(Int(-last.timeIntervalSinceNow))s ago")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                // With a service the button re-reads the stores; without one it probes.
-                Button(action: { vm.serviceInstalled ? vm.reload() : vm.probe() }) {
+                Button(action: { vm.readNow() }) {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .disabled(vm.isLoading || vm.isProbing)
-                .help(vm.serviceInstalled ? "Read the stored view again" : "Probe every account now")
+                .disabled(vm.isLoading || vm.isReading)
+                .help("Read every account now (tokeman --fresh)")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -1214,12 +1116,12 @@ struct PopoverContent: View {
             Divider()
 
             if let overview = vm.overview {
-                if vm.history.values.contains(where: { $0.count >= 2 }) {
+                if !claudeHistory.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("24h overview (7d remaining)")
+                        Text("Claude, last 24h (weekly remaining)")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
-                        ComparisonChart(history: vm.history)
+                        ComparisonChart(history: claudeHistory)
                     }
                     .padding(.horizontal, 14)
                     .padding(.top, 10)
@@ -1227,15 +1129,11 @@ struct PopoverContent: View {
 
                 if let maxCardsHeight {
                     ScrollView {
-                        OverviewCards(overview: overview, history: vm.history) { name in
-                            vm.launchAccount(name)
-                        }
+                        OverviewCards(overview: overview, vm: vm)
                     }
                     .frame(maxHeight: maxCardsHeight)
                 } else {
-                    OverviewCards(overview: overview, history: vm.history) { name in
-                        vm.launchAccount(name)
-                    }
+                    OverviewCards(overview: overview, vm: vm)
                 }
 
                 Divider()
@@ -1247,7 +1145,7 @@ struct PopoverContent: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(overview.claude.isEmpty)
+                        .disabled(!overview.accounts.contains(where: { $0.isClaude }))
                         .help("Runs `tokeman launch`: Claude on the account the policy picks")
 
                         Text("default: \(overview.default_account ?? "/login")"
@@ -1294,7 +1192,7 @@ struct PopoverContent: View {
                             .controlSize(.small)
                     } else {
                         ProgressView()
-                        Text("Reading the stored view...")
+                        Text("Reading the fleet view...")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -1325,7 +1223,7 @@ struct PopoverContent: View {
 
 /// `TokemanTray --render <file.png>` draws the popover once from the stored
 /// view, at full height, and exits: a way to look at the layout without a
-/// menu bar. It reads what the app reads and probes nothing.
+/// menu bar. It reads what the app reads and has nothing read.
 @MainActor
 func renderPopover(to path: String) async -> Bool {
     let vm = TokemanViewModel(polls: false)
