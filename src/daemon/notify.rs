@@ -333,7 +333,10 @@ mod tests {
         // Standing for two days, looked at every hour: still told once.
         for hour in 1..48 {
             let later = NOW + hour * 3_600;
-            assert!(ledger.due(&three, later).is_empty(), "told again at +{hour}h");
+            assert!(
+                ledger.due(&three, later).is_empty(),
+                "told again at +{hour}h"
+            );
         }
         let one = [login_ends("a", Within::OneDay)];
         assert_eq!(

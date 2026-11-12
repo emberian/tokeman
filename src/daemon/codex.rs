@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 
 use super::lock::is_paused;
 use crate::account::Fleet;
-use crate::codex::auth::CodexHome;
 use crate::codex::Client;
+use crate::codex::auth::CodexHome;
 use crate::codex::keep::{self, Tend, Tended};
 use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Terms};
 use crate::codex::seats::Seats;

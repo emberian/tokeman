@@ -869,7 +869,10 @@ mod tests {
             ]
         );
         let dir = tempfile::tempdir().unwrap();
-        let text = format!("ops@example.com {}\n", id_token("ops@example.com", "acct-ops", "team"));
+        let text = format!(
+            "ops@example.com {}\n",
+            id_token("ops@example.com", "acct-ops", "team")
+        );
         let imported = import_into(&text, dir.path(), false).unwrap();
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].home, dir.path().join("ops-example"));
@@ -996,7 +999,12 @@ mod tests {
         );
         // The landing has reset credits on offer; moving listed and spent none.
         assert_eq!(
-            look.probed[0].codex().unwrap().reset_credits.unwrap().available,
+            look.probed[0]
+                .codex()
+                .unwrap()
+                .reset_credits
+                .unwrap()
+                .available,
             2
         );
         assert!(backend.requests("/credits").is_empty());
