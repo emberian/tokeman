@@ -1,8 +1,8 @@
 //! Rows written before the `readings` table, read as they are and turned
 //! into [`Reading`]s: the `snapshots` wide table (Claude), `codex_readings`
 //! (one JSON probe per row) and `service_readings` (one JSON usage per row).
-//! Nothing here writes, creates or alters a table. The shapes below are the
-//! ones those builds stored; they exist only to be read.
+//! Only `compact` reads them, once, on its way to dropping them. The shapes
+//! below are the ones those builds stored; they exist only to be read.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::types::Value as Sql;
@@ -16,170 +16,134 @@ use crate::quota::{
     SpendControl, Verdict, Window, WindowStatus, parse_wire,
 };
 
-/// Which rows to read.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Rows<'a> {
-    /// The newest rows, newest first.
-    Recent {
-        account: Option<&'a str>,
+/// One old table, and the columns its rows are walked by: the ones that
+/// name the account, then the time, in the order of the index it was created
+/// with. `id` breaks ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OldTable {
+    pub table: &'static str,
+    key: &'static [&'static str],
+    index: &'static str,
+}
+
+const OLD_TABLES: [OldTable; 3] = [
+    OldTable {
+        table: "snapshots",
+        key: &["token_name", "probed_at"],
+        index: "idx_snapshots_token_time",
+    },
+    OldTable {
+        table: "codex_readings",
+        key: &["account", "at"],
+        index: "idx_codex_readings_account_time",
+    },
+    OldTable {
+        table: "service_readings",
+        key: &["service", "account", "at"],
+        index: "idx_service_readings_account_time",
+    },
+];
+
+/// One row of an old table: where it stands in the walk, and what it says.
+pub(super) struct OldRow {
+    /// The key columns and the id, to continue after this row.
+    pub place: Vec<Sql>,
+    /// `None` for a row that does not read: an unparseable time, a document
+    /// in a shape this build does not know, or one that names another
+    /// service, account or time than the row that holds it.
+    pub reading: Option<Reading>,
+}
+
+/// The old tables this database has.
+pub(super) fn present(conn: &Connection) -> rusqlite::Result<Vec<&'static OldTable>> {
+    let mut present = Vec::new();
+    for table in &OLD_TABLES {
+        if super::has_table(conn, table.table)? {
+            present.push(table);
+        }
+    }
+    Ok(present)
+}
+
+impl OldTable {
+    pub fn count(&self, conn: &Connection) -> rusqlite::Result<u64> {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {}", self.table), [], |row| {
+            row.get(0)
+        })
+    }
+
+    /// The index the walk follows, for a table created without it.
+    pub fn ensure_index(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+            self.index,
+            self.table,
+            self.key.join(", ")
+        ))
+    }
+
+    /// Up to `limit` rows after `place` (from the first row when `None`), in
+    /// key order: one account's rows together, oldest first.
+    pub fn rows(
+        &self,
+        conn: &Connection,
+        place: Option<&[Sql]>,
         limit: usize,
-    },
-    /// Rows at or after `since` (epoch seconds), oldest first.
-    Since {
-        account: Option<&'a str>,
-        since: i64,
-    },
-}
-
-/// Whether this database has the table at all.
-pub(super) fn has_table(conn: &Connection, table: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [table],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
-/// One old table: its name, how it names the account and the time, and
-/// whether it holds several services.
-struct Table {
-    name: &'static str,
-    account: &'static str,
-    time: &'static str,
-    /// The time column holds RFC 3339 text rather than epoch seconds.
-    text_time: bool,
-    /// The table has a `service` column, and these rows are this one's.
-    service: Option<Service>,
-}
-
-impl Table {
-    fn of(service: Service) -> Self {
-        match service {
-            Service::Claude => Self {
-                name: "snapshots",
-                account: "token_name",
-                time: "probed_at",
-                text_time: true,
-                service: None,
-            },
-            Service::Codex => Self {
-                name: "codex_readings",
-                account: "account",
-                time: "at",
-                text_time: false,
-                service: None,
-            },
-            Service::Antigravity | Service::Zai | Service::Kimi => Self {
-                name: "service_readings",
-                account: "account",
-                time: "at",
-                text_time: false,
-                service: Some(service),
-            },
-        }
-    }
-
-    /// `WHERE ... ORDER BY ... LIMIT ...` for `rows`, and its parameters.
-    fn tail(&self, rows: Rows) -> (String, Vec<Sql>) {
-        let Self { account, time, .. } = self;
-        let mut conditions = Vec::new();
-        let mut args = Vec::new();
-        if let Some(service) = self.service {
-            args.push(Sql::Text(service.name().into()));
-            conditions.push(format!("service = ?{}", args.len()));
-        }
-        let (Rows::Recent { account: named, .. } | Rows::Since { account: named, .. }) = rows;
-        if let Some(named) = named {
-            args.push(Sql::Text(named.into()));
-            conditions.push(format!("{account} = ?{}", args.len()));
-        }
-        let order = match rows {
-            Rows::Recent { limit, .. } => {
-                args.push(Sql::Integer(limit as i64));
-                // Rows were appended as they were read, so across accounts
-                // the newest are the last ids; one account's are found
-                // through the table's (account, time) index.
-                let newest_first = match named {
-                    Some(_) => format!("{time} DESC, id DESC"),
-                    None => "id DESC".to_owned(),
-                };
-                format!("ORDER BY {newest_first} LIMIT ?{}", args.len())
+    ) -> rusqlite::Result<Vec<OldRow>> {
+        let columns = format!("{}, id", self.key.join(", "));
+        let after = match place {
+            Some(place) => {
+                let holes: Vec<String> = (1..=place.len()).map(|n| format!("?{n}")).collect();
+                format!("WHERE ({columns}) > ({})", holes.join(", "))
             }
-            Rows::Since { since, .. } => {
-                args.push(if self.text_time {
-                    Sql::Text(
-                        DateTime::from_timestamp(since, 0)
-                            .unwrap_or_default()
-                            .to_rfc3339(),
-                    )
-                } else {
-                    Sql::Integer(since)
-                });
-                conditions.push(format!("{time} >= ?{}", args.len()));
-                format!("ORDER BY {time} ASC, id ASC")
+            None => String::new(),
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM {} {after} ORDER BY {columns} LIMIT {limit}",
+            self.table
+        ))?;
+        let params = rusqlite::params_from_iter(place.unwrap_or_default().iter());
+        let rows = stmt.query_map(params, |row| {
+            let mut place = Vec::with_capacity(self.key.len() + 1);
+            for column in self.key.iter().chain(&["id"]) {
+                place.push(row.get::<_, Sql>(*column)?);
             }
-        };
-        let filter = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-        (format!("{filter} {order}"), args)
-    }
-}
-
-/// The rows of `service` written before the `readings` table. A row that
-/// no longer reads (an unparseable time, a document in a shape this build
-/// does not know) is left out; a database without the table has none.
-pub(super) fn read(
-    conn: &Connection,
-    service: Service,
-    rows: Rows,
-) -> rusqlite::Result<Vec<Reading>> {
-    let table = Table::of(service);
-    if !has_table(conn, table.name) {
-        return Ok(Vec::new());
-    }
-    let (tail, args) = table.tail(rows);
-    let params = rusqlite::params_from_iter(args);
-    match service {
-        Service::Claude => {
-            let mut stmt = conn.prepare(&format!("SELECT * FROM snapshots {tail}"))?;
-            let rows = stmt
-                .query_map(params, |row| Ok(snapshot(row)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows.into_iter().flatten().collect())
-        }
-        Service::Codex => documents(conn, "probe", "codex_readings", &tail, params, |json| {
-            serde_json::from_str::<StoredProbe>(json)
-                .ok()
-                .map(StoredProbe::reading)
-        }),
-        Service::Antigravity | Service::Zai | Service::Kimi => {
-            documents(conn, "usage", "service_readings", &tail, params, |json| {
-                serde_json::from_str::<StoredUsage>(json)
-                    .ok()
-                    .map(StoredUsage::reading)
+            Ok(OldRow {
+                place,
+                reading: self.reading(row),
             })
-        }
+        })?;
+        rows.collect()
     }
-}
 
-/// One JSON document per row, converted.
-fn documents(
-    conn: &Connection,
-    column: &str,
-    table: &str,
-    tail: &str,
-    params: impl rusqlite::Params,
-    convert: impl Fn(&str) -> Option<Reading>,
-) -> rusqlite::Result<Vec<Reading>> {
-    let mut stmt = conn.prepare(&format!("SELECT {column} FROM {table} {tail}"))?;
-    let rows = stmt
-        .query_map(params, |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows.iter().filter_map(|json| convert(json)).collect())
+    fn reading(&self, row: &Row) -> Option<Reading> {
+        let document = |column: &str| get::<String>(row, column);
+        let (reading, service) = match self.table {
+            "snapshots" => return snapshot(row),
+            "codex_readings" => (
+                serde_json::from_str::<StoredProbe>(&document("probe")?)
+                    .ok()?
+                    .reading(),
+                Service::Codex,
+            ),
+            _ => {
+                let service: Service = parse_wire(&document("service")?)?;
+                if !matches!(service, Service::Antigravity | Service::Zai | Service::Kimi) {
+                    return None;
+                }
+                (
+                    serde_json::from_str::<StoredUsage>(&document("usage")?)
+                        .ok()?
+                        .reading(),
+                    service,
+                )
+            }
+        };
+        (reading.service == service
+            && Some(&reading.account) == get::<String>(row, "account").as_ref()
+            && Some(reading.at) == get::<i64>(row, "at"))
+        .then_some(reading)
+    }
 }
 
 /// A column by name: `None` when the row is NULL there, holds another type,

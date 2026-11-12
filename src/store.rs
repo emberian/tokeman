@@ -2,15 +2,14 @@
 //! stored view.
 //!
 //! Every read of every service is one JSON [`Reading`] in the `readings`
-//! table. Rows written by earlier builds stay where they are, in their own
-//! tables, and are never rewritten: they are converted as they are read
-//! (`legacy`), so one set of accessors serves the whole history.
+//! table, and the accessors read nothing else. The tables builds before 0.4
+//! wrote are rewritten into it once, by [`compact`]; until then
+//! [`Store::has_old_tables`] says so and their rows are not shown.
 //! [`Store::open_read_only`] is for surfaces that only show what was stored:
 //! it creates no file, table or row.
 
+pub mod compact;
 mod legacy;
-
-use legacy::Rows;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -99,8 +98,8 @@ impl Store {
         Ok(store)
     }
 
-    /// Open the history without creating, migrating or writing anything. A
-    /// table this database does not have reads as no rows.
+    /// Open the history without creating or writing anything. A table this
+    /// database does not have reads as no rows.
     pub fn open_read_only() -> Result<Self> {
         Self::open_read_only_at(&paths::snapshots_db())
     }
@@ -179,29 +178,36 @@ impl Store {
         let same = newest
             .as_ref()
             .is_some_and(|(_, stored)| same_but_when(stored, &json));
-        let held = same
-            && newest
+        let confirmed: Option<i64> = tx
+            .query_row(
+                "SELECT at FROM confirmed WHERE service = ?1 AND account = ?2",
+                params![service, reading.account],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let kept = keep(
+            newest.as_ref().map(|(at, _)| *at),
+            same,
+            confirmed,
+            reading.at,
+        );
+        if let Some(at) = kept.closing
+            && let Some(mut closing) = newest
                 .as_ref()
-                .is_some_and(|(at, _)| reading.at - at < HOLD_SECS);
-        if !held {
-            if let Some((at, stored)) = newest.as_ref().filter(|_| !same) {
-                let confirmed: Option<i64> = tx
-                    .query_row(
-                        "SELECT at FROM confirmed WHERE service = ?1 AND account = ?2",
-                        params![service, reading.account],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(confirmed) = confirmed.filter(|seen| seen > at && *seen < reading.at)
-                    && let Ok(mut closing) = serde_json::from_str::<Reading>(stored)
-                {
-                    closing.at = confirmed;
-                    tx.execute(
-                        "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
-                        params![service, reading.account, confirmed, serde_json::to_string(&closing)?],
-                    )?;
-                }
-            }
+                .and_then(|(_, stored)| serde_json::from_str::<Reading>(stored).ok())
+        {
+            closing.at = at;
+            tx.execute(
+                "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    service,
+                    reading.account,
+                    at,
+                    serde_json::to_string(&closing)?
+                ],
+            )?;
+        }
+        if kept.row {
             tx.execute(
                 "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
                 params![service, reading.account, reading.at, json],
@@ -216,10 +222,14 @@ impl Store {
         Ok(())
     }
 
+    /// Whether this database still has a table a build before 0.4 wrote.
+    /// Nothing reads them but [`compact`], which drops them.
+    pub fn has_old_tables(&self) -> bool {
+        legacy::present(&self.conn).is_ok_and(|tables| !tables.is_empty())
+    }
+
     /// The newest reading of each of `accounts`, as of its last
-    /// confirmation. An account with a row in `readings` is answered from
-    /// there alone; the tables of earlier builds are asked only for one
-    /// without.
+    /// confirmation.
     pub fn latest(&self, accounts: &[(Service, &str)]) -> Result<Vec<Reading>> {
         let mut latest = Vec::new();
         for (service, account) in accounts {
@@ -229,24 +239,12 @@ impl Store {
                     params![service.name(), account],
                 )?
                 .pop();
-            let reading = match newest {
-                Some(mut reading) => {
-                    if let Some(held) = self.held(*service, Some(account))?.into_iter().next() {
-                        reading.at = held.at;
-                    }
-                    Some(reading)
+            if let Some(mut reading) = newest {
+                if let Some(held) = self.held(*service, Some(account))?.into_iter().next() {
+                    reading.at = held.at;
                 }
-                None => legacy::read(
-                    &self.conn,
-                    *service,
-                    Rows::Recent {
-                        account: Some(account),
-                        limit: 1,
-                    },
-                )?
-                .pop(),
-            };
-            latest.extend(reading);
+                latest.push(reading);
+            }
         }
         Ok(latest)
     }
@@ -271,12 +269,6 @@ impl Store {
                 params![service.name(), count],
             )?,
         });
-        readings.extend(legacy::read(
-            &self.conn,
-            service,
-            Rows::Recent { account, limit },
-        )?);
-        // Stable: at one instant, a row of this table stays ahead of an old one.
         readings.sort_by_key(|reading| std::cmp::Reverse(reading.at));
         readings.truncate(limit);
         Ok(readings)
@@ -290,8 +282,7 @@ impl Store {
         account: Option<&str>,
         since: i64,
     ) -> Result<Vec<Reading>> {
-        let mut readings = legacy::read(&self.conn, service, Rows::Since { account, since })?;
-        readings.extend(match account {
+        let mut readings = match account {
             Some(name) => self.query(
                 "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
                 params![service.name(), name, since],
@@ -300,7 +291,7 @@ impl Store {
                 "WHERE service = ?1 AND at >= ?2 ORDER BY at ASC, id ASC",
                 params![service.name(), since],
             )?,
-        });
+        };
         readings.extend(
             self.held(service, account)?
                 .into_iter()
@@ -314,7 +305,7 @@ impl Store {
     /// confirmation, for every account confirmed after that row was written.
     /// It ends a history the way the closing row ends an earlier hold.
     fn held(&self, service: Service, account: Option<&str>) -> Result<Vec<Reading>> {
-        if !legacy::has_table(&self.conn, "confirmed") {
+        if !has_table(&self.conn, "confirmed")? {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
@@ -341,7 +332,7 @@ impl Store {
     /// `readings` rows. Rows that no longer parse (a field this build does
     /// not know) are skipped; a database without the table has none.
     fn query(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Reading>> {
-        if !legacy::has_table(&self.conn, "readings") {
+        if !has_table(&self.conn, "readings")? {
             return Ok(Vec::new());
         }
         let mut stmt = self
@@ -357,13 +348,57 @@ impl Store {
     }
 }
 
+/// Whether this database has the table at all. A database that cannot be
+/// read (another process holds it) is an error, not a missing table.
+fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// What the growth rule does with one read of an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Kept {
+    /// Write the value the account held once more, at this time (its last
+    /// confirmation), before the read that ends the hold.
+    closing: Option<i64>,
+    /// Write the read as a row.
+    row: bool,
+}
+
+/// The growth rule. `newest` is when the account's newest row was written,
+/// `same` whether the read says what that row says, `confirmed` when the
+/// account was last read, `at` when this read was made.
+fn keep(newest: Option<i64>, same: bool, confirmed: Option<i64>, at: i64) -> Kept {
+    match newest {
+        Some(row) if same => Kept {
+            closing: None,
+            row: at - row >= HOLD_SECS,
+        },
+        Some(row) => Kept {
+            closing: confirmed.filter(|seen| *seen > row && *seen < at),
+            row: true,
+        },
+        None => Kept {
+            closing: None,
+            row: true,
+        },
+    }
+}
+
+/// What a stored reading says, apart from when.
+fn body(json: &str) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.as_object_mut()?.remove("at");
+    Some(value)
+}
+
 /// Whether two stored readings say the same thing at different times.
 fn same_but_when(stored: &str, new: &str) -> bool {
-    let body = |json: &str| {
-        let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
-        value.as_object_mut()?.remove("at");
-        Some(value)
-    };
     match (body(stored), body(new)) {
         (Some(stored), Some(new)) => stored == new,
         _ => false,
@@ -462,10 +497,10 @@ fn burn(series: Series, label: String, readings: &[Reading]) -> Burn {
 mod tests {
     use super::*;
     use crate::quota::{
-        Limit, ModelKey, Overage, Scope, SessionLimit, Signals, Source, Span, Verdict, WindowStatus,
+        Limit, ModelKey, Overage, Scope, SessionLimit, Signals, Source, Span, Verdict,
     };
 
-    fn reading() -> Reading {
+    pub(super) fn reading() -> Reading {
         let mut reading = Reading::empty(Service::Claude, "acct", 1_700_000_000);
         reading.limits = vec![
             Limit::new(
@@ -504,18 +539,18 @@ mod tests {
         reading
     }
 
-    fn overage() -> Series {
+    pub(super) fn overage() -> Series {
         Series::new(Span::Unknown, Scope::extra_usage())
     }
 
     /// The newest reading of every account named, sorted.
-    fn latest(store: &Store, accounts: &[(Service, &str)]) -> Vec<Reading> {
+    pub(super) fn latest(store: &Store, accounts: &[(Service, &str)]) -> Vec<Reading> {
         let mut latest = store.latest(accounts).unwrap();
         latest.sort_by(|a, b| (a.service, &a.account).cmp(&(b.service, &b.account)));
         latest
     }
 
-    fn open() -> (tempfile::TempDir, Store) {
+    pub(super) fn open() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(&dir.path().join("s.db")).unwrap();
         (dir, store)
@@ -555,7 +590,7 @@ mod tests {
 
     /// The `snapshots` table as 0.3.1 created it, with three rows as 0.3.1
     /// wrote them: a full reading, a later one, and a refusal.
-    const OLD_SNAPSHOTS: &str = "CREATE TABLE snapshots (
+    pub(super) const OLD_SNAPSHOTS: &str = "CREATE TABLE snapshots (
             id INTEGER PRIMARY KEY, token_name TEXT NOT NULL, probed_at TEXT NOT NULL,
             unified_status TEXT, utilization_5h REAL, reset_5h INTEGER,
             utilization_7d REAL, reset_7d INTEGER, representative_claim TEXT,
@@ -578,7 +613,7 @@ mod tests {
          INSERT INTO snapshots (token_name, probed_at, unified_status, error)
          VALUES ('dead', '2023-11-14T22:15:00+00:00', 'unknown', 'HTTP 401: revoked');";
 
-    fn old_database(dir: &std::path::Path, schema: &str) -> std::path::PathBuf {
+    pub(super) fn old_database(dir: &std::path::Path, schema: &str) -> std::path::PathBuf {
         let path = dir.join("old.db");
         Connection::open(&path)
             .unwrap()
@@ -587,150 +622,78 @@ mod tests {
         path
     }
 
+    /// `service_readings` and `codex_readings` as 0.3.x created them, with
+    /// rows in the shapes 0.3.x wrote (the service rows are today's, with
+    /// the account names changed).
+    pub(super) const OLD_DOCUMENTS: &str = r#"
+        CREATE TABLE service_readings (id INTEGER PRIMARY KEY, service TEXT NOT NULL,
+            account TEXT NOT NULL, at INTEGER NOT NULL, usage TEXT NOT NULL);
+        CREATE INDEX idx_service_readings_account_time ON service_readings(service, account, at);
+        CREATE TABLE codex_readings (id INTEGER PRIMARY KEY, account TEXT NOT NULL,
+            at INTEGER NOT NULL, probe TEXT NOT NULL);
+        INSERT INTO service_readings (service, account, at, usage) VALUES
+        ('zai', 'glm', 100, '{"service":"zai","account":"glm","at":100,"plan":"max","meters":[{"label":"5h","window":{"utilization":0.005,"reset":1794448052},"span_secs":18000,"amount":{"used":159.0,"limit":28000.0,"unit":"credits"}},{"label":"weekly","window":{"utilization":0.01435,"reset":1794879119},"span_secs":604800,"amount":{"used":2009.0,"limit":140000.0,"unit":"credits"}},{"group":"MCP tools","label":"monthly","window":{"utilization":0.25,"reset":0},"span_secs":2592000}]}'),
+        ('kimi', 'kimi', 110, '{"service":"kimi","account":"kimi","at":110,"plan":"Vivace","meters":[{"label":"5h","window":{"utilization":0.0093,"reset":1794458418},"span_secs":18000},{"label":"monthly (Kimi Code share)","window":{"utilization":0.2258,"reset":1794519618}}],"balances":[{"label":"extra usage","left_minor":2196,"total_minor":5000,"currency":"USD"}]}'),
+        ('antigravity', 'a@example.com', 120, '{"service":"antigravity","account":"a@example.com","at":120,"plan":"g1-ultra-tier","meters":[{"group":"Gemini Models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800},{"group":"Gemini Models","label":"5h","window":{"utilization":0.1,"reset":0},"span_secs":18000},{"group":"Claude and GPT models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800}]}'),
+        ('antigravity', 'a@example.com', 130, '{"service":"antigravity","account":"a@example.com","at":130,"meters":[],"error":"sign in again: the grant was revoked"}'),
+        ('kimi', 'kimi', 140, '{"service":"a service this build does not know","account":"kimi","at":140}');
+        INSERT INTO codex_readings (account, at, probe) VALUES
+        ('work', 200, '{"account":"work","codex_home":"/homes/work","at":200,"usage":{"user_id":"u1","account_id":"acct-1","email":"w@example.com","plan":"plus","limit":{"allowed":true,"limit_reached":false,"windows":[{"span":"weekly","utilization":0.42,"reset":1794607293},{"span":"five_hour","utilization":0.1,"reset":4600},{"span":{"seconds":86400},"utilization":0.5,"reset":99}]},"credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":null,"balance":"0"},"limit_reason":null,"extra":[{"name":"codex_spark","feature":"gpt-5.3-codex-spark","model":null,"limit":{"allowed":false,"limit_reached":true,"windows":[{"span":"unknown","utilization":1.0,"reset":100}]}}],"models":[{"slug":"gpt-6-astra","available":true,"available_at":null,"credits_would_enable":false}],"spend_control":{"reached":false,"limit":null},"reset_credits":{"available":2,"applicable":0}},"error":null,"last_refresh":"2026-11-10T00:00:00Z","email_hint":"hint@example.com"}'),
+        ('work', 210, '{"account":"work","codex_home":"/homes/work","at":210,"usage":null,"error":{"kind":"challenged","status":403,"attempts":4},"last_refresh":null,"email_hint":"hint@example.com"}'),
+        ('gone', 220, '{"account":"gone","codex_home":"/homes/gone","at":220,"usage":null,"error":{"kind":"auth_file_has_no_access_token"},"last_refresh":null,"email_hint":null}');
+    "#;
+
     #[test]
-    fn a_database_holding_only_old_snapshots_yields_the_same_history() {
+    fn a_database_held_by_another_connection_is_an_error_not_an_empty_history() {
+        let (dir, store) = open();
+        store.insert(&reading()).unwrap();
+        drop(store);
+        let path = dir.path().join("s.db");
+        let fleet = [(Service::Claude, "acct")];
+        // Held the way `history compact` holds it.
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE; COMMIT;").unwrap();
+        let reader = Store::open_read_only_at(&path).unwrap();
+        reader.conn.busy_timeout(Duration::ZERO).unwrap();
+        assert!(reader.latest(&fleet).is_err());
+        assert!(reader.since(Service::Claude, None, 0).is_err());
+        assert!(reader.recent(Service::Claude, None, 5).is_err());
+        assert!(!reader.has_old_tables());
+        drop(holder);
+        let reader = Store::open_read_only_at(&path).unwrap();
+        assert_eq!(reader.latest(&fleet).unwrap(), [reading()]);
+    }
+
+    #[test]
+    fn the_tables_of_earlier_builds_are_not_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = old_database(dir.path(), OLD_SNAPSHOTS);
+        let path = old_database(dir.path(), &format!("{OLD_SNAPSHOTS}{OLD_DOCUMENTS}"));
         let bytes = std::fs::read(&path).unwrap();
         let store = Store::open_read_only_at(&path).unwrap();
-
-        let history = store.since(Service::Claude, Some("acct"), 0).unwrap();
-        assert_eq!(history.len(), 2);
-        let first = &history[0];
-        assert_eq!((first.service, first.at), (Service::Claude, 1_700_000_000));
-        assert_eq!(first.session(), Some(Window::new(0.25, 10)));
-        assert_eq!(first.weekly(), Some(Window::new(0.5, 20)));
-        assert_eq!(
-            first.limit(Span::Weekly, &Scope::All).unwrap().status,
-            Some(WindowStatus {
-                verdict: Verdict::AllowedWarning,
-                surpassed_threshold: Some(0.5)
-            }),
-            "the window status the signals column held rides on its limit"
-        );
-        let models: Vec<_> = first
-            .models()
-            .map(|limit| (limit.key().unwrap().as_str(), limit.window, limit.share))
-            .collect();
-        assert_eq!(
-            models,
-            [
-                ("opus48", Window::new(0.75, 30), None),
-                ("fable", Window::new(0.2, 9), Some(0.5))
-            ],
-            "an uncanonical key is read as its model, and an unreadable bucket is dropped alone"
-        );
-        assert_eq!(first.models().nth(1).unwrap().source, Source::Headers);
-        let claude = first.claude().unwrap();
-        assert_eq!(claude.verdict, Verdict::Allowed);
-        assert_eq!(claude.claim.as_deref(), Some("five_hour"));
-        assert_eq!(claude.session_limit, SessionLimit::Absent);
-        assert_eq!(claude.signals.claims, ["seven_day"]);
-        assert_eq!(claude.signals.upgrade_paths, ["overage"]);
-        assert_eq!(overage().window(first), Some(Window::new(0.1, 40)));
-        assert_eq!(
-            claude.overage.as_ref().unwrap().status.as_deref(),
-            Some("ok")
-        );
-        assert!(first.has_quota() && first.above(0.05, 0.05, None));
-
-        let second = &history[1];
-        assert_eq!(second.at, 1_700_000_060);
-        assert_eq!(second.session(), None);
-        assert_eq!(second.verdict(), Verdict::Rejected);
-        assert_eq!(
-            second.claude().unwrap().profile_error.as_deref(),
-            Some("usage nope")
-        );
-        assert_eq!(second.session_limit(), SessionLimit::Unknown);
-
-        // The same rows through every accessor.
-        assert_eq!(
-            store
-                .since(Service::Claude, Some("acct"), 1_700_000_030)
-                .unwrap(),
-            std::slice::from_ref(second)
-        );
-        let recent = store.recent(Service::Claude, None, 2).unwrap();
-        assert_eq!(
-            recent
-                .iter()
-                .map(|r| r.account.as_str())
-                .collect::<Vec<_>>(),
-            ["dead", "acct"]
-        );
-        assert_eq!(
-            recent[0].error,
-            Some(crate::quota::ReadError::Http {
-                status: 401,
-                body: "revoked".into()
-            })
-        );
-        assert!(recent[0].is_refused());
-        assert_eq!(store.since(Service::Claude, None, 0).unwrap().len(), 3);
-        let fleet = [
-            (Service::Claude, "acct"),
-            (Service::Claude, "dead"),
-            (Service::Claude, "never read"),
-            (Service::Codex, "acct"),
-        ];
-        assert_eq!(latest(&store, &fleet), [second.clone(), recent[0].clone()]);
+        assert!(store.has_old_tables());
+        for service in Service::ALL {
+            assert!(store.since(service, None, 0).unwrap().is_empty());
+            assert!(store.recent(service, None, 9).unwrap().is_empty());
+        }
+        let fleet = [(Service::Claude, "acct"), (Service::Zai, "glm")];
+        assert!(store.latest(&fleet).unwrap().is_empty());
         drop(store);
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing is rewritten");
 
-        // Opened for writing, the old rows stay where they are and new
-        // readings join the same history.
+        // A writer leaves them where they are and reads only its own rows.
         let store = Store::open_at(&path).unwrap();
-        let mut new = reading();
-        new.at = 1_700_000_120;
-        store.insert(&new).unwrap();
-        let history = store.since(Service::Claude, Some("acct"), 0).unwrap();
-        assert_eq!(
-            history.iter().map(|r| r.at).collect::<Vec<_>>(),
-            [1_700_000_000, 1_700_000_060, 1_700_000_120]
-        );
-        assert_eq!(history[..2], [first.clone(), second.clone()]);
-        assert_eq!(
-            store.recent(Service::Claude, Some("acct"), 2).unwrap(),
-            [new.clone(), second.clone()]
-        );
-        assert_eq!(latest(&store, &fleet), [new.clone(), recent[0].clone()]);
-        let old_rows: i64 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(old_rows, 3);
+        store.insert(&reading()).unwrap();
+        assert_eq!(store.since(Service::Claude, None, 0).unwrap(), [reading()]);
+        assert_eq!(store.latest(&fleet).unwrap(), [reading()]);
+        assert!(store.has_old_tables());
+        let (_dir, new) = open();
+        assert!(!new.has_old_tables());
     }
 
-    #[test]
-    fn a_table_from_before_a_column_existed_reads_without_it() {
-        // 0.2: no session_limit or signals column, a naive timestamp, and the
-        // per-family columns, which are no longer read.
-        let dir = tempfile::tempdir().unwrap();
-        let path = old_database(
-            dir.path(),
-            "CREATE TABLE snapshots (
-                id INTEGER PRIMARY KEY, token_name TEXT NOT NULL, probed_at TEXT NOT NULL,
-                unified_status TEXT, utilization_5h REAL, reset_5h INTEGER,
-                utilization_7d REAL, reset_7d INTEGER, representative_claim TEXT,
-                overage_status TEXT, utilization_overage REAL, reset_overage INTEGER,
-                error TEXT, utilization_opus_7d REAL, reset_opus_7d INTEGER);
-             INSERT INTO snapshots (token_name, probed_at, utilization_7d, reset_7d,
-                utilization_opus_7d, reset_opus_7d)
-             VALUES ('old', '2026-01-01T00:00:00.5', 0.5, 9, 0.4, 7);
-             INSERT INTO snapshots (token_name, probed_at, utilization_7d)
-             VALUES ('old', 'not a time', 0.6);",
-        );
-        let store = Store::open_read_only_at(&path).unwrap();
-        let rows = store.recent(Service::Claude, Some("old"), 5).unwrap();
-        assert_eq!(rows.len(), 1, "a row without a readable time is left out");
-        assert_eq!(rows[0].weekly(), Some(Window::new(0.5, 9)));
-        assert_eq!(rows[0].models().count(), 0);
-        assert_eq!(rows[0].verdict(), Verdict::Unknown);
-        assert_eq!(rows[0].at, 1_767_225_600);
-    }
-
-    fn usage(service: Service, account: &str, at: i64, used: f64) -> Reading {
+    pub(super) fn usage(service: Service, account: &str, at: i64, used: f64) -> Reading {
         Reading {
             plan: Some("max".into()),
             limits: vec![crate::providers::limit(
@@ -785,155 +748,6 @@ mod tests {
         );
         assert_eq!(store.recent(Service::Kimi, None, 1).unwrap(), [failed]);
         assert_eq!(store.since(Service::Kimi, None, 0).unwrap().len(), 2);
-    }
-
-    /// `service_readings` and `codex_readings` as 0.3.x created them, with
-    /// rows in the shapes 0.3.x wrote (the service rows are today's, with
-    /// the account names changed).
-    const OLD_DOCUMENTS: &str = r#"
-        CREATE TABLE service_readings (id INTEGER PRIMARY KEY, service TEXT NOT NULL,
-            account TEXT NOT NULL, at INTEGER NOT NULL, usage TEXT NOT NULL);
-        CREATE INDEX idx_service_readings_account_time ON service_readings(service, account, at);
-        CREATE TABLE codex_readings (id INTEGER PRIMARY KEY, account TEXT NOT NULL,
-            at INTEGER NOT NULL, probe TEXT NOT NULL);
-        INSERT INTO service_readings (service, account, at, usage) VALUES
-        ('zai', 'glm', 100, '{"service":"zai","account":"glm","at":100,"plan":"max","meters":[{"label":"5h","window":{"utilization":0.005,"reset":1794448052},"span_secs":18000,"amount":{"used":159.0,"limit":28000.0,"unit":"credits"}},{"label":"weekly","window":{"utilization":0.01435,"reset":1794879119},"span_secs":604800,"amount":{"used":2009.0,"limit":140000.0,"unit":"credits"}},{"group":"MCP tools","label":"monthly","window":{"utilization":0.25,"reset":0},"span_secs":2592000}]}'),
-        ('kimi', 'kimi', 110, '{"service":"kimi","account":"kimi","at":110,"plan":"Vivace","meters":[{"label":"5h","window":{"utilization":0.0093,"reset":1794458418},"span_secs":18000},{"label":"monthly (Kimi Code share)","window":{"utilization":0.2258,"reset":1794519618}}],"balances":[{"label":"extra usage","left_minor":2196,"total_minor":5000,"currency":"USD"}]}'),
-        ('antigravity', 'a@example.com', 120, '{"service":"antigravity","account":"a@example.com","at":120,"plan":"g1-ultra-tier","meters":[{"group":"Gemini Models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800},{"group":"Gemini Models","label":"5h","window":{"utilization":0.1,"reset":0},"span_secs":18000},{"group":"Claude and GPT models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800}]}'),
-        ('antigravity', 'a@example.com', 130, '{"service":"antigravity","account":"a@example.com","at":130,"meters":[],"error":"sign in again: the grant was revoked"}'),
-        ('kimi', 'kimi', 140, '{"service":"a service this build does not know","account":"kimi","at":140}');
-        INSERT INTO codex_readings (account, at, probe) VALUES
-        ('work', 200, '{"account":"work","codex_home":"/homes/work","at":200,"usage":{"user_id":"u1","account_id":"acct-1","email":"w@example.com","plan":"plus","limit":{"allowed":true,"limit_reached":false,"windows":[{"span":"weekly","utilization":0.42,"reset":1794607293},{"span":"five_hour","utilization":0.1,"reset":4600},{"span":{"seconds":86400},"utilization":0.5,"reset":99}]},"credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":null,"balance":"0"},"limit_reason":null,"extra":[{"name":"codex_spark","feature":"gpt-5.3-codex-spark","model":null,"limit":{"allowed":false,"limit_reached":true,"windows":[{"span":"unknown","utilization":1.0,"reset":100}]}}],"models":[{"slug":"gpt-6-astra","available":true,"available_at":null,"credits_would_enable":false}],"spend_control":{"reached":false,"limit":null},"reset_credits":{"available":2,"applicable":0}},"error":null,"last_refresh":"2026-11-10T00:00:00Z","email_hint":"hint@example.com"}'),
-        ('work', 210, '{"account":"work","codex_home":"/homes/work","at":210,"usage":null,"error":{"kind":"challenged","status":403,"attempts":4},"last_refresh":null,"email_hint":"hint@example.com"}'),
-        ('gone', 220, '{"account":"gone","codex_home":"/homes/gone","at":220,"usage":null,"error":{"kind":"auth_file_has_no_access_token"},"last_refresh":null,"email_hint":null}');
-    "#;
-
-    #[test]
-    fn old_service_and_codex_rows_read_as_readings() {
-        use crate::quota::{CodexDetail, ReadError, ResetCreditCount};
-        let dir = tempfile::tempdir().unwrap();
-        let path = old_database(dir.path(), OLD_DOCUMENTS);
-        let bytes = std::fs::read(&path).unwrap();
-        let store = Store::open_read_only_at(&path).unwrap();
-
-        let glm = store
-            .recent(Service::Zai, Some("glm"), 5)
-            .unwrap()
-            .remove(0);
-        assert_eq!((glm.at, glm.plan.as_deref()), (100, Some("max")));
-        assert_eq!(glm.session(), Some(Window::new(0.005, 1_794_448_052)));
-        assert_eq!(glm.weekly(), Some(Window::new(0.01435, 1_794_879_119)));
-        assert_eq!(glm.limits[0].label, "5h");
-        assert_eq!(glm.limits[0].source, Source::Poll);
-        assert_eq!(glm.limits[0].amount.as_ref().unwrap().unit, "credits");
-        let mcp = &glm.limits[2];
-        assert_eq!((mcp.span, mcp.group()), (Span::Monthly, Some("MCP tools")));
-        assert_eq!(glm.detail, crate::quota::Detail::None);
-
-        let kimi = store.since(Service::Kimi, None, 0).unwrap();
-        assert_eq!(kimi.len(), 1, "a row this build cannot read is left out");
-        assert_eq!(kimi[0].limits[1].span, Span::Unknown);
-        assert_eq!(kimi[0].limits[1].label, "monthly (Kimi Code share)");
-        assert_eq!(kimi[0].balances[0].left_minor, 2196);
-
-        let agy = store
-            .since(Service::Antigravity, Some("a@example.com"), 0)
-            .unwrap();
-        assert_eq!(agy.iter().map(|r| r.at).collect::<Vec<_>>(), [120, 130]);
-        assert_eq!(agy[0].scoped().len(), 2);
-        assert!(!agy[0].has_quota());
-        assert!(
-            agy[0]
-                .scoped_to(Some("gemini"))
-                .unwrap()
-                .above(0.05, 0.05, None)
-        );
-        assert_eq!(
-            agy[1].error,
-            Some(ReadError::Other {
-                message: "sign in again: the grant was revoked".into()
-            })
-        );
-
-        let work = store.since(Service::Codex, Some("work"), 0).unwrap();
-        assert_eq!(work.len(), 2);
-        let read = &work[0];
-        assert_eq!((read.at, read.plan.as_deref()), (200, Some("plus")));
-        assert_eq!(read.weekly(), Some(Window::new(0.42, 1_794_607_293)));
-        assert_eq!(read.session(), Some(Window::new(0.1, 4_600)));
-        assert_eq!(
-            read.window(Span::Other(86_400), &Scope::All),
-            Some(Window::new(0.5, 99))
-        );
-        let spark = read
-            .limit(Span::Unknown, &Scope::Group("gpt-5.3-codex-spark".into()))
-            .unwrap();
-        assert_eq!(spark.label, "codex_spark");
-        assert!(spark.is_rejected());
-        let codex: &CodexDetail = read.codex().unwrap();
-        assert_eq!(codex.email.as_deref(), Some("w@example.com"));
-        assert_eq!(codex.allowed, Some(true));
-        assert_eq!(codex.models[0].slug, "gpt-6-astra");
-        assert_eq!(
-            codex.reset_credits,
-            Some(ResetCreditCount {
-                available: 2,
-                applicable: Some(0)
-            })
-        );
-        assert!(read.above(0.0, 0.0, None));
-        assert_eq!(
-            work[1].error,
-            Some(ReadError::Edge {
-                status: 403,
-                attempts: 4
-            })
-        );
-        assert_eq!(
-            work[1].codex().unwrap().email.as_deref(),
-            Some("hint@example.com"),
-            "the stored id token's email stands in"
-        );
-
-        let fleet = [
-            (Service::Codex, "gone"),
-            (Service::Codex, "work"),
-            (Service::Antigravity, "a@example.com"),
-            (Service::Zai, "glm"),
-            (Service::Kimi, "kimi"),
-        ];
-        let newest: Vec<_> = latest(&store, &fleet)
-            .into_iter()
-            .map(|r| (r.service, r.account, r.at))
-            .collect();
-        assert_eq!(
-            newest,
-            [
-                (Service::Codex, "gone".to_owned(), 220),
-                (Service::Codex, "work".to_owned(), 210),
-                (Service::Antigravity, "a@example.com".to_owned(), 130),
-                (Service::Zai, "glm".to_owned(), 100),
-            ],
-            "kimi's newest row is unreadable, so it has no latest"
-        );
-        let gone = store.recent(Service::Codex, Some("gone"), 1).unwrap();
-        assert!(gone[0].is_refused());
-        assert_eq!(
-            gone[0].error.as_ref().unwrap().to_string(),
-            "auth.json has no access_token"
-        );
-        drop(store);
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing is rewritten");
-
-        // A new read of an old account is the latest, and the history is one.
-        let store = Store::open_at(&path).unwrap();
-        store.insert(&usage(Service::Zai, "glm", 300, 0.3)).unwrap();
-        let history = store.since(Service::Zai, Some("glm"), 0).unwrap();
-        assert_eq!(history.iter().map(|r| r.at).collect::<Vec<_>>(), [100, 300]);
-        assert_eq!(
-            store.latest(&[(Service::Zai, "glm")]).unwrap(),
-            [usage(Service::Zai, "glm", 300, 0.3)]
-        );
     }
 
     #[test]
@@ -1182,24 +996,5 @@ mod tests {
         assert_eq!(weekly.latest, Some(0.0));
         assert_eq!(weekly.hours_left, None, "nothing is burning now");
         assert_eq!(all.limits[1].label, "Fable");
-    }
-
-    #[test]
-    fn an_account_with_a_new_row_is_not_looked_up_in_the_old_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = old_database(dir.path(), OLD_SNAPSHOTS);
-        let store = Store::open_at(&path).unwrap();
-        let mut new = reading();
-        new.at = 1_600_000_000;
-        store.insert(&new).unwrap();
-        // The old rows of `acct` are newer than its row in `readings`; the
-        // row in `readings` is still the answer, and `dead`, which has none
-        // there, is read from the old table.
-        let newest = latest(
-            &store,
-            &[(Service::Claude, "acct"), (Service::Claude, "dead")],
-        );
-        assert_eq!(newest[0], new);
-        assert_eq!(newest[1].account, "dead");
     }
 }
