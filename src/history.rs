@@ -187,15 +187,6 @@ pub fn account_at(events: &[Event], at: i64) -> Option<Option<String>> {
         .map(|event| event.account.clone())
 }
 
-/// The account a fingerprint was last offered for.
-pub fn account_for(events: &[Event], fingerprint: &Fingerprint) -> Option<String> {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.fingerprint.as_ref() == Some(fingerprint))
-        .and_then(|event| event.account.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

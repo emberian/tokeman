@@ -36,20 +36,6 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
         .map_or(s, |(idx, _)| &s[..idx])
 }
 
-/// The first 16 and last 4 characters of a key, or `****` for a short one.
-pub fn mask_key(key: &str) -> String {
-    let chars: Vec<_> = key.chars().collect();
-    if chars.len() > 20 {
-        format!(
-            "{}...{}",
-            chars[..16].iter().collect::<String>(),
-            chars[chars.len() - 4..].iter().collect::<String>()
-        )
-    } else {
-        "****".into()
-    }
-}
-
 /// Long and short names for the limit the server named as binding.
 pub fn claim_label(claim: &str) -> Option<(&'static str, &'static str)> {
     Some(match claim {
@@ -695,9 +681,9 @@ fn print_offers(overview: &Overview) {
 
 /// The fleet view as cards: `tokeman`, and every `<service> list`.
 pub fn print_overview(overview: &Overview) {
-    let hint = match (overview.origin, overview.monitor) {
-        (Origin::Stored, _) => format!("  {DIM}(`tokeman --fresh` reads now){RESET}"),
-        (Origin::Fresh, _) => String::new(),
+    let hint = match overview.origin {
+        Origin::Stored => format!("  {DIM}(`tokeman --fresh` reads now){RESET}"),
+        Origin::Fresh => String::new(),
     };
     println!(
         "\n {BOLD}tokeman{RESET} — {}{hint}\n",
@@ -1580,8 +1566,6 @@ mod tests {
         assert_eq!(one_line("a\n  b\tc", 10), "a b c");
         assert_eq!(one_line("💥💥💥", 2), "💥💥…");
         assert_eq!(truncate_chars("héllo", 2), "hé");
-        assert!(mask_key("abcdefghijklmnop💥qrstuv").starts_with("abcdefghijklmnop..."));
-        assert_eq!(mask_key("short"), "****");
     }
 
     #[test]

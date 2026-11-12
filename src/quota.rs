@@ -343,16 +343,6 @@ impl Source {
             Self::Poll => "usage endpoint",
         }
     }
-
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::Profile => "profile",
-            Self::Headers => "headers",
-            Self::Observed => "observed!",
-            Self::Carried => "carried",
-            Self::Poll => "usage",
-        }
-    }
 }
 
 /// An absolute amount behind a window's fraction, when the service reports it.
