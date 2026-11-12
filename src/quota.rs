@@ -35,7 +35,8 @@ impl Window {
 }
 
 /// How much of a window is left, for display.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Ok,
     Low,
@@ -179,24 +180,10 @@ impl fmt::Display for ModelKey {
 }
 
 /// A subscription service tokeman reads quota from.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Service {
-    #[value(skip)]
     Claude,
-    #[value(skip)]
     Codex,
     Antigravity,
     Zai,
@@ -319,6 +306,16 @@ pub enum Scope {
     Group(String),
 }
 
+impl Scope {
+    /// Claude's extra usage beyond the subscription: a group of its own,
+    /// metered apart from every window.
+    pub const EXTRA_USAGE: &'static str = "extra usage";
+
+    pub fn extra_usage() -> Self {
+        Self::Group(Self::EXTRA_USAGE.to_owned())
+    }
+}
+
 /// Where a limit's reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -414,6 +411,14 @@ impl Limit {
             share: None,
             status: None,
             amount: None,
+        }
+    }
+
+    /// Claude's extra-usage window.
+    pub fn extra_usage(window: Window, source: Source) -> Self {
+        Self {
+            label: Scope::EXTRA_USAGE.to_owned(),
+            ..Self::new(Span::Unknown, Scope::extra_usage(), window, source)
         }
     }
 
@@ -640,12 +645,14 @@ impl SessionLimit {
     }
 }
 
-/// Extra usage beyond the subscription, when the account has it.
+/// The state of extra usage beyond the subscription, when the account has
+/// it. Its window, when the server reports one, is a [`Limit`] scoped to
+/// [`Scope::extra_usage`].
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Overage {
     pub status: Option<String>,
-    pub window: Option<Window>,
     pub disabled_reason: Option<String>,
+    #[serde(default)]
     pub in_use: bool,
 }
 

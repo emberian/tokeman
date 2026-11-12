@@ -13,35 +13,69 @@ mod legacy;
 use legacy::Rows;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::time::Duration;
 
 use crate::paths;
-use crate::quota::{ModelKey, Reading, Service, Window};
+use crate::quota::{Limit, Reading, Scope, Service, Span, Window};
+
+/// How long an unchanged reading goes without a row of its own.
+pub const HOLD_SECS: i64 = 600;
 
 pub struct Store {
     conn: Connection,
 }
 
-/// A series a chart can draw.
-#[derive(Clone, Copy)]
-pub enum Series<'a> {
-    Session,
-    Weekly,
-    Overage,
-    Model(&'a ModelKey),
+/// One limit followed through the history: the window of this length over
+/// this scope, in every reading that has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Series {
+    pub span: Span,
+    pub scope: Scope,
 }
 
-impl Series<'_> {
+impl Series {
+    pub fn new(span: Span, scope: Scope) -> Self {
+        Self { span, scope }
+    }
+
+    /// The account-wide 5-hour window.
+    pub fn session() -> Self {
+        Self::new(Span::FiveHour, Scope::All)
+    }
+
+    /// The account-wide weekly window.
+    pub fn weekly() -> Self {
+        Self::new(Span::Weekly, Scope::All)
+    }
+
+    pub fn of(limit: &Limit) -> Self {
+        Self::new(limit.span, limit.scope.clone())
+    }
+
+    pub fn limit<'a>(&self, reading: &'a Reading) -> Option<&'a Limit> {
+        reading.limit(self.span, &self.scope)
+    }
+
     /// This series' window in one reading.
-    pub fn window(self, reading: &Reading) -> Option<Window> {
-        match self {
-            Self::Session => reading.session(),
-            Self::Weekly => reading.weekly(),
-            Self::Overage => reading.claude()?.overage.as_ref()?.window,
-            Self::Model(key) => reading.model_limit(key).map(|limit| limit.window),
+    pub fn window(&self, reading: &Reading) -> Option<Window> {
+        reading.window(self.span, &self.scope)
+    }
+
+    /// Every series `readings` hold, in the order the newest reading that
+    /// has each reports it, with that reading's limit.
+    pub fn known(readings: &[Reading]) -> Vec<(Series, &Limit)> {
+        let mut known: Vec<(Series, &Limit)> = Vec::new();
+        for limit in readings.iter().rev().flat_map(|reading| &reading.limits) {
+            if !known
+                .iter()
+                .any(|(series, _)| series.span == limit.span && series.scope == limit.scope)
+            {
+                known.push((Series::of(limit), limit));
+            }
         }
+        known
     }
 }
 
@@ -108,40 +142,106 @@ impl Store {
                 reading TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_readings_account_time
-                ON readings(service, account, at);",
+                ON readings(service, account, at);
+            CREATE TABLE IF NOT EXISTS confirmed (
+                service TEXT NOT NULL,
+                account TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (service, account)
+            ) WITHOUT ROWID;",
         )?;
         Ok(())
     }
 
+    /// Record a read. A reading that says what the account's newest row
+    /// says, apart from when, adds no row until that row is [`HOLD_SECS`]
+    /// old: the value is held, and `confirmed` keeps when it was last seen.
+    /// A reading that differs is written, after a row that closes the hold
+    /// it ends (the old value at its last confirmation), so the history
+    /// shows how long each value stood and when it moved.
     pub fn insert(&self, reading: &Reading) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                reading.service.name(),
-                reading.account,
-                reading.at,
-                serde_json::to_string(reading)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The newest reading of each account of each service, in no particular
-    /// order.
-    pub fn latest(&self) -> Result<Vec<Reading>> {
-        let mut latest = self.query(
-            "WHERE id IN (SELECT MAX(id) FROM readings GROUP BY service, account)",
-            [],
-        )?;
-        for service in Service::ALL {
-            for reading in legacy::read(&self.conn, service, Rows::Latest)? {
-                let newer = latest
-                    .iter()
-                    .any(|new| new.service == reading.service && new.account == reading.account);
-                if !newer {
-                    latest.push(reading);
+        let service = reading.service.name();
+        let tx = self.conn.unchecked_transaction()?;
+        let newest: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT at, reading FROM readings WHERE service = ?1 AND account = ?2
+                 ORDER BY at DESC, id DESC LIMIT 1",
+                params![service, reading.account],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let json = serde_json::to_string(reading)?;
+        let same = newest
+            .as_ref()
+            .is_some_and(|(_, stored)| same_but_when(stored, &json));
+        let held = same
+            && newest
+                .as_ref()
+                .is_some_and(|(at, _)| reading.at - at < HOLD_SECS);
+        if !held {
+            if let Some((at, stored)) = newest.as_ref().filter(|_| !same) {
+                let confirmed: Option<i64> = tx
+                    .query_row(
+                        "SELECT at FROM confirmed WHERE service = ?1 AND account = ?2",
+                        params![service, reading.account],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(confirmed) = confirmed.filter(|seen| seen > at && *seen < reading.at)
+                    && let Ok(mut closing) = serde_json::from_str::<Reading>(stored)
+                {
+                    closing.at = confirmed;
+                    tx.execute(
+                        "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
+                        params![service, reading.account, confirmed, serde_json::to_string(&closing)?],
+                    )?;
                 }
             }
+            tx.execute(
+                "INSERT INTO readings (service, account, at, reading) VALUES (?1, ?2, ?3, ?4)",
+                params![service, reading.account, reading.at, json],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO confirmed (service, account, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (service, account) DO UPDATE SET at = MAX(at, excluded.at)",
+            params![service, reading.account, reading.at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest reading of each of `accounts`, as of its last
+    /// confirmation. An account with a row in `readings` is answered from
+    /// there alone; the tables of earlier builds are asked only for one
+    /// without.
+    pub fn latest(&self, accounts: &[(Service, &str)]) -> Result<Vec<Reading>> {
+        let mut latest = Vec::new();
+        for (service, account) in accounts {
+            let newest = self
+                .query(
+                    "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT 1",
+                    params![service.name(), account],
+                )?
+                .pop();
+            let reading = match newest {
+                Some(mut reading) => {
+                    if let Some(held) = self.held(*service, Some(account))?.into_iter().next() {
+                        reading.at = held.at;
+                    }
+                    Some(reading)
+                }
+                None => legacy::read(
+                    &self.conn,
+                    *service,
+                    Rows::Recent {
+                        account: Some(account),
+                        limit: 1,
+                    },
+                )?
+                .pop(),
+            };
+            latest.extend(reading);
         }
         Ok(latest)
     }
@@ -155,7 +255,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Reading>> {
         let count = limit as i64;
-        let mut readings = match account {
+        let mut readings = self.held(service, account)?;
+        readings.extend(match account {
             Some(name) => self.query(
                 "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT ?3",
                 params![service.name(), name, count],
@@ -164,7 +265,7 @@ impl Store {
                 "WHERE service = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
                 params![service.name(), count],
             )?,
-        };
+        });
         readings.extend(legacy::read(
             &self.conn,
             service,
@@ -195,8 +296,41 @@ impl Store {
                 params![service.name(), since],
             )?,
         });
+        readings.extend(
+            self.held(service, account)?
+                .into_iter()
+                .filter(|reading| reading.at >= since),
+        );
         readings.sort_by_key(|reading| reading.at);
         Ok(readings)
+    }
+
+    /// The value each account holds now: its newest row, dated at its last
+    /// confirmation, for every account confirmed after that row was written.
+    /// It ends a history the way the closing row ends an earlier hold.
+    fn held(&self, service: Service, account: Option<&str>) -> Result<Vec<Reading>> {
+        if !legacy::has_table(&self.conn, "confirmed") {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT r.reading, c.at FROM confirmed c JOIN readings r ON r.id = (
+                 SELECT id FROM readings WHERE service = c.service AND account = c.account
+                 ORDER BY at DESC, id DESC LIMIT 1)
+             WHERE c.service = ?1 AND (?2 IS NULL OR c.account = ?2) AND c.at > r.at",
+        )?;
+        let rows = stmt
+            .query_map(params![service.name(), account], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(json, at)| {
+                let mut reading: Reading = serde_json::from_str(&json).ok()?;
+                reading.at = at;
+                Some(reading)
+            })
+            .collect())
     }
 
     /// `readings` rows. Rows that no longer parse (a field this build does
@@ -218,60 +352,104 @@ impl Store {
     }
 }
 
+/// Whether two stored readings say the same thing at different times.
+fn same_but_when(stored: &str, new: &str) -> bool {
+    let body = |json: &str| {
+        let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+        value.as_object_mut()?.remove("at");
+        Some(value)
+    };
+    match (body(stored), body(new)) {
+        (Some(stored), Some(new)) => stored == new,
+        _ => false,
+    }
+}
+
+/// How fast one limit of an account is being used, from its history.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Burn {
+    pub series: Series,
+    /// The limit's name, as its newest reading gives it.
+    pub label: String,
+    /// Fraction of the window used per hour, between the last two readings.
+    pub latest: Option<f64>,
+    /// Use per hour over the whole history, each interval weighted by its
+    /// length.
+    pub mean: Option<f64>,
+    pub stddev: Option<f64>,
+    pub peak: Option<f64>,
+    /// Hours until the window is spent at the latest rate.
+    pub hours_left: Option<f64>,
+}
+
 /// Burn rates over an account's history, between consecutive readings of
-/// the same reset window.
-#[derive(Debug, Clone, Serialize)]
+/// the same reset window. A value held between two rows counts as no use
+/// over that time, so the rates do not depend on how many rows a hold left.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Stats {
     pub account: String,
-    pub snapshots: usize,
-    /// Fraction of the window used per hour, from the latest pair.
-    pub session_rate: Option<f64>,
-    pub weekly_rate: Option<f64>,
-    pub weekly_rate_mean: Option<f64>,
-    pub weekly_rate_stddev: Option<f64>,
-    pub weekly_rate_peak: Option<f64>,
-    pub session_hours_left: Option<f64>,
-    pub weekly_hours_left: Option<f64>,
+    pub readings: usize,
+    /// One entry per limit the history holds: account-wide ones first.
+    pub limits: Vec<Burn>,
 }
 
 impl Stats {
-    pub fn compute(account: &str, snapshots: &[Reading]) -> Self {
-        let rates = |series: Series| -> Vec<f64> {
-            snapshots
-                .windows(2)
-                .filter_map(|pair| {
-                    let hours = (pair[1].at - pair[0].at) as f64 / 3600.0;
-                    let (a, b) = (series.window(&pair[0])?, series.window(&pair[1])?);
-                    let rate = (b.used - a.used) / hours;
-                    (hours > 0.0
-                        && a.resets_at == b.resets_at
-                        && b.used >= a.used
-                        && rate.is_finite())
-                    .then_some(rate)
-                })
-                .collect()
-        };
-        let session = rates(Series::Session);
-        let weekly = rates(Series::Weekly);
-        let mean = (!weekly.is_empty()).then(|| weekly.iter().sum::<f64>() / weekly.len() as f64);
-        let stddev = mean.map(|mean| {
-            (weekly.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / weekly.len() as f64).sqrt()
-        });
-        let hours_left = |latest: Option<f64>, series: Series| {
-            let rate = latest.filter(|&r| r > 0.0)?;
-            Some(series.window(snapshots.last()?)?.remaining() / rate)
-        };
+    /// `readings` are one account's, oldest first.
+    pub fn compute(account: &str, readings: &[Reading]) -> Self {
+        let mut known = Series::known(readings);
+        known.sort_by_key(|(series, _)| series.scope != Scope::All);
         Self {
             account: account.to_owned(),
-            snapshots: snapshots.len(),
-            session_rate: session.last().copied(),
-            weekly_rate: weekly.last().copied(),
-            weekly_rate_mean: mean,
-            weekly_rate_stddev: stddev,
-            weekly_rate_peak: weekly.iter().copied().reduce(f64::max),
-            session_hours_left: hours_left(session.last().copied(), Series::Session),
-            weekly_hours_left: hours_left(weekly.last().copied(), Series::Weekly),
+            readings: readings.len(),
+            limits: known
+                .into_iter()
+                .map(|(series, limit)| burn(series, limit.name(), readings))
+                .collect(),
         }
+    }
+}
+
+fn burn(series: Series, label: String, readings: &[Reading]) -> Burn {
+    // (hours, use per hour) of each interval inside one reset window.
+    let intervals: Vec<(f64, f64)> = readings
+        .windows(2)
+        .filter_map(|pair| {
+            let hours = (pair[1].at - pair[0].at) as f64 / 3600.0;
+            let (a, b) = (series.window(&pair[0])?, series.window(&pair[1])?);
+            let rate = (b.used - a.used) / hours;
+            (hours > 0.0 && a.resets_at == b.resets_at && b.used >= a.used && rate.is_finite())
+                .then_some((hours, rate))
+        })
+        .collect();
+    let hours: f64 = intervals.iter().map(|(hours, _)| hours).sum();
+    let mean = (hours > 0.0).then(|| {
+        intervals
+            .iter()
+            .map(|(hours, rate)| hours * rate)
+            .sum::<f64>()
+            / hours
+    });
+    let stddev = mean.map(|mean| {
+        (intervals
+            .iter()
+            .map(|(hours, rate)| hours * (rate - mean).powi(2))
+            .sum::<f64>()
+            / hours)
+            .sqrt()
+    });
+    let latest = intervals.last().map(|(_, rate)| *rate);
+    let hours_left = latest.filter(|rate| *rate > 0.0).and_then(|rate| {
+        let window = readings.iter().rev().find_map(|r| series.window(r))?;
+        Some(window.remaining() / rate)
+    });
+    Burn {
+        series,
+        label,
+        latest,
+        mean,
+        stddev,
+        peak: intervals.iter().map(|(_, rate)| *rate).reduce(f64::max),
+        hours_left,
     }
 }
 
@@ -279,7 +457,7 @@ impl Stats {
 mod tests {
     use super::*;
     use crate::quota::{
-        Limit, Overage, Scope, SessionLimit, Signals, Source, Span, Verdict, WindowStatus,
+        Limit, ModelKey, Overage, Scope, SessionLimit, Signals, Source, Span, Verdict, WindowStatus,
     };
 
     fn reading() -> Reading {
@@ -303,13 +481,13 @@ mod tests {
                 Window::new(0.75, 30),
                 Source::Profile,
             ),
+            Limit::extra_usage(Window::new(0.1, 40), Source::Headers),
         ];
         let claude = reading.claude_mut();
         claude.verdict = Verdict::Allowed;
         claude.claim = Some("five_hour".into());
         claude.overage = Some(Overage {
             status: Some("ok".into()),
-            window: Some(Window::new(0.1, 40)),
             ..Overage::default()
         });
         claude.session_limit = SessionLimit::Absent;
@@ -319,6 +497,17 @@ mod tests {
             ..Signals::default()
         };
         reading
+    }
+
+    fn overage() -> Series {
+        Series::new(Span::Unknown, Scope::extra_usage())
+    }
+
+    /// The newest reading of every account named, sorted.
+    fn latest(store: &Store, accounts: &[(Service, &str)]) -> Vec<Reading> {
+        let mut latest = store.latest(accounts).unwrap();
+        latest.sort_by(|a, b| (a.service, &a.account).cmp(&(b.service, &b.account)));
+        latest
     }
 
     fn open() -> (tempfile::TempDir, Store) {
@@ -334,12 +523,17 @@ mod tests {
         let rows = store.recent(Service::Claude, Some("acct"), 5).unwrap();
         assert_eq!(rows, [reading()]);
         let row = &rows[0];
-        assert_eq!(Series::Session.window(row), Some(Window::new(0.25, 10)));
-        assert_eq!(Series::Overage.window(row), Some(Window::new(0.1, 40)));
+        assert_eq!(Series::session().window(row), Some(Window::new(0.25, 10)));
+        assert_eq!(overage().window(row), Some(Window::new(0.1, 40)));
         assert_eq!(
-            Series::Model(&ModelKey::new("opus48")).window(row),
+            Series::new(Span::Weekly, Scope::Model(ModelKey::new("opus48"))).window(row),
             Some(Window::new(0.75, 30))
         );
+        let known: Vec<String> = Series::known(&rows)
+            .into_iter()
+            .map(|(_, limit)| limit.name())
+            .collect();
+        assert_eq!(known, ["5h", "weekly", "Opus 4.8", "extra usage"]);
         assert!(
             store
                 .recent(Service::Claude, Some("other"), 5)
@@ -428,7 +622,7 @@ mod tests {
         assert_eq!(claude.session_limit, SessionLimit::Absent);
         assert_eq!(claude.signals.claims, ["seven_day"]);
         assert_eq!(claude.signals.upgrade_paths, ["overage"]);
-        assert_eq!(Series::Overage.window(first), Some(Window::new(0.1, 40)));
+        assert_eq!(overage().window(first), Some(Window::new(0.1, 40)));
         assert_eq!(
             claude.overage.as_ref().unwrap().status.as_deref(),
             Some("ok")
@@ -469,9 +663,13 @@ mod tests {
         );
         assert!(recent[0].is_refused());
         assert_eq!(store.since(Service::Claude, None, 0).unwrap().len(), 3);
-        let mut latest = store.latest().unwrap();
-        latest.sort_by(|a, b| a.account.cmp(&b.account));
-        assert_eq!(latest, [second.clone(), recent[0].clone()]);
+        let fleet = [
+            (Service::Claude, "acct"),
+            (Service::Claude, "dead"),
+            (Service::Claude, "never read"),
+            (Service::Codex, "acct"),
+        ];
+        assert_eq!(latest(&store, &fleet), [second.clone(), recent[0].clone()]);
         drop(store);
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing is rewritten");
 
@@ -491,9 +689,7 @@ mod tests {
             store.recent(Service::Claude, Some("acct"), 2).unwrap(),
             [new.clone(), second.clone()]
         );
-        let latest = store.latest().unwrap();
-        assert_eq!(latest.len(), 2);
-        assert!(latest.contains(&new));
+        assert_eq!(latest(&store, &fleet), [new.clone(), recent[0].clone()]);
         let old_rows: i64 = store
             .conn
             .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
@@ -560,15 +756,21 @@ mod tests {
         assert_eq!(glm, [usage(Service::Zai, "glm", 200, 0.2)]);
         let recent = store.recent(Service::Zai, Some("glm"), 5).unwrap();
         assert_eq!(recent.iter().map(|u| u.at).collect::<Vec<_>>(), [200, 100]);
-        let mut latest: Vec<_> = store
-            .latest()
-            .unwrap()
-            .into_iter()
-            .map(|u| (u.service, u.account, u.at))
-            .collect();
-        latest.sort();
+        let newest: Vec<_> = latest(
+            &store,
+            &[
+                (Service::Claude, "acct"),
+                (Service::Zai, "glm"),
+                (Service::Kimi, "glm"),
+                (Service::Kimi, "kimi"),
+                (Service::Antigravity, "glm"),
+            ],
+        )
+        .into_iter()
+        .map(|u| (u.service, u.account, u.at))
+        .collect();
         assert_eq!(
-            latest,
+            newest,
             [
                 (Service::Claude, "acct".to_owned(), 1_700_000_000),
                 (Service::Zai, "glm".to_owned(), 200),
@@ -688,15 +890,19 @@ mod tests {
             "the stored id token's email stands in"
         );
 
-        let mut latest: Vec<_> = store
-            .latest()
-            .unwrap()
+        let fleet = [
+            (Service::Codex, "gone"),
+            (Service::Codex, "work"),
+            (Service::Antigravity, "a@example.com"),
+            (Service::Zai, "glm"),
+            (Service::Kimi, "kimi"),
+        ];
+        let newest: Vec<_> = latest(&store, &fleet)
             .into_iter()
             .map(|r| (r.service, r.account, r.at))
             .collect();
-        latest.sort();
         assert_eq!(
-            latest,
+            newest,
             [
                 (Service::Codex, "gone".to_owned(), 220),
                 (Service::Codex, "work".to_owned(), 210),
@@ -719,11 +925,9 @@ mod tests {
         store.insert(&usage(Service::Zai, "glm", 300, 0.3)).unwrap();
         let history = store.since(Service::Zai, Some("glm"), 0).unwrap();
         assert_eq!(history.iter().map(|r| r.at).collect::<Vec<_>>(), [100, 300]);
-        assert!(
-            store
-                .latest()
-                .unwrap()
-                .contains(&usage(Service::Zai, "glm", 300, 0.3))
+        assert_eq!(
+            store.latest(&[(Service::Zai, "glm")]).unwrap(),
+            [usage(Service::Zai, "glm", 300, 0.3)]
         );
     }
 
@@ -759,8 +963,7 @@ mod tests {
         assert_eq!(files(dir.path()), ["s.db"]);
         let store = Store::open_read_only_at(&path).unwrap();
         let of = |store: &Store, service| -> Reading {
-            let mut latest = store.latest().unwrap();
-            latest.retain(|reading| reading.service == service);
+            let mut latest = store.latest(&[(service, "acct")]).unwrap();
             assert_eq!(latest.len(), 1);
             latest.remove(0)
         };
@@ -797,8 +1000,201 @@ mod tests {
             .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
             .unwrap();
         let store = Store::open_read_only_at(&old).unwrap();
-        assert!(store.latest().unwrap().is_empty());
+        assert!(
+            store
+                .latest(&[(Service::Codex, "acct")])
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.since(Service::Codex, None, 0).unwrap().is_empty());
         assert!(store.recent(Service::Kimi, None, 9).unwrap().is_empty());
+    }
+
+    fn weekly_at(at: i64, used: f64) -> Reading {
+        let mut reading = Reading::empty(Service::Claude, "acct", at);
+        reading.limits = vec![
+            Limit::new(
+                Span::Weekly,
+                Scope::All,
+                Window::new(used, 9_000_000),
+                Source::Headers,
+            ),
+            Limit::model(
+                ModelKey::new("fable"),
+                "Fable",
+                Window::new(used / 2.0, 9_000_000),
+                Source::Headers,
+            ),
+        ];
+        reading.claude_mut().verdict = Verdict::Allowed;
+        reading
+    }
+
+    fn rows(store: &Store) -> Vec<(i64, f64)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT reading FROM readings ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|json| {
+                let reading: Reading = serde_json::from_str(&json.unwrap()).unwrap();
+                (reading.at, reading.weekly().unwrap().used)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unchanged_reading_adds_no_row_until_the_hold_is_ten_minutes_old() {
+        let (_dir, store) = open();
+        // Probed every 20 s: 0.10 for 25 minutes, then a step to 0.12.
+        for tick in 0..=75 {
+            store.insert(&weekly_at(1_000 + tick * 20, 0.10)).unwrap();
+        }
+        assert_eq!(
+            rows(&store),
+            [(1_000, 0.10), (1_600, 0.10), (2_200, 0.10)],
+            "one row when the value appears, then one every ten minutes"
+        );
+        // The stored view is as fresh as the last read that confirmed it.
+        let newest = store.latest(&[(Service::Claude, "acct")]).unwrap();
+        assert_eq!(newest, [weekly_at(2_500, 0.10)]);
+        let history = store.since(Service::Claude, Some("acct"), 0).unwrap();
+        assert_eq!(
+            history.iter().map(|r| r.at).collect::<Vec<_>>(),
+            [1_000, 1_600, 2_200, 2_500],
+            "the held value ends the history at its last confirmation"
+        );
+        assert_eq!(
+            store.recent(Service::Claude, None, 2).unwrap(),
+            [weekly_at(2_500, 0.10), weekly_at(2_200, 0.10)]
+        );
+
+        store.insert(&weekly_at(2_520, 0.12)).unwrap();
+        assert_eq!(
+            rows(&store),
+            [
+                (1_000, 0.10),
+                (1_600, 0.10),
+                (2_200, 0.10),
+                (2_500, 0.10),
+                (2_520, 0.12)
+            ],
+            "a change is written with the row that closes the hold before it"
+        );
+        // A change straight after a written row needs no closing row, and a
+        // failed read is a change like any other.
+        store.insert(&weekly_at(2_540, 0.13)).unwrap();
+        let failed = Reading::failed(
+            Service::Claude,
+            "acct",
+            2_560,
+            crate::quota::ReadError::Network {
+                message: "down".into(),
+            },
+        );
+        store.insert(&failed).unwrap();
+        store
+            .insert(&Reading {
+                at: 2_580,
+                ..failed.clone()
+            })
+            .unwrap();
+        let history = store.since(Service::Claude, Some("acct"), 2_530).unwrap();
+        assert_eq!(
+            history.iter().map(|r| r.at).collect::<Vec<_>>(),
+            [2_540, 2_560, 2_580]
+        );
+        assert_eq!(history[1].error, failed.error);
+        // Another account's hold is its own.
+        let mut other = weekly_at(2_590, 0.13);
+        other.account = "other".into();
+        store.insert(&other).unwrap();
+        assert_eq!(
+            store.latest(&[(Service::Claude, "other")]).unwrap(),
+            [other]
+        );
+    }
+
+    #[test]
+    fn burn_rates_are_the_same_from_dense_and_sparse_rows() {
+        // One account's use, read every 20 s for an hour: idle for 20
+        // minutes, burning 0.001 per read for 10, idle for 15, a burst, then
+        // a reset to a new window.
+        let mut used = 0.10;
+        let mut dense = Vec::new();
+        for tick in 0..=180i64 {
+            let at = 10_000 + tick * 20;
+            if (60..90).contains(&tick) {
+                used += 0.001;
+            }
+            if tick == 135 {
+                used += 0.05;
+            }
+            let mut reading = weekly_at(at, used);
+            if tick >= 170 {
+                reading.limits[0].window = Window::new(0.0, 9_600_000);
+            }
+            dense.push(reading);
+        }
+        // The rows 0.3 wrote: one per read.
+        let all = Stats::compute("acct", &dense);
+        // The rows this store keeps of the same reads.
+        let (_dir, store) = open();
+        for reading in &dense {
+            store.insert(reading).unwrap();
+        }
+        let kept = store.since(Service::Claude, Some("acct"), 0).unwrap();
+        assert!(
+            kept.len() < dense.len() / 2,
+            "{} of {} rows",
+            kept.len(),
+            dense.len()
+        );
+        let sparse = Stats::compute("acct", &kept);
+
+        assert_eq!(all.limits.len(), 2);
+        assert_eq!(sparse.limits.len(), 2);
+        for (dense, sparse) in all.limits.iter().zip(&sparse.limits) {
+            assert_eq!(dense.series, sparse.series);
+            assert_eq!(dense.label, sparse.label);
+            let close = |a: Option<f64>, b: Option<f64>, what: &str| {
+                let (a, b) = (a.unwrap(), b.unwrap());
+                assert!((a - b).abs() < 1e-9, "{} {what}: {a} vs {b}", dense.label);
+            };
+            close(dense.latest, sparse.latest, "latest");
+            close(dense.mean, sparse.mean, "mean");
+            close(dense.stddev, sparse.stddev, "stddev");
+            close(dense.peak, sparse.peak, "peak");
+            assert_eq!(dense.hours_left, sparse.hours_left);
+        }
+        let weekly = &all.limits[0];
+        assert_eq!(weekly.label, "weekly");
+        // 0.08 used over the 179 intervals that do not span the reset.
+        let hours = 179.0 * 20.0 / 3600.0;
+        assert!((weekly.mean.unwrap() - 0.08 / hours).abs() < 1e-9);
+        assert!((weekly.peak.unwrap() - 0.05 / (20.0 / 3600.0)).abs() < 1e-9);
+        assert_eq!(weekly.latest, Some(0.0));
+        assert_eq!(weekly.hours_left, None, "nothing is burning now");
+        assert_eq!(all.limits[1].label, "Fable");
+    }
+
+    #[test]
+    fn an_account_with_a_new_row_is_not_looked_up_in_the_old_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = old_database(dir.path(), OLD_SNAPSHOTS);
+        let store = Store::open_at(&path).unwrap();
+        let mut new = reading();
+        new.at = 1_600_000_000;
+        store.insert(&new).unwrap();
+        // The old rows of `acct` are newer than its row in `readings`; the
+        // row in `readings` is still the answer, and `dead`, which has none
+        // there, is read from the old table.
+        let newest = latest(
+            &store,
+            &[(Service::Claude, "acct"), (Service::Claude, "dead")],
+        );
+        assert_eq!(newest[0], new);
+        assert_eq!(newest[1].account, "dead");
     }
 }

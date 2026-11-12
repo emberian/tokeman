@@ -139,7 +139,10 @@ mod tests {
             "the next poll waits for its interval"
         );
         assert_eq!(poller.next, Some(started));
-        let stored = Store::open_at(&db).unwrap().latest().unwrap();
+        let stored = Store::open_at(&db)
+            .unwrap()
+            .latest(&fleet.account_keys())
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].service, Service::Zai);
         assert!(

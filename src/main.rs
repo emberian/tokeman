@@ -57,20 +57,24 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate_command(action).await?,
         Command::History {
+            service,
             last,
             account,
             since,
             json,
         } => {
-            let readings = view::history(Service::Claude, account.as_deref(), last, since)?;
+            let readings = view::history(service.into(), account.as_deref(), last, since)?;
             if json {
                 text::print_json(&readings)?;
             } else {
                 text::print_history(&readings);
             }
         }
-        Command::Stats => text::print_stats(&view::stats(&Fleet::load()?)?),
+        Command::Stats { service } => {
+            text::print_stats(&view::stats(&Fleet::load()?, service.into()))
+        }
         Command::Chart {
+            service,
             hours,
             metric,
             output,
@@ -78,6 +82,7 @@ async fn dispatch(command: Command) -> Result<()> {
             width,
             height,
         } => text::print_chart(&tokeman::ui::chart::run(&tokeman::ui::chart::Request {
+            service: service.into(),
             hours,
             metric,
             output,

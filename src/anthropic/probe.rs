@@ -39,6 +39,7 @@ struct Quota {
     weekly_status: Option<WindowStatus>,
     model_weekly_status: Option<WindowStatus>,
     overage: Option<Overage>,
+    overage_window: Option<Window>,
     signals: Signals,
 }
 
@@ -143,7 +144,6 @@ fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
     let overage_window = header_window(headers, &format!("{PREFIX}-overage"));
     let overage = (overage_status.is_some() || overage_window.is_some()).then(|| Overage {
         status: overage_status,
-        window: overage_window,
         disabled_reason: header_str(headers, &format!("{PREFIX}-overage-disabled-reason")),
         in_use: header_str(headers, &format!("{PREFIX}-overage-in-use"))
             .is_some_and(|value| value == "true"),
@@ -159,6 +159,7 @@ fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
         weekly_status: window_status(headers, &format!("{PREFIX}-7d")),
         model_weekly_status: window_status(headers, &format!("{PREFIX}-7d_oi")),
         overage,
+        overage_window,
         signals: signals(headers, PREFIX),
     })
 }
@@ -242,6 +243,11 @@ fn reading_of(account: &str, now: i64, quota: &Option<Quota>) -> Reading {
                     ..Limit::new(span, Scope::All, window, Source::Headers)
                 });
             }
+        }
+        if let Some(window) = quota.overage_window {
+            reading
+                .limits
+                .push(Limit::extra_usage(window, Source::Headers));
         }
         let claude = reading.claude_mut();
         claude.verdict = quota.verdict;
@@ -454,7 +460,7 @@ mod tests {
             Some("org_level_disabled")
         );
         assert!(!overage.in_use);
-        assert!(overage.window.is_none());
+        assert_eq!(quota.overage_window, None);
 
         let bare = parse_quota(&headers(&[
             ("anthropic-ratelimit-unified-status", "rejected"),

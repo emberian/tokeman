@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::observe::{Family, LimitWindow};
+use crate::quota::Service;
 
 #[derive(Parser)]
 #[command(
@@ -72,8 +73,11 @@ pub enum Command {
         #[command(subcommand)]
         action: RotateAction,
     },
-    /// Show recent stored reads
+    /// Show recent stored reads of one service
     History {
+        /// Which service's reads
+        #[arg(long, value_enum, default_value = "claude")]
+        service: ServiceArg,
         #[arg(long, default_value = "20")]
         last: usize,
         /// Only this account
@@ -85,17 +89,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Burn rates and time to depletion
-    Stats,
-    /// Render a history chart (inline in iTerm2)
+    /// Burn rates and time to depletion, per limit
+    Stats {
+        /// Which service's accounts
+        #[arg(long, value_enum, default_value = "claude")]
+        service: ServiceArg,
+    },
+    /// Render a history chart of one limit (inline in iTerm2)
     Chart {
+        /// Which service's accounts
+        #[arg(long, value_enum, default_value = "claude")]
+        service: ServiceArg,
         /// Hours of history to show
         #[arg(long, default_value = "24")]
         hours: f64,
-        /// five-hour, seven-day, overage, or a model's weekly bucket by name
-        /// (fable, opus-5, "Opus 4.8")
-        #[arg(long, default_value = "five-hour")]
-        metric: String,
+        /// The limit to draw: a window by length (5h, weekly, monthly,
+        /// daily), `overage`, or a limit by its model or group (fable,
+        /// "Opus 4.8", gemini, "gemini 5h", spark). Default: the service's
+        /// first account-wide window
+        #[arg(long)]
+        metric: Option<String>,
         /// Also save the PNG here
         #[arg(long)]
         output: Option<PathBuf>,
@@ -396,6 +409,30 @@ pub enum RotateAction {
         #[arg(long)]
         pid: u32,
     },
+}
+
+/// A service, as `--service` names it: the words that select it as a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServiceArg {
+    Claude,
+    Codex,
+    #[value(alias = "antigravity")]
+    Agy,
+    #[value(alias = "zai")]
+    Glm,
+    Kimi,
+}
+
+impl From<ServiceArg> for Service {
+    fn from(value: ServiceArg) -> Self {
+        match value {
+            ServiceArg::Claude => Self::Claude,
+            ServiceArg::Codex => Self::Codex,
+            ServiceArg::Agy => Self::Antigravity,
+            ServiceArg::Glm => Self::Zai,
+            ServiceArg::Kimi => Self::Kimi,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -292,6 +292,19 @@ pub struct FleetLock {
 }
 
 impl Fleet {
+    /// Every configured account of every service, in configured order:
+    /// Claude, then Codex, then the others.
+    pub fn account_keys(&self) -> Vec<(crate::quota::Service, &str)> {
+        use crate::quota::Service;
+        let claude = self
+            .accounts
+            .iter()
+            .map(|a| (Service::Claude, a.name.as_str()));
+        let codex = self.codex.iter().map(|a| (Service::Codex, a.name.as_str()));
+        let services = self.services.iter().map(|a| (a.service, a.name.as_str()));
+        claude.chain(codex).chain(services).collect()
+    }
+
     pub fn account(&self, name: &str) -> Option<&Account> {
         self.accounts.iter().find(|account| account.name == name)
     }

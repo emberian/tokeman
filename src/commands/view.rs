@@ -297,20 +297,22 @@ pub fn history(
     }
 }
 
-/// Burn rates of each Claude account over the last week.
-pub fn stats(fleet: &Fleet) -> Result<Vec<Stats>> {
-    let store = Store::open()?;
+/// Burn rates of each account of `service` over the last week, in
+/// configured order. Writes nothing; no history yet is no stats.
+pub fn stats(fleet: &Fleet, service: Service) -> Vec<Stats> {
+    let Ok(store) = Store::open_read_only() else {
+        return Vec::new();
+    };
     let since = now() - 7 * 86_400;
-    Ok(fleet
-        .accounts
-        .iter()
-        .filter_map(|account| {
-            let readings = store
-                .since(Service::Claude, Some(&account.name), since)
-                .ok()?;
-            Some(Stats::compute(&account.name, &readings))
+    fleet
+        .account_keys()
+        .into_iter()
+        .filter(|(of, _)| *of == service)
+        .filter_map(|(_, account)| {
+            let readings = store.since(service, Some(account), since).ok()?;
+            Some(Stats::compute(account, &readings))
         })
-        .collect())
+        .collect()
 }
 
 /// The launch settings, as `key = value` pairs.

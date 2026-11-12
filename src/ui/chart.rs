@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -14,9 +13,10 @@ use crate::account::Fleet;
 use crate::anthropic::probe::PROBE_MODEL_LABEL;
 use crate::paths;
 use crate::policy::Mode;
-use crate::quota::{Family, ModelKey, Reading, Service};
+use crate::quota::{Limit, ModelKey, Reading, Scope, Service, Span};
 use crate::settings::PolicySettings;
-use crate::store::{Series, Store};
+use crate::store::{self, Series, Store};
+use crate::ui::text::limit_name;
 
 const COLORS: [[u8; 4]; 10] = [
     [91, 192, 235, 255],
@@ -33,94 +33,120 @@ const COLORS: [[u8; 4]; 10] = [
 
 /// `tokeman chart`, as the command line spells it.
 pub struct Request {
+    pub service: Service,
     pub hours: f64,
-    pub metric: String,
+    /// Which limit to draw; `None` is the service's first account-wide one.
+    pub metric: Option<String>,
     pub output: Option<PathBuf>,
     pub iterm: bool,
     pub width: u32,
     pub height: u32,
 }
 
-/// What to chart: a shared window, or one per-model weekly bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Metric {
-    Session,
-    Weekly,
-    Overage,
-    Model(ModelKey),
+/// A window length by name: `5h`, `five-hour`, `weekly`, `7d`, `seven-day`,
+/// `monthly`, `daily`.
+fn span_named(word: &str) -> Option<Span> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "5h" | "five-hour" => Span::FiveHour,
+        "7d" | "seven-day" | "weekly" => Span::Weekly,
+        "monthly" => Span::Monthly,
+        "daily" => Span::Other(Span::DAY_SECS),
+        _ => return None,
+    })
 }
 
-impl FromStr for Metric {
-    type Err = anyhow::Error;
-
-    /// `five-hour`, `seven-day`, `overage`, or any model name: `fable`,
-    /// `opus-5`, `"Opus 4.8"`. `opus-weekly`/`sonnet-weekly` still work.
-    fn from_str(value: &str) -> Result<Self> {
-        Ok(match value {
-            "five-hour" | "5h" => Self::Session,
-            "seven-day" | "7d" => Self::Weekly,
-            "overage" => Self::Overage,
-            "opus-weekly" => Self::Model(ModelKey::family_wide(Family::Opus)),
-            "sonnet-weekly" => Self::Model(ModelKey::family_wide(Family::Sonnet)),
-            other => {
-                let key = ModelKey::new(other);
-                if key.is_empty() {
-                    bail!("unknown metric {other:?}");
-                }
-                Self::Model(key)
-            }
+/// The series `--metric` names, among the limits `readings` hold.
+///
+/// A length alone (`5h`, `weekly`, `monthly`, `daily`) is the account-wide
+/// window of that length; `overage` is Claude's extra usage; anything else
+/// names a scoped limit by its model, group or label (`fable`, `"Opus 4.8"`,
+/// `gemini`, `spark`), optionally followed by a length (`"gemini 5h"`). With
+/// no metric: the first account-wide limit, or the first limit of any kind.
+pub fn resolve(metric: Option<&str>, readings: &[Reading]) -> Result<Series> {
+    let known = Series::known(readings);
+    let names = || {
+        let names: Vec<String> = known.iter().map(|(_, limit)| limit_name(limit)).collect();
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.join(", ")
+        }
+    };
+    let Some(metric) = metric.map(str::trim) else {
+        return known
+            .iter()
+            .find(|(series, _)| series.scope == Scope::All)
+            .or(known.first())
+            .map(|(series, _)| series.clone())
+            .context("no chartable history in this range; run `tokeman --fresh` to read once");
+    };
+    if let Some(span) = span_named(metric) {
+        return Ok(Series::new(span, Scope::All));
+    }
+    if metric == "overage" {
+        return Ok(Series::new(Span::Unknown, Scope::extra_usage()));
+    }
+    let (needle, span) = match metric.rsplit_once(char::is_whitespace) {
+        Some((needle, last)) if span_named(last).is_some() => (needle.trim(), span_named(last)),
+        _ => (metric, None),
+    };
+    let key = ModelKey::new(needle);
+    if key.is_empty() {
+        bail!("unknown metric {metric:?}; recorded limits: {}", names());
+    }
+    let scoped = |matches: &dyn Fn(&Limit) -> bool| {
+        known
+            .iter()
+            .filter(|(series, _)| span.is_none_or(|span| series.span == span))
+            .find(|(_, limit)| matches(limit))
+            .map(|(series, _)| series.clone())
+    };
+    scoped(&|limit| limit.key() == Some(&key))
+        .or_else(|| scoped(&|limit| limit.matches(needle)))
+        .with_context(|| {
+            format!(
+                "no history for a limit named {metric:?} in this range; recorded limits: {}",
+                names()
+            )
         })
-    }
 }
 
-impl Metric {
-    pub fn series(&self) -> Series<'_> {
-        match self {
-            Self::Session => Series::Session,
-            Self::Weekly => Series::Weekly,
-            Self::Overage => Series::Overage,
-            Self::Model(key) => Series::Model(key),
-        }
+/// The (normal, sip) floors a series is judged by, as fractions remaining:
+/// the rotation's, for Claude's account-wide 5-hour and weekly windows.
+pub fn floors(service: Service, series: &Series, policy: &PolicySettings) -> Option<(f64, f64)> {
+    if service != Service::Claude || series.scope != Scope::All {
+        return None;
     }
-
-    /// The (normal, sip) floors this metric is judged by, as fractions
-    /// remaining; model buckets and overage have none drawn.
-    pub fn floors(&self, policy: &PolicySettings) -> Option<(f64, f64)> {
-        let normal = policy.floors(Mode::Normal);
-        let sip = policy.floors(Mode::Sip);
-        match self {
-            Self::Session => Some((normal.session, sip.session)),
-            Self::Weekly => Some((normal.weekly, sip.weekly)),
-            Self::Overage | Self::Model(_) => None,
-        }
-    }
-
-    fn title(&self, snapshots: &[Reading]) -> String {
-        match self {
-            Self::Session => "5-HOUR CAPACITY REMAINING".into(),
-            Self::Weekly => "7-DAY CAPACITY REMAINING".into(),
-            Self::Overage => "OVERAGE CAPACITY REMAINING".into(),
-            Self::Model(key) => {
-                let label = known_buckets(snapshots)
-                    .remove(key)
-                    .unwrap_or_else(|| key.to_string());
-                format!("{} 7-DAY CAPACITY REMAINING", label.to_uppercase())
-            }
-        }
+    let normal = policy.floors(Mode::Normal);
+    let sip = policy.floors(Mode::Sip);
+    match series.span {
+        Span::FiveHour => Some((normal.session, sip.session)),
+        Span::Weekly => Some((normal.weekly, sip.weekly)),
+        _ => None,
     }
 }
 
 /// What a chart of `series` measures, for its caption.
-pub fn signal_label(series: &Series) -> String {
-    match series {
-        Series::Model(_) => {
+pub fn signal_label(service: Service, series: &Series) -> String {
+    match (service, &series.scope) {
+        (Service::Claude, Scope::Model(_)) => {
             "PER-MODEL WEEKLY LIMIT · COLD-REQUEST ADMISSION CAN BE STRICTER".into()
         }
-        Series::Session | Series::Weekly | Series::Overage => format!(
+        (Service::Claude, _) => format!(
             "{} QUOTA SIGNAL · PREMIUM ADMISSION UNMEASURED",
             PROBE_MODEL_LABEL.to_uppercase()
         ),
+        (service, _) => format!("{} USAGE ENDPOINT", service.label().to_uppercase()),
     }
+}
+
+/// The name of `series`, as the newest reading that has it names its limit.
+pub fn series_name(series: &Series, readings: &[Reading]) -> String {
+    readings
+        .iter()
+        .rev()
+        .find_map(|reading| series.limit(reading))
+        .map_or_else(|| series.span.label(), limit_name)
 }
 
 /// One reading of one series.
@@ -136,7 +162,7 @@ pub struct Point {
 
 /// The points of `series` in `snapshots`, in their order, skipping readings
 /// without the window or with a non-finite value.
-pub fn points(snapshots: &[Reading], series: Series) -> Vec<Point> {
+pub fn points(snapshots: &[Reading], series: &Series) -> Vec<Point> {
     snapshots
         .iter()
         .filter_map(|snapshot| {
@@ -158,13 +184,33 @@ pub fn breaks_segment(prev: &Point, cur: &Point, gap_secs: i64) -> bool {
     cur.at - prev.at > gap_secs || reset_changed || cur.remaining > prev.remaining + 0.025
 }
 
-/// Runs of points a line may join.
+/// The longest a value is held without a row, with room for one late read.
+const HELD_SECS: i64 = store::HOLD_SECS + 300;
+
+/// Runs of points a line may join. Points further apart than `gap_secs` were
+/// not read back to back: up to the hold the store keeps (or two and a half
+/// of the series' usual intervals, for a service read less often) the value
+/// stood until the later read, and is drawn as a step; beyond that nothing
+/// was reading, and the line breaks.
 pub fn segments(points: &[Point], gap_secs: i64) -> Vec<Vec<Point>> {
+    let mut intervals: Vec<i64> = points
+        .windows(2)
+        .map(|pair| pair[1].at - pair[0].at)
+        .collect();
+    intervals.sort_unstable();
+    let usual = intervals.get(intervals.len() / 2).copied().unwrap_or(0);
+    let held = gap_secs.max(HELD_SECS).max(usual * 5 / 2);
     let mut segments: Vec<Vec<Point>> = Vec::new();
     let mut previous: Option<&Point> = None;
     for point in points {
         match (previous, segments.last_mut()) {
-            (Some(prev), Some(segment)) if !breaks_segment(prev, point, gap_secs) => {
+            (Some(prev), Some(segment)) if !breaks_segment(prev, point, held) => {
+                if point.at - prev.at > gap_secs && point.remaining != prev.remaining {
+                    segment.push(Point {
+                        at: point.at,
+                        ..*prev
+                    });
+                }
                 segment.push(*point);
             }
             _ => segments.push(vec![*point]),
@@ -172,19 +218,6 @@ pub fn segments(points: &[Point], gap_secs: i64) -> Vec<Vec<Point>> {
         previous = Some(point);
     }
     segments
-}
-
-/// Every model bucket with history, key to label (the latest label wins).
-pub fn known_buckets(snapshots: &[Reading]) -> BTreeMap<ModelKey, String> {
-    let mut known = BTreeMap::new();
-    for limit in snapshots.iter().rev().flat_map(Reading::models) {
-        if let Some(key) = limit.key() {
-            known
-                .entry(key.clone())
-                .or_insert_with(|| limit.label.clone());
-        }
-    }
-    known
 }
 
 /// `2d`, `36h`, `45m`.
@@ -216,15 +249,19 @@ pub fn run(request: &Request) -> Result<Rendered> {
     if !(360..=2160).contains(&request.height) {
         bail!("--height must be between 360 and 2160");
     }
-    let metric: Metric = request.metric.parse()?;
     let policy = Fleet::load()?.policy;
 
     let cutoff = Utc::now() - Duration::milliseconds((request.hours * 3_600_000.0).round() as i64);
-    let snapshots = Store::open()?.since(Service::Claude, None, cutoff.timestamp())?;
+    let readings = match Store::open_read_only() {
+        Ok(store) => store.since(request.service, None, cutoff.timestamp())?,
+        Err(_) => Vec::new(),
+    };
+    let series = resolve(request.metric.as_deref(), &readings)?;
     let png = render_png(
         &policy,
-        &snapshots,
-        &metric,
+        request.service,
+        &readings,
+        &series,
         request.hours,
         request.width,
         request.height,
@@ -259,8 +296,9 @@ fn iterm_image(png: &[u8]) -> String {
 
 fn render_png(
     policy: &PolicySettings,
+    service: Service,
     snapshots: &[Reading],
-    metric: &Metric,
+    series: &Series,
     hours: f64,
     width: u32,
     height: u32,
@@ -272,27 +310,26 @@ fn render_png(
             .or_default()
             .push(snapshot.clone());
     }
-    let series: Vec<(&str, Vec<Point>)> = by_account
+    let lines: Vec<(&str, Vec<Point>)> = by_account
         .iter()
-        .map(|(name, rows)| (*name, points(rows, metric.series())))
+        .map(|(name, rows)| (*name, points(rows, series)))
         .filter(|(_, points)| !points.is_empty())
         .collect();
-    if series.is_empty() {
-        if let Metric::Model(key) = metric {
-            let known: Vec<String> = known_buckets(snapshots)
-                .keys()
-                .map(ToString::to_string)
-                .collect();
-            bail!(
-                "no history for model bucket {key:?} in this range; recorded buckets: {}",
-                if known.is_empty() {
-                    "none".into()
-                } else {
-                    known.join(", ")
-                }
-            );
-        }
-        bail!("no chartable history in this range; run `tokeman` to collect a snapshot first");
+    if lines.is_empty() {
+        let known: Vec<String> = Series::known(snapshots)
+            .iter()
+            .map(|(_, limit)| limit_name(limit))
+            .collect();
+        bail!(
+            "no history for the {} limit of {} in this range; recorded limits: {}",
+            series_name(series, snapshots),
+            service.label(),
+            if known.is_empty() {
+                "none (run `tokeman --fresh` to read once)".into()
+            } else {
+                known.join(", ")
+            }
+        );
     }
 
     let mut canvas = Canvas::new(width, height, [12, 17, 27, 255]);
@@ -305,13 +342,18 @@ fn render_png(
         bail!("chart dimensions are too small");
     }
 
-    canvas.text(24, 22, &metric.title(snapshots), 3, [229, 235, 244, 255]);
+    let title = format!(
+        "{} {} REMAINING",
+        crate::commands::services::command_word(service),
+        series_name(series, snapshots)
+    );
+    canvas.text(24, 22, &title, 3, [229, 235, 244, 255]);
     canvas.text(
         24,
         52,
         &format!(
             "{} · LAST {}",
-            signal_label(&metric.series()),
+            signal_label(service, series),
             format_duration_hours(hours).to_uppercase()
         ),
         1,
@@ -352,7 +394,7 @@ fn render_png(
         );
     }
 
-    if let Some((normal_floor, sip_floor)) = metric.floors(policy) {
+    if let Some((normal_floor, sip_floor)) = floors(service, series, policy) {
         if normal_floor > 0.0 {
             let y = map_y(normal_floor, top, bottom);
             canvas.dashed_line(left, y, right, 8, [253, 184, 51, 210]);
@@ -379,7 +421,7 @@ fn render_png(
 
     let chart_span_secs = (now - start).max(1);
     let gap_limit = (chart_span_secs / 100).clamp(180, 900);
-    for (index, (name, points)) in series.iter().enumerate() {
+    for (index, (name, points)) in lines.iter().enumerate() {
         let color = COLORS[index % COLORS.len()];
         for segment in segments(points, gap_limit) {
             let mut previous: Option<Point> = None;
@@ -611,6 +653,8 @@ fn glyph(character: char) -> [u8; 7] {
         '.' => [0, 0, 0, 0, 0, 12, 12],
         ':' => [0, 12, 12, 0, 12, 12, 0],
         '/' => [1, 2, 4, 8, 16, 0, 0],
+        '(' => [2, 4, 8, 8, 8, 4, 2],
+        ')' => [8, 4, 2, 2, 2, 4, 8],
         '_' => [0, 0, 0, 0, 0, 0, 31],
         '·' => [0, 0, 0, 4, 0, 0, 0],
         '…' => [0, 0, 0, 0, 0, 21, 0],
@@ -638,41 +682,165 @@ mod tests {
         assert_eq!(map_y(1.0, 10, 110), 10);
     }
 
-    #[test]
-    fn metrics_parse_by_window_name_or_model_name() {
-        let parse = |s: &str| s.parse::<Metric>();
-        assert_eq!(parse("five-hour").unwrap(), Metric::Session);
-        assert_eq!(parse("5h").unwrap(), Metric::Session);
-        assert_eq!(parse("seven-day").unwrap(), Metric::Weekly);
-        assert_eq!(parse("overage").unwrap(), Metric::Overage);
-        assert_eq!(
-            parse("opus-weekly").unwrap(),
-            Metric::Model(ModelKey::new("opus"))
-        );
-        assert_eq!(
-            parse("Opus 4.8").unwrap(),
-            Metric::Model(ModelKey::new("claude-opus-4-8"))
-        );
-        assert_eq!(
-            parse("fable").unwrap(),
-            Metric::Model(ModelKey::family_wide(Family::Fable))
-        );
-        assert!(parse("---").is_err());
+    fn history() -> Vec<Reading> {
+        let mut claude = crate::testing::reading("a", 0.2, 0.4);
+        claude.limits.push(crate::testing::model_limit(
+            "opus48",
+            "Opus 4.8",
+            0.5,
+            crate::quota::Source::Profile,
+        ));
+        claude.limits.push(crate::testing::model_limit(
+            "fable",
+            "Fable",
+            0.5,
+            crate::quota::Source::Headers,
+        ));
+        claude.limits.push(Limit::extra_usage(
+            crate::quota::Window::new(0.1, 0),
+            crate::quota::Source::Headers,
+        ));
+        vec![claude]
+    }
+
+    fn groups() -> Vec<Reading> {
+        let limit = |group: &str, label: &str, secs: i64| {
+            crate::providers::limit(
+                Some(group.to_owned()),
+                label,
+                Some(secs),
+                crate::quota::Window::new(0.3, 0),
+                None,
+            )
+        };
+        vec![Reading {
+            limits: vec![
+                limit("Gemini Models", "weekly", Span::WEEK_SECS),
+                limit("Gemini Models", "5h", Span::FIVE_HOUR_SECS),
+                limit("Claude and GPT models", "weekly", Span::WEEK_SECS),
+            ],
+            ..Reading::empty(Service::Antigravity, "g", 0)
+        }]
     }
 
     #[test]
-    fn only_shared_windows_have_floors() {
+    fn a_metric_names_a_window_by_length_or_a_limit_by_what_it_covers() {
+        let claude = history();
+        let of = |metric: &str| resolve(Some(metric), &claude).unwrap();
+        assert_eq!(of("five-hour"), Series::session());
+        assert_eq!(of("5h"), Series::session());
+        assert_eq!(of("seven-day"), Series::weekly());
+        assert_eq!(of("monthly"), Series::new(Span::Monthly, Scope::All));
+        assert_eq!(
+            of("overage"),
+            Series::new(Span::Unknown, Scope::extra_usage())
+        );
+        let model = |key: &str| Series::new(Span::Weekly, Scope::Model(ModelKey::new(key)));
+        assert_eq!(of("Opus 4.8"), model("claude-opus-4-8"));
+        assert_eq!(of("fable"), model("fable"));
+        assert_eq!(of("opus"), model("opus48"), "a loose match on the label");
+        assert_eq!(resolve(None, &claude).unwrap(), Series::session());
+        let unknown = resolve(Some("sonnet"), &claude).unwrap_err().to_string();
+        assert!(
+            unknown.contains(
+                "recorded limits: 5h, weekly, Opus 4.8 weekly, Fable weekly, extra usage"
+            ),
+            "{unknown}"
+        );
+        assert!(resolve(Some("---"), &claude).is_err());
+
+        let agy = groups();
+        let group = |span, name: &str| Series::new(span, Scope::Group(name.to_owned()));
+        let of = |metric: &str| resolve(Some(metric), &agy).unwrap();
+        assert_eq!(of("gemini"), group(Span::Weekly, "Gemini Models"));
+        assert_eq!(of("gemini 5h"), group(Span::FiveHour, "Gemini Models"));
+        assert_eq!(of("claude"), group(Span::Weekly, "Claude and GPT models"));
+        assert!(resolve(Some("claude 5h"), &agy).is_err());
+        // No account-wide limit: the first one reported.
+        assert_eq!(
+            resolve(None, &agy).unwrap(),
+            group(Span::Weekly, "Gemini Models")
+        );
+        assert_eq!(series_name(&of("gemini 5h"), &agy), "Gemini Models 5h");
+        assert!(resolve(None, &[]).is_err());
+    }
+
+    #[test]
+    fn only_the_rotation_windows_have_floors() {
         let policy = PolicySettings::default();
         assert_eq!(
-            Metric::Session.floors(&policy),
+            floors(Service::Claude, &Series::session(), &policy),
             Some((policy.normal_min_5h_remaining, policy.sip_min_5h_remaining))
         );
         assert_eq!(
-            Metric::Weekly.floors(&policy),
+            floors(Service::Claude, &Series::weekly(), &policy),
             Some((policy.normal_min_7d_remaining, policy.sip_min_7d_remaining))
         );
-        assert_eq!(Metric::Overage.floors(&policy), None);
-        assert_eq!(Metric::Model(ModelKey::new("fable")).floors(&policy), None);
+        assert_eq!(floors(Service::Codex, &Series::weekly(), &policy), None);
+        let fable = Series::new(Span::Weekly, Scope::Model(ModelKey::new("fable")));
+        assert_eq!(floors(Service::Claude, &fable, &policy), None);
+    }
+
+    #[test]
+    fn a_chart_of_another_service_draws() {
+        let mut later = groups().remove(0);
+        later.at = 600;
+        let readings = vec![groups().remove(0), later];
+        let series = resolve(Some("gemini"), &readings).unwrap();
+        let png = render_png(
+            &PolicySettings::default(),
+            Service::Antigravity,
+            &readings,
+            &series,
+            1.0,
+            800,
+            400,
+        )
+        .unwrap();
+        assert_eq!(&png[1..4], b"PNG");
+        let missing = Series::new(Span::Monthly, Scope::All);
+        let error = render_png(
+            &PolicySettings::default(),
+            Service::Antigravity,
+            &readings,
+            &missing,
+            1.0,
+            800,
+            400,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("recorded limits: Gemini Models weekly"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_held_value_is_a_step_and_a_silence_is_a_gap() {
+        // Read every 20 s; the store kept a row per change and one per ten
+        // minutes of hold.
+        let points = [
+            point(0, 0.9, Some(100)),
+            point(20, 0.8, Some(100)),
+            point(620, 0.8, Some(100)),
+            point(1220, 0.7, Some(100)),
+            point(5000, 0.7, Some(100)),
+        ];
+        let runs: Vec<Vec<(i64, f64)>> = segments(&points, 180)
+            .iter()
+            .map(|run| run.iter().map(|p| (p.at, p.remaining)).collect())
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                vec![(0, 0.9), (20, 0.8), (620, 0.8), (1220, 0.8), (1220, 0.7)],
+                vec![(5000, 0.7)]
+            ]
+        );
+        // A service read every half hour is joined at its own cadence.
+        let slow: Vec<Point> = (0..5).map(|i| point(i * 1800, 0.5, None)).collect();
+        assert_eq!(segments(&slow, 180).len(), 1);
     }
 
     #[test]

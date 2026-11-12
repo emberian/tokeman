@@ -587,7 +587,10 @@ impl TrayApp {
                     let note = crate::ui::text::share_note(limit, reading.weekly().as_ref());
                     Self::draw_gauge_noted(ui, &label, 3, limit.window, note.as_deref());
                 }
-                if let Some(window) = crate::store::Series::Overage.window(reading) {
+                if let Some(window) = reading.window(
+                    crate::quota::Span::Unknown,
+                    &crate::quota::Scope::extra_usage(),
+                ) {
                     Self::draw_gauge(ui, "$$", window);
                 }
             } else if let Some(error) = &reading.error {

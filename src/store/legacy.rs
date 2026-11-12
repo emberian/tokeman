@@ -19,8 +19,6 @@ use crate::quota::{
 /// Which rows to read.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Rows<'a> {
-    /// The newest row of each account.
-    Latest,
     /// The newest rows, newest first.
     Recent {
         account: Option<&'a str>,
@@ -84,40 +82,29 @@ impl Table {
 
     /// `WHERE ... ORDER BY ... LIMIT ...` for `rows`, and its parameters.
     fn tail(&self, rows: Rows) -> (String, Vec<Sql>) {
-        let Self {
-            name,
-            account,
-            time,
-            ..
-        } = self;
+        let Self { account, time, .. } = self;
         let mut conditions = Vec::new();
         let mut args = Vec::new();
         if let Some(service) = self.service {
             args.push(Sql::Text(service.name().into()));
             conditions.push(format!("service = ?{}", args.len()));
         }
-        let named = match rows {
-            Rows::Latest => None,
-            Rows::Recent { account, .. } | Rows::Since { account, .. } => account,
-        };
+        let (Rows::Recent { account: named, .. } | Rows::Since { account: named, .. }) = rows;
         if let Some(named) = named {
             args.push(Sql::Text(named.into()));
             conditions.push(format!("{account} = ?{}", args.len()));
         }
         let order = match rows {
-            Rows::Latest => {
-                let group = match self.service {
-                    Some(_) => format!("service, {account}"),
-                    None => (*account).to_owned(),
-                };
-                conditions.push(format!(
-                    "id IN (SELECT MAX(id) FROM {name} GROUP BY {group})"
-                ));
-                String::new()
-            }
             Rows::Recent { limit, .. } => {
                 args.push(Sql::Integer(limit as i64));
-                format!("ORDER BY {time} DESC, id DESC LIMIT ?{}", args.len())
+                // Rows were appended as they were read, so across accounts
+                // the newest are the last ids; one account's are found
+                // through the table's (account, time) index.
+                let newest_first = match named {
+                    Some(_) => format!("{time} DESC, id DESC"),
+                    None => "id DESC".to_owned(),
+                };
+                format!("ORDER BY {newest_first} LIMIT ?{}", args.len())
             }
             Rows::Since { since, .. } => {
                 args.push(if self.text_time {
@@ -276,7 +263,9 @@ fn snapshot(row: &Row) -> Option<Reading> {
         )
     }));
     let overage_status: Option<String> = get(row, "overage_status");
-    let overage_window = window("utilization_overage", "reset_overage");
+    if let Some(window) = window("utilization_overage", "reset_overage") {
+        limits.push(Limit::extra_usage(window, Source::Headers));
+    }
     Some(Reading {
         limits,
         error: get::<String>(row, "error").map(|text| claude_error(&text)),
@@ -290,9 +279,8 @@ fn snapshot(row: &Row) -> Option<Reading> {
             signals: signals
                 .and_then(|json| serde_json::from_str::<Signals>(&json).ok())
                 .unwrap_or_default(),
-            overage: (overage_status.is_some() || overage_window.is_some()).then(|| Overage {
-                status: overage_status,
-                window: overage_window,
+            overage: overage_status.map(|status| Overage {
+                status: Some(status),
                 ..Overage::default()
             }),
             profile_error: get(row, "model_usage_error"),

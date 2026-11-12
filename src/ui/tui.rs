@@ -26,9 +26,9 @@ use crate::daemon;
 use crate::observe;
 use crate::policy::{self, Mode};
 use crate::providers;
-use crate::quota::{Level, ModelKey, Reading, Service, Source, Window};
+use crate::quota::{Level, ModelKey, Reading, Scope, Service, Source, Span as QSpan, Window};
 use crate::store::{Series, Store};
-use crate::ui::chart::{Point, format_duration_hours, known_buckets, points, segments};
+use crate::ui::chart::{Point, format_duration_hours, points, segments};
 use crate::ui::text::{
     claim_label, format_age, format_reset_compact, short_bucket_label, status_badge,
     truncate_chars, usage_summary,
@@ -58,12 +58,12 @@ impl ChartWindow {
         }
     }
 
-    fn series(&self) -> Series<'_> {
+    fn series(&self) -> Series {
         match self {
-            Self::Session => Series::Session,
-            Self::Weekly => Series::Weekly,
-            Self::Model { key, .. } => Series::Model(key),
-            Self::Overage => Series::Overage,
+            Self::Session => Series::session(),
+            Self::Weekly => Series::weekly(),
+            Self::Model { key, .. } => Series::new(QSpan::Weekly, Scope::Model(key.clone())),
+            Self::Overage => Series::new(QSpan::Unknown, Scope::extra_usage()),
         }
     }
 }
@@ -213,18 +213,13 @@ impl App {
 
     /// The stored reads of the configured service accounts, in fleet order.
     fn seed_services(&mut self) {
-        let latest = self.store.latest().unwrap_or_default();
-        self.services = self
+        let accounts: Vec<(Service, &str)> = self
             .fleet
             .services
             .iter()
-            .filter_map(|account| {
-                latest
-                    .iter()
-                    .find(|usage| usage.service == account.service && usage.account == account.name)
-                    .cloned()
-            })
+            .map(|account| (account.service, account.name.as_str()))
             .collect();
+        self.services = self.store.latest(&accounts).unwrap_or_default();
     }
 
     fn range_days(&self) -> i64 {
@@ -253,9 +248,11 @@ impl App {
                     .or_insert_with(|| limit.label.clone());
             }
         }
-        for snapshots in self.history.values() {
-            for (key, label) in known_buckets(snapshots) {
-                buckets.entry(key).or_insert(label);
+        for limit in self.history.values().flatten().flat_map(Reading::models) {
+            if let Some(key) = limit.key() {
+                buckets
+                    .entry(key.clone())
+                    .or_insert_with(|| limit.label.clone());
             }
         }
         let mut windows = vec![ChartWindow::Weekly, ChartWindow::Session];
@@ -493,7 +490,7 @@ fn shared_windows(reading: &Reading) -> Vec<(&'static str, Window)> {
     [
         ("5h", reading.session()),
         ("7d", reading.weekly()),
-        ("$$", Series::Overage.window(reading)),
+        ("$$", reading.window(QSpan::Unknown, &Scope::extra_usage())),
     ]
     .into_iter()
     .filter_map(|(label, window)| Some((label, window?)))
@@ -814,7 +811,7 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .filter_map(|(index, (name, snapshots))| {
-            let points = points(snapshots, series);
+            let points = points(snapshots, &series);
             if points.is_empty() {
                 return None;
             }
@@ -889,7 +886,7 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
                     app.chart_window.label(),
                     app.range_label(),
                     app.mode.label(),
-                    crate::ui::chart::signal_label(&app.chart_window.series()),
+                    crate::ui::chart::signal_label(Service::Claude, &app.chart_window.series()),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),

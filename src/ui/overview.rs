@@ -13,7 +13,8 @@ use crate::codex::probe::State;
 use crate::daemon::{lock, service};
 use crate::providers::ServiceAccount;
 use crate::quota::{Limit, Reading, ResetCreditCount, Service, SessionLimit, Source, Window};
-use crate::store::{Series, Store};
+use crate::quota::{Scope, Span};
+use crate::store::Store;
 use crate::ui::text;
 
 /// Whether anything is keeping the stored reads fresh.
@@ -162,12 +163,13 @@ impl Stored {
     /// created or written; a store that does not exist yet reads as empty.
     pub fn load(fleet: &Fleet, now: i64) -> Self {
         let store = Store::open_read_only().ok();
+        let accounts = fleet.account_keys();
         let cache = Cache::default();
         let settings = claude_settings::load().ok();
         Self {
             readings: store
                 .as_ref()
-                .and_then(|store| store.latest().ok())
+                .and_then(|store| store.latest(&accounts).ok())
                 .unwrap_or_default(),
             offers: fleet
                 .accounts
@@ -293,7 +295,7 @@ fn claude_view(
                 session: snapshot.session(),
                 session_limit: snapshot.session_limit(),
                 weekly,
-                overage: Series::Overage.window(snapshot),
+                overage: snapshot.window(Span::Unknown, &Scope::extra_usage()),
                 buckets: snapshot
                     .models()
                     .map(|limit| bucket_view(limit, weekly.as_ref()))
@@ -377,7 +379,6 @@ fn service_view(account: &ServiceAccount, usage: Option<&Reading>) -> ServiceVie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::Span;
     use crate::testing::{codex_account, login_account, setup_account};
 
     const NOW: i64 = 1_794_000_000;

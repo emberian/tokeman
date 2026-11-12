@@ -10,11 +10,12 @@ use crate::codex::resets as codex_resets;
 use crate::commands::codex::{self, Listed};
 use crate::daemon::status::Report;
 use crate::paths::tilde;
+use crate::quota::Scope;
 use crate::quota::{
     Balance, CodexDetail, Level, Limit, Reading, ResetCreditCount, Service, SessionLimit, Span,
     Verdict, Window,
 };
-use crate::store::{Series, Stats};
+use crate::store::Stats;
 use crate::util::one_line;
 
 const BAR_WIDTH: usize = 40;
@@ -283,10 +284,11 @@ fn print_windows(reading: &Reading) {
         );
     }
     let claude = reading.claude();
-    if let Some(overage) = claude.and_then(|claude| claude.overage.as_ref())
-        && let Some(w) = overage.window
-    {
-        let label = match overage.disabled_reason.as_deref() {
+    if let Some(w) = reading.window(Span::Unknown, &Scope::extra_usage()) {
+        let disabled = claude
+            .and_then(|claude| claude.overage.as_ref())
+            .and_then(|overage| overage.disabled_reason.as_deref());
+        let label = match disabled {
             Some("out_of_credits") => format!("Extra usage  {RED}(no credits){RESET}"),
             Some(reason) => format!("Extra usage  {YELLOW}({reason}){RESET}"),
             None => "Extra usage ".into(),
@@ -390,11 +392,26 @@ fn balance_text(balance: &Balance) -> String {
     }
 }
 
-/// A service limit's name: its group, when it has one, then its label.
-fn meter_name(meter: &Limit) -> String {
-    match meter.group() {
-        Some(group) => format!("{group} {}", meter.name()),
-        None => meter.name(),
+/// A limit's name on a line of its own: what it covers, then its length.
+/// `5h` and `weekly` for the account-wide windows, `Fable weekly` for a
+/// model's, `Gemini Models 5h` for a group's, `codex_spark weekly` for a
+/// limit the server names itself.
+pub fn limit_name(limit: &Limit) -> String {
+    let span = limit.span.label();
+    let label = limit.label.as_str();
+    // A label that only says how long the window is names nothing by itself.
+    let is_length = label == span || matches!(label, "5h" | "weekly" | "monthly" | "daily");
+    let head = match &limit.scope {
+        Scope::All => return limit.name(),
+        Scope::Group(group) if label.is_empty() => group.clone(),
+        Scope::Group(group) if is_length => return format!("{group} {label}"),
+        Scope::Model(key) if label.is_empty() => key.to_string(),
+        _ => label.to_owned(),
+    };
+    if limit.span == Span::Unknown || head.ends_with(&span) {
+        head
+    } else {
+        format!("{head} {span}")
     }
 }
 
@@ -410,7 +427,7 @@ pub fn usage_summary(usage: &Reading) -> String {
         .map(|meter| {
             format!(
                 "{} {:.0}%",
-                meter_name(meter),
+                limit_name(meter),
                 (meter.window.remaining().max(0.0) * 100.0).round()
             )
         })
@@ -569,7 +586,7 @@ fn print_gauges(usages: &[Reading], seated: Option<&str>) {
         let width = usage
             .limits
             .iter()
-            .map(|meter| meter_name(meter).chars().count())
+            .map(|meter| limit_name(meter).chars().count())
             .max()
             .unwrap_or(0);
         for meter in &usage.limits {
@@ -585,7 +602,7 @@ fn print_gauges(usages: &[Reading], seated: Option<&str>) {
                 .unwrap_or_default();
             println!(
                 "   {:<width$} {}  resets {}{amount}",
-                meter_name(meter),
+                limit_name(meter),
                 bar(meter.window.used.clamp(0.0, 1.0)),
                 format_reset(meter.window.resets_at),
             );
@@ -609,73 +626,68 @@ pub fn share_note(limit: &Limit, weekly: Option<&Window>) -> Option<String> {
     })
 }
 
-pub fn print_history(snapshots: &[Reading]) {
-    if snapshots.is_empty() {
-        println!("No snapshots recorded yet.");
+/// `tokeman history`: one stored read per line, newest first.
+pub fn print_history(readings: &[Reading]) {
+    if readings.is_empty() {
+        println!("No readings recorded yet.");
         return;
     }
-    println!("\n {BOLD}tokeman{RESET} — {} snapshots\n", snapshots.len());
-    let left = |w: Option<crate::quota::Window>| {
-        w.map_or("--".to_string(), |w| {
-            format!("{:.1}%", w.remaining() * 100.0)
-        })
-    };
-    for s in snapshots {
-        let overage = Series::Overage
-            .window(s)
-            .map(|w| format!("  ov: {:>5.1}%", w.remaining() * 100.0))
-            .unwrap_or_default();
-        let models: Vec<_> = s
-            .models()
-            .map(|b| format!("{}:{:.1}%", b.label, b.window.remaining() * 100.0))
-            .collect();
-        let models = if models.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", models.join(" "))
+    println!("\n {BOLD}tokeman{RESET} — {} readings\n", readings.len());
+    for reading in readings {
+        let at = DateTime::from_timestamp(reading.at, 0).unwrap_or_default();
+        let state = match reading.claude() {
+            Some(claude) => format!(
+                "  [{} {}]",
+                claude.verdict.as_str(),
+                claude
+                    .claim
+                    .as_deref()
+                    .map(|claim| claim_label(claim).map_or(claim, |(_, short)| short))
+                    .unwrap_or("--"),
+            ),
+            None => String::new(),
         };
-        let at = DateTime::from_timestamp(s.at, 0).unwrap_or_default();
-        let claude = s.claude();
         println!(
-            "  {} {BOLD}{:<16}{RESET}  5h: {:>6} left  7d: {:>6} left{overage}{models}  [{} {}]",
+            "  {} {BOLD}{:<16}{RESET}  {}{state}",
             at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
-            s.account,
-            left(s.session()),
-            left(s.weekly()),
-            claude.map_or("--", |claude| claude.verdict.as_str()),
-            claude
-                .and_then(|claude| claude.claim.as_deref())
-                .map(|c| claim_label(c).map_or(c, |(_, short)| short))
-                .unwrap_or("--"),
+            reading.account,
+            usage_summary(reading),
         );
     }
     println!();
 }
 
+/// `tokeman stats`: how fast each limit of each account is being used.
 pub fn print_stats(stats: &[Stats]) {
     if stats.is_empty() {
-        println!("No stats available. Need at least 2 snapshots per account.");
+        println!("No stats available. Need at least 2 readings per account.");
         return;
     }
     println!("\n {BOLD}tokeman stats{RESET}\n");
-    for s in stats {
-        println!(" {BOLD}{}{RESET} ({} snapshots)", s.account, s.snapshots);
-        if s.snapshots < 2 {
-            println!("   Need at least 2 snapshots to compute rates.\n");
+    for account in stats {
+        println!(
+            " {BOLD}{}{RESET} ({} readings)",
+            account.account, account.readings
+        );
+        if account.readings < 2 {
+            println!("   Need at least 2 readings to compute rates.\n");
             continue;
         }
-        let line = |label: &str, value: Option<f64>, unit: &str| {
-            if let Some(value) = value {
-                println!("   {label:<23}{value:.4}{unit}");
-            }
-        };
-        line("5h burn rate (latest):", s.session_rate, "/hr");
-        line("5h time to deplete:", s.session_hours_left, "h");
-        line("7d burn rate (latest):", s.weekly_rate, "/hr");
-        line("7d burn rate (mean):", s.weekly_rate_mean, "/hr");
-        line("7d burn rate (stddev):", s.weekly_rate_stddev, "/hr");
-        line("7d burn rate (peak):", s.weekly_rate_peak, "/hr");
-        line("7d time to deplete:", s.weekly_hours_left, "h");
+        for burn in &account.limits {
+            let line = |what: &str, value: Option<f64>, unit: &str| {
+                if let Some(value) = value {
+                    println!(
+                        "   {:<34}{value:.4}{unit}",
+                        format!("{} {what}:", burn.label)
+                    );
+                }
+            };
+            line("burn rate (latest)", burn.latest, "/hr");
+            line("burn rate (mean)", burn.mean, "/hr");
+            line("burn rate (stddev)", burn.stddev, "/hr");
+            line("burn rate (peak)", burn.peak, "/hr");
+            line("time to deplete", burn.hours_left, "h");
+        }
         println!();
     }
 }
