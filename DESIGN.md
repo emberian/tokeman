@@ -64,6 +64,8 @@ src/
   history.rs     credential history: Event, Fingerprint, account_at (JSONL)
   claims.rs      the claim journal: reset claims (Claude grants, Codex credits) sent without a definite answer, keyed
                  by (Service, account); one request id per claim, resent verbatim; the only writer of claims.json
+  drift.rs       what a read carried that no parser knows: the collector every parser fills from the known sets it
+                 keeps beside itself, and the ledger of items the daemon has logged; the only writer of drift.json
   notice.rs      progress lines (a lock being waited on, a retry sleeping, dry-run narration) go to a sink the binary
                  installs; the library never writes to the terminal
   util.rs        pure helpers shared across domains, once each: one_line, shell_quote, parse_reset, backoff_secs
@@ -118,6 +120,8 @@ src/
   commands/      what each command does, returning data; nothing here prints or reads the terminal
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
     codex.rs     add, remove, discover, import, list, refresh, use, watch, reset plan / claim / clear
+    doctor.rs    one fresh read of every account, the tools, the hook, the service, file modes, agy's login and
+                 pending claims -> Findings; Report::assemble (pure) decides what is a problem and names its fix
     services.rs  agy / glm / kimi: add, remove, import, the account agy holds, agy use, agy run
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
@@ -169,6 +173,7 @@ pub struct Reading {
     pub balances: Vec<Balance>,
     pub error: Option<ReadError>,
     pub detail: Detail,
+    pub unrecognized: Vec<String>,          // header names, body keys and enum words no parser knows (drift.rs)
 }
 pub enum Detail { None, Claude(ClaudeDetail), Codex(CodexDetail) }
 pub struct ClaudeDetail { verdict /* requested model only */, claim, session_limit, signals, overage, profile_error }
@@ -275,8 +280,9 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   itself (`view_caption`) are each one function in `ui/text.rs`.
 - **Who sends a quota request.** The service's loop (the rotation cycle,
   the services poll, the Codex sweep); `commands::view::probe`, behind every
-  `<service> list` and `best`, `--fresh`, and the surfaces when no service
-  reads; `tokeman rotate status` and `rotate run`, which read Claude the way
+  `<service> list` and `best`, `--fresh`, `tokeman doctor` (which also reads
+  the reset programs and the Codex credit list), and the surfaces when no
+  service reads; `tokeman rotate status` and `rotate run`, which read Claude the way
   a cycle does; and the commands that act on one account (`codex use`,
   `codex watch`, the two `reset`s, `glm|kimi add`, `agy import`). Nothing in
   `ui/` sends a request: a surface calls `commands::view::overview`, which
@@ -284,6 +290,16 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
 - **A view says what it is.** Every `Overview` carries its origin and the
   time of its newest reading, and every surface shows both; a stored view
   the service has not refreshed for ten minutes is called stale.
+- **A parser says what it did not recognise.** Beside each parser are the
+  names it knows as constants: what it reads, and what has been seen and is
+  not read, with where it was seen. Every other rate-limit header, body key
+  and word of an enumerated field lands in `Reading::unrecognized` (the
+  reset programs' in `ResetStatus::unrecognized`, the Codex credit list's in
+  `CreditList::unrecognized`) as a path (`usage.limits[].kind=daily_all`,
+  `header anthropic-ratelimit-unified-8h-reset`): names and enum words only,
+  never the content of a free-form field. A read of a service that has not
+  changed reports nothing. The daemon logs an item the first time it sees
+  it; `tokeman doctor` is where it becomes a problem.
 - **Nothing stringly typed for state.** Event kinds, backup states,
   verdicts, modes and sources are enums with fixed serde names.
 - **The policy is pure.** `policy.rs` imports only `quota.rs` and the
@@ -292,7 +308,8 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
 - **One writer per file.** `claude/settings.rs` for settings.json,
   `account.rs` for tokens.toml, `daemon/cadence.rs` for the cycle state,
   `observe.rs` for the admission state, `history.rs` for the JSONL,
-  `claims.rs` for claims.json, `store.rs` for snapshots.db.
+  `claims.rs` for claims.json, `drift.rs` for drift.json, `store.rs` for
+  snapshots.db.
 - **Printing and reading the terminal.** Nothing outside `ui/text.rs`
   prints, and nothing outside `ui/prompt.rs` reads the terminal.
   `commands/` and the domain modules return data; a long operation reports
@@ -357,6 +374,10 @@ owner-only.
   `reset-claims/<account>.pending` and `codex-reset-pending.json` from 0.3
   are read where they are; the first change to the journal folds them in and
   renames each to `<name>.imported`.
+- `drift.json`: the unrecognised items the daemon has logged, by service,
+  each with when and on which account's read it was first seen, and the
+  version that judged them. Another version's file reads as empty: its
+  known sets differ.
 - `antigravity-access-tokens.json`, `agy-login-backup.json`,
   `claude-login-keychain-backup.json`, `claude-rotate.log`, the lock files,
   `claude-rotate.paused`, and the launchd launcher script and log.

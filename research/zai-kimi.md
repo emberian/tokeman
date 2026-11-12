@@ -123,6 +123,9 @@ No rate-limit headers were returned **[live]**. A burst of 8 calls in about 2 s 
 - A companion endpoint, `GET https://api.kimi.com/coding/v1/me` (same auth), returns the plan tier: `user_level`
   (int) and `user_level_name`, for example `30` / `"Vivace"` **[live]**. It also returns PII (user_id, nickname, avatar,
   phone, global_id), which tokeman should not store.
+  The `tokeman doctor` run of 2026-11-11 saw keys beyond those named here. `/me`: `region, status,
+  goods_version, created_time, last_login_time`. `booster_wallet`: `autoRefillCharge, autoRefillThreshold,
+  createdAt, updatedAt`; its `balance`: `userId, subscriptionId, createTime, updateTime`. None is read.
 
 ### Real response (booster wallet ids redacted)
 

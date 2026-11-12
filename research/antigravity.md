@@ -118,6 +118,9 @@ what Antigravity-Manager sends **[web]**). The relevant response fields:
               "upgradeSubscriptionText": "You are subscribed to the best Google AI plan."}}
 ```
 
+The answer also carries a top-level `upgradeSubscriptionUri` (seen in the `tokeman doctor` run of
+2026-11-11; not read).
+
 The plan is `paidTier.id`, not `currentTier`. That `currentTier` says `free-tier` for an Ultra
 account is expected; CodexBar and Antigravity-Manager both prefer `paidTier` **[web]**. The
 project for consumer accounts is the shared `aicode-consumers`.

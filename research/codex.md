@@ -37,6 +37,8 @@ Changes against what tokeman assumes (its fixtures use primary = 18000 s, second
 - `additional_rate_limits[]`: per-feature/model limits, each `{limit_name, metered_feature, rate_limit{…},
   normal_model_slug}` (src). Null on this account.
 - `spend_control {reached, individual_limit}`, `rate_limit_upsell`, `promo`.
+- Top level also carries `user_id`, `account_id` and `email` (seen again in the `tokeman doctor` run of
+  2026-11-11); they say whose answer it is and tokeman keeps none of them but `email`.
 - **`rate_limit_reset_credits {available_count, applicable_available_count}`**: reset credits.
   This account has 2, with 0 applicable now (nothing is at a limit).
 

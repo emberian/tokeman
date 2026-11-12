@@ -109,6 +109,10 @@ seven_day_opus, seven_day_sonnet, cinder_cove, wattle_ember, extra_usage, limits
   credits_ever_enabled, daily, weekly, user_disabled, spend_limit_reached}`.
 - `spend`: `{enabled, can_toggle, can_purchase_credits, balance, cap, limit, percent, severity, used: {amount_minor, currency, exponent}, auto_reload, disclaimer}`.
 - `pace` (null so far), `member_dashboard_available`.
+- Also in tokeman's cached answers of 2026-11-11 and not in the lists above: top-level `indicator` and
+  `promo_credits` (null), `seven_day_cowork`, `seven_day_omelette` (null); `limits[].group` is `session` or
+  `weekly`; `cedar_ember.paused_held`, a grant's `arm` (null), `juniper_tide.event_props` (null) and
+  `juniper_tide.ineligible_reason: "not_at_wall"`; `extra_usage.decimal_places`.
 - Codenamed programs: `cedar_ember`, `juniper_tide`, `starry_waterfall`, `amber_cistern(_offer)`,
   `amber_gauge`, `amber_ladder`, `brass_thimble`, `copper_kite`, `granite_teacup`, `harbor_lantern`,
   `iguana_necktie`, `nimbus_quill`, `tangelo`, `omelette_promotional`.

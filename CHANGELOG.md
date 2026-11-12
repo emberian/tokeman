@@ -89,6 +89,23 @@ rewrites the plist, launcher and hook for the new binary.
   weekly room expiring within 24 hours first, and an account with a spent
   limit is left out.
 
+### Noticing when a service changes
+
+- Every parser reports what it did not recognise: a rate-limit header, a
+  key of a usage body, a `limits[]` kind, a z.ai limit type, a Kimi window,
+  an Antigravity bucket window. The names each parser knows sit beside it as
+  constants, seeded from what it reads and what has been seen and is not
+  read, so a read today reports nothing. The items travel with the read
+  (`unrecognized` in a `Reading`, left out when empty) as names only.
+- The background service logs each new item once (`drift.json`).
+- New: `tokeman doctor [--json]` reads every account once and reports what
+  was reached, each credential's state, the unrecognised items, the
+  installed tools against the versions this build was verified with (Claude
+  Code 2.1.322, codex 0.167.0, agy 1.5.6, Antigravity 2.31.2), the
+  SessionStart hook, the background service, file modes, agy's login and
+  unanswered reset claims. Exit 0 when healthy, 1 with problems, each with
+  the command that fixes it.
+
 ### Commands
 
 - Service first: `tokeman claude|codex|agy|glm|kimi <verb>` with the same
