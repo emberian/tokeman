@@ -7,6 +7,7 @@ use crate::claude::sessions;
 use crate::daemon::status::Report;
 use crate::quota::{Balance, Level, Limit, Reading, SessionLimit, Verdict};
 use crate::store::{Series, Stats};
+use crate::util::one_line;
 
 const BAR_WIDTH: usize = 40;
 const BOLD: &str = "\x1b[1m";
@@ -16,15 +17,9 @@ const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 
-/// Collapse whitespace and cap at `max_chars`, marking a cut with `…`.
-pub fn one_line(text: &str, max_chars: usize) -> String {
-    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single.chars().count() <= max_chars {
-        single
-    } else {
-        let cut: String = single.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
+/// A progress line, on stderr. `main` installs this as the library's notice sink.
+pub fn notice(message: &str) {
+    eprintln!("{message}");
 }
 
 pub fn truncate_chars(s: &str, max_chars: usize) -> &str {

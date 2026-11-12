@@ -25,10 +25,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::profile::{Cache, Endpoint};
-use super::{Client, describe, one_line};
+use super::{Client, describe};
 use crate::account::Account;
 use crate::fs::write_atomic;
 use crate::paths;
+use crate::util::one_line;
 
 /// What a grant resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

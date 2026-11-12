@@ -123,25 +123,3 @@ pub fn is_edge_challenge(response: &reqwest::Response) -> bool {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("text/html")))
 }
-
-/// Collapse whitespace and cap the length, so an error body fits a table row.
-pub(crate) fn one_line(text: &str, max_chars: usize) -> String {
-    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single.chars().count() <= max_chars {
-        single
-    } else {
-        let cut: String = single.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_line_flattens_and_caps_on_characters() {
-        assert_eq!(one_line("  a\n  b\t c ", 10), "a b c");
-        assert_eq!(one_line("héllo wörld", 5), "héllo…");
-    }
-}

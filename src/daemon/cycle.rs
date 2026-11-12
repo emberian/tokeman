@@ -216,7 +216,7 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
     }
     let note = |message: &str| {
         if options.dry_run {
-            eprintln!("dry run: {message}");
+            crate::notice::notice(&format!("dry run: {message}"));
         } else {
             log(message);
         }
@@ -354,10 +354,10 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
         cadence.consecutive_degraded_probes.saturating_add(1)
     };
     if options.dry_run {
-        eprintln!(
+        crate::notice::notice(&format!(
             "dry run: would record {} mode with the next probe in {next_interval}s",
             mode.label()
-        );
+        ));
     } else {
         cadence.save()?;
     }

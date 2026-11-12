@@ -24,5 +24,5 @@ pub fn log(message: &str) {
 /// Log, and print to stderr as well, for commands run by hand.
 pub fn log_and_say(message: &str) {
     log(message);
-    eprintln!("{message}");
+    crate::notice::notice(message);
 }

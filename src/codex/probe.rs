@@ -402,13 +402,16 @@ pub(crate) async fn call(
     if !status.is_success() {
         let challenged = is_edge_challenge(&response);
         if std::env::var_os("TOKEMAN_CODEX_DEBUG").is_some() {
-            eprintln!(
+            crate::notice::notice(&format!(
                 "--- {account} {method} {url} {status} {:?} (attempts: {})",
                 response.version(),
                 attempt + 1
-            );
+            ));
             for (name, value) in response.headers() {
-                eprintln!("    {name}: {}", value.to_str().unwrap_or("<binary>"));
+                crate::notice::notice(&format!(
+                    "    {name}: {}",
+                    value.to_str().unwrap_or("<binary>")
+                ));
             }
         }
         let body = response.text().await.unwrap_or_default();
@@ -420,7 +423,7 @@ pub(crate) async fn call(
         } else {
             ReadError::Http {
                 status: status.as_u16(),
-                body: super::one_line(&body, 160),
+                body: crate::util::one_line(&body, 160),
             }
         });
     }

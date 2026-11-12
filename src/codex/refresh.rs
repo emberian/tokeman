@@ -134,7 +134,7 @@ pub async fn exchange(client: &Client, refresh_token: &str) -> Result<TokenBundl
     if !status.is_success() {
         return Err(RefreshError {
             failure: classify(status, &body),
-            detail: format!("HTTP {status}: {}", super::one_line(&body, 200)),
+            detail: format!("HTTP {status}: {}", crate::util::one_line(&body, 200)),
         });
     }
     let parsed: RefreshResponse = serde_json::from_str(&body).map_err(|err| {

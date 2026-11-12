@@ -14,7 +14,7 @@ use crate::account::{Account, Fleet};
 use crate::anthropic::{Client, oauth};
 use crate::claude::settings as claude_settings;
 use crate::history::{self, Event, EventKind};
-use crate::ui::text::one_line;
+use crate::util::one_line;
 
 /// Per-account retry schedule for refreshes that failed transiently. Held in
 /// the daemon's memory: a restart retrying at once is the right behaviour.

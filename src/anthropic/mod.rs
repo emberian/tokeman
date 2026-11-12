@@ -210,17 +210,6 @@ pub fn http_error(status: reqwest::StatusCode, body: String) -> ReadError {
     }
 }
 
-/// `text` on one line, cut to `max_chars` with an ellipsis.
-pub fn one_line(text: &str, max_chars: usize) -> String {
-    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.chars().count() <= max_chars {
-        single_line
-    } else {
-        let cut: String = single_line.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
-}
-
 /// `Retry-After` in seconds, when the server sent one.
 pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
     headers
@@ -269,12 +258,6 @@ mod tests {
             .expect("claude-cli/<version> (external, cli)");
         assert!(!version.is_empty());
         assert!(version.chars().all(|c| c.is_ascii_digit() || c == '.'));
-    }
-
-    #[test]
-    fn one_line_flattens_and_caps_on_characters() {
-        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
-        assert_eq!(one_line("ééééé", 3), "ééé…");
     }
 
     #[test]

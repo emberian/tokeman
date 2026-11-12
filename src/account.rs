@@ -138,6 +138,12 @@ impl<'a> Credential<'a> {
 }
 
 impl Account {
+    /// The fingerprint of the credential this account offers at `now_ms`.
+    pub fn fingerprint(&self, now_ms: i64) -> Option<crate::history::Fingerprint> {
+        self.credential(now_ms)
+            .map(|credential| crate::history::Fingerprint::of(credential.value()))
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -714,15 +720,11 @@ fn sync_tables<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{HOUR_MS, codex_account, profile_only_account};
-
-    fn login_account(expires_at: i64) -> Account {
-        crate::testing::login_account("acct", expires_at)
-    }
+    use crate::testing::{HOUR_MS, codex_account, login_account, profile_only_account};
 
     #[test]
     fn a_live_login_is_preferred_over_the_setup_key() {
-        let account = login_account(10 * HOUR_MS);
+        let account = login_account("acct", 10 * HOUR_MS);
         let credential = account.credential(0).unwrap();
         assert!(credential.is_login());
         assert_eq!(credential.value(), "sk-ant-oat01-access-acct");
@@ -736,16 +738,16 @@ mod tests {
 
     #[test]
     fn a_refused_or_expiring_login_falls_back_to_the_setup_key() {
-        let mut refused = login_account(10 * HOUR_MS);
+        let mut refused = login_account("acct", 10 * HOUR_MS);
         refused.login.as_mut().unwrap().error = Some("invalid_grant".into());
         assert_eq!(
             refused.credential(0),
             Some(Credential::Setup("sk-ant-oat01-setup-acct"))
         );
         // One minute left is too little to hand to a session.
-        let expiring = login_account(60_000);
+        let expiring = login_account("acct", 60_000);
         assert!(!expiring.credential(0).unwrap().is_login());
-        let mut login_only = login_account(60_000);
+        let mut login_only = login_account("acct", 60_000);
         login_only.setup_key = None;
         assert!(login_only.credential(0).is_none());
     }
@@ -761,11 +763,11 @@ mod tests {
     #[test]
     fn refresh_is_due_inside_the_margin_but_not_for_a_fresh_token() {
         let expires_at = 10 * HOUR_MS;
-        let account = login_account(expires_at);
+        let account = login_account("acct", expires_at);
         assert!(!account.needs_refresh(expires_at - REFRESH_MARGIN_MS - 1));
         assert!(account.needs_refresh(expires_at - REFRESH_MARGIN_MS + 1));
         assert!(account.needs_refresh(expires_at + 1));
-        let mut young = login_account(expires_at);
+        let mut young = login_account("acct", expires_at);
         young.login.as_mut().unwrap().obtained_at = Some(expires_at - 20 * 60_000);
         assert!(!young.needs_refresh(expires_at - 19 * 60_000));
         assert!(young.needs_refresh(expires_at));
@@ -773,7 +775,7 @@ mod tests {
 
     #[test]
     fn a_grant_without_a_refresh_token_keeps_the_old_one() {
-        let mut account = login_account(HOUR_MS);
+        let mut account = login_account("acct", HOUR_MS);
         account.login.as_mut().unwrap().error = Some("stale".into());
         account.apply_grant(
             Grant {
@@ -833,7 +835,7 @@ mod tests {
     #[test]
     fn re_adding_an_account_keeps_its_login_grant() {
         let mut fleet = Fleet::default();
-        fleet.accounts.push(login_account(HOUR_MS));
+        fleet.accounts.push(login_account("acct", HOUR_MS));
         fleet.add_setup_key("acct", "sk-ant-oat01-new-setup".into());
         assert_eq!(fleet.accounts.len(), 1);
         assert_eq!(
@@ -1002,7 +1004,7 @@ mod tests {
     #[test]
     fn render_round_trips_every_table() {
         let mut fleet = Fleet::default();
-        fleet.accounts.push(login_account(HOUR_MS));
+        fleet.accounts.push(login_account("acct", HOUR_MS));
         fleet.services.push(crate::providers::ServiceAccount {
             refresh_token: Some("1//refresh".into()),
             access_token: Some("ya29.access".into()),

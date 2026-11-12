@@ -314,7 +314,7 @@ fn brief_error(error: &str) -> String {
         let message = body["error"]["message"].as_str()?;
         Some(format!("{}{message}", &error[..start]))
     });
-    message.unwrap_or_else(|| text::one_line(error, 200))
+    message.unwrap_or_else(|| crate::util::one_line(error, 200))
 }
 
 pub fn bucket_view(bucket: &Limit, weekly: Option<&Window>) -> BucketView {

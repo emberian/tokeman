@@ -225,7 +225,9 @@ async fn exchange_waiting(
         match post_token(client, &body).await {
             Err(error) if error.is_rate_limited() => match waits.next() {
                 Some(secs) => {
-                    eprintln!("  token endpoint is rate limiting; retrying in {secs}s");
+                    crate::notice::notice(&format!(
+                        "  token endpoint is rate limiting; retrying in {secs}s"
+                    ));
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                 }
                 None => return Err(error),

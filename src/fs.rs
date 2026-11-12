@@ -93,13 +93,13 @@ impl FileLock {
         }
     }
 
-    /// Take the lock, saying so on stderr when another process holds it, so a
+    /// Take the lock, saying so (a notice) when another process holds it, so a
     /// command that has to wait never looks hung.
     pub fn acquire_announced(path: &Path, holder: &str) -> Result<Self> {
         if let Some(lock) = Self::try_acquire(path)? {
             return Ok(lock);
         }
-        eprintln!("waiting for {holder}");
+        crate::notice::notice(&format!("waiting for {holder}"));
         Self::acquire(path)
     }
 }

@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{Client, describe, one_line, retry_after_secs};
+use super::{Client, describe, retry_after_secs};
 use crate::account::Account;
 use crate::fs::write_atomic;
 use crate::paths;
 use crate::quota::{Limit, ModelKey, Reading, Scope, SessionLimit, Source, Span, Window};
+use crate::util::{one_line, parse_reset};
 
 /// How long an answer is reused before the endpoint is asked again.
 pub const MAX_AGE_SECS: i64 = 300;
@@ -113,7 +114,7 @@ impl Backoff {
         self.rate_limited = self.rate_limited.saturating_add(1);
         self.retry_after = self
             .retry_after
-            .max(now + backoff_secs(true, self.rate_limited, retry_after));
+            .max(now + retry_delay_secs(true, self.rate_limited, retry_after));
         self.last_error = Some(message.to_owned());
     }
 
@@ -257,7 +258,7 @@ impl Cache {
                             &failure.message,
                         );
                     } else {
-                        entry.retry_after = now + backoff_secs(false, 0, None);
+                        entry.retry_after = now + retry_delay_secs(false, 0, None);
                     }
                 });
                 match entry.body {
@@ -271,12 +272,12 @@ impl Cache {
 
 /// 10 minutes, doubling per consecutive 429 up to an hour, or the server's
 /// `Retry-After` when that is longer; other errors retry after a minute.
-fn backoff_secs(rate_limited: bool, consecutive: u32, retry_after: Option<i64>) -> i64 {
+fn retry_delay_secs(rate_limited: bool, consecutive: u32, retry_after: Option<i64>) -> i64 {
     if !rate_limited {
         return ERROR_RETRY_SECS;
     }
-    let doubling = FIRST_BACKOFF_SECS << consecutive.saturating_sub(1).min(6);
-    doubling.min(MAX_BACKOFF_SECS).max(retry_after.unwrap_or(0))
+    crate::util::backoff_secs(FIRST_BACKOFF_SECS, MAX_BACKOFF_SECS, consecutive)
+        .max(retry_after.unwrap_or(0))
 }
 
 struct Failure {
@@ -400,13 +401,6 @@ pub struct ProfileUsage {
     pub session_limit: SessionLimit,
     /// The per-model weekly limits.
     pub models: Vec<Limit>,
-}
-
-fn parse_reset(resets_at: Option<&str>) -> i64 {
-    // An unused bucket may have no reset yet; 0 renders as "--".
-    resets_at
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map_or(0, |time| time.timestamp())
 }
 
 /// Percent to fraction, once, at the boundary. Over 100 stays over 1.0.
@@ -584,11 +578,11 @@ mod tests {
 
     #[test]
     fn rate_limits_back_off_exponentially_and_honor_retry_after() {
-        assert_eq!(backoff_secs(true, 1, None), 600);
-        assert_eq!(backoff_secs(true, 2, None), 1200);
-        assert_eq!(backoff_secs(true, 9, None), 3600);
-        assert_eq!(backoff_secs(true, 1, Some(7200)), 7200);
-        assert_eq!(backoff_secs(false, 5, Some(7200)), 60);
+        assert_eq!(retry_delay_secs(true, 1, None), 600);
+        assert_eq!(retry_delay_secs(true, 2, None), 1200);
+        assert_eq!(retry_delay_secs(true, 9, None), 3600);
+        assert_eq!(retry_delay_secs(true, 1, Some(7200)), 7200);
+        assert_eq!(retry_delay_secs(false, 5, Some(7200)), 60);
     }
 
     #[test]

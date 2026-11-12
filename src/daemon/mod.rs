@@ -67,7 +67,7 @@ pub async fn run() -> Result<()> {
             Ok(fleet) => fleet,
             Err(error) => {
                 log(&format!("ERROR config reload failed: {error:#}"));
-                eprintln!("tokeman config reload failed: {error:#}");
+                crate::notice::notice(&format!("tokeman config reload failed: {error:#}"));
                 continue;
             }
         };
@@ -80,11 +80,11 @@ pub async fn run() -> Result<()> {
             ..cycle::Options::default()
         };
         match cycle::run(&fleet, scheduled).await {
-            Ok(outcome) if outcome.is_notable() => println!("{}", outcome.message),
+            Ok(outcome) if outcome.is_notable() => crate::notice::notice(&outcome.message),
             Ok(_) => {}
             Err(error) => {
                 log(&format!("ERROR rotation cycle failed: {error:#}"));
-                eprintln!("tokeman rotation cycle failed: {error:#}");
+                crate::notice::notice(&format!("tokeman rotation cycle failed: {error:#}"));
             }
         }
         if Instant::now() >= next_codex_sweep {

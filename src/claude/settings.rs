@@ -67,7 +67,7 @@ pub fn commit(settings: &Settings, event: Option<Event>) -> Result<()> {
     if let Some(event) = event
         && let Err(error) = history::append(&event)
     {
-        eprintln!("could not record credential history: {error:#}");
+        crate::notice::notice(&format!("could not record credential history: {error:#}"));
     }
     Ok(())
 }
@@ -209,16 +209,12 @@ pub fn reinstall_reason(settings: &Settings, account: &Account, now_ms: i64) -> 
 pub fn hook_command(binary: &Path) -> String {
     format!(
         "{} rotate observe-session --pid \"$PPID\"",
-        shell_quote(&binary.to_string_lossy())
+        crate::util::shell_quote(&binary.to_string_lossy())
     )
 }
 
 pub fn is_observer_hook(command: &str) -> bool {
     command.contains(" rotate observe-session ") || command.ends_with(" rotate observe-session")
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Replace any earlier observer hook with one for `binary`; other hooks stay.
@@ -288,11 +284,7 @@ pub fn remove_observer_hook(settings: &mut Settings) -> bool {
 mod tests {
     use super::*;
     use crate::history::Fingerprint;
-    use crate::testing::HOUR_MS;
-
-    fn login_account(name: &str) -> Account {
-        crate::testing::login_account(name, 8 * HOUR_MS)
-    }
+    use crate::testing::{HOUR_MS, login_account};
 
     /// Fresh settings with `account` installed as a switch.
     fn installed(account: &Account) -> Settings {
@@ -303,7 +295,7 @@ mod tests {
 
     #[test]
     fn installing_a_login_declares_its_scopes_and_a_401_wait() {
-        let account = login_account("a");
+        let account = login_account("a", 8 * HOUR_MS);
         let mut settings = Settings::new();
         let event = install(&mut settings, &account, 0, EventKind::Switch).unwrap();
         let env = settings["env"].as_object().unwrap();
@@ -323,7 +315,7 @@ mod tests {
 
     #[test]
     fn falling_back_to_a_setup_token_withdraws_the_scope_claim() {
-        let mut account = login_account("a");
+        let mut account = login_account("a", 8 * HOUR_MS);
         let mut settings = installed(&account);
         account.login.as_mut().unwrap().error = Some("invalid_grant".into());
         assert_eq!(
@@ -340,7 +332,7 @@ mod tests {
             "its inference-only setup token (login refused; run `tokeman login`)"
         );
         assert_eq!(
-            describe_credential(&login_account("a"), 0),
+            describe_credential(&login_account("a", 8 * HOUR_MS), 0),
             "a full-scope login token (valid 480m)"
         );
         assert_eq!(
@@ -351,7 +343,7 @@ mod tests {
 
     #[test]
     fn reinstall_reasons_distinguish_upgrade_refresh_and_repair() {
-        let mut account = login_account("a");
+        let mut account = login_account("a", 8 * HOUR_MS);
         // Settings still hold the setup token from before `tokeman login`.
         let mut settings = installed(&Account {
             login: None,
@@ -383,7 +375,7 @@ mod tests {
 
     #[test]
     fn clearing_removes_every_managed_key() {
-        let mut settings = installed(&login_account("a"));
+        let mut settings = installed(&login_account("a", 8 * HOUR_MS));
         settings
             .get_mut("env")
             .and_then(Value::as_object_mut)
@@ -394,7 +386,7 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env["UNRELATED"], "kept");
         assert!(!clear(&mut settings));
-        let mut only_ours = installed(&login_account("a"));
+        let mut only_ours = installed(&login_account("a", 8 * HOUR_MS));
         assert!(clear(&mut only_ours));
         assert!(!only_ours.contains_key("env"));
     }
@@ -407,7 +399,7 @@ mod tests {
         assert!(!is_observer_hook("bash ~/.claude/hooks/postmark-nudge.sh"));
         assert_eq!(
             hook_command(Path::new("/opt/to'ken/tokeman")),
-            "'/opt/to'\"'\"'ken/tokeman' rotate observe-session --pid \"$PPID\""
+            "'/opt/to'\\''ken/tokeman' rotate observe-session --pid \"$PPID\""
         );
     }
 
@@ -475,7 +467,13 @@ mod tests {
         assert!(load_from(&path).unwrap().is_empty());
         let mut settings = Settings::new();
         settings.insert("model".into(), Value::String("opus".into()));
-        install(&mut settings, &login_account("a"), 0, EventKind::Switch).unwrap();
+        install(
+            &mut settings,
+            &login_account("a", 8 * HOUR_MS),
+            0,
+            EventKind::Switch,
+        )
+        .unwrap();
         save_to(&path, &settings).unwrap();
         let loaded = load_from(&path).unwrap();
         assert_eq!(configured_token(&loaded), Some("sk-ant-oat01-access-a"));

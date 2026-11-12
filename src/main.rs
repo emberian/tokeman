@@ -10,6 +10,7 @@ use tokeman::ui::text;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tokeman::notice::set_sink(text::notice);
     let cli = Cli::parse();
     match cli.command {
         None if cli.watch => tokeman::ui::tui::run(Fleet::load()?).await,

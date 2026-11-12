@@ -6,6 +6,8 @@ use std::process::Command;
 
 use crate::account::Fleet;
 use crate::daemon::cycle::{self, Options};
+use crate::notice::notice;
+use crate::util::shell_quote;
 
 const TAG: &str = " \x1b[1mtokeman:\x1b[0m";
 
@@ -17,22 +19,22 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
             "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
         );
     }
-    eprintln!(
+    notice(&format!(
         "{TAG} probing {} accounts and selecting the default...",
         fleet.accounts.len()
-    );
+    ));
     let outcome = cycle::run(&fleet, Options::default()).await?;
-    eprintln!("{TAG} {}", outcome.message);
+    notice(&format!("{TAG} {}", outcome.message));
     let (binary, args) = fleet.launch.command(claude_args);
     let shown: Vec<String> = args.iter().map(|arg| format!("{arg:?}")).collect();
-    eprintln!("{TAG} launching {binary} {}", shown.join(" "));
+    notice(&format!("{TAG} launching {binary} {}", shown.join(" ")));
     if auto {
-        eprintln!(
+        notice(&format!(
             "{TAG} default monitor enabled ({}s normal / {}s sip-and-drain)",
             fleet.policy.normal_probe_interval_secs, fleet.policy.sip_probe_interval_secs
-        );
+        ));
     }
-    eprintln!();
+    notice("");
     // The child reads its credential from settings.json like every other
     // session; an inherited token would pin it to the launch-time account.
     let mut child = tokio::process::Command::new(&binary)
@@ -56,15 +58,15 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
                 };
                 match cycle::run(&fleet, scheduled).await {
                     Ok(outcome) if outcome.changed() => {
-                        eprintln!("\n{TAG}\x1b[32m {}\x1b[0m", outcome.message)
+                        notice(&format!("\n{TAG}\x1b[32m {}\x1b[0m", outcome.message))
                     }
                     Ok(outcome) if outcome.action == cycle::Action::NoneViable => {
-                        eprintln!("\n{TAG}\x1b[33m {}\x1b[0m", outcome.message)
+                        notice(&format!("\n{TAG}\x1b[33m {}\x1b[0m", outcome.message))
                     }
                     Ok(_) => {}
-                    Err(error) => {
-                        eprintln!("\n{TAG}\x1b[31m rotation probe failed: {error:#}\x1b[0m")
-                    }
+                    Err(error) => notice(&format!(
+                        "\n{TAG}\x1b[31m rotation probe failed: {error:#}\x1b[0m"
+                    )),
                 }
             }
         })
@@ -89,18 +91,59 @@ pub fn in_terminal(binary: &str, args: &[String], terminal: Option<&str>) -> Res
     open_terminal(&command, terminal)
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-#[cfg(target_os = "macos")]
+/// Run `command` in a new terminal window: AppleScript on macOS, the first
+/// terminal emulator that starts on Linux, `cmd` elsewhere.
 fn open_terminal(command: &str, terminal: Option<&str>) -> Result<()> {
-    let script = apple_script(terminal.unwrap_or("Terminal"), command);
-    let status = Command::new("osascript").arg("-e").arg(&script).status()?;
-    if !status.success() {
-        bail!("osascript exited with {status}");
+    #[cfg(target_os = "macos")]
+    {
+        let script = apple_script(terminal.unwrap_or("Terminal"), command);
+        let status = Command::new("osascript").arg("-e").arg(&script).status()?;
+        if !status.success() {
+            bail!("osascript exited with {status}");
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(target_os = "linux")]
+    {
+        let shell_command = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
+        let preferred = terminal.map(|pref| [pref]);
+        let terminals: &[&str] = match &preferred {
+            Some(pref) => pref,
+            None => &[
+                "x-terminal-emulator",
+                "gnome-terminal",
+                "konsole",
+                "xfce4-terminal",
+                "alacritty",
+                "kitty",
+                "wezterm",
+                "xterm",
+            ],
+        };
+        for &terminal in terminals {
+            let exec_flag = if terminal == "gnome-terminal" {
+                "--"
+            } else {
+                "-e"
+            };
+            if Command::new(terminal)
+                .args([exec_flag, "bash", "-c", shell_command.as_str()])
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        bail!("No terminal emulator found. Set terminal in settings.")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = terminal;
+        Command::new("cmd")
+            .args(["/c", "start", "cmd", "/k", command])
+            .spawn()?;
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -130,48 +173,6 @@ fn apple_script_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[cfg(target_os = "linux")]
-fn open_terminal(command: &str, terminal: Option<&str>) -> Result<()> {
-    let shell_command = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
-    let preferred = terminal.map(|pref| [pref]);
-    let terminals: &[&str] = match &preferred {
-        Some(pref) => pref,
-        None => &[
-            "x-terminal-emulator",
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "alacritty",
-            "kitty",
-            "wezterm",
-            "xterm",
-        ],
-    };
-    for &terminal in terminals {
-        let exec_flag = if terminal == "gnome-terminal" {
-            "--"
-        } else {
-            "-e"
-        };
-        if Command::new(terminal)
-            .args([exec_flag, "bash", "-c", shell_command.as_str()])
-            .spawn()
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    bail!("No terminal emulator found. Set terminal in settings.")
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_terminal(command: &str, _terminal: Option<&str>) -> Result<()> {
-    Command::new("cmd")
-        .args(["/c", "start", "cmd", "/k", command])
-        .spawn()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +184,5 @@ mod tests {
         assert!(script.contains("write text \"printf '\\\\033]1337;SetBadgeFormat="));
         assert!(script.contains("\\\"x\\\""));
         assert!(apple_script("Terminal", "'claude'").contains("do script \"'claude'\""));
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 }

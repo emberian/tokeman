@@ -152,11 +152,6 @@ fn fixed_point_to_cents(value: f64) -> i64 {
     }
 }
 
-fn parse_reset(text: Option<&str>) -> i64 {
-    text.and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-        .map_or(0, |at| at.timestamp())
-}
-
 fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
     Some(limit(
         None,
@@ -164,7 +159,7 @@ fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
         span_secs,
         Window::new(
             number(pool.used_ratio.as_ref())?,
-            parse_reset(pool.reset_time.as_deref()),
+            crate::util::parse_reset(pool.reset_time.as_deref()),
         ),
         None,
     ))

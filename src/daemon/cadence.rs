@@ -28,8 +28,8 @@ pub struct Backoff {
 }
 
 /// 5m, 10m, 20m, then every 30m.
-fn backoff_secs(failures: u32) -> f64 {
-    (300.0 * 2f64.powi(failures.saturating_sub(1).min(8) as i32)).min(1800.0)
+fn probe_backoff_secs(failures: u32) -> f64 {
+    crate::util::backoff_secs(300, 1800, failures) as f64
 }
 
 /// The last probe made with the startup model for one account.
@@ -70,12 +70,6 @@ pub struct Cadence {
     pub samples: BTreeMap<String, Sample>,
 }
 
-fn fingerprint(account: &Account, now: f64) -> Option<Fingerprint> {
-    account
-        .credential((now * 1000.0) as i64)
-        .map(|credential| Fingerprint::of(credential.value()))
-}
-
 impl Cadence {
     pub fn load() -> Self {
         std::fs::read(paths::cadence_state())
@@ -101,7 +95,8 @@ impl Cadence {
     /// credential that was refused.
     pub fn is_parked(&self, account: &Account, now: f64) -> bool {
         self.backoff.get(&account.name).is_some_and(|entry| {
-            now < entry.next_attempt_epoch && entry.credential == fingerprint(account, now)
+            now < entry.next_attempt_epoch
+                && entry.credential == account.fingerprint((now * 1000.0) as i64)
         })
     }
 
@@ -131,11 +126,11 @@ impl Cadence {
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_default();
-                entry.next_attempt_epoch = now + backoff_secs(entry.failures);
+                entry.next_attempt_epoch = now + probe_backoff_secs(entry.failures);
                 entry.credential = accounts
                     .iter()
                     .find(|account| account.name == reading.account)
-                    .and_then(|account| fingerprint(account, now));
+                    .and_then(|account| account.fingerprint((now * 1000.0) as i64));
                 if entry.failures == 1 {
                     newly_parked.push(reading.account.clone());
                 }
@@ -247,11 +242,11 @@ mod tests {
 
     #[test]
     fn backoff_schedule_climbs_then_caps_at_thirty_minutes() {
-        assert_eq!(backoff_secs(1), 300.0);
-        assert_eq!(backoff_secs(2), 600.0);
-        assert_eq!(backoff_secs(3), 1200.0);
-        assert_eq!(backoff_secs(4), 1800.0);
-        assert_eq!(backoff_secs(50), 1800.0);
+        assert_eq!(probe_backoff_secs(1), 300.0);
+        assert_eq!(probe_backoff_secs(2), 600.0);
+        assert_eq!(probe_backoff_secs(3), 1200.0);
+        assert_eq!(probe_backoff_secs(4), 1800.0);
+        assert_eq!(probe_backoff_secs(50), 1800.0);
     }
 
     #[test]

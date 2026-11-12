@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod fs;
 pub mod history;
 pub mod launch;
+pub mod notice;
 pub mod observe;
 pub mod paths;
 pub mod policy;
@@ -25,3 +26,4 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod ui;
+pub mod util;
