@@ -24,6 +24,14 @@ pub struct LaunchSettings {
     /// How often the daemon and the TUI read the `[[services]]` quotas.
     #[serde(default = "default_services_interval")]
     pub services_interval_secs: u64,
+    /// Whether the daemon sends a desktop notification for what needs the
+    /// user. Off, each item is a line in the rotation log alone.
+    #[serde(default = "yes")]
+    pub notifications: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_probe_interval() -> u64 {
@@ -46,19 +54,21 @@ impl Default for LaunchSettings {
             claude_bin: None,
             probe_interval_secs: default_probe_interval(),
             services_interval_secs: default_services_interval(),
+            notifications: true,
         }
     }
 }
 
 impl LaunchSettings {
     /// Every key `tokeman settings set` accepts.
-    pub const KEYS: [&'static str; 6] = [
+    pub const KEYS: [&'static str; 7] = [
         "launch_args",
         "dangerous_mode",
         "terminal",
         "claude_bin",
         "probe_interval_secs",
         "services_interval_secs",
+        "notifications",
     ];
 
     /// The services poll interval, never below [`MIN_SERVICES_INTERVAL_SECS`]
@@ -92,13 +102,8 @@ impl LaunchSettings {
             "launch_args" => {
                 self.launch_args = value.split_whitespace().map(str::to_owned).collect()
             }
-            "dangerous_mode" => {
-                self.dangerous_mode = match value {
-                    "true" | "on" | "1" => true,
-                    "false" | "off" | "0" => false,
-                    _ => bail!("dangerous_mode takes true or false, not {value:?}"),
-                }
-            }
+            "dangerous_mode" => self.dangerous_mode = switch(key, value)?,
+            "notifications" => self.notifications = switch(key, value)?,
             "terminal" => self.terminal = (!value.is_empty()).then(|| value.to_owned()),
             "claude_bin" => self.claude_bin = (!value.is_empty()).then(|| value.to_owned()),
             "probe_interval_secs" => {
@@ -121,7 +126,7 @@ impl LaunchSettings {
     }
 
     /// `(key, value)` pairs in the order of [`Self::KEYS`], for display.
-    pub fn entries(&self) -> [(&'static str, String); 6] {
+    pub fn entries(&self) -> [(&'static str, String); 7] {
         [
             ("launch_args", self.launch_args.join(" ")),
             ("dangerous_mode", self.dangerous_mode.to_string()),
@@ -132,7 +137,17 @@ impl LaunchSettings {
                 "services_interval_secs",
                 self.services_interval_secs.to_string(),
             ),
+            ("notifications", self.notifications.to_string()),
         ]
+    }
+}
+
+/// An on/off setting from its command-line spelling.
+fn switch(key: &str, value: &str) -> Result<bool> {
+    match value {
+        "true" | "on" | "1" => Ok(true),
+        "false" | "off" | "0" => Ok(false),
+        _ => bail!("{key} takes true or false, not {value:?}"),
     }
 }
 
@@ -270,6 +285,11 @@ mod tests {
             settings.services_interval().as_secs(),
             MIN_SERVICES_INTERVAL_SECS
         );
+        assert!(settings.notifications, "on unless turned off");
+        settings.set("notifications", "off").unwrap();
+        assert!(!settings.notifications);
+        assert!(settings.set("notifications", "sometimes").is_err());
+        assert_eq!(settings.entries()[6], ("notifications", "false".to_owned()));
         assert!(settings.set("colour", "red").is_err());
     }
 

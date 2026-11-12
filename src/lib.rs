@@ -8,12 +8,14 @@
 
 pub mod account;
 pub mod anthropic;
+pub mod attention;
 pub mod claims;
 pub mod claude;
 pub mod cli;
 pub mod codex;
 pub mod commands;
 pub mod daemon;
+pub mod forecast;
 pub mod fs;
 pub mod history;
 pub mod launch;

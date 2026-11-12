@@ -276,7 +276,10 @@ pub async fn list_detailed(client: &Client, fleet: &Fleet) -> Vec<Listed> {
     probes
         .into_iter()
         .zip(lists)
-        .map(|(probe, list)| {
+        .map(|(mut probe, list)| {
+            if let Some(Ok(list)) = &list {
+                list.date(&mut probe);
+            }
             let (reset_credit_list, reset_credit_error) = match list {
                 None => (None, None),
                 Some(Ok(list)) => (Some(list), None),

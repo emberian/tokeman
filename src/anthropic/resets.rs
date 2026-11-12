@@ -27,7 +27,7 @@ use super::profile::{Cache, Endpoint};
 use super::{Client, describe};
 use crate::account::Account;
 use crate::claims::{Conflict, Journal};
-use crate::quota::Service;
+use crate::quota::{Family, ModelKey, Service};
 use crate::util::one_line;
 
 /// What a grant resets.
@@ -122,6 +122,25 @@ impl ResetGrant {
     /// with resets left.
     pub fn is_usable(&self, now: i64) -> bool {
         self.state(now) == GrantState::Usable
+    }
+
+    /// Epoch seconds after which the grant cannot be used, when it has an end.
+    pub fn expires_at(&self) -> Option<i64> {
+        instant(self.ends_at.as_deref()).map(|end| end.timestamp())
+    }
+
+    /// How many times the grant would refill the weekly window for sessions
+    /// on `model`: its resets left when it clears `seven_day`. A grant that
+    /// gives back only Fable's use of the weekly refills it for Fable alone.
+    pub fn weekly_refills(&self, model: Option<&ModelKey>) -> u32 {
+        let clears_weekly = self.clears.iter().any(|window| window == "seven_day");
+        let for_model = !self.gives_back_weekly
+            || model.is_some_and(|model| model.family() == Some(Family::Fable));
+        if clears_weekly && for_model {
+            self.resets_left
+        } else {
+            0
+        }
     }
 }
 
@@ -329,20 +348,19 @@ pub async fn status(
 }
 
 /// The usable granted resets in the cached cedar_ember read of `account`,
-/// one line each, and when that read was made. No request is made; `None`
-/// when the account was never read.
-pub fn stored_offers(cache: &Cache, account: &str, now: i64) -> Option<(i64, Vec<String>)> {
+/// and when that read was made. No request is made; `None` when the account
+/// was never read.
+pub fn stored_grants(cache: &Cache, account: &str, now: i64) -> Option<(i64, Vec<ResetGrant>)> {
     let (fetched_at, body) = cache.stored(account, Endpoint::CedarEmber)?;
     let status: ResetStatus = serde_json::from_value(body).ok()?;
-    let offers = status
+    let grants = status
         .cedar_ember
         .map(|program| program.grants())
         .unwrap_or_default()
-        .iter()
+        .into_iter()
         .filter(|grant| grant.is_usable(now))
-        .map(|grant| describe_grant(grant, now))
         .collect();
-    Some((fetched_at, offers))
+    Some((fetched_at, grants))
 }
 
 async fn organization_uuid(client: &Client, bearer: &str) -> Result<String> {
@@ -753,16 +771,19 @@ mod tests {
 
         // The cached read answers later without a request, however old.
         let then = at("2026-10-01T00:00:00Z");
-        let (read_at, offers) = stored_offers(&cache, "acct", then).unwrap();
+        let (read_at, grants) = stored_grants(&cache, "acct", then).unwrap();
         assert_eq!(read_at, 1);
-        assert_eq!(offers.len(), 1);
-        assert!(offers[0].contains("usable now"), "{offers:?}");
+        assert_eq!(grants.len(), 1);
+        assert!(
+            describe_grant(&grants[0], then).contains("usable now"),
+            "{grants:?}"
+        );
         let expired = at("2026-10-23T00:00:00Z");
         assert_eq!(
-            stored_offers(&cache, "acct", expired),
+            stored_grants(&cache, "acct", expired),
             Some((1, Vec::new()))
         );
-        assert_eq!(stored_offers(&cache, "never-read", then), None);
+        assert_eq!(stored_grants(&cache, "never-read", then), None);
     }
 
     #[tokio::test]

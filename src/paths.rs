@@ -106,6 +106,12 @@ pub fn claims_journal() -> PathBuf {
     config_dir().join("claims.json")
 }
 
+/// Which attention items the daemon has notified; written only by
+/// `daemon::notify`.
+pub fn notified_ledger() -> PathBuf {
+    config_dir().join("notified.json")
+}
+
 pub fn claims_lock() -> PathBuf {
     config_dir().join("claims.lock")
 }

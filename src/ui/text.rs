@@ -4,17 +4,20 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::account::Account;
 use crate::anthropic::resets;
+use crate::attention::Attention;
 use crate::claude::sessions;
 use crate::codex::probe::State;
 use crate::codex::resets as codex_resets;
 use crate::commands::codex::{self, Listed};
+use crate::daemon::notify::{Channel, Delivery};
+use crate::forecast::{self, Forecast, Outlook};
 use crate::paths::tilde;
 use crate::quota::{
     Balance, Detail, Level, Limit, ModelKey, Reading, ResetCreditCount, Scope, Service,
     SessionLimit, Span, Verdict, Window,
 };
 use crate::store::Stats;
-use crate::ui::overview::{AccountView, Monitor, Origin, Overview};
+use crate::ui::overview::{AccountView, ForecastView, Monitor, Origin, Overview};
 use crate::util::one_line;
 
 const BAR_WIDTH: usize = 40;
@@ -539,6 +542,163 @@ pub fn format_age(at: i64, now: i64) -> String {
     }
 }
 
+/// How far off `at` is from `now`, and when: `in 40m`, `in 9h12m
+/// (3:10PM)`, `Sat Nov 14 3PM (in 2d)`; `now` for a time not ahead.
+pub fn format_until(at: i64, now: i64) -> String {
+    let left = at - now;
+    let local = DateTime::from_timestamp(at, 0)
+        .unwrap_or_default()
+        .with_timezone(&Local);
+    match left {
+        left if left <= 0 => "now".to_owned(),
+        left if left < 3_600 => format!("in {}m", (left / 60).max(1)),
+        left if left < 86_400 => format!(
+            "in {}h{}m ({})",
+            left / 3_600,
+            left % 3_600 / 60,
+            local.format("%-I:%M%p")
+        ),
+        left => format!(
+            "{} (in {}d)",
+            local.format("%a %b %-d %-I%p"),
+            left / 86_400
+        ),
+    }
+}
+
+/// One thing that needs the user, in a sentence without its remedy.
+pub fn attention_text(item: &Attention, now: i64) -> String {
+    match item {
+        Attention::DaemonStopped => {
+            "the background service is installed but not running".to_owned()
+        }
+        Attention::BelowFloor {
+            service: Service::Claude,
+        } => "Claude: every account is below its floor".to_owned(),
+        Attention::BelowFloor { service } => format!("{}: no account has room", service.label()),
+        Attention::RunsDry { service, at } => format!(
+            "{} runs dry {} at the last {} h rate",
+            service.label(),
+            format_until(*at, now),
+            forecast::BURN_HOURS
+        ),
+        Attention::LoginRefused { account } => format!("the login of {account} was refused"),
+        Attention::LoginEnds {
+            account, ends_at, ..
+        } if *ends_at <= now => {
+            format!("the login of {account} ended {}", format_age(*ends_at, now))
+        }
+        Attention::LoginEnds {
+            account, ends_at, ..
+        } => format!(
+            "the login of {account} ends {}",
+            format_until(*ends_at, now)
+        ),
+        Attention::LoginAgeing { account } => format!(
+            "the login of {account} is over {} days old, and logins have lasted 28 to 30",
+            crate::account::LOGIN_WARNING_DAYS
+        ),
+        Attention::ResetExpires {
+            service,
+            account,
+            expires_at,
+            ..
+        } => format!(
+            "a reset on offer to {account} ({}) expires {}",
+            service.label(),
+            format_until(*expires_at, now)
+        ),
+    }
+}
+
+/// The command that deals with an item, when one does. A reset is named
+/// for the user to spend; tokeman never spends one by itself.
+pub fn attention_fix(item: &Attention) -> Option<String> {
+    match item {
+        Attention::DaemonStopped => Some("tokeman rotate install".to_owned()),
+        Attention::LoginRefused { account }
+        | Attention::LoginEnds { account, .. }
+        | Attention::LoginAgeing { account } => Some(format!("tokeman claude login {account}")),
+        Attention::ResetExpires {
+            service, account, ..
+        } => Some(format!(
+            "tokeman {} reset {account}",
+            crate::commands::services::command_word(*service)
+        )),
+        Attention::BelowFloor { .. } | Attention::RunsDry { .. } => None,
+    }
+}
+
+/// `2 resets` / `1 reset`.
+fn resets_word(count: u32) -> String {
+    format!("{count} reset{}", if count == 1 { "" } else { "s" })
+}
+
+/// A forecast on one line: the outlook, the rate it rests on and the room
+/// it started from, then what the resets on offer would add.
+pub fn forecast_text(forecast: &Forecast, now: i64) -> String {
+    let service = forecast.service.label();
+    let basis = format!("at the last {} h rate", forecast.burn_hours);
+    let accounts = if forecast.accounts == 1 {
+        "1 account".to_owned()
+    } else {
+        format!("{} accounts", forecast.accounts)
+    };
+    let room = format!(
+        "{:.0}% of a {} window left across {accounts}",
+        forecast.room * 100.0,
+        forecast.span.label()
+    );
+    let measured = if forecast.measured < forecast.accounts {
+        format!(", measured on {}", forecast.measured)
+    } else {
+        String::new()
+    };
+    let detail = format!("{room}, used at {:.1}%/h{measured}", forecast.rate * 100.0);
+    let with_resets = match forecast.with_resets {
+        Some(Outlook::Dry { at }) => format!(
+            "; with the {} on offer, {}",
+            resets_word(forecast.refills),
+            format_until(at, now)
+        ),
+        Some(_) => format!(
+            "; with the {} on offer, not within {} days",
+            resets_word(forecast.refills),
+            forecast::HORIZON_SECS / 86_400
+        ),
+        None => String::new(),
+    };
+    match forecast.outlook {
+        Outlook::Dry { at } if at <= now => {
+            format!("{service} is dry now ({detail}){with_resets}")
+        }
+        Outlook::Dry { at } => format!(
+            "{service} runs dry {} {basis} ({detail}){with_resets}",
+            format_until(at, now)
+        ),
+        Outlook::Beyond => format!(
+            "{service} lasts more than {} days {basis} ({detail})",
+            forecast::HORIZON_SECS / 86_400
+        ),
+        Outlook::Idle => format!(
+            "{service} was not used in the last {} h: no forecast ({room})",
+            forecast.burn_hours
+        ),
+    }
+}
+
+/// A forecast in a few words, for a header: `Claude dry in 9h12m
+/// (3:10PM)`, `Claude 7d+`, `Claude idle`.
+pub fn forecast_brief(forecast: &Forecast, now: i64) -> String {
+    let service = forecast.service.label();
+    match forecast.outlook {
+        Outlook::Dry { at } if at <= now => format!("{service} dry now"),
+        Outlook::Dry { at } => format!("{service} dry {}", format_until(at, now)),
+        Outlook::Beyond => format!("{service} {}d+", forecast::HORIZON_SECS / 86_400),
+        Outlook::Idle => format!("{service} idle"),
+    }
+}
+
 /// A stored view older than this, with the background service running, is
 /// said to be stale.
 pub const STALE_SECS: i64 = 600;
@@ -687,6 +847,95 @@ fn print_offers(overview: &Overview) {
     }
 }
 
+/// The "needs attention" section and the forecasts of the services in
+/// use, as the lines every text report opens with; empty when there is
+/// neither.
+pub fn headlines(overview: &Overview) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !overview.attention.is_empty() {
+        lines.push(format!(" {BOLD}needs attention{RESET}"));
+    }
+    for item in &overview.attention {
+        let color = match item.level {
+            Level::Critical => RED,
+            _ => YELLOW,
+        };
+        let fix = item
+            .fix
+            .as_ref()
+            .map(|fix| format!("  {DIM}`{fix}`{RESET}"))
+            .unwrap_or_default();
+        lines.push(format!("  {color}! {}{RESET}{fix}", item.text));
+    }
+    for forecast in &overview.forecasts {
+        let color = match forecast.forecast.outlook {
+            Outlook::Dry { .. } => "",
+            Outlook::Beyond => DIM,
+            // A service nobody used has no time to give; `tokeman stats` says so.
+            Outlook::Idle => continue,
+        };
+        lines.push(format!(" {color}forecast: {}{RESET}", forecast.text));
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn print_headlines(overview: &Overview) {
+    for line in headlines(overview) {
+        println!("{line}");
+    }
+}
+
+/// `tokeman notify`: what needs the user now, and whether the background
+/// service tells them.
+pub fn print_attention_report(overview: &Overview, notifications: bool) {
+    if overview.attention.is_empty() {
+        println!("nothing needs attention ({})", view_caption(overview));
+    }
+    for item in &overview.attention {
+        match &item.fix {
+            Some(fix) => println!("! {}: `{fix}`", item.text),
+            None => println!("! {}", item.text),
+        }
+    }
+    println!(
+        "{}",
+        match (notifications, overview.monitor) {
+            (false, _) =>
+                "notifications are off (`tokeman settings set notifications true`); the rotation log still names each item",
+            (true, Monitor::Running | Monitor::Paused) =>
+                "the background service notifies each of these once (`tokeman notify --test` sends one now)",
+            (true, _) =>
+                "nothing notifies: the background service is not running (`tokeman rotate install`)",
+        }
+    );
+}
+
+/// `tokeman notify --test`: what became of the notification.
+pub fn print_notify_test(delivery: &Delivery) {
+    match delivery {
+        Delivery::Sent { channel } => println!(
+            "sent a test notification through {}. If none appeared, allow notifications for {} in the system's notification settings (and check Focus).",
+            match channel {
+                Channel::Osascript => "osascript",
+                Channel::NotifySend => "notify-send",
+            },
+            match channel {
+                Channel::Osascript => "Script Editor",
+                Channel::NotifySend => "tokeman",
+            }
+        ),
+        Delivery::NoNotifier => println!(
+            "this system has no notifier tokeman knows (notify-send is not on PATH): what needs you goes to the rotation log alone"
+        ),
+        Delivery::Failed { reason, .. } => {
+            eprintln!("the notification was not delivered: {reason}")
+        }
+    }
+}
+
 /// The fleet view as cards: `tokeman`, and every `<service> list`.
 pub fn print_overview(overview: &Overview) {
     let hint = match overview.origin {
@@ -697,6 +946,7 @@ pub fn print_overview(overview: &Overview) {
         "\n {BOLD}tokeman{RESET} — {}{hint}\n",
         view_caption(overview)
     );
+    print_headlines(overview);
     let target = target_of(overview);
     for account in &overview.accounts {
         for line in account_lines(account, target.as_ref(), aged_at(overview)) {
@@ -715,6 +965,7 @@ pub fn print_list(overview: &Overview) {
         return;
     }
     println!("\n {BOLD}tokeman{RESET} — {}\n", view_caption(overview));
+    print_headlines(overview);
     for account in &overview.accounts {
         let detail = match &account.reading {
             Some(reading) => format!(
@@ -786,8 +1037,9 @@ pub fn print_history(readings: &[Reading]) {
     println!();
 }
 
-/// `tokeman stats`: how fast each limit of each account is being used.
-pub fn print_stats(stats: &[Stats]) {
+/// `tokeman stats`: how fast each limit of each account is being used,
+/// then when the service's accounts run dry at the recent rate.
+pub fn print_stats(stats: &[Stats], forecast: Option<&ForecastView>) {
     if stats.is_empty() {
         println!("No stats available. Need at least 2 readings per account.");
         return;
@@ -818,6 +1070,13 @@ pub fn print_stats(stats: &[Stats]) {
             line("time to deplete", burn.hours_left, "h");
         }
         println!();
+    }
+    match forecast {
+        Some(forecast) => println!(" forecast: {}\n", forecast.text),
+        None => println!(
+            " forecast: none (it needs an hour of readings of one reset window within the last {} h)\n",
+            forecast::BURN_HOURS
+        ),
     }
 }
 
@@ -1956,6 +2215,165 @@ mod tests {
         );
         assert_eq!(brief_error("network: timed out"), "network: timed out");
         assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
+    }
+
+    #[test]
+    fn what_needs_the_user_is_a_sentence_and_the_command_that_deals_with_it() {
+        use crate::attention::Within;
+        const NOW: i64 = 1_794_000_000;
+        let say = |item: &Attention| (attention_text(item, NOW), attention_fix(item));
+        let (text, fix) = say(&Attention::LoginEnds {
+            account: "first@example.com".into(),
+            ends_at: NOW + 5 * 3_600 + 240,
+            within: Within::OneDay,
+        });
+        assert!(
+            text.starts_with("the login of first@example.com ends in 5h4m ("),
+            "{text}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some("tokeman claude login first@example.com")
+        );
+        let (text, _) = say(&Attention::LoginEnds {
+            account: "a".into(),
+            ends_at: NOW - 7_200,
+            within: Within::OneDay,
+        });
+        assert_eq!(text, "the login of a ended 2h ago");
+        let (text, fix) = say(&Attention::ResetExpires {
+            service: Service::Codex,
+            account: "work".into(),
+            expires_at: NOW + 2 * 86_400 + 60,
+            within: Within::ThreeDays,
+        });
+        assert!(
+            text.starts_with("a reset on offer to work (Codex) expires ")
+                && text.ends_with("(in 2d)"),
+            "{text}"
+        );
+        assert_eq!(fix.as_deref(), Some("tokeman codex reset work"));
+        assert_eq!(
+            say(&Attention::BelowFloor {
+                service: Service::Claude
+            }),
+            ("Claude: every account is below its floor".to_owned(), None)
+        );
+        assert_eq!(
+            say(&Attention::BelowFloor {
+                service: Service::Kimi
+            })
+            .0,
+            "Kimi Code: no account has room"
+        );
+        let (text, fix) = say(&Attention::RunsDry {
+            service: Service::Claude,
+            at: NOW + 1_800,
+        });
+        assert_eq!(text, "Claude runs dry in 30m at the last 6 h rate");
+        assert_eq!(fix, None);
+        assert_eq!(
+            say(&Attention::DaemonStopped).1.as_deref(),
+            Some("tokeman rotate install")
+        );
+        assert_eq!(format_until(NOW, NOW), "now");
+        assert_eq!(format_until(NOW + 20, NOW), "in 1m");
+    }
+
+    #[test]
+    fn a_forecast_says_its_outlook_its_basis_and_what_resets_would_add() {
+        const NOW: i64 = 1_794_000_000;
+        let forecast = |outlook, with_resets| Forecast {
+            service: Service::Claude,
+            outlook,
+            burn_hours: 6,
+            rate: 0.041,
+            room: 2.12,
+            span: Span::Weekly,
+            accounts: 7,
+            measured: 7,
+            refills: 2,
+            with_resets,
+        };
+        let dry = forecast(
+            Outlook::Dry { at: NOW + 1_800 },
+            Some(Outlook::Dry { at: NOW + 3_000 }),
+        );
+        assert_eq!(
+            forecast_text(&dry, NOW),
+            "Claude runs dry in 30m at the last 6 h rate (212% of a weekly window left across \
+             7 accounts, used at 4.1%/h); with the 2 resets on offer, in 50m"
+        );
+        assert_eq!(forecast_brief(&dry, NOW), "Claude dry in 30m");
+        let carried = forecast(Outlook::Dry { at: NOW }, Some(Outlook::Beyond));
+        let text = forecast_text(&carried, NOW);
+        assert!(
+            text.starts_with("Claude is dry now (")
+                && text.ends_with("; with the 2 resets on offer, not within 7 days"),
+            "{text}"
+        );
+        assert_eq!(forecast_brief(&carried, NOW), "Claude dry now");
+        let beyond = Forecast {
+            measured: 3,
+            ..forecast(Outlook::Beyond, None)
+        };
+        assert_eq!(
+            forecast_text(&beyond, NOW),
+            "Claude lasts more than 7 days at the last 6 h rate (212% of a weekly window left \
+             across 7 accounts, used at 4.1%/h, measured on 3)"
+        );
+        assert_eq!(forecast_brief(&beyond, NOW), "Claude 7d+");
+        let idle = forecast(Outlook::Idle, None);
+        assert_eq!(
+            forecast_text(&idle, NOW),
+            "Claude was not used in the last 6 h: no forecast (212% of a weekly window left \
+             across 7 accounts)"
+        );
+        assert_eq!(forecast_brief(&idle, NOW), "Claude idle");
+    }
+
+    #[test]
+    fn the_reports_open_with_what_needs_attention_and_the_forecasts() {
+        use crate::account::Fleet;
+        use crate::ui::overview::Facts;
+        const NOW: i64 = 1_794_000_000;
+        let mut refused = crate::testing::login_account("first@example.com", NOW * 1000);
+        refused.login.as_mut().unwrap().error = Some("invalid_grant".into());
+        let fleet = Fleet {
+            accounts: vec![refused],
+            ..Fleet::default()
+        };
+        let recent: Vec<Reading> = (0..=6)
+            .map(|hour| {
+                let mut reading = crate::testing::reading("first@example.com", 0.0, 0.0);
+                reading.at = NOW - (6 - hour) * 3_600;
+                reading.set_weekly(Some(Window::new(
+                    0.10 + 0.001 * hour as f64,
+                    NOW + 6 * 86_400,
+                )));
+                reading
+            })
+            .collect();
+        let facts = Facts {
+            readings: vec![recent.last().unwrap().clone()],
+            recent,
+            ..Facts::default()
+        };
+        let lines = plain(headlines(&Overview::build(&fleet, facts, None, NOW)));
+        assert_eq!(lines[0], " needs attention");
+        assert_eq!(
+            lines[1],
+            "  ! the login of first@example.com was refused  `tokeman claude login first@example.com`"
+        );
+        assert!(
+            lines[2].starts_with(" forecast: Claude lasts more than 7 days at the last 6 h rate"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[3], "");
+        assert_eq!(lines.len(), 4);
+        // Nothing to say is no section at all.
+        let quiet = Overview::build(&Fleet::default(), Facts::default(), None, NOW);
+        assert!(headlines(&quiet).is_empty());
     }
 
     #[test]

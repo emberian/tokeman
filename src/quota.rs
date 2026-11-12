@@ -802,6 +802,11 @@ pub struct SpendLimit {
 pub struct ResetCreditCount {
     pub available: i64,
     pub applicable: Option<i64>,
+    /// Epoch seconds when the first available credit to expire does, from
+    /// the credit list (`codex::resets::with_expiry`); the usage body does
+    /// not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// What only Codex's usage endpoint says.

@@ -125,6 +125,15 @@ pub enum Command {
         #[arg(long, default_value = "680")]
         height: u32,
     },
+    /// What needs you now, as the background service notifies it
+    ///
+    /// Makes no request and writes nothing.
+    Notify {
+        /// Send one test notification now, to see it arrive and to grant
+        /// the permission it needs
+        #[arg(long)]
+        test: bool,
+    },
     /// Show or change the launch settings in tokens.toml
     Settings {
         #[command(subcommand)]

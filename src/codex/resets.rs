@@ -16,7 +16,7 @@ use super::auth::CodexHome;
 use super::probe::{self, State, epoch_of};
 use crate::account::CodexAccount;
 use crate::claims::{Conflict, Journal, Pending};
-use crate::quota::{ReadError, Reading, Service};
+use crate::quota::{Detail, ReadError, Reading, Service};
 
 /// Where a credit stands. Spellings the backend adds later are kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +82,24 @@ pub struct CreditList {
 impl CreditList {
     pub fn find(&self, id: &str) -> Option<&ResetCredit> {
         self.credits.iter().find(|credit| credit.id == id)
+    }
+
+    /// Epoch seconds when the first available credit to expire does.
+    pub fn next_expiry(&self) -> Option<i64> {
+        self.credits
+            .iter()
+            .filter(|credit| credit.status == CreditStatus::Available)
+            .filter_map(|credit| credit.expires_at)
+            .min()
+    }
+
+    /// Put [`Self::next_expiry`] beside the count in `probe`.
+    pub fn date(&self, probe: &mut Reading) {
+        if let Detail::Codex(codex) = &mut probe.detail
+            && let Some(count) = &mut codex.reset_credits
+        {
+            count.expires_at = self.next_expiry();
+        }
     }
 }
 
@@ -150,6 +168,31 @@ pub async fn list(client: &Client, account: &CodexAccount) -> Result<CreditList,
     )
     .await?;
     decode_credit_list(&body)
+}
+
+/// Read the credit list of every account whose probe counts reset credits
+/// and put the first expiry beside the count. A list that cannot be read
+/// leaves the count as the usage body gave it.
+pub async fn with_expiry(client: &Client, accounts: &[CodexAccount], probes: &mut [Reading]) {
+    let lists = futures::future::join_all(probes.iter().map(|probe| async {
+        let holds = probe
+            .codex()
+            .and_then(|codex| codex.reset_credits)
+            .is_some_and(|count| count.available > 0);
+        let account = accounts
+            .iter()
+            .find(|account| account.name == probe.account)?;
+        if !holds {
+            return None;
+        }
+        list(client, account).await.ok()
+    }))
+    .await;
+    for (probe, list) in probes.iter_mut().zip(lists) {
+        if let Some(list) = list {
+            list.date(probe);
+        }
+    }
 }
 
 /// The backend's answer to a claim.
@@ -694,6 +737,57 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![first_id.clone(), first_id]);
         assert_eq!(journal.pending(Service::Codex, "one").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_first_expiry_is_put_beside_the_count_only_where_credits_are_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = profile(dir.path(), "holder", "r1");
+        let none = profile(dir.path(), "none", "r2");
+        let mut empty = weekly_only_body(5.0);
+        empty["rate_limit_reset_credits"]["available_count"] = json!(0);
+        let mut list = credit_list_body();
+        // A redeemed credit's date is not an expiry of anything on offer,
+        // and of two available credits the earlier date counts.
+        list["credits"][1]["expires_at"] = json!("2026-11-12T00:00:00Z");
+        list["credits"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "c", "status": "available", "expires_at": "2026-11-20T00:00:00Z"}));
+        let backend = Backend::default()
+            .usage_answers(vec![
+                ok(weekly_only_body(5.0)),
+                ok(empty),
+                ok(weekly_only_body(5.0)),
+            ])
+            .credit_answers(vec![
+                (StatusCode::OK, list.to_string()),
+                (StatusCode::INTERNAL_SERVER_ERROR, "oops".into()),
+            ]);
+        let client = backend.client().await;
+        let accounts = [holder, none];
+        let mut probes = probe::probe_all(&client, &accounts).await;
+        let expiry = |probes: &[Reading], index: usize| {
+            probes[index]
+                .codex()
+                .and_then(|codex| codex.reset_credits)
+                .and_then(|count| count.expires_at)
+        };
+        with_expiry(&client, &accounts, &mut probes).await;
+        assert_eq!(backend.requests("/credits").len(), 1, "only the holder");
+        let nov_20 = DateTime::parse_from_rfc3339("2026-11-20T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(expiry(&probes, 0), Some(nov_20));
+        assert_eq!(expiry(&probes, 1), None);
+        // A list that cannot be read leaves the count as it was.
+        let mut again = probe::probe_all(&client, &accounts[..1]).await;
+        with_expiry(&client, &accounts, &mut again).await;
+        assert_eq!(expiry(&again, 0), None);
+        assert_eq!(
+            again[0].codex().unwrap().reset_credits.unwrap().available,
+            2
+        );
     }
 
     #[tokio::test]
