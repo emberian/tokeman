@@ -105,31 +105,28 @@ pub async fn report(fleet: &Fleet) -> Result<Report> {
         .iter()
         .filter(|reading| {
             reading
-                .buckets
-                .iter()
-                .any(|bucket| bucket.source == Source::Profile)
+                .models()
+                .any(|limit| limit.source == Source::Profile)
         })
         .count();
     let accounts = readings
         .iter()
         .map(|reading| AccountReport {
             name: reading.account.clone(),
-            remaining_session: reading.session.map(|w| w.remaining()),
-            remaining_weekly: reading.weekly.map(|w| w.remaining()),
-            session_limit: reading.session_limit,
+            remaining_session: reading.session_remaining(),
+            remaining_weekly: reading.weekly_remaining(),
+            session_limit: reading.session_limit(),
             buckets: reading
-                .buckets
-                .iter()
-                .map(|bucket| BucketReport {
-                    relevant: model
-                        .as_ref()
-                        .is_some_and(|model| model.is_limited_by(&bucket.key)),
-                    key: bucket.key.clone(),
-                    label: bucket.label.clone(),
-                    remaining: bucket.window.remaining(),
-                    room: bucket.room(reading.weekly.as_ref()),
-                    resets_at: bucket.window.resets_at,
-                    source: bucket.source,
+                .models()
+                .filter_map(|limit| Some((limit, limit.key()?)))
+                .map(|(limit, key)| BucketReport {
+                    relevant: model.as_ref().is_some_and(|model| model.is_limited_by(key)),
+                    key: key.clone(),
+                    label: limit.label.clone(),
+                    remaining: limit.window.remaining(),
+                    room: limit.room(reading.weekly().as_ref()),
+                    resets_at: limit.window.resets_at,
+                    source: limit.source,
                 })
                 .collect(),
             limits: limits

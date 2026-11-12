@@ -6,8 +6,8 @@ use crate::account::Account;
 use crate::claude::sessions;
 use crate::daemon::status::Report;
 use crate::providers::{Balance, Meter, Usage};
-use crate::quota::{Bucket, Level, Reading, SessionLimit, Verdict};
-use crate::store::{Snapshot, Stats};
+use crate::quota::{Level, Limit, Reading, SessionLimit, Verdict};
+use crate::store::{Series, Stats};
 
 const BAR_WIDTH: usize = 40;
 const BOLD: &str = "\x1b[1m";
@@ -148,14 +148,14 @@ pub fn bar(used: f64) -> String {
 
 /// A word for the reading's state and the level to colour it with.
 pub fn status_badge(reading: &Reading) -> (&'static str, Option<Level>) {
-    if reading.session.is_none() && reading.weekly.is_none() {
+    if reading.session().is_none() && reading.weekly().is_none() {
         return if reading.error.is_some() {
             ("error", Some(Level::Critical))
         } else {
             ("no quota", None)
         };
     }
-    match reading.verdict {
+    match reading.verdict() {
         Verdict::Allowed => ("allowed", Some(Level::Ok)),
         Verdict::AllowedWarning => ("warning", Some(Level::Low)),
         Verdict::Rejected => ("REJECTED", Some(Level::Critical)),
@@ -248,7 +248,7 @@ pub fn print_readings(readings: &[Reading], probe_model: &str) {
     println!("\n {BOLD}tokeman{RESET} — {ok}/{total} accounts probed with {probe_model}\n");
     for reading in readings {
         println!(" {BOLD}{}{RESET}", reading.account);
-        let reported = reading.session.is_some() || reading.weekly.is_some();
+        let reported = reading.session().is_some() || reading.weekly().is_some();
         match (&reading.error, reported) {
             (Some(error), false) => println!("   {RED}error: {error}{RESET}"),
             (_, true) => print_windows(reading),
@@ -262,18 +262,18 @@ pub fn print_readings(readings: &[Reading], probe_model: &str) {
 }
 
 fn print_windows(reading: &Reading) {
-    match reading.session {
+    match reading.session() {
         Some(w) => println!(
             "   Session (5h) {}  resets {}",
             bar(w.used),
             format_reset(w.resets_at)
         ),
-        None if reading.session_limit == SessionLimit::Absent => {
+        None if reading.session_limit() == SessionLimit::Absent => {
             println!("   Session (5h) {DIM}no 5h limit on this account{RESET}");
         }
         None => {}
     }
-    if let Some(w) = reading.weekly {
+    if let Some(w) = reading.weekly() {
         let warning = match w.remaining() {
             r if r < 0.10 => format!("  {RED}!! critical{RESET}"),
             r if r < 0.20 => format!("  {YELLOW}! low{RESET}"),
@@ -285,7 +285,8 @@ fn print_windows(reading: &Reading) {
             format_reset(w.resets_at)
         );
     }
-    if let Some(overage) = &reading.overage
+    let claude = reading.claude();
+    if let Some(overage) = claude.and_then(|claude| claude.overage.as_ref())
         && let Some(w) = overage.window
     {
         let label = match overage.disabled_reason.as_deref() {
@@ -301,13 +302,15 @@ fn print_windows(reading: &Reading) {
     }
     let (word, level) = status_badge(reading);
     let color = level.map_or(DIM, level_color);
-    let claim = reading
-        .claim
-        .as_deref()
+    let claim = claude
+        .and_then(|claude| claude.claim.as_deref())
         .map(|claim| claim_label(claim).map_or(claim, |(long, _)| long))
         .unwrap_or("--");
     println!("   Status: {color}{word}{RESET}  (limit: {claim})");
-    for line in signal_lines(&reading.signals) {
+    for line in claude
+        .map(|claude| signal_lines(&claude.signals))
+        .unwrap_or_default()
+    {
         println!("   {DIM}{line}{RESET}");
     }
 }
@@ -344,21 +347,24 @@ pub fn signal_lines(signals: &crate::quota::Signals) -> Vec<String> {
 }
 
 fn print_buckets(reading: &Reading) {
-    if reading.buckets.is_empty() {
-        let reason = match &reading.profile_error {
+    if reading.models().next().is_none() {
+        let reason = match reading
+            .claude()
+            .and_then(|claude| claude.profile_error.as_ref())
+        {
             Some(_) => "profile usage credential expired or unavailable",
             None => "no per-model limits reported",
         };
         println!("   Model   (7d) --  {DIM}{reason}{RESET}");
     }
-    for bucket in &reading.buckets {
+    for limit in reading.models() {
         println!(
             "   {:<12} {}  resets {}  {DIM}{}{}{RESET}",
-            format!("{} (7d)", bucket.label),
-            bar(bucket.window.used),
-            format_reset(bucket.window.resets_at),
-            bucket.source.label(),
-            share_note(bucket, reading),
+            format!("{} (7d)", limit.label),
+            bar(limit.window.used),
+            format_reset(limit.window.resets_at),
+            limit.source.label(),
+            share_note(limit, reading),
         );
     }
 }
@@ -596,12 +602,12 @@ pub fn print_usages(usages: &[Usage], seated: Option<&str>) {
 
 /// For a limit that is a share of the weekly: how much of the weekly it
 /// still allows.
-fn share_note(bucket: &Bucket, reading: &Reading) -> String {
-    match bucket.share {
+fn share_note(limit: &Limit, reading: &Reading) -> String {
+    match limit.share {
         Some(share) => format!(
             "; {:.0}% of the weekly, {:.0}% of the weekly left for it",
             share * 100.0,
-            bucket.room(reading.weekly.as_ref()).max(0.0) * 100.0
+            limit.room(reading.weekly().as_ref()).max(0.0) * 100.0
         ),
         None => String::new(),
     }
@@ -625,7 +631,7 @@ pub fn print_ranking(ranked: &[(&Usage, f64)], seated: Option<&str>) {
     }
 }
 
-pub fn print_history(snapshots: &[Snapshot]) {
+pub fn print_history(snapshots: &[Reading]) {
     if snapshots.is_empty() {
         println!("No snapshots recorded yet.");
         return;
@@ -637,13 +643,12 @@ pub fn print_history(snapshots: &[Snapshot]) {
         })
     };
     for s in snapshots {
-        let overage = s
-            .overage
+        let overage = Series::Overage
+            .window(s)
             .map(|w| format!("  ov: {:>5.1}%", w.remaining() * 100.0))
             .unwrap_or_default();
         let models: Vec<_> = s
-            .buckets
-            .iter()
+            .models()
             .map(|b| format!("{}:{:.1}%", b.label, b.window.remaining() * 100.0))
             .collect();
         let models = if models.is_empty() {
@@ -651,15 +656,17 @@ pub fn print_history(snapshots: &[Snapshot]) {
         } else {
             format!("  {}", models.join(" "))
         };
+        let at = DateTime::from_timestamp(s.at, 0).unwrap_or_default();
+        let claude = s.claude();
         println!(
             "  {} {BOLD}{:<16}{RESET}  5h: {:>6} left  7d: {:>6} left{overage}{models}  [{} {}]",
-            s.at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+            at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
             s.account,
-            left(s.session),
-            left(s.weekly),
-            s.status.as_deref().unwrap_or("--"),
-            s.claim
-                .as_deref()
+            left(s.session()),
+            left(s.weekly()),
+            claude.map_or("--", |claude| claude.verdict.as_str()),
+            claude
+                .and_then(|claude| claude.claim.as_deref())
                 .map(|c| claim_label(c).map_or(c, |(_, short)| short))
                 .unwrap_or("--"),
         );
@@ -921,15 +928,16 @@ mod tests {
     #[test]
     fn signals_are_described_but_quiet_when_absent() {
         let mut reading = crate::testing::reading("a", 0.1, 0.2);
-        assert!(signal_lines(&reading.signals).is_empty());
-        reading.signals.claims = vec!["seven_day".into(), "seven_day_overage_included".into()];
-        reading.signals.slow = Some(crate::quota::SlowLane {
+        assert!(signal_lines(&reading.claude().unwrap().signals).is_empty());
+        let signals = &mut reading.claude_mut().signals;
+        signals.claims = vec!["seven_day".into(), "seven_day_overage_included".into()];
+        signals.slow = Some(crate::quota::SlowLane {
             status: Some(crate::quota::SlowStatus::SlotBusy),
             budget: Some(crate::quota::Window::new(0.25, 0)),
             ..Default::default()
         });
-        reading.signals.upgrade_paths = vec!["overage".into()];
-        let lines = signal_lines(&reading.signals);
+        signals.upgrade_paths = vec!["overage".into()];
+        let lines = signal_lines(&reading.claude().unwrap().signals);
         assert_eq!(
             lines,
             [
@@ -944,10 +952,10 @@ mod tests {
     fn a_shared_limit_says_how_much_of_the_weekly_it_still_allows() {
         let mut reading = crate::testing::reading("a", 0.0, 0.4);
         let mut fable =
-            crate::testing::bucket("fable", "Fable", 0.5, crate::quota::Source::Profile);
+            crate::testing::model_limit("fable", "Fable", 0.5, crate::quota::Source::Profile);
         assert_eq!(share_note(&fable, &reading), "");
         fable.share = Some(0.5);
-        reading.buckets.push(fable.clone());
+        reading.limits.push(fable.clone());
         assert_eq!(
             share_note(&fable, &reading),
             "; 50% of the weekly, 25% of the weekly left for it"

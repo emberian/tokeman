@@ -106,7 +106,7 @@ fn level_color(level: Level) -> egui::Color32 {
 }
 
 fn weekly_remaining(reading: &Reading) -> f64 {
-    reading.weekly.map_or(0.0, |w| w.remaining())
+    reading.weekly_remaining().unwrap_or(0.0)
 }
 
 fn status_color(best: Option<&Reading>) -> [u8; 3] {
@@ -565,10 +565,10 @@ impl TrayApp {
             });
             ui.add_space(4.0);
 
-            if reading.session.is_some() || reading.weekly.is_some() {
-                if let Some(window) = reading.session {
+            if reading.session().is_some() || reading.weekly().is_some() {
+                if let Some(window) = reading.session() {
                     Self::draw_gauge(ui, "5h", window);
-                } else if reading.session_limit == crate::quota::SessionLimit::Absent {
+                } else if reading.session_limit() == crate::quota::SessionLimit::Absent {
                     ui.label(
                         egui::RichText::new("no 5h limit")
                             .monospace()
@@ -576,10 +576,10 @@ impl TrayApp {
                             .color(egui::Color32::from_gray(110)),
                     );
                 }
-                if let Some(window) = reading.weekly {
+                if let Some(window) = reading.weekly() {
                     Self::draw_gauge(ui, "7d", window);
                 }
-                if reading.buckets.is_empty() {
+                if reading.models().next().is_none() {
                     ui.label(
                         egui::RichText::new("per-model limits unavailable")
                             .monospace()
@@ -587,15 +587,15 @@ impl TrayApp {
                             .color(egui::Color32::from_gray(110)),
                     );
                 }
-                for bucket in &reading.buckets {
-                    let mut label = short_bucket_label(&bucket.label);
-                    if bucket.source == Source::Observed {
+                for limit in reading.models() {
+                    let mut label = short_bucket_label(&limit.label);
+                    if limit.source == Source::Observed {
                         label.push('!');
                     }
-                    let note = share_note(bucket, reading.weekly.as_ref());
-                    Self::draw_gauge_noted(ui, &label, 3, bucket.window, note.as_deref());
+                    let note = share_note(limit, reading.weekly().as_ref());
+                    Self::draw_gauge_noted(ui, &label, 3, limit.window, note.as_deref());
                 }
-                if let Some(window) = reading.overage.as_ref().and_then(|o| o.window) {
+                if let Some(window) = crate::store::Series::Overage.window(reading) {
                     Self::draw_gauge(ui, "$$", window);
                 }
             } else if let Some(error) = &reading.error {
@@ -605,7 +605,11 @@ impl TrayApp {
                         .size(11.0),
                 );
             }
-            for line in crate::ui::text::signal_lines(&reading.signals) {
+            for line in reading
+                .claude()
+                .map(|claude| crate::ui::text::signal_lines(&claude.signals))
+                .unwrap_or_default()
+            {
                 Self::caption(ui, line, DIM);
             }
             if let Some(view) = view
@@ -741,12 +745,12 @@ fn gauge_caption(window: Window, note: Option<&str>) -> String {
 
 /// For a limit that is a share of the weekly: how much of the weekly it
 /// still allows.
-fn share_note(bucket: &crate::quota::Bucket, weekly: Option<&Window>) -> Option<String> {
-    bucket.share.map(|share| {
+fn share_note(limit: &crate::quota::Limit, weekly: Option<&Window>) -> Option<String> {
+    limit.share.map(|share| {
         format!(
             "{:.0}% of the weekly, {:.0}% of the weekly left for it",
             share * 100.0,
-            bucket.room(weekly).max(0.0) * 100.0
+            limit.room(weekly).max(0.0) * 100.0
         )
     })
 }
@@ -966,7 +970,7 @@ mod tests {
     #[test]
     fn a_shared_limit_is_noted_in_weekly_terms_and_an_idle_window_has_no_reset() {
         let weekly = Window::new(0.4, 0);
-        let mut fable = crate::testing::bucket("fable", "Fable", 0.5, Source::Profile);
+        let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
         assert_eq!(share_note(&fable, Some(&weekly)), None);
         fable.share = Some(0.5);
         let note = share_note(&fable, Some(&weekly)).unwrap();
@@ -983,7 +987,7 @@ mod tests {
         assert_eq!(status_color(None), GRAY);
         let mut reading = crate::testing::reading("a", 0.0, 0.1);
         assert_eq!(status_color(Some(&reading)), level_rgb(Level::Ok));
-        reading.weekly = Some(Window::new(0.9, 0));
+        reading.set_weekly(Some(Window::new(0.9, 0)));
         assert_eq!(status_color(Some(&reading)), level_rgb(Level::Critical));
     }
 }

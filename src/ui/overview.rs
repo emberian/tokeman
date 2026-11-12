@@ -11,9 +11,9 @@ use crate::anthropic::resets;
 use crate::claude::settings as claude_settings;
 use crate::codex::probe::{Probe, ResetCreditCount, SpanWindow};
 use crate::daemon::{lock, service};
-use crate::providers::{Service, ServiceAccount, Usage};
-use crate::quota::{Bucket, SessionLimit, Source, Window};
-use crate::store::{Snapshot, Store};
+use crate::providers::{ServiceAccount, Usage};
+use crate::quota::{Limit, Reading, Service, SessionLimit, Source, Window};
+use crate::store::{Series, Store};
 use crate::ui::text;
 
 /// Whether anything is keeping the stored reads fresh.
@@ -143,7 +143,8 @@ pub struct ServiceView {
 /// What the stores hold, gathered before the view is built.
 #[derive(Debug, Clone, Default)]
 pub struct Stored {
-    pub snapshots: Vec<Snapshot>,
+    /// The newest Claude reading of each account.
+    pub snapshots: Vec<Reading>,
     pub codex: Vec<Probe>,
     pub usages: Vec<Usage>,
     /// Per account: when its reset offers were read, and the usable ones.
@@ -162,8 +163,11 @@ impl Stored {
         Self {
             snapshots: store
                 .as_ref()
-                .and_then(|store| store.latest_snapshots().ok())
-                .unwrap_or_default(),
+                .and_then(|store| store.latest().ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|reading| reading.service == Service::Claude)
+                .collect(),
             codex: store
                 .as_ref()
                 .and_then(|store| store.latest_codex().ok())
@@ -284,7 +288,7 @@ impl Overview {
 
 fn claude_view(
     account: &Account,
-    snapshot: Option<&Snapshot>,
+    snapshot: Option<&Reading>,
     is_default: bool,
     now_ms: i64,
 ) -> ClaudeView {
@@ -299,20 +303,28 @@ fn claude_view(
         login_ends_at: login
             .and_then(|login| login.refresh_expires_at)
             .map(|at| at / 1000),
-        reading: snapshot.map(|snapshot| ClaudeReading {
-            at: snapshot.at.timestamp(),
-            status: snapshot.status.clone(),
-            error: snapshot.error.as_deref().map(brief_error),
-            session: snapshot.session,
-            session_limit: snapshot.session_limit,
-            weekly: snapshot.weekly,
-            overage: snapshot.overage,
-            buckets: snapshot
-                .buckets
-                .iter()
-                .map(|bucket| bucket_view(bucket, snapshot.weekly.as_ref()))
-                .collect(),
-            notes: text::signal_lines(&snapshot.signals),
+        reading: snapshot.map(|snapshot| {
+            let claude = snapshot.claude();
+            let weekly = snapshot.weekly();
+            ClaudeReading {
+                at: snapshot.at,
+                status: claude.map(|claude| claude.verdict.as_str().to_owned()),
+                error: snapshot
+                    .error
+                    .as_ref()
+                    .map(|error| brief_error(&error.to_string())),
+                session: snapshot.session(),
+                session_limit: snapshot.session_limit(),
+                weekly,
+                overage: Series::Overage.window(snapshot),
+                buckets: snapshot
+                    .models()
+                    .map(|limit| bucket_view(limit, weekly.as_ref()))
+                    .collect(),
+                notes: claude
+                    .map(|claude| text::signal_lines(&claude.signals))
+                    .unwrap_or_default(),
+            }
         }),
     }
 }
@@ -328,7 +340,7 @@ fn brief_error(error: &str) -> String {
     message.unwrap_or_else(|| text::one_line(error, 200))
 }
 
-pub fn bucket_view(bucket: &Bucket, weekly: Option<&Window>) -> BucketView {
+pub fn bucket_view(bucket: &Limit, weekly: Option<&Window>) -> BucketView {
     BucketView {
         label: bucket.label.clone(),
         short: text::short_bucket_label(&bucket.label),
@@ -398,28 +410,19 @@ mod tests {
     use super::*;
     use crate::codex::probe::{RateLimit, Span, Usage as CodexUsage};
     use crate::providers::Meter;
-    use crate::quota::Signals;
+    use crate::quota::Service;
     use crate::testing::{codex_account, login_account, setup_account};
 
     const NOW: i64 = 1_794_000_000;
     const DAY_MS: i64 = 86_400_000;
 
-    fn snapshot(account: &str, weekly: f64) -> Snapshot {
-        Snapshot {
-            account: account.into(),
-            at: chrono::DateTime::from_timestamp(NOW - 60, 0).unwrap(),
-            status: Some("allowed".into()),
-            claim: None,
-            session: None,
-            weekly: Some(Window::new(weekly, NOW + 3600)),
-            overage_status: None,
-            overage: None,
-            error: None,
-            profile_error: None,
-            buckets: Vec::new(),
-            session_limit: SessionLimit::Unknown,
-            signals: Signals::default(),
-        }
+    fn snapshot(account: &str, weekly: f64) -> Reading {
+        let mut reading = crate::testing::reading(account, 0.0, 0.0);
+        reading.at = NOW - 60;
+        reading.set_session(None);
+        reading.set_weekly(Some(Window::new(weekly, NOW + 3600)));
+        reading.claude_mut().session_limit = SessionLimit::Unknown;
+        reading
     }
 
     fn fleet() -> Fleet {
@@ -441,10 +444,10 @@ mod tests {
     #[test]
     fn an_account_without_a_5h_limit_differs_from_one_that_did_not_say() {
         let mut absent = snapshot("ultra", 0.4);
-        absent.session_limit = SessionLimit::Absent;
-        let mut fable = crate::testing::bucket("fable", "Fable", 0.5, Source::Profile);
+        absent.claude_mut().session_limit = SessionLimit::Absent;
+        let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
         fable.share = Some(0.5);
-        absent.buckets.push(fable);
+        absent.limits.push(fable);
         let stored = Stored {
             snapshots: vec![absent, snapshot("plain", 0.9)],
             default_account: Some("ultra".into()),

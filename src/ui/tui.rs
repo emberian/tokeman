@@ -27,8 +27,8 @@ use crate::daemon;
 use crate::observe;
 use crate::policy::{self, Mode};
 use crate::providers::{self, Usage};
-use crate::quota::{Level, ModelKey, Reading, Source, Window};
-use crate::store::{Series, Snapshot, Store};
+use crate::quota::{Level, ModelKey, Reading, Service, Source, Window};
+use crate::store::{Series, Store};
 use crate::ui::chart::{Point, format_duration_hours, known_buckets, points, segments};
 use crate::ui::text::{
     claim_label, format_age, format_reset_compact, short_bucket_label, status_badge,
@@ -114,7 +114,7 @@ struct App {
     chart_window: ChartWindow,
     /// Index into `RANGE_DAYS`.
     chart_range: usize,
-    history: BTreeMap<String, Vec<Snapshot>>,
+    history: BTreeMap<String, Vec<Reading>>,
     refresh_interval: Duration,
     default_account: Option<String>,
     /// The model Claude starts on, as settings.json spells it.
@@ -190,7 +190,10 @@ impl App {
         let since = Utc::now() - chrono::Duration::days(self.range_days());
         self.history.clear();
         for account in &self.fleet.accounts {
-            if let Ok(snapshots) = self.store.for_account_since(&account.name, since) {
+            if let Ok(snapshots) =
+                self.store
+                    .since(Service::Claude, Some(&account.name), since.timestamp())
+            {
                 self.history.insert(account.name.clone(), snapshots);
             }
         }
@@ -253,10 +256,12 @@ impl App {
 
     fn available_chart_windows(&self) -> Vec<ChartWindow> {
         let mut buckets = BTreeMap::<ModelKey, String>::new();
-        for bucket in self.readings.iter().flat_map(|r| r.buckets.iter()) {
-            buckets
-                .entry(bucket.key.clone())
-                .or_insert_with(|| bucket.label.clone());
+        for limit in self.readings.iter().flat_map(Reading::models) {
+            if let Some(key) = limit.key() {
+                buckets
+                    .entry(key.clone())
+                    .or_insert_with(|| limit.label.clone());
+            }
         }
         for snapshots in self.history.values() {
             for (key, label) in known_buckets(snapshots) {
@@ -501,9 +506,9 @@ fn draw(f: &mut Frame, app: &App) {
 /// The shared windows a card shows, with their gauge labels.
 fn shared_windows(reading: &Reading) -> Vec<(&'static str, Window)> {
     [
-        ("5h", reading.session),
-        ("7d", reading.weekly),
-        ("$$", reading.overage.as_ref().and_then(|o| o.window)),
+        ("5h", reading.session()),
+        ("7d", reading.weekly()),
+        ("$$", Series::Overage.window(reading)),
     ]
     .into_iter()
     .filter_map(|(label, window)| Some((label, window?)))
@@ -514,7 +519,7 @@ fn shared_windows(reading: &Reading) -> Vec<(&'static str, Window)> {
 /// optional sparkline, spacer.
 fn card_rows(reading: &Reading, show_spark: bool) -> u16 {
     let quota_rows = shared_windows(reading).len().max(1) as u16;
-    2 + quota_rows + reading.buckets.len().max(1) as u16 + u16::from(show_spark)
+    2 + quota_rows + reading.models().count().max(1) as u16 + u16::from(show_spark)
 }
 
 /// Which cards fit, keeping the selected one visible when the fleet is
@@ -582,7 +587,7 @@ fn draw_card(
     row_count: u16,
     selected: bool,
     is_default: bool,
-    spark_history: Option<&Vec<Snapshot>>,
+    spark_history: Option<&Vec<Reading>>,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -598,11 +603,11 @@ fn draw_card(
     let (status, level) = status_badge(reading);
     let status_color = level.map_or(Color::DarkGray, level_color);
     let claim = reading
-        .claim
-        .as_deref()
+        .claude()
+        .and_then(|claude| claude.claim.as_deref())
         .and_then(claim_label)
         .map_or(String::new(), |(_, short)| format!(" {short}"));
-    let claim = if reading.session_limit == crate::quota::SessionLimit::Absent {
+    let claim = if reading.session_limit() == crate::quota::SessionLimit::Absent {
         format!("{claim} · no 5h limit")
     } else {
         claim
@@ -646,8 +651,11 @@ fn draw_card(
         f.render_widget(Paragraph::new(line), rows[row]);
         row += 1;
     }
-    if reading.buckets.is_empty() {
-        let reason = if reading.profile_error.is_some() {
+    if reading.models().next().is_none() {
+        let reason = if reading
+            .claude()
+            .is_some_and(|claude| claude.profile_error.is_some())
+        {
             "profile credential expired/unavailable"
         } else {
             "profile usage not captured"
@@ -659,9 +667,9 @@ fn draw_card(
         f.render_widget(Paragraph::new(line), rows[row]);
         row += 1;
     } else {
-        for bucket in &reading.buckets {
-            let label = compact_bucket_label(&bucket.label, bucket.source == Source::Observed);
-            f.render_widget(Paragraph::new(gauge_line(&label, bucket.window)), rows[row]);
+        for limit in reading.models() {
+            let label = compact_bucket_label(&limit.label, limit.source == Source::Observed);
+            f.render_widget(Paragraph::new(gauge_line(&label, limit.window)), rows[row]);
             row += 1;
         }
     }
@@ -669,7 +677,7 @@ fn draw_card(
     if let Some(snapshots) = spark_history {
         let spark_data: Vec<u64> = snapshots
             .iter()
-            .filter_map(|s| s.weekly)
+            .filter_map(Reading::weekly)
             .map(|w| (w.remaining() * 100.0).round().clamp(0.0, 100.0) as u64)
             .collect();
         if !spark_data.is_empty() {
@@ -921,8 +929,8 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::ProbeError;
-    use crate::testing::{bucket, point};
+    use crate::quota::ReadError;
+    use crate::testing::{model_limit, point};
 
     #[test]
     fn each_service_account_gets_a_line_read_or_not() {
@@ -975,8 +983,8 @@ mod tests {
 
     fn reading() -> Reading {
         let mut r = crate::testing::reading("a", 0.2, 0.4);
-        r.buckets
-            .push(bucket("fable", "Fable", 0.1, Source::Observed));
+        r.limits
+            .push(model_limit("fable", "Fable", 0.1, Source::Observed));
         r
     }
 
@@ -984,7 +992,7 @@ mod tests {
     fn card_rows_count_every_line() {
         assert_eq!(card_rows(&reading(), false), 2 + 2 + 1);
         assert_eq!(card_rows(&reading(), true), 2 + 2 + 1 + 1);
-        let failed = Reading::failed("a", 0, ProbeError::NoCredential);
+        let failed = Reading::failed(Service::Claude, "a", 0, ReadError::NoCredential);
         assert_eq!(card_rows(&failed, false), 2 + 1 + 1);
     }
 

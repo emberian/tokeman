@@ -14,9 +14,9 @@ use crate::account::Fleet;
 use crate::anthropic::probe::PROBE_MODEL_LABEL;
 use crate::paths;
 use crate::policy::Mode;
-use crate::quota::{Family, ModelKey};
+use crate::quota::{Family, ModelKey, Reading, Service};
 use crate::settings::PolicySettings;
-use crate::store::{Series, Snapshot, Store};
+use crate::store::{Series, Store};
 
 const COLORS: [[u8; 4]; 10] = [
     [91, 192, 235, 255],
@@ -95,7 +95,7 @@ impl Metric {
         }
     }
 
-    fn title(&self, snapshots: &[Snapshot]) -> String {
+    fn title(&self, snapshots: &[Reading]) -> String {
         match self {
             Self::Session => "5-HOUR CAPACITY REMAINING".into(),
             Self::Weekly => "7-DAY CAPACITY REMAINING".into(),
@@ -135,13 +135,13 @@ pub struct Point {
 
 /// The points of `series` in `snapshots`, in their order, skipping readings
 /// without the window or with a non-finite value.
-pub fn points(snapshots: &[Snapshot], series: Series) -> Vec<Point> {
+pub fn points(snapshots: &[Reading], series: Series) -> Vec<Point> {
     snapshots
         .iter()
         .filter_map(|snapshot| {
-            let window = snapshot.window(series)?;
+            let window = series.window(snapshot)?;
             window.used.is_finite().then(|| Point {
-                at: snapshot.at.timestamp(),
+                at: snapshot.at,
                 remaining: window.remaining().clamp(0.0, 1.0),
                 resets_at: (window.resets_at != 0).then_some(window.resets_at),
             })
@@ -174,12 +174,14 @@ pub fn segments(points: &[Point], gap_secs: i64) -> Vec<Vec<Point>> {
 }
 
 /// Every model bucket with history, key to label (the latest label wins).
-pub fn known_buckets(snapshots: &[Snapshot]) -> BTreeMap<ModelKey, String> {
+pub fn known_buckets(snapshots: &[Reading]) -> BTreeMap<ModelKey, String> {
     let mut known = BTreeMap::new();
-    for bucket in snapshots.iter().rev().flat_map(|s| s.buckets.iter()) {
-        known
-            .entry(bucket.key.clone())
-            .or_insert_with(|| bucket.label.clone());
+    for limit in snapshots.iter().rev().flat_map(Reading::models) {
+        if let Some(key) = limit.key() {
+            known
+                .entry(key.clone())
+                .or_insert_with(|| limit.label.clone());
+        }
     }
     known
 }
@@ -209,7 +211,7 @@ pub fn run(request: &Request) -> Result<()> {
     let policy = Fleet::load()?.policy;
 
     let cutoff = Utc::now() - Duration::milliseconds((request.hours * 3_600_000.0).round() as i64);
-    let snapshots = Store::open()?.all_since(cutoff)?;
+    let snapshots = Store::open()?.since(Service::Claude, None, cutoff.timestamp())?;
     let png = render_png(
         &policy,
         &snapshots,
@@ -253,13 +255,13 @@ fn print_iterm_image(png: &[u8]) {
 
 fn render_png(
     policy: &PolicySettings,
-    snapshots: &[Snapshot],
+    snapshots: &[Reading],
     metric: &Metric,
     hours: f64,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
-    let mut by_account: BTreeMap<&str, Vec<Snapshot>> = BTreeMap::new();
+    let mut by_account: BTreeMap<&str, Vec<Reading>> = BTreeMap::new();
     for snapshot in snapshots {
         by_account
             .entry(snapshot.account.as_str())

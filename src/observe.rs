@@ -26,7 +26,7 @@ use crate::claude::settings::{self, ACCOUNT as ACCOUNT_ENV};
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::history;
 use crate::paths;
-use crate::quota::{self, Bucket, ModelKey, Reading, Source, Verdict, Window};
+use crate::quota::{self, Limit, ModelKey, Reading, Scope, Source, Span, Verdict, Window};
 
 /// Declares whether a session spends this machine's Anthropic subscription,
 /// overriding the base-URL check: 1 for a session reaching Anthropic through
@@ -220,9 +220,9 @@ struct SessionBinding {
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct AdmissionState {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::fs::lenient_map")]
     sessions: BTreeMap<String, SessionBinding>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::fs::lenient_vec")]
     limits: Vec<ObservedLimit>,
 }
 
@@ -664,12 +664,10 @@ fn apply_limit(reading: &mut Reading, limit: &ObservedLimit) {
         (LimitWindow::Weekly, _, Some(model)) => reject_bucket(reading, model.clone(), full),
         (LimitWindow::Weekly, Family::General, None) => {
             if reading.error.is_none() {
-                reading.weekly = Some(full);
-                reading.verdict = Verdict::Rejected;
-                reading.claim = Some("seven_day".into());
+                reject_shared(reading, Span::Weekly, full, "seven_day");
             }
         }
-        // The same bucket the `7d_oi` header and the profile report under.
+        // The same limit the `7d_oi` header and the profile report under.
         (LimitWindow::Weekly, family, None) => {
             if let Some(family) = family.metered() {
                 reject_bucket(reading, ModelKey::family_wide(family), full);
@@ -677,25 +675,24 @@ fn apply_limit(reading: &mut Reading, limit: &ObservedLimit) {
         }
         (LimitWindow::Session, _, _) => {
             if reading.error.is_none() {
-                reading.session = Some(full);
-                reading.verdict = Verdict::Rejected;
-                reading.claim = Some("five_hour".into());
+                reject_shared(reading, Span::FiveHour, full, "five_hour");
             }
         }
     }
 }
 
+fn reject_shared(reading: &mut Reading, span: Span, window: Window, claim: &str) {
+    reading.set_window(span, Scope::All, window, Source::Observed);
+    let claude = reading.claude_mut();
+    claude.verdict = Verdict::Rejected;
+    claude.claim = Some(claim.into());
+}
+
 fn reject_bucket(reading: &mut Reading, key: ModelKey, window: Window) {
     let label = reading
-        .bucket(&key)
-        .map_or_else(|| model_label(&key), |bucket| bucket.label.clone());
-    reading.set_bucket(Bucket {
-        key,
-        label,
-        window,
-        source: Source::Observed,
-        share: None,
-    });
+        .model_limit(&key)
+        .map_or_else(|| model_label(&key), |limit| limit.label.clone());
+    reading.set_limit(Limit::model(key, &label, window, Source::Observed));
 }
 
 // Quarantine.
@@ -859,12 +856,16 @@ fn format_reset(reset: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bucket;
+    use crate::testing::model_limit;
     use serde_json::json;
     use std::io::Write;
 
     fn reading(name: &str) -> Reading {
         crate::testing::reading(name, 0.1, 0.2)
+    }
+
+    fn models(reading: &Reading) -> Vec<&Limit> {
+        reading.models().collect()
     }
 
     fn binding(last_model: Option<&str>) -> SessionBinding {
@@ -972,9 +973,9 @@ mod tests {
     fn observed_opus_limit_stays_separate_from_general_weekly() {
         let mut result = reading("ember");
         apply_limit(&mut result, &limit(Family::Opus, None, LimitWindow::Weekly));
-        assert_eq!(result.weekly.map(|window| window.used), Some(0.2));
-        assert_eq!(result.verdict, Verdict::Allowed);
-        let bucket = result.bucket(&ModelKey::new("opus")).unwrap();
+        assert_eq!(result.weekly().map(|window| window.used), Some(0.2));
+        assert_eq!(result.verdict(), Verdict::Allowed);
+        let bucket = result.model_limit(&ModelKey::new("opus")).unwrap();
         assert_eq!(bucket.window.used, 1.0);
         assert_eq!(bucket.window.resets_at, 2);
         assert_eq!(bucket.source, Source::Observed);
@@ -988,28 +989,37 @@ mod tests {
             &mut result,
             &limit(Family::General, None, LimitWindow::Weekly),
         );
-        assert_eq!(result.verdict, Verdict::Rejected);
-        assert_eq!(result.claim.as_deref(), Some("seven_day"));
-        assert_eq!(result.weekly, Some(Window::new(1.0, 2)));
-        assert_eq!(result.session.map(|window| window.used), Some(0.1));
+        assert_eq!(result.verdict(), Verdict::Rejected);
+        assert_eq!(result.claude().unwrap().claim.as_deref(), Some("seven_day"));
+        assert_eq!(result.weekly(), Some(Window::new(1.0, 2)));
+        assert_eq!(
+            result.limit(Span::Weekly, &Scope::All).unwrap().source,
+            Source::Observed
+        );
+        assert_eq!(result.session().map(|window| window.used), Some(0.1));
 
         let mut result = reading("ember");
         apply_limit(
             &mut result,
             &limit(Family::Opus, Some("claude-opus-5"), LimitWindow::Session),
         );
-        assert_eq!(result.verdict, Verdict::Rejected);
-        assert_eq!(result.claim.as_deref(), Some("five_hour"));
-        assert_eq!(result.session, Some(Window::new(1.0, 2)));
-        assert!(result.buckets.is_empty());
+        assert_eq!(result.verdict(), Verdict::Rejected);
+        assert_eq!(result.claude().unwrap().claim.as_deref(), Some("five_hour"));
+        assert_eq!(result.session(), Some(Window::new(1.0, 2)));
+        assert!(models(&result).is_empty());
 
-        let mut failed = Reading::failed("ember", 0, quota::ProbeError::NoCredential);
+        let mut failed = Reading::failed(
+            quota::Service::Claude,
+            "ember",
+            0,
+            quota::ReadError::NoCredential,
+        );
         apply_limit(
             &mut failed,
             &limit(Family::General, None, LimitWindow::Session),
         );
-        assert_eq!(failed.session, None);
-        assert_eq!(failed.verdict, Verdict::Unknown);
+        assert_eq!(failed.session(), None);
+        assert_eq!(failed.verdict(), Verdict::Unknown);
     }
 
     #[test]
@@ -1049,13 +1059,13 @@ mod tests {
             &mut result,
             &limit(Family::Opus, Some("claude-opus-4-8"), LimitWindow::Weekly),
         );
-        assert!(result.bucket(&ModelKey::new("opus")).is_none());
-        assert_eq!(result.buckets.len(), 1);
-        assert_eq!(result.buckets[0].key.as_str(), "opus48");
-        assert_eq!(result.buckets[0].label, "Opus 4.8");
-        assert_eq!(result.buckets[0].window.used, 1.0);
-        assert_eq!(result.buckets[0].source, Source::Observed);
-        assert_eq!(result.weekly.map(|window| window.used), Some(0.2));
+        assert!(result.model_limit(&ModelKey::new("opus")).is_none());
+        assert_eq!(models(&result).len(), 1);
+        assert_eq!(models(&result)[0].key().unwrap().as_str(), "opus48");
+        assert_eq!(models(&result)[0].label, "Opus 4.8");
+        assert_eq!(models(&result)[0].window.used, 1.0);
+        assert_eq!(models(&result)[0].source, Source::Observed);
+        assert_eq!(result.weekly().map(|window| window.used), Some(0.2));
     }
 
     #[test]
@@ -1067,31 +1077,31 @@ mod tests {
 
         let mut result = reading("ember");
         apply_limit(&mut result, &limit);
-        assert_eq!(result.verdict, Verdict::Allowed);
-        assert_eq!(result.weekly.map(|window| window.used), Some(0.2));
-        assert_eq!(result.buckets.len(), 1);
-        assert_eq!(result.buckets[0].key.as_str(), "fable51");
-        assert_eq!(result.buckets[0].label, "Fable 5.1");
-        assert_eq!(result.buckets[0].window.used, 1.0);
-        assert_eq!(result.buckets[0].source, Source::Observed);
+        assert_eq!(result.verdict(), Verdict::Allowed);
+        assert_eq!(result.weekly().map(|window| window.used), Some(0.2));
+        assert_eq!(models(&result).len(), 1);
+        assert_eq!(models(&result)[0].key().unwrap().as_str(), "fable51");
+        assert_eq!(models(&result)[0].label, "Fable 5.1");
+        assert_eq!(models(&result)[0].window.used, 1.0);
+        assert_eq!(models(&result)[0].source, Source::Observed);
     }
 
     #[test]
     fn a_family_wide_fable_limit_lands_on_the_shared_fable_bucket() {
         let mut result = reading("ember");
         result
-            .buckets
-            .push(bucket("fable", "Fable", 0.4, Source::Headers));
+            .limits
+            .push(model_limit("fable", "Fable", 0.4, Source::Headers));
         apply_limit(
             &mut result,
             &limit(Family::Fable, None, LimitWindow::Weekly),
         );
-        assert_eq!(result.buckets.len(), 1);
-        assert_eq!(result.buckets[0].key.as_str(), "fable");
-        assert_eq!(result.buckets[0].label, "Fable");
-        assert_eq!(result.buckets[0].window, Window::new(1.0, 2));
-        assert_eq!(result.buckets[0].source, Source::Observed);
-        assert_eq!(result.weekly.map(|window| window.used), Some(0.2));
+        assert_eq!(models(&result).len(), 1);
+        assert_eq!(models(&result)[0].key().unwrap().as_str(), "fable");
+        assert_eq!(models(&result)[0].label, "Fable");
+        assert_eq!(models(&result)[0].window, Window::new(1.0, 2));
+        assert_eq!(models(&result)[0].source, Source::Observed);
+        assert_eq!(result.weekly().map(|window| window.used), Some(0.2));
         assert_eq!(Family::of("claude-fable-5-1"), Family::Fable);
         assert_eq!(Family::of("claude-haiku-4-5"), Family::General);
         assert_eq!(

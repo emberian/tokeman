@@ -4,6 +4,7 @@ use clap::Parser;
 use tokeman::account::Fleet;
 use tokeman::cli::{Cli, Command, ResetAction, RotateAction, SettingsAction};
 use tokeman::daemon::{self, cycle};
+use tokeman::quota::Service;
 use tokeman::store::{Stats, Store};
 use tokeman::ui::text;
 
@@ -141,23 +142,16 @@ async fn dispatch(command: Command) -> Result<()> {
             since,
             json,
         } => {
-            let read = |store: &Store| match since {
-                Some(hours) => {
-                    let cutoff = chrono::Utc::now()
-                        - chrono::Duration::milliseconds((hours * 3_600_000.0) as i64);
-                    match account.as_deref() {
-                        Some(name) => store.for_account_since(name, cutoff),
-                        None => store.all_since(cutoff),
+            // Reading history writes nothing; no history yet reads as empty.
+            let snapshots = match Store::open_read_only() {
+                Ok(store) => match since {
+                    Some(hours) => {
+                        let cutoff = chrono::Utc::now().timestamp() - (hours * 3_600.0) as i64;
+                        store.since(Service::Claude, account.as_deref(), cutoff)?
                     }
-                }
-                None => store.recent(account.as_deref(), last),
-            };
-            // Reading history writes nothing. Only a database from an older
-            // tokeman, which lacks columns this one selects, is opened for
-            // writing so that it is migrated.
-            let snapshots = match Store::open_read_only().and_then(|store| read(&store)) {
-                Ok(snapshots) => snapshots,
-                Err(_) => read(&Store::open()?)?,
+                    None => store.recent(Service::Claude, account.as_deref(), last)?,
+                },
+                Err(_) => Vec::new(),
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshots)?);
@@ -171,8 +165,10 @@ async fn dispatch(command: Command) -> Result<()> {
                 .accounts
                 .iter()
                 .filter_map(|account| {
-                    let since = chrono::Utc::now() - chrono::Duration::days(7);
-                    let snapshots = store.for_account_since(&account.name, since).ok()?;
+                    let since = chrono::Utc::now().timestamp() - 7 * 86_400;
+                    let snapshots = store
+                        .since(Service::Claude, Some(&account.name), since)
+                        .ok()?;
                     Some(Stats::compute(&account.name, &snapshots))
                 })
                 .collect();

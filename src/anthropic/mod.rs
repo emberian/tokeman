@@ -16,7 +16,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 
 use crate::account::Credential;
-use crate::quota::ProbeError;
+use crate::quota::ReadError;
 
 pub const API: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -181,8 +181,8 @@ impl Client {
 }
 
 /// A request that never completed, with its cause chain in one line.
-pub fn network_error(error: &reqwest::Error) -> ProbeError {
-    ProbeError::Network {
+pub fn network_error(error: &reqwest::Error) -> ReadError {
+    ReadError::Network {
         message: describe(error),
     }
 }
@@ -201,10 +201,10 @@ pub fn describe(error: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
-/// A non-success answer. The body is kept whole: [`ProbeError::reason`]
+/// A non-success answer. The body is kept whole: [`ReadError::reason`]
 /// reads the cause out of it.
-pub fn http_error(status: reqwest::StatusCode, body: String) -> ProbeError {
-    ProbeError::Http {
+pub fn http_error(status: reqwest::StatusCode, body: String) -> ReadError {
+    ReadError::Http {
         status: status.as_u16(),
         body,
     }

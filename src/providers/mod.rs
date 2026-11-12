@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 use crate::quota::Window;
+pub use crate::quota::{Amount, Balance, Service};
 
 /// Every request a service read makes is bounded by this.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -45,6 +46,15 @@ pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) 
         Service::Zai => zai::read(client, account, now).await,
         Service::Kimi => kimi::read(client, account, now).await,
         Service::Antigravity => antigravity::read(client, account, now).await,
+        Service::Claude | Service::Codex => Usage::failed(
+            account.service,
+            &account.name,
+            now,
+            format!(
+                "{} accounts are not [[services]] entries",
+                account.service.label()
+            ),
+        ),
     }
 }
 
@@ -69,47 +79,6 @@ pub async fn read_all(
         }
     }))
     .await
-}
-
-/// A subscription service tokeman can read quota from.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    clap::ValueEnum,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Service {
-    Antigravity,
-    Zai,
-    Kimi,
-}
-
-impl Service {
-    pub const ALL: [Service; 3] = [Service::Antigravity, Service::Zai, Service::Kimi];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Antigravity => "antigravity",
-            Self::Zai => "zai",
-            Self::Kimi => "kimi",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Antigravity => "Antigravity",
-            Self::Zai => "GLM (z.ai)",
-            Self::Kimi => "Kimi Code",
-        }
-    }
 }
 
 /// How a service account authenticates. One `[[services]]` table in
@@ -211,25 +180,6 @@ pub struct Meter {
     /// Absolute amounts when the service reports them (credits, requests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<Amount>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Amount {
-    pub used: f64,
-    pub limit: f64,
-    /// "credits", "requests", "tokens", ...
-    pub unit: String,
-}
-
-/// A money balance beside the limits (Kimi's booster wallet).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Balance {
-    pub label: String,
-    /// Minor units (cents).
-    pub left_minor: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_minor: Option<i64>,
-    pub currency: String,
 }
 
 /// One poll of one service account.

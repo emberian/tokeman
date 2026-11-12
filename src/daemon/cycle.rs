@@ -179,20 +179,17 @@ pub fn describe(reading: Option<&Reading>, model: Option<&ModelKey>) -> String {
             format!("{:.0}% left", left * 100.0)
         })
     };
-    let session = match (reading.session_remaining(), reading.session_limit) {
+    let session = match (reading.session_remaining(), reading.session_limit()) {
         (None, crate::quota::SessionLimit::Absent) => "none (no 5h limit)".to_string(),
         (remaining, _) => left(remaining),
     };
     let mut text = format!("5h {session}, 7d {}", left(reading.weekly_remaining()));
-    for bucket in reading
-        .buckets
-        .iter()
-        .filter(|bucket| model.is_some_and(|model| model.is_limited_by(&bucket.key)))
-    {
+    let weekly = reading.weekly();
+    for limit in reading.limits_for(model) {
         text.push_str(&format!(
             ", {} 7d {:.0}% left",
-            bucket.label,
-            bucket.room(reading.weekly.as_ref()) * 100.0
+            limit.label,
+            limit.room(weekly.as_ref()) * 100.0
         ));
     }
     text

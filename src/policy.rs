@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use crate::quota::{ModelKey, Reading, Window};
+use crate::quota::{ModelKey, Reading, Span, Window};
 use crate::settings::PolicySettings;
 
 /// How the fleet is doing as a whole: `Sip` once no account is above the
@@ -38,8 +38,9 @@ impl Mode {
     }
 }
 
-/// Minimum fractions remaining in the session and weekly windows. Model
-/// buckets are weekly windows and use the weekly floor.
+/// Minimum fractions remaining in the session and weekly windows. A model's
+/// limit is a weekly window and uses the weekly floor, as does an
+/// account-wide window of any length but five hours.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Floors {
     pub session: f64,
@@ -182,18 +183,31 @@ pub fn choose_above<'a>(
     readings
         .iter()
         .filter(|reading| above(reading, floors, model))
-        .min_by(|a, b| {
-            compare_reset(expiring_reset(a), expiring_reset(b))
-                .then_with(|| {
-                    compare_f64(dwell_score(b, floors, model), dwell_score(a, floors, model))
-                })
-                .then_with(|| {
-                    compare_reset(reset_delay(a, floors, model), reset_delay(b, floors, model))
-                })
-                .then_with(|| compare_f64(used(a).0, used(b).0))
-                .then_with(|| compare_f64(used(a).1, used(b).1))
-                .then_with(|| a.account.cmp(&b.account))
-        })
+        .min_by(|a, b| landing_order(a, b, floors, model))
+}
+
+/// Every account above `floors`, in the order [`choose_above`] prefers them.
+pub fn rank_above<'a>(
+    readings: &'a [Reading],
+    floors: Floors,
+    model: Option<&ModelKey>,
+) -> Vec<&'a Reading> {
+    let mut ranked: Vec<&Reading> = readings
+        .iter()
+        .filter(|reading| above(reading, floors, model))
+        .collect();
+    ranked.sort_by(|a, b| landing_order(a, b, floors, model));
+    ranked
+}
+
+/// The better landing first.
+fn landing_order(a: &Reading, b: &Reading, floors: Floors, model: Option<&ModelKey>) -> Ordering {
+    compare_reset(expiring_reset(a), expiring_reset(b))
+        .then_with(|| compare_f64(dwell_score(b, floors, model), dwell_score(a, floors, model)))
+        .then_with(|| compare_reset(reset_delay(a, floors, model), reset_delay(b, floors, model)))
+        .then_with(|| compare_f64(used(a).0, used(b).0))
+        .then_with(|| compare_f64(used(a).1, used(b).1))
+        .then_with(|| a.account.cmp(&b.account))
 }
 
 /// How close a weekly reset must be, measured from the reading, for the room
@@ -206,7 +220,7 @@ pub const EXPIRING_WITHIN_SECS: i64 = 24 * 3600;
 /// unreported.
 fn expiring_reset(reading: &Reading) -> Option<i64> {
     reading
-        .weekly
+        .weekly()
         .map(|window| window.resets_at)
         .filter(|&reset| reset > 0 && reset - reading.at <= EXPIRING_WITHIN_SECS)
 }
@@ -224,32 +238,33 @@ fn compare_reset(a: Option<i64>, b: Option<i64>) -> Ordering {
 /// Use of the shared windows; an unreported window has none.
 fn used(reading: &Reading) -> (f64, f64) {
     (
-        reading.session.map_or(0.0, |w| w.used),
-        reading.weekly.map_or(0.0, |w| w.used),
+        reading.session().map_or(0.0, |w| w.used),
+        reading.weekly().map_or(0.0, |w| w.used),
     )
 }
 
-/// Every reported window with its floor: the shared ones, then the model
-/// buckets that limit `model`.
+/// Every reported window with its floor: the account-wide ones (the session
+/// floor for a 5h window, the weekly floor for any other), then the limits
+/// on `model`.
 fn limiting_windows<'a>(
     reading: &'a Reading,
     floors: Floors,
     model: Option<&'a ModelKey>,
 ) -> impl Iterator<Item = (f64, i64)> + 'a {
+    let weekly = reading.weekly();
     reading
-        .session
-        .iter()
-        .map(move |w| (margin(w, floors.session), w.resets_at))
-        .chain(
-            reading
-                .weekly
-                .iter()
-                .map(move |w| (margin(w, floors.weekly), w.resets_at)),
-        )
-        .chain(reading.buckets_limiting(model).map(move |bucket| {
+        .shared()
+        .map(move |limit| {
+            let floor = match limit.span {
+                Span::FiveHour => floors.session,
+                _ => floors.weekly,
+            };
+            (margin(&limit.window, floor), limit.window.resets_at)
+        })
+        .chain(reading.limits_for(model).map(move |limit| {
             (
-                room_margin(bucket.room(reading.weekly.as_ref()), floors.weekly),
-                bucket.window.resets_at,
+                room_margin(limit.room(weekly.as_ref()), floors.weekly),
+                limit.window.resets_at,
             )
         }))
 }
@@ -434,8 +449,8 @@ pub fn decide<'a>(situation: &Situation<'a>, policy: &PolicySettings) -> Decisio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::{ProbeError, Source};
-    use crate::testing::{bucket, reading, reading_with_bucket, reading_with_resets};
+    use crate::quota::{ReadError, Service, SessionLimit, Source};
+    use crate::testing::{model_limit, reading, reading_with_model, reading_with_resets};
 
     fn key(model: &str) -> ModelKey {
         ModelKey::new(model)
@@ -446,7 +461,7 @@ mod tests {
     }
 
     fn with_opus(name: &str, session_used: f64, weekly_used: f64, opus_used: f64) -> Reading {
-        reading_with_bucket(name, session_used, weekly_used, "opus", "Opus", opus_used)
+        reading_with_model(name, session_used, weekly_used, "opus", "Opus", opus_used)
     }
 
     /// Viability under the default floors for an opus session.
@@ -499,7 +514,7 @@ mod tests {
 
     #[test]
     fn exhausted_opus_48_bucket_does_not_poison_opus_5_or_fable() {
-        let r = reading_with_bucket("separate-models", 0.0, 0.0, "opus48", "Opus 4.8", 1.0);
+        let r = reading_with_model("separate-models", 0.0, 0.0, "opus48", "Opus 4.8", 1.0);
         assert!(viable_for(&r, "opus"));
         assert!(!viable_for(&r, "claude-opus-4-8"));
         assert!(viable_for(&r, "claude-fable-5-1"));
@@ -507,7 +522,7 @@ mod tests {
 
     #[test]
     fn the_fable_limit_gates_fable_sessions_only() {
-        let r = reading_with_bucket("profile", 0.0, 0.0, "fable", "Fable", 1.0);
+        let r = reading_with_model("profile", 0.0, 0.0, "fable", "Fable", 1.0);
         assert!(!viable_for(&r, "claude-fable-5-1"));
         assert!(!viable_for(&r, "fable"));
         assert!(viable_for(&r, "opus"));
@@ -515,15 +530,15 @@ mod tests {
 
     #[test]
     fn the_opus_alias_obeys_the_opus_5_bucket() {
-        let r = reading_with_bucket("opus-five", 0.0, 0.0, "claudeopus5", "Opus 5", 0.95);
+        let r = reading_with_model("opus-five", 0.0, 0.0, "claudeopus5", "Opus 5", 0.95);
         assert!(!viable_for(&r, "opus[1m]"));
     }
 
     #[test]
     fn unrelated_family_bucket_does_not_affect_selection() {
         let mut r = with_opus("family-split", 0.0, 0.0, 0.10);
-        r.buckets
-            .push(bucket("sonnet", "Sonnet", 1.0, Source::Profile));
+        r.limits
+            .push(model_limit("sonnet", "Sonnet", 1.0, Source::Profile));
         assert!(viable_for(&r, "opus"));
         assert!(!viable_for(&r, "sonnet"));
     }
@@ -625,9 +640,9 @@ mod tests {
     fn fable_landing_ranks_on_fable_room_in_weekly_terms() {
         let fable = key("claude-fable-5-2");
         let with_fable = |name: &str, weekly_used: f64, fable_used: f64| {
-            let mut r = reading_with_bucket(name, 0.0, weekly_used, "fable", "Fable", fable_used);
-            r.session = None;
-            r.buckets[0].share = Some(0.5);
+            let mut r = reading_with_model(name, 0.0, weekly_used, "fable", "Fable", fable_used);
+            r.set_session(None);
+            r.limits[1].share = Some(0.5);
             r
         };
         // a: Fable 80% of half the weekly = 40%, capped by the 30% weekly left.
@@ -682,10 +697,10 @@ mod tests {
         // The horizon is measured from the reading, not from epoch zero.
         let mut late = reading_with_resets("expiring-later-read", 0.0, 0.6, 0, 0);
         late.at = 10 * 86_400;
-        late.weekly = Some(Window::new(0.6, late.at + 3_600));
+        late.set_weekly(Some(Window::new(0.6, late.at + 3_600)));
         let mut fresh = reading_with_resets("fresh-read-late", 0.0, 0.0, 0, 0);
         fresh.at = late.at;
-        fresh.weekly = Some(Window::new(0.0, late.at + 6 * 86_400));
+        fresh.set_weekly(Some(Window::new(0.0, late.at + 6 * 86_400)));
         assert_eq!(land(&[fresh, late]), Some("expiring-later-read".into()));
         // Below the landing floors it still falls back to the sip floors.
         assert_eq!(
@@ -700,15 +715,15 @@ mod tests {
     #[test]
     fn a_weekly_only_account_is_ranked_on_its_weekly_room_alone() {
         let mut ultra = reading_with_resets("ultra", 0.0, 0.5, 0, 3_600);
-        ultra.session = None;
-        ultra.session_limit = crate::quota::SessionLimit::Absent;
+        ultra.set_session(None);
+        ultra.claude_mut().session_limit = SessionLimit::Absent;
         let pro = reading_with_resets("pro", 0.85, 0.5, 600, 3_600);
         assert_eq!(
             best(&[pro.clone(), ultra.clone()], Mode::Normal, opus().as_ref()),
             Some("ultra")
         );
         // Its weekly room is its only gate.
-        ultra.weekly = Some(Window::new(0.96, 3_600));
+        ultra.set_weekly(Some(Window::new(0.96, 3_600)));
         assert!(!viable_in(&ultra, Mode::Normal));
     }
 
@@ -787,7 +802,7 @@ mod tests {
         let fresh = [reading("otto", 0.0, 0.27)];
         let landing = landing_exists(&fresh, &policy, Some(&fable));
         let stays = |used| {
-            let current = reading_with_bucket("boto", 0.0, 0.0, "fable", "Fable", used);
+            let current = reading_with_model("boto", 0.0, 0.0, "fable", "Fable", used);
             should_stay(&current, landing, &policy, Some(&fable))
         };
         assert!(stays(0.91));
@@ -813,18 +828,20 @@ mod tests {
     #[test]
     fn a_failed_probe_is_not_a_reading_but_a_refusal_is_definitive() {
         let failed = Reading::failed(
+            Service::Claude,
             "failed",
             0,
-            ProbeError::Network {
+            ReadError::Network {
                 message: "transient".into(),
             },
         );
         assert!(!failed.has_quota());
         assert!(!complete(std::slice::from_ref(&failed), 1));
         let expired = Reading::failed(
+            Service::Claude,
             "expired",
             0,
-            ProbeError::Http {
+            ReadError::Http {
                 status: 401,
                 body: "expired".into(),
             },
@@ -839,7 +856,7 @@ mod tests {
     fn an_account_reporting_only_its_weekly_window_is_a_complete_reading() {
         let policy = PolicySettings::default();
         let mut idle = reading("idle", 0.0, 0.26);
-        idle.session = None;
+        idle.set_session(None);
         assert!(complete(std::slice::from_ref(&idle), 1));
         assert!(viable(&idle, Mode::Normal, &policy, opus().as_ref()));
         assert_eq!(

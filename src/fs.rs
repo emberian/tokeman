@@ -145,3 +145,35 @@ mod tests {
         assert_eq!(read_if_present(&dir.path().join("missing")).unwrap(), None);
     }
 }
+
+/// Deserialize a map entry by entry and leave out the entries that do not
+/// parse. A state file outlives the build that wrote it: one entry in an
+/// older or newer shape costs that entry, not the file.
+pub fn lenient_map<'de, D, T>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::Deserialize;
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, serde_json::from_value(value).ok()?)))
+        .collect())
+}
+
+/// [`lenient_map`] for a list.
+pub fn lenient_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::Deserialize;
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}

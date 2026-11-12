@@ -12,7 +12,7 @@ use crate::fs::write_atomic;
 use crate::history::Fingerprint;
 use crate::paths;
 use crate::policy::Mode;
-use crate::quota::{Bucket, Family, ModelKey, ProbeError, Reading, Source, Window};
+use crate::quota::{Family, Limit, ModelKey, ReadError, Reading, Service, Source, Window};
 use crate::settings::PolicySettings;
 
 /// A refused credential and when to ask again. The refusal is an answer
@@ -56,9 +56,17 @@ pub struct Cadence {
     pub probe_interval_secs: Option<u64>,
     #[serde(default)]
     pub consecutive_degraded_probes: u32,
-    #[serde(default, rename = "auth_backoff")]
+    #[serde(
+        default,
+        rename = "auth_backoff",
+        deserialize_with = "crate::fs::lenient_map"
+    )]
     pub backoff: BTreeMap<String, Backoff>,
-    #[serde(default, rename = "header_samples")]
+    #[serde(
+        default,
+        rename = "header_samples",
+        deserialize_with = "crate::fs::lenient_map"
+    )]
     pub samples: BTreeMap<String, Sample>,
 }
 
@@ -146,9 +154,10 @@ impl Cadence {
             return None;
         }
         Some(Reading::failed(
+            Service::Claude,
             &account.name,
             now as i64,
-            ProbeError::Http {
+            ReadError::Http {
                 status: 401,
                 body: format!("authentication previously refused: {}", entry.last_error),
             },
@@ -156,7 +165,7 @@ impl Cadence {
     }
 
     /// Whether to spend a target-model probe on this account this cycle. An
-    /// account with profile reads already gets the limit as a bucket.
+    /// account with profile reads already gets the limit from them.
     pub fn due_for_sample(&self, account: &Account, policy: &PolicySettings, now: f64) -> bool {
         let interval = policy.target_model_sample_secs as f64;
         interval > 0.0
@@ -191,7 +200,7 @@ impl Cadence {
                 Sample {
                     sampled_at: now,
                     answered,
-                    window: sample.bucket(&fable).map(|bucket| bucket.window),
+                    window: sample.model_limit(&fable).map(|limit| limit.window),
                 },
             );
         }
@@ -203,7 +212,7 @@ impl Cadence {
     pub fn apply_samples(&self, readings: &mut [Reading], now: f64) {
         let fable = ModelKey::family_wide(Family::Fable);
         for reading in readings {
-            if reading.bucket(&fable).is_some() {
+            if reading.model_limit(&fable).is_some() {
                 continue;
             }
             let carried = self
@@ -212,13 +221,12 @@ impl Cadence {
                 .and_then(|sample| sample.window)
                 .filter(|window| window.resets_at == 0 || window.resets_at as f64 > now);
             if let Some(window) = carried {
-                reading.set_bucket(Bucket {
-                    key: fable.clone(),
-                    label: Family::Fable.label().to_owned(),
+                reading.set_limit(Limit::model(
+                    fable.clone(),
+                    Family::Fable.label(),
                     window,
-                    source: Source::Carried,
-                    share: None,
-                });
+                    Source::Carried,
+                ));
             }
         }
     }
@@ -227,7 +235,7 @@ impl Cadence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FAR_FUTURE_MS, bucket, login_account, refused};
+    use crate::testing::{FAR_FUTURE_MS, login_account, model_limit, refused};
 
     fn account(name: &str) -> Account {
         login_account(name, FAR_FUTURE_MS)
@@ -288,9 +296,10 @@ mod tests {
         let accounts = [account("flaky")];
         let mut cadence = Cadence::default();
         let timeout = Reading::failed(
+            Service::Claude,
             "flaky",
             0,
-            ProbeError::Network {
+            ReadError::Network {
                 message: "timed out".into(),
             },
         );
@@ -331,9 +340,9 @@ mod tests {
         assert!(!cadence.due_for_sample(&account("with-profile"), &policy, 10.0));
 
         let mut sampled = fine("s");
-        sampled.set_bucket(Bucket {
+        sampled.set_limit(Limit {
             window: Window::new(0.6, 5_000),
-            ..bucket("fable", "Fable", 0.6, Source::Headers)
+            ..model_limit("fable", "Fable", 0.6, Source::Headers)
         });
         assert!(cadence.record_samples([&sampled], 10.0).is_empty());
         assert!(!cadence.due_for_sample(&setup_only, &policy, 20.0));
@@ -346,19 +355,20 @@ mod tests {
         let mut readings = [fine("s")];
         cadence.apply_samples(&mut readings, 100.0);
         let carried = readings[0]
-            .bucket(&ModelKey::family_wide(Family::Fable))
+            .model_limit(&ModelKey::family_wide(Family::Fable))
             .unwrap();
         assert_eq!(carried.source, Source::Carried);
         assert_eq!(carried.window, Window::new(0.6, 5_000));
         let mut after_reset = [fine("s")];
         cadence.apply_samples(&mut after_reset, 6_000.0);
-        assert!(after_reset[0].buckets.is_empty());
+        assert_eq!(after_reset[0].models().count(), 0);
 
         // An unanswered sample is reported once, not every cycle.
         let unanswered = Reading::failed(
+            Service::Claude,
             "s",
             0,
-            ProbeError::Http {
+            ReadError::Http {
                 status: 429,
                 body: String::new(),
             },

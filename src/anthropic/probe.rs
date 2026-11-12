@@ -13,8 +13,8 @@ use serde_json::json;
 use super::{CLAUDE_CODE_IDENTITY, Client, http_error, network_error, profile};
 use crate::account::{Account, Credential};
 use crate::quota::{
-    Bucket, Family, Grace, ModelKey, Overage, ProbeError, Reading, SessionLimit, Signals, SlowLane,
-    Source, Verdict, Window, WindowStatus, parse_wire,
+    Family, Grace, Limit, ModelKey, Overage, ReadError, Reading, Scope, Service, SessionLimit,
+    Signals, SlowLane, Source, Span, Verdict, Window, WindowStatus, parse_wire,
 };
 
 pub const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -24,17 +24,22 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Families whose weekly limit appears only in the headers of requests to them.
 const HEADER_ONLY_FAMILIES: &[Family] = &[Family::Fable];
 
-/// What the unified rate-limit headers of one response say.
+/// What the unified rate-limit headers of one response say. Wire shape:
+/// private to this parser, which turns it into a [`Reading`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct Quota {
-    pub verdict: Verdict,
-    pub claim: Option<String>,
-    pub session: Option<Window>,
-    pub weekly: Option<Window>,
+struct Quota {
+    verdict: Verdict,
+    claim: Option<String>,
+    session: Option<Window>,
+    weekly: Option<Window>,
     /// The `7d_oi` window: the requested model's own weekly limit.
-    pub model_weekly: Option<Window>,
-    pub overage: Option<Overage>,
-    pub signals: Signals,
+    model_weekly: Option<Window>,
+    /// Each window's own `-status` and `-surpassed-threshold` headers.
+    session_status: Option<WindowStatus>,
+    weekly_status: Option<WindowStatus>,
+    model_weekly_status: Option<WindowStatus>,
+    overage: Option<Overage>,
+    signals: Signals,
 }
 
 fn header_str(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -113,9 +118,6 @@ fn grace(headers: &HeaderMap, prefix: &str) -> Option<Grace> {
 fn signals(headers: &HeaderMap, prefix: &str) -> Signals {
     let fallback = header_str(headers, &format!("{prefix}-fallback"));
     Signals {
-        session_status: window_status(headers, &format!("{prefix}-5h")),
-        weekly_status: window_status(headers, &format!("{prefix}-7d")),
-        model_weekly_status: window_status(headers, &format!("{prefix}-7d_oi")),
         claims: headers
             .get_all(format!("{prefix}-claim"))
             .iter()
@@ -134,7 +136,7 @@ fn signals(headers: &HeaderMap, prefix: &str) -> Signals {
 }
 
 /// `None` without a `unified-status` header; a 429 still carries them.
-pub fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
+fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
     const PREFIX: &str = "anthropic-ratelimit-unified";
     let status = header_str(headers, &format!("{PREFIX}-status"))?;
     let overage_status = header_str(headers, &format!("{PREFIX}-overage-status"));
@@ -153,6 +155,9 @@ pub fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
         session: header_window(headers, &format!("{PREFIX}-5h")),
         weekly: header_window(headers, &format!("{PREFIX}-7d")),
         model_weekly: header_window(headers, &format!("{PREFIX}-7d_oi")),
+        session_status: window_status(headers, &format!("{PREFIX}-5h")),
+        weekly_status: window_status(headers, &format!("{PREFIX}-7d")),
+        model_weekly_status: window_status(headers, &format!("{PREFIX}-7d_oi")),
         overage,
         signals: signals(headers, PREFIX),
     })
@@ -167,26 +172,26 @@ pub fn sample_model(target: Option<&str>) -> Option<&str> {
     (base.starts_with("claude-") && HEADER_ONLY_FAMILIES.contains(&family)).then_some(base)
 }
 
-/// Record the `7d_oi` window as the family-wide Fable bucket, unless a
-/// bucket of that family is already known (the profile endpoint's row).
-pub fn attach_model_weekly(reading: &mut Reading, window: Option<Window>) {
-    let Some(window) = window else {
-        return;
-    };
-    if reading
-        .buckets
-        .iter()
-        .any(|bucket| bucket.key.family() == Some(Family::Fable))
+/// Record the `7d_oi` window as the family-wide Fable limit, unless a limit
+/// of that family is already known (the profile endpoint's row). The
+/// window's own status lands on whichever Fable limit the reading has.
+fn attach_model_weekly(reading: &mut Reading, quota: &Quota) {
+    let is_fable = |limit: &Limit| limit.key().and_then(ModelKey::family) == Some(Family::Fable);
+    if let Some(window) = quota.model_weekly
+        && !reading.limits.iter().any(is_fable)
     {
-        return;
+        reading.limits.push(Limit::model(
+            ModelKey::family_wide(Family::Fable),
+            Family::Fable.label(),
+            window,
+            Source::Headers,
+        ));
     }
-    reading.buckets.push(Bucket {
-        key: ModelKey::family_wide(Family::Fable),
-        label: Family::Fable.label().to_owned(),
-        window,
-        source: Source::Headers,
-        share: None,
-    });
+    if let Some(status) = quota.model_weekly_status
+        && let Some(limit) = reading.limits.iter_mut().find(|limit| is_fable(limit))
+    {
+        limit.status = Some(status);
+    }
 }
 
 /// One request to `/v1/messages` on `model`; the quota headers, or why not.
@@ -196,7 +201,7 @@ async fn request(
     credential: Credential<'_>,
     model: &str,
     timeout: Duration,
-) -> Result<Option<Quota>, ProbeError> {
+) -> Result<Option<Quota>, ReadError> {
     let body = json!({
         "model": model,
         "max_tokens": 1,
@@ -222,25 +227,32 @@ async fn request(
 }
 
 /// A reading of the shared windows; the model's own window is attached by
-/// the caller once it knows what the profile endpoint said.
+/// the caller once it knows what the profile endpoint said. A window's
+/// status header without its utilization describes no limit and is dropped.
 fn reading_of(account: &str, now: i64, quota: &Option<Quota>) -> Reading {
-    let mut reading = Reading::empty(account, now);
+    let mut reading = Reading::empty(Service::Claude, account, now);
     if let Some(quota) = quota {
-        reading.verdict = quota.verdict;
-        reading.claim = quota.claim.clone();
-        reading.session = quota.session;
-        reading.weekly = quota.weekly;
-        reading.overage = quota.overage.clone();
-        reading.signals = quota.signals.clone();
+        for (span, window, status) in [
+            (Span::FiveHour, quota.session, quota.session_status),
+            (Span::Weekly, quota.weekly, quota.weekly_status),
+        ] {
+            if let Some(window) = window {
+                reading.limits.push(Limit {
+                    status,
+                    ..Limit::new(span, Scope::All, window, Source::Headers)
+                });
+            }
+        }
+        let claude = reading.claude_mut();
+        claude.verdict = quota.verdict;
+        claude.claim = quota.claim.clone();
+        claude.overage = quota.overage.clone();
+        claude.signals = quota.signals.clone();
         if quota.session.is_some() {
-            reading.session_limit = SessionLimit::Present;
+            claude.session_limit = SessionLimit::Present;
         }
     }
     reading
-}
-
-fn model_weekly(quota: &Option<Quota>) -> Option<Window> {
-    quota.as_ref().and_then(|quota| quota.model_weekly)
 }
 
 /// Probe `account` with `model` and fold in the profile endpoint (through
@@ -254,7 +266,7 @@ pub async fn probe_with(
     now: i64,
 ) -> Reading {
     let Some(credential) = account.credential(now * 1000) else {
-        return Reading::failed(&account.name, now, ProbeError::NoCredential);
+        return Reading::failed(Service::Claude, &account.name, now, ReadError::NoCredential);
     };
     let (answer, usage) = futures::join!(
         request(client, credential, model, timeout),
@@ -262,11 +274,11 @@ pub async fn probe_with(
     );
     let mut reading = match &answer {
         Ok(quota) => reading_of(&account.name, now, quota),
-        Err(error) => Reading::failed(&account.name, now, error.clone()),
+        Err(error) => Reading::failed(Service::Claude, &account.name, now, error.clone()),
     };
     profile::merge(&mut reading, usage);
-    if let Ok(quota) = &answer {
-        attach_model_weekly(&mut reading, model_weekly(quota));
+    if let Ok(Some(quota)) = &answer {
+        attach_model_weekly(&mut reading, quota);
     }
     reading
 }
@@ -302,7 +314,7 @@ pub async fn probe_all<'a>(
 }
 
 /// The target-model sample: the same request on `model`, without the
-/// profile read, so its `7d_oi` window lands as a `Source::Headers` bucket.
+/// profile read, so its `7d_oi` window lands as a `Source::Headers` limit.
 /// An answer without quota headers is a reading with an error.
 pub async fn sample(
     client: &Client,
@@ -312,15 +324,17 @@ pub async fn sample(
     now: i64,
 ) -> Reading {
     let Some(credential) = account.credential(now * 1000) else {
-        return Reading::failed(&account.name, now, ProbeError::NoCredential);
+        return Reading::failed(Service::Claude, &account.name, now, ReadError::NoCredential);
     };
     match request(client, credential, model, timeout).await {
         Ok(quota) => {
             let mut reading = reading_of(&account.name, now, &quota);
-            attach_model_weekly(&mut reading, model_weekly(&quota));
+            if let Some(quota) = &quota {
+                attach_model_weekly(&mut reading, quota);
+            }
             reading
         }
-        Err(error) => Reading::failed(&account.name, now, error),
+        Err(error) => Reading::failed(Service::Claude, &account.name, now, error),
     }
 }
 
@@ -343,7 +357,7 @@ pub async fn sample_all<'a>(
 mod tests {
     use super::*;
     use crate::anthropic::testing::{dead_client, serve, temp_cache};
-    use crate::testing::{bucket, profile_only_account, setup_account};
+    use crate::testing::{model_limit, profile_only_account, setup_account};
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::{get, post};
@@ -504,16 +518,14 @@ mod tests {
         assert_eq!(quota.session, None);
         assert_eq!(quota.model_weekly, Some(Window::new(1.02, 1794657600)));
         let signals = &quota.signals;
-        assert_eq!(signals.session_status, None);
+        assert_eq!(quota.session_status, None);
+        let warned = WindowStatus {
+            verdict: Verdict::AllowedWarning,
+            surpassed_threshold: Some(0.75),
+        };
+        assert_eq!(quota.weekly_status, Some(warned));
         assert_eq!(
-            signals.weekly_status,
-            Some(WindowStatus {
-                verdict: Verdict::AllowedWarning,
-                surpassed_threshold: Some(0.75),
-            })
-        );
-        assert_eq!(
-            signals.model_weekly_status.map(|status| status.verdict),
+            quota.model_weekly_status.map(|status| status.verdict),
             Some(Verdict::Rejected)
         );
         assert_eq!(signals.claims, ["seven_day_overage_included", "seven_day"]);
@@ -532,13 +544,24 @@ mod tests {
 
         // The reading keeps them, and the weekly window still limits by its
         // own numbers: grace and the slow lane are not room.
-        let reading = reading_of("a", 0, &Some(quota));
-        assert_eq!(reading.signals.claims.len(), 2);
-        assert_eq!(reading.session_limit, SessionLimit::Unknown);
+        let mut reading = reading_of("a", 0, &Some(quota.clone()));
+        assert_eq!(reading.claude().unwrap().signals.claims.len(), 2);
+        assert_eq!(reading.session_limit(), SessionLimit::Unknown);
         assert!(
             !reading.above(0.0, 0.0, None),
             "the overall verdict is rejected"
         );
+        // Each window's own status rides on its limit.
+        assert_eq!(
+            reading.limit(Span::Weekly, &Scope::All).unwrap().status,
+            Some(warned)
+        );
+        attach_model_weekly(&mut reading, &quota);
+        let fable = reading
+            .model_limit(&ModelKey::family_wide(Family::Fable))
+            .unwrap();
+        assert_eq!(fable.window, Window::new(1.02, 1794657600));
+        assert!(fable.is_rejected());
     }
 
     #[test]
@@ -550,7 +573,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            reading_of("a", 0, &Some(quota)).session_limit,
+            reading_of("a", 0, &Some(quota)).session_limit(),
             SessionLimit::Present
         );
         let bare = parse_quota(&headers(&[(
@@ -577,32 +600,36 @@ mod tests {
 
     #[test]
     fn the_model_weekly_window_becomes_a_fable_bucket_unless_the_profile_has_one() {
+        let quota = |model_weekly: Option<&str>| {
+            parse_quota(&quota_headers("allowed", model_weekly)).unwrap()
+        };
         let mut reading = reading_of("a", 0, &None);
-        attach_model_weekly(&mut reading, None);
-        assert!(reading.buckets.is_empty());
-        attach_model_weekly(&mut reading, Some(Window::new(0.7, 5_000)));
-        assert_eq!(reading.buckets.len(), 1);
+        attach_model_weekly(&mut reading, &quota(None));
+        assert_eq!(reading.models().count(), 0);
+        attach_model_weekly(&mut reading, &quota(Some("0.7")));
+        assert_eq!(reading.models().count(), 1);
         let fable = reading
-            .bucket(&ModelKey::family_wide(Family::Fable))
+            .model_limit(&ModelKey::family_wide(Family::Fable))
             .unwrap();
         assert_eq!(fable.label, "Fable");
         assert_eq!(fable.source, Source::Headers);
-        assert_eq!(fable.window, Window::new(0.7, 5_000));
-        assert!(ModelKey::new("claude-fable-5-1").is_limited_by(&fable.key));
+        assert_eq!(fable.window, Window::new(0.7, 0));
+        assert_eq!(fable.span, Span::Weekly);
+        assert!(ModelKey::new("claude-fable-5-1").is_limited_by(fable.key().unwrap()));
 
         let mut with_profile = reading_of("a", 0, &None);
         with_profile
-            .buckets
-            .push(bucket("Fable 5", "Fable 5", 0.1, Source::Profile));
-        attach_model_weekly(&mut with_profile, Some(Window::new(0.7, 5_000)));
-        assert_eq!(with_profile.buckets.len(), 1);
-        assert_eq!(with_profile.buckets[0].source, Source::Profile);
+            .limits
+            .push(model_limit("Fable 5", "Fable 5", 0.1, Source::Profile));
+        attach_model_weekly(&mut with_profile, &quota(Some("0.7")));
+        assert_eq!(with_profile.models().count(), 1);
+        assert_eq!(with_profile.limits[0].source, Source::Profile);
     }
 
     #[tokio::test]
     async fn an_account_without_a_credential_is_refused_without_a_request() {
         let reading = probe(&dead_client(), &Account::new("empty"), PROBE_MODEL, 7).await;
-        assert_eq!(reading.error, Some(ProbeError::NoCredential));
+        assert_eq!(reading.error, Some(ReadError::NoCredential));
         assert!(reading.is_refused());
         assert_eq!(reading.at, 7);
     }
@@ -676,24 +703,27 @@ mod tests {
 
         let haiku = probe(PROBE_MODEL).await;
         assert_eq!(haiku.error, None);
-        assert_eq!(haiku.verdict, Verdict::Allowed);
-        assert_eq!(haiku.session, Some(Window::new(0.3, 100)));
-        assert_eq!(haiku.weekly, Some(Window::new(0.6, 200)));
-        assert!(haiku.buckets.is_empty(), "a setup key reads no profile");
-        assert_eq!(haiku.profile_error, None);
+        assert_eq!(haiku.service, Service::Claude);
+        assert_eq!(haiku.verdict(), Verdict::Allowed);
+        assert_eq!(haiku.session(), Some(Window::new(0.3, 100)));
+        assert_eq!(haiku.weekly(), Some(Window::new(0.6, 200)));
+        assert_eq!(haiku.models().count(), 0, "a setup key reads no profile");
+        assert_eq!(haiku.claude().unwrap().profile_error, None);
         assert!(haiku.has_quota());
 
         // A 429 with quota headers is a reading, and the 7d_oi window a bucket.
         let fable = probe("claude-fable-5-1").await;
         assert_eq!(fable.error, None);
-        assert_eq!(fable.verdict, Verdict::Rejected);
+        assert_eq!(fable.verdict(), Verdict::Rejected);
         assert!(fable.has_quota());
-        let bucket = fable.bucket(&ModelKey::family_wide(Family::Fable)).unwrap();
-        assert_eq!(bucket.source, Source::Headers);
-        assert_eq!(bucket.window.used, 1.0);
+        let limit = fable
+            .model_limit(&ModelKey::family_wide(Family::Fable))
+            .unwrap();
+        assert_eq!(limit.source, Source::Headers);
+        assert_eq!(limit.window.used, 1.0);
 
         let opus = probe("claude-opus-4-8").await;
-        assert_eq!(opus.verdict, Verdict::Unknown);
+        assert_eq!(opus.verdict(), Verdict::Unknown);
         assert!(opus.is_refused());
         assert_eq!(opus.error.as_ref().unwrap().reason(), "401 revoked");
     }
@@ -712,11 +742,11 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(bare.error, Some(ProbeError::Http { status: 429, .. })),
+            matches!(bare.error, Some(ReadError::Http { status: 429, .. })),
             "{bare:?}"
         );
         assert!(!bare.is_refused(), "a 429 is not definitive");
-        assert!(bare.buckets.is_empty());
+        assert!(bare.limits.is_empty());
 
         let login = profile_only_account("l", "profile-token");
         let reading = probe_with(
@@ -728,10 +758,11 @@ mod tests {
             1,
         )
         .await;
-        assert_eq!(reading.buckets.len(), 1, "{:?}", reading.buckets);
-        assert_eq!(reading.buckets[0].key.as_str(), "fable5");
-        assert_eq!(reading.buckets[0].source, Source::Profile);
-        assert_eq!(reading.buckets[0].window.used, 0.9);
+        let models: Vec<_> = reading.models().collect();
+        assert_eq!(models.len(), 1, "{models:?}");
+        assert_eq!(models[0].key().unwrap().as_str(), "fable5");
+        assert_eq!(models[0].source, Source::Profile);
+        assert_eq!(models[0].window.used, 0.9);
 
         let all = probe_all(
             &client,
@@ -743,10 +774,10 @@ mod tests {
         .await;
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].account, "l");
-        assert_eq!(all[1].error, Some(ProbeError::NoCredential));
+        assert_eq!(all[1].error, Some(ReadError::NoCredential));
         let samples = sample_all(&client, &[login], "claude-fable-5-1", PROBE_TIMEOUT, 3).await;
         assert_eq!(
-            samples[0].buckets[0].source,
+            samples[0].models().next().unwrap().source,
             Source::Headers,
             "a sample skips the profile"
         );
@@ -771,7 +802,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(reading.error, Some(ProbeError::Network { .. })),
+            matches!(reading.error, Some(ReadError::Network { .. })),
             "{reading:?}"
         );
         assert!(!reading.is_refused());
