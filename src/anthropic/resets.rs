@@ -752,6 +752,12 @@ mod tests {
         );
         assert_eq!(program.usable_resets(at("2026-10-01T00:00:00Z")), Some(1));
         assert_eq!(program.usable_resets(at("2026-10-23T00:00:00Z")), Some(0));
+        // It clears the weekly window for every model, once per reset left.
+        assert_eq!(grants[0].weekly_refills(None), 1);
+        assert_eq!(
+            grants[0].weekly_refills(Some(&ModelKey::new("claude-opus-5-5"))),
+            1
+        );
         assert_eq!(
             serde_json::from_str::<ResetStatus>("{}").unwrap(),
             ResetStatus::default()
@@ -775,6 +781,7 @@ mod tests {
             grant.state(at("2026-11-08T00:00:00Z")),
             GrantState::NotStarted
         );
+        assert_eq!(grant.state(at("2026-11-09T18:00:00Z")), GrantState::Usable);
         assert_eq!(grant.state(at("2026-11-11T00:00:00Z")), GrantState::Usable);
         assert_eq!(grant.state(at("2027-03-09T07:59:00Z")), GrantState::Expired);
         assert!(!grant.is_usable(at("2026-11-08T00:00:00Z")));
@@ -797,6 +804,23 @@ mod tests {
              (gives back 5h Fable's use of 7d Fable 7d; now at 0% 61% 100%), use by 2027-03-09"
         );
         assert!(describe_grant(&grant, at("2026-11-08T00:00:00Z")).contains("starts 2026-11-09"));
+        // So it refills the weekly window for Fable work alone.
+        assert_eq!(grant.weekly_refills(None), 0);
+        assert_eq!(
+            grant.weekly_refills(Some(&ModelKey::new("claude-opus-5-5"))),
+            0
+        );
+        assert_eq!(
+            grant.weekly_refills(Some(&ModelKey::new("claude-fable-5-2"))),
+            2
+        );
+        // A grant that clears no weekly window refills none.
+        let session_only = ResetGrant {
+            clears: vec!["five_hour".into()],
+            gives_back_weekly: false,
+            ..grant.clone()
+        };
+        assert_eq!(session_only.weekly_refills(None), 0);
     }
 
     #[test]
@@ -817,6 +841,10 @@ mod tests {
         let session: SessionProgram =
             serde_json::from_str(r#"{"eligible": false, "ineligible_reason": "surface"}"#).unwrap();
         assert_eq!(session.standing(), Standing::Unknown);
+        // At the wall the session reset is on offer whatever `eligible` says.
+        let offered: SessionProgram =
+            serde_json::from_str(r#"{"eligible": false, "available": true}"#).unwrap();
+        assert_eq!(offered.standing(), Standing::Eligible);
     }
 
     #[test]

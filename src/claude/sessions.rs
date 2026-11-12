@@ -190,8 +190,11 @@ mod tests {
         let session = parse_ps_session("40102 ttys016 Sun Jul 26 18:23:11 2026 claude").unwrap();
         assert_eq!(session.0, 40102);
         assert_eq!(session.1.as_deref(), Some("ttys016"));
-        let expected = parse_lstart("Sun Jul 26 18:23:11 2026").unwrap();
-        assert_eq!(session.2, expected.with_timezone(&Utc));
+        // `ps` prints local time.
+        let started = chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+            .and_then(|day| day.and_hms_opt(18, 23, 11))
+            .unwrap();
+        assert_eq!(session.2.with_timezone(&Local).naive_local(), started);
         let daemon = parse_ps_session("40103 ?? Sun Jul 26 18:23:11 2026 /opt/bin/claude").unwrap();
         assert_eq!(daemon.1, None);
         assert!(

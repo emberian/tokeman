@@ -187,5 +187,15 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(read_if_present(&dir.path().join("missing")).unwrap(), None);
+        // Only a missing file reads as absent.
+        assert!(read_if_present(dir.path()).is_err());
+
+        let log = dir.path().join("log").join("events.jsonl");
+        append_line(&log, "one").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_line(&log, "two").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(mode(log.parent().unwrap()), 0o700);
     }
 }

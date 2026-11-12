@@ -301,7 +301,8 @@ mod tests {
     fn installing_a_login_declares_its_scopes_and_a_401_wait() {
         let account = login_account("a", 8 * HOUR_MS);
         let mut settings = Settings::new();
-        let event = install(&mut settings, &account, 0, EventKind::Switch).unwrap();
+        let event = install(&mut settings, &account, 5_000, EventKind::Switch).unwrap();
+        assert_eq!(event.at, 5, "the history is in seconds");
         let env = settings["env"].as_object().unwrap();
         assert_eq!(env[OAUTH_TOKEN], "sk-ant-oat01-access-a");
         assert_eq!(env[OAUTH_SCOPES], "user:inference user:profile");
@@ -375,6 +376,17 @@ mod tests {
             reinstall_reason(&settings, &account, 0),
             Some(EventKind::Repair)
         );
+        // The account marker and the declared scopes are repaired the same way.
+        for (key, value) in [(ACCOUNT, "someone-else"), (OAUTH_SCOPES, "user:inference")] {
+            let mut settings = installed(&account);
+            assert_eq!(reinstall_reason(&settings, &account, 0), None);
+            settings["env"][key] = Value::String(value.into());
+            assert_eq!(
+                reinstall_reason(&settings, &account, 0),
+                Some(EventKind::Repair),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -479,6 +491,12 @@ mod tests {
         )
         .unwrap();
         save_to(&path, &settings).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the file holds a bearer token");
+        }
         let loaded = load_from(&path).unwrap();
         assert_eq!(configured_token(&loaded), Some("sk-ant-oat01-access-a"));
         assert_eq!(target_model(&loaded), Some("opus"));

@@ -703,7 +703,16 @@ pub(crate) mod tests {
         );
         assert_eq!(
             journal.pending(Service::Claude, "me@example.com").unwrap(),
-            Some(new)
+            Some(new.clone())
+        );
+        // The old file's entry was not folded in beside it: once the claim
+        // is answered the account is free.
+        journal
+            .finish(Service::Claude, "me@example.com", &new.request_id)
+            .unwrap();
+        assert_eq!(
+            journal.pending(Service::Claude, "me@example.com").unwrap(),
+            None
         );
     }
 
