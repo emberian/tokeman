@@ -99,8 +99,15 @@ pub(crate) fn limits_of(shared: Option<&Block>, extras: &[Extra]) -> Vec<Limit> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
     Ok,
-    Limited { reason: Option<String> },
-    Error { error: ReadError },
+    /// The backend answered without a limit block: nothing says the account
+    /// is refused, and nothing says it has room.
+    NoLimits,
+    Limited {
+        reason: Option<String>,
+    },
+    Error {
+        error: ReadError,
+    },
 }
 
 impl State {
@@ -110,7 +117,11 @@ impl State {
                 error: error.clone(),
             };
         }
-        if reading.accepts_work() {
+        let no_block = reading.shared().next().is_none()
+            && reading.codex().is_none_or(|codex| codex.allowed.is_none());
+        if no_block {
+            Self::NoLimits
+        } else if reading.accepts_work() {
             Self::Ok
         } else {
             Self::Limited {
@@ -124,6 +135,7 @@ impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ok => f.write_str("ok"),
+            Self::NoLimits => f.write_str("no limits reported"),
             Self::Limited {
                 reason: Some(reason),
             } => write!(f, "limited ({reason})"),
@@ -1044,7 +1056,22 @@ pub(crate) mod tests {
             with(None, None).accepts_work(),
             "no limit block: nothing enforced"
         );
-        assert_eq!(State::of(&with(None, None)), State::Ok);
+        assert_eq!(State::of(&with(None, None)), State::NoLimits);
+        assert_eq!(
+            State::of(&with(None, None)).to_string(),
+            "no limits reported",
+            "an answer without a limit block is not called ok"
+        );
+        assert_eq!(
+            State::of(&with(
+                Some(Block {
+                    allowed: Some(true),
+                    ..Block::default()
+                }),
+                None
+            )),
+            State::Ok
+        );
         let reached = with(
             Some(Block {
                 limit_reached: Some(true),

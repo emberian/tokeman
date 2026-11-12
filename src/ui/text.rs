@@ -139,6 +139,7 @@ pub fn badge(reading: &Reading) -> Option<(String, Option<Level>)> {
         }
         Detail::Codex(_) => match State::of(reading) {
             State::Ok => ("ok", Some(Level::Ok)),
+            State::NoLimits => ("no limits reported", Some(Level::Low)),
             State::Error { .. } => ("error", Some(Level::Critical)),
             limited => return Some((limited.to_string(), Some(Level::Critical))),
         },
