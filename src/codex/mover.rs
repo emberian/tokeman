@@ -628,7 +628,7 @@ pub async fn sweep(
 mod tests {
     use super::*;
     use crate::codex::appserver::tests::{FakeAppServer, limits_answer};
-    use crate::codex::probe::tests::{Backend, ok, profile, status, usage_body};
+    use crate::codex::probe::tests::{Backend, limited_body, ok, profile, status, usage_body};
     use axum::http::StatusCode;
     use serde_json::json;
 
@@ -993,5 +993,38 @@ mod tests {
         // Without an id from the running Codex, the email decides.
         assert!(seat(None, "a@x.y").is_on(&a));
         assert!(!seat(None, "b@x.y").is_on(&a));
+    }
+
+    #[tokio::test]
+    async fn a_codex_with_nowhere_to_go_drains_and_no_reset_credit_is_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
+        let (fake, mut fleet) = running_on_a(dir.path(), limits_answer(100.0, 100.0));
+        fleet.codex.truncate(2);
+        // The only other profile is at its limit and holds a reset credit
+        // that applies: claiming it would make a landing.
+        let backend = Backend::default()
+            .usage_answers(vec![ok(limited_body())])
+            .consume_answers(vec![(
+                StatusCode::OK,
+                json!({"code": "reset", "windows_reset": 1}).to_string(),
+            )]);
+        let client = backend.client().await;
+        let home = CodexHome::new(fake.home.path());
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
+        assert_eq!(look.outcome, Outcome::Draining);
+        assert_eq!(
+            look.probed[0]
+                .codex()
+                .unwrap()
+                .reset_credits
+                .unwrap()
+                .applicable,
+            Some(1)
+        );
+        // The half-hour sweep over the same profiles spends none either.
+        crate::codex::maintenance::sweep(&client, &fleet.codex, &mut Default::default()).await;
+        assert!(backend.requests("/credits/consume").is_empty());
+        assert!(fake.logins().is_empty());
     }
 }
