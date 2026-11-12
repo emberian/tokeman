@@ -137,7 +137,11 @@ impl Event {
 
 /// The recorded events, oldest first.
 pub fn load() -> Vec<Event> {
-    let Ok(Some(contents)) = read_if_present(&paths::credential_history()) else {
+    load_from(&paths::credential_history())
+}
+
+fn load_from(path: &Path) -> Vec<Event> {
+    let Ok(Some(contents)) = read_if_present(path) else {
         return Vec::new();
     };
     let mut events: Vec<Event> = contents
@@ -151,10 +155,13 @@ pub fn load() -> Vec<Event> {
 /// Append one event. Callers hold the rotation lock, so appends never
 /// interleave with compaction.
 pub fn append(event: &Event) -> Result<()> {
-    let path = paths::credential_history();
-    append_line(&path, &serde_json::to_string(event)?)?;
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > COMPACT_ABOVE_BYTES {
-        compact(&path, event.at)?;
+    append_to(&paths::credential_history(), event, COMPACT_ABOVE_BYTES)
+}
+
+fn append_to(path: &Path, event: &Event, compact_above: u64) -> Result<()> {
+    append_line(path, &serde_json::to_string(event)?)?;
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > compact_above {
+        compact(path, event.at)?;
     }
     Ok(())
 }
@@ -163,7 +170,7 @@ pub fn append(event: &Event) -> Result<()> {
 /// which is the state in effect at the window's start.
 fn compact(path: &Path, now: i64) -> Result<()> {
     let cutoff = now - RETENTION_SECS;
-    let events = load();
+    let events = load_from(path);
     let first_kept = events
         .iter()
         .rposition(|event| event.at <= cutoff)
@@ -208,16 +215,49 @@ mod tests {
             event(500, "b", "b0", Some(100_000)),
         ];
         assert_eq!(account_at(&events, 400), Some(Some("a".into())));
+        assert_eq!(account_at(&events, 499), Some(Some("a".into())));
+        assert_eq!(account_at(&events, 500), Some(Some("b".into())));
         assert_eq!(account_at(&events, 600), Some(Some("b".into())));
     }
 
     #[test]
     fn a_revocation_is_not_an_offer() {
+        // `a`'s token is renewed (its old one revoked) while `b` is offered.
         let events = vec![
             event(0, "a", "a0", Some(10_000)),
+            event(300, "b", "b0", Some(10_000)),
             Event::revoke(400, "a", "secret"),
         ];
-        assert_eq!(account_at(&events, 500), Some(Some("a".into())));
+        assert_eq!(account_at(&events, 500), Some(Some("b".into())));
+        let line = serde_json::to_string(&events[2]).unwrap();
+        assert!(!line.contains("secret"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_keeps_the_month_and_the_offer_in_effect_at_its_start() {
+        use std::os::unix::fs::PermissionsExt;
+        const DAY: i64 = 24 * 3600;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let now = 100 * DAY;
+        for (age_days, account) in [(40, "a"), (35, "b"), (10, "c")] {
+            let old = event(now - age_days * DAY, account, account, None);
+            append_to(&path, &old, u64::MAX).unwrap();
+        }
+        assert_eq!(
+            load_from(&path).len(),
+            3,
+            "below the size, nothing is dropped"
+        );
+        append_to(&path, &event(now, "d", "d", None), 0).unwrap();
+        let kept = load_from(&path);
+        let accounts: Vec<_> = kept.iter().filter_map(|e| e.account.as_deref()).collect();
+        assert_eq!(accounts, ["b", "c", "d"]);
+        // A rejection from the first day of the window is still attributed.
+        assert_eq!(account_at(&kept, now - 30 * DAY), Some(Some("b".into())));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

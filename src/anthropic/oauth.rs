@@ -434,6 +434,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_code_or_refresh_token_is_sent_once() {
+        // An authorization code and a refresh token are single-use: only a
+        // 429, which redeems nothing, is worth sending the same one again.
+        let ok = (StatusCode::OK, serde_json::json!({"access_token": "a"}));
+        let (router, calls, _) = scripted(vec![
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "invalid_grant"}),
+            ),
+            ok.clone(),
+        ]);
+        let client = serve(router).await;
+        let pkce = begin(None).unwrap();
+        let error = exchange_waiting(&client, "thecode", &pkce, &[0, 0, 0])
+            .await
+            .unwrap_err();
+        assert!(error.is_permanent(), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for refusal in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let (router, calls, _) = scripted(vec![
+                (refusal, serde_json::json!({"error": "later"})),
+                ok.clone(),
+            ]);
+            let client = serve(router).await;
+            let error = refresh(&client, "single-use", &[]).await.unwrap_err();
+            assert!(!error.is_permanent(), "{error}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{refusal}");
+        }
+    }
+
+    #[tokio::test]
     async fn an_exchange_waits_out_the_token_endpoints_429s() {
         let no_wait = [0u64; 3];
         let limited = (

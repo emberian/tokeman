@@ -941,6 +941,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expired_login_token_is_not_sent() {
+        use std::sync::{Arc, Mutex};
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = |sent: &Arc<Mutex<Vec<String>>>, path: &'static str| {
+            let sent = sent.clone();
+            move |headers: HeaderMap| {
+                let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                sent.lock().unwrap().push(format!("{path} {bearer}"));
+                async { (StatusCode::OK, quota_headers("allowed", None), "{}") }
+            }
+        };
+        let router = Router::new()
+            .route("/v1/messages", post(record(&sent, "messages")))
+            .route("/api/oauth/usage", get(record(&sent, "usage")));
+        let client = serve(router).await;
+        let (_dir, cache) = temp_cache();
+        // The access token expires at 10 000 s (the account file keeps
+        // milliseconds); the setup key does not expire.
+        let account = crate::testing::login_account("a", 10_000_000);
+        probe_with(&client, &cache, &account, PROBE_MODEL, PROBE_TIMEOUT, 9_000).await;
+        let mut live = std::mem::take(&mut *sent.lock().unwrap());
+        live.sort();
+        assert_eq!(
+            live,
+            [
+                "messages Bearer sk-ant-oat01-access-a",
+                "usage Bearer sk-ant-oat01-access-a"
+            ]
+        );
+        probe_with(
+            &client,
+            &cache,
+            &account,
+            PROBE_MODEL,
+            PROBE_TIMEOUT,
+            20_000,
+        )
+        .await;
+        sample(&client, &account, PROBE_MODEL, PROBE_TIMEOUT, 20_000).await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["messages Bearer sk-ant-oat01-setup-a"; 2],
+            "after its expiry the login is neither probed with nor used for the profile"
+        );
+    }
+
+    #[tokio::test]
     async fn a_timeout_is_a_network_error() {
         let router = Router::new().route(
             "/v1/messages",
@@ -1044,6 +1091,14 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(quota.unrecognized, Vec::<String>::new());
+        // The usage-credit window is a limit of its own and no account-wide
+        // window: it gates nothing.
+        let reading = reading_of("a", 0, &Some(quota));
+        let credits = reading
+            .limit(Span::Unknown, &Scope::extra_usage())
+            .expect("the usage-credit window");
+        assert_eq!(credits.window, Window::new(0.1, 1_794_657_600));
+        assert_eq!(reading.shared().count(), 2);
     }
 
     #[test]

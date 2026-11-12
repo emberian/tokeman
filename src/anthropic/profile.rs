@@ -704,24 +704,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_usage_windows_normalize_percent_and_stay_unknown_when_incomplete() {
-        let window = usage_window(&UsageWindow {
-            utilization: Some(67.5),
-            resets_at: Some("2026-07-31T12:34:56Z".into()),
-        })
-        .expect("valid profile usage window");
-        assert!((window.used - 0.675).abs() < f64::EPSILON);
-        assert_eq!(window.resets_at, 1_785_501_296);
-        assert!(
-            usage_window(&UsageWindow {
-                utilization: None,
-                resets_at: None,
-            })
-            .is_none()
-        );
-    }
-
-    #[test]
     fn the_legacy_per_family_fields_are_not_read() {
         let usage: UsageResponse = serde_json::from_str(
             r#"{
@@ -737,7 +719,18 @@ mod tests {
         .expect("usage response");
         let profile = usage_of(&usage);
         assert!(profile.models.is_empty());
-        assert!((profile.weekly.unwrap().used - 0.2).abs() < f64::EPSILON);
+        assert_eq!(profile.session, Some(Window::new(0.1, 1_785_067_200)));
+        assert_eq!(profile.weekly, Some(Window::new(0.2, 1_785_585_600)));
+        // A window the plan does not have is sent with a null utilization.
+        let idle: UsageResponse = serde_json::from_str(
+            r#"{"five_hour": {"utilization": null, "resets_at": null},
+                "seven_day": {"utilization": 67.5, "resets_at": "2026-07-31T12:34:56Z"}}"#,
+        )
+        .unwrap();
+        let profile = usage_of(&idle);
+        assert_eq!(profile.session, None);
+        assert_eq!(profile.session_limit, SessionLimit::Unknown);
+        assert_eq!(profile.weekly, Some(Window::new(0.675, 1_785_501_296)));
     }
 
     #[test]
@@ -1040,6 +1033,7 @@ mod tests {
             (StatusCode::OK, None, good.clone()),
             refused,
             (StatusCode::OK, None, good.clone()),
+            (StatusCode::OK, None, good.clone()),
         ]);
         let client = serve(router).await;
         let (_dir, cache) = temp_cache();
@@ -1096,6 +1090,27 @@ mod tests {
         assert_eq!(read("fourth", after, false).await.unwrap(), good);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert_eq!(cache.load().backoff, Backoff::default());
+
+        // A fresh read asks even when the stored answer is young.
+        assert_eq!(read("fourth", after + 1, true).await.unwrap(), good);
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn a_429_after_the_backoff_ran_out_starts_a_new_one_for_its_account_alone() {
+        let mut backoff = Backoff {
+            retry_after: 1600,
+            rate_limited: 1,
+            last_error: Some("HTTP 429".into()),
+            accounts: vec!["a".into()],
+        };
+        backoff.rate_limited("b", 2000, None, "HTTP 429");
+        assert_eq!(backoff.accounts, ["b"]);
+        assert!(backoff.holds("b", 2001));
+        assert!(
+            !backoff.holds("c", 2001),
+            "two 429s in different backoffs do not hold back the fleet"
+        );
     }
 
     #[test]

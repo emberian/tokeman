@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::paths;
@@ -384,36 +384,58 @@ impl Fleet {
     }
 
     pub fn load() -> Result<Self> {
-        let path = paths::accounts_file();
-        let Some(contents) = read_if_present(&path)? else {
+        Self::load_from(&paths::accounts_file())
+    }
+
+    fn load_from(path: &Path) -> Result<Self> {
+        let Some(contents) = read_if_present(path)? else {
             return Ok(Self::default());
         };
         Self::parse(&contents).with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    pub fn load_locked() -> Result<(Self, FleetLock)> {
-        let lock = FleetLock {
+    fn lock_at(lock: &Path) -> Result<FleetLock> {
+        Ok(FleetLock {
             _lock: FileLock::acquire_announced(
-                &paths::accounts_lock(),
+                lock,
                 "the account file lock (another tokeman is writing tokens.toml)",
             )?,
-        };
+        })
+    }
+
+    pub fn load_locked() -> Result<(Self, FleetLock)> {
+        let lock = Self::lock_at(&paths::accounts_lock())?;
         Ok((Self::load()?, lock))
     }
 
     /// Change the fleet under the lock and save it.
     pub fn update<T>(mutate: impl FnOnce(&mut Self) -> Result<T>) -> Result<(Self, T)> {
-        let (mut fleet, lock) = Self::load_locked()?;
+        Self::update_at(&paths::accounts_file(), &paths::accounts_lock(), mutate)
+    }
+
+    /// [`Fleet::update`] of the account file at `path` under the lock at
+    /// `lock`: the file is read after the lock is held and written before
+    /// it is released.
+    fn update_at<T>(
+        path: &Path,
+        lock: &Path,
+        mutate: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(Self, T)> {
+        let lock = Self::lock_at(lock)?;
+        let mut fleet = Self::load_from(path)?;
         let result = mutate(&mut fleet)?;
-        fleet.save(&lock)?;
+        fleet.save_to(path, &lock)?;
         Ok((fleet, result))
     }
 
-    pub fn save(&self, _lock: &FleetLock) -> Result<()> {
+    pub fn save(&self, lock: &FleetLock) -> Result<()> {
+        self.save_to(&paths::accounts_file(), lock)
+    }
+
+    fn save_to(&self, path: &Path, _lock: &FleetLock) -> Result<()> {
         self.policy.validate()?;
-        let path = paths::accounts_file();
-        let existing = read_if_present(&path)?.unwrap_or_default();
-        write_atomic(&path, self.render(&existing)?.as_bytes(), 0o600)
+        let existing = read_if_present(path)?.unwrap_or_default();
+        write_atomic(path, self.render(&existing)?.as_bytes(), 0o600)
     }
 
     pub fn parse(contents: &str) -> Result<Self> {
@@ -783,6 +805,11 @@ mod tests {
         assert!(!account.credential(0).unwrap().is_login());
         assert_eq!(account.profile_token(0), Some("captured"));
         assert!(!account.needs_refresh(0));
+        // It reads the profile until it expires, and not after.
+        let mut dated = profile_only_account("acct", "captured");
+        dated.login.as_mut().unwrap().expires_at = Some(HOUR_MS);
+        assert_eq!(dated.profile_token(HOUR_MS - 1), Some("captured"));
+        assert_eq!(dated.profile_token(HOUR_MS), None);
     }
 
     #[test]
@@ -796,6 +823,11 @@ mod tests {
         young.login.as_mut().unwrap().obtained_at = Some(expires_at - 20 * 60_000);
         assert!(!young.needs_refresh(expires_at - 19 * 60_000));
         assert!(young.needs_refresh(expires_at));
+        // An expired token is renewed however young it is.
+        let mut expired = login_account("acct", expires_at);
+        expired.login.as_mut().unwrap().obtained_at = Some(expires_at - 60_000);
+        assert!(!expired.needs_refresh(expires_at - 1));
+        assert!(expired.needs_refresh(expires_at));
     }
 
     #[test]
@@ -928,6 +960,8 @@ mod tests {
             label: Some("work".into()),
             ..ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key-2")
         });
+        let names: Vec<&str> = fleet.services.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["glm", "kimi"], "a replaced account keeps its place");
         let rendered = fleet.render(existing).unwrap();
         assert!(rendered.contains("# the GLM coding plan"), "{rendered}");
         let reparsed = Fleet::parse(&rendered).unwrap();
@@ -1024,6 +1058,64 @@ mod tests {
                 .refresh_expires_at,
             Some(60 * DAY_MS)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_update_rereads_the_file_under_the_lock_and_leaves_it_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, lock) = (
+            dir.path().join("tokens.toml"),
+            dir.path().join("tokens.lock"),
+        );
+        std::fs::write(
+            &path,
+            "# kept\n[[tokens]]\nname = \"a\"\nkey = \"sk-ant-oat01-setup\"\n",
+        )
+        .unwrap();
+        let grant = |refresh: &str| Grant {
+            access_token: "access".into(),
+            refresh_token: Some(refresh.into()),
+            ..Grant::default()
+        };
+        Fleet::update_at(&path, &lock, |fleet| {
+            fleet.ensure_account("a").record_login(grant("first"), 0);
+            Ok(())
+        })
+        .unwrap();
+        let refresh_token = |fleet: &Fleet, name: &str| {
+            let login = fleet.account(name).unwrap().login.clone().unwrap();
+            login.refresh_token.unwrap()
+        };
+        let (saved, seen) = Fleet::update_at(&path, &lock, |fleet| {
+            assert!(
+                FileLock::try_acquire(&lock).unwrap().is_none(),
+                "the lock is held while the fleet is changed"
+            );
+            let seen = refresh_token(fleet, "a");
+            fleet.add_setup_key("b", "sk-ant-oat01-other".into());
+            Ok(seen)
+        })
+        .unwrap();
+        assert_eq!(seen, "first", "the change starts from the file, not a copy");
+        assert!(FileLock::try_acquire(&lock).unwrap().is_some());
+        let on_disk = Fleet::load_from(&path).unwrap();
+        assert_eq!(on_disk, saved);
+        assert_eq!(refresh_token(&on_disk, "a"), "first");
+        assert!(on_disk.account("b").is_some());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# kept\n"), "{text}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A change that fails writes nothing.
+        let failed = Fleet::update_at(&path, &lock, |fleet| -> Result<()> {
+            fleet.remove_account("a");
+            anyhow::bail!("no")
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]
