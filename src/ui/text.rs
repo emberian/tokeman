@@ -608,6 +608,33 @@ pub fn attention_text(item: &Attention, now: i64) -> String {
             service.label(),
             format_until(*expires_at, now)
         ),
+        Attention::CodexSeatExpires {
+            home,
+            account,
+            expires_at,
+            why,
+            ..
+        } => {
+            use crate::attention::Unkept;
+            use crate::codex::seats::Cause;
+            let end = match expires_at {
+                Some(at) if *at <= now => format!("stopped working {}", format_age(*at, now)),
+                Some(at) => format!("stops working {}", format_until(*at, now)),
+                None => "may stop working at any time".to_owned(),
+            };
+            let reason = match why {
+                Unkept::Tried(Cause::Refused) => "its login was refused",
+                Unkept::Tried(Cause::RefreshFailed) => "renewing it failed",
+                Unkept::Tried(Cause::Unanswered) => "its control socket does not answer",
+                Unkept::Tried(Cause::PushFailed) => "Codex refused the renewed token",
+                Unkept::Tried(Cause::ProfileGone) => "its profile is no longer registered",
+                Unkept::Tried(Cause::Unknown) => "it could not be renewed",
+                Unkept::Paused => "rotation is paused, so nothing renews it",
+                Unkept::NoDaemon => "no background service runs to renew it",
+                Unkept::Overdue => "the background service has not renewed it",
+            };
+            format!("the Codex on {home} runs on a token of {account} that {end}: {reason}")
+        }
     }
 }
 
@@ -625,6 +652,29 @@ pub fn attention_fix(item: &Attention) -> Option<String> {
             "tokeman {} reset {account}",
             crate::commands::services::command_word(*service)
         )),
+        Attention::CodexSeatExpires {
+            home,
+            account,
+            profile_home,
+            why,
+            ..
+        } => {
+            use crate::attention::Unkept;
+            use crate::codex::seats::Cause;
+            let push_again = format!("tokeman codex use {account} --codex-home {home}");
+            Some(match (why, profile_home) {
+                (Unkept::Paused, _) => "tokeman rotate resume".to_owned(),
+                (Unkept::NoDaemon, _) => format!("tokeman rotate install (or now: {push_again})"),
+                (Unkept::Tried(Cause::Refused), Some(profile)) => {
+                    format!("CODEX_HOME={profile} codex login, then {push_again}")
+                }
+                // Onto whichever registered profile has the most room.
+                (Unkept::Tried(Cause::ProfileGone), _) | (_, None) => {
+                    format!("tokeman codex use --codex-home {home}")
+                }
+                _ => push_again,
+            })
+        }
         Attention::BelowFloor { .. } | Attention::RunsDry { .. } => None,
     }
 }

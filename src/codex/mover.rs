@@ -2,7 +2,8 @@
 //!
 //! A running Codex is asked over its control socket what its account-wide
 //! windows hold. While they are above the leaving floors nothing else
-//! happens and no request leaves the machine. Below them the other profiles
+//! happens (Codex itself fetches its usage to answer; tokeman sends
+//! nothing). Below them the other profiles
 //! are probed, and the best one above the landing floors is announced to the
 //! app-server; the swap lands between turns. `tokeman codex watch` runs this
 //! in the foreground on each push from Codex, the daemon on [`INTERVAL`].
@@ -19,10 +20,13 @@ use std::time::Duration;
 use super::Client;
 use super::appserver::{self, AccountInfo, AppServer, ReportedLimits};
 use super::auth::CodexHome;
+use super::keep;
 use super::probe;
-use super::refresh::{self, DEFAULT_MAX_AGE_DAYS, RefreshError};
+use super::refresh::RefreshError;
+use super::seats::{Pushed, Seats};
 use crate::account::{CodexAccount, Fleet};
 use crate::fs::{append_line, read_if_present, write_atomic};
+use crate::history::Fingerprint;
 use crate::paths::{self, tilde};
 use crate::policy::{self, Floors, Relocation};
 use crate::quota::{CodexDetail, Detail, Limit, Reading, Scope, Service, Source, Span, Window};
@@ -63,6 +67,26 @@ impl MoveFloors {
                 session: self.land.session.max(min_remaining),
                 weekly: self.land.weekly.max(min_remaining),
             },
+        }
+    }
+}
+
+/// What a look moves by: the floors, the seat file a push is recorded in,
+/// and who is asking.
+#[derive(Debug, Clone)]
+pub struct Terms {
+    pub floors: MoveFloors,
+    pub seats: Seats,
+    pub by: By,
+}
+
+impl Terms {
+    /// The `[rotation]` floors and the live seat file.
+    pub fn of(fleet: &Fleet, by: By) -> Self {
+        Self {
+            floors: MoveFloors::of(fleet),
+            seats: Seats::default(),
+            by,
         }
     }
 }
@@ -255,20 +279,29 @@ pub fn moves_at(path: &Path) -> Vec<Move> {
 pub struct Announced {
     /// Refreshing the account first failed; its stored token was sent as is.
     pub refresh_error: Option<RefreshError>,
+    /// The push could not be written to the seat file, so the daemon will
+    /// not renew this token.
+    pub record_error: Option<String>,
     /// What the running Codex reported before and after. A successful RPC
     /// only means the request was accepted; `after` is the proof.
     pub before: Option<AccountInfo>,
     pub after: Option<AccountInfo>,
 }
 
-/// Put the Codex behind `socket` onto `account`: refresh the account's
-/// bundle when it is due (the app-server takes the token as is and does not
-/// refresh it), then hand its token to the app-server.
-pub async fn announce(client: &Client, account: &CodexAccount, socket: &Path) -> Result<Announced> {
+/// Put the Codex running on `home` onto `account`: renew the account's
+/// bundle when it is due ([`keep::freshen`]; the app-server takes the token
+/// as is and never renews it), hand its token to the app-server, and record
+/// the push in the seat file so the daemon keeps it alive.
+pub async fn announce(
+    client: &Client,
+    account: &CodexAccount,
+    home: &CodexHome,
+    seats: &Seats,
+    by: By,
+) -> Result<Announced> {
+    let now = Utc::now().timestamp();
     let source = CodexHome::new(account.home());
-    let refresh_error = refresh::refresh(client, &source, false, DEFAULT_MAX_AGE_DAYS, Utc::now())
-        .await
-        .err();
+    let refresh_error = keep::freshen(client, &source, false, now).await.err();
     let auth = source.read()?;
     let access_token = auth
         .access_token()
@@ -276,8 +309,12 @@ pub async fn announce(client: &Client, account: &CodexAccount, socket: &Path) ->
     let account_id = auth
         .effective_account_id()
         .with_context(|| format!("{} has no chatgpt_account_id", account.name))?;
-    let plan = auth.claims().and_then(|claims| claims.chatgpt_plan_type);
-    let mut server = AppServer::connect(socket).await?;
+    let claims = auth.claims();
+    let plan = claims
+        .as_ref()
+        .and_then(|claims| claims.chatgpt_plan_type.clone());
+    let socket = appserver::control_socket_path(home.path());
+    let mut server = AppServer::connect(&socket).await?;
     let before = server.read_account().await.ok();
     let sent = server
         .reseat(access_token, &account_id, plan.as_deref())
@@ -288,8 +325,25 @@ pub async fn announce(client: &Client, account: &CodexAccount, socket: &Path) ->
     };
     server.close().await;
     sent?;
+    // From here the Codex runs on a token it cannot renew; the seat file is
+    // what gets it renewed.
+    let record_error = seats
+        .put(Pushed {
+            home: tilde(home.path()),
+            account: account.name.clone(),
+            account_id,
+            email: claims.and_then(|claims| claims.email),
+            token: Fingerprint::of(access_token),
+            expires_at: keep::expiry(access_token),
+            pushed_at: now,
+            by,
+            trouble: None,
+        })
+        .err()
+        .map(|error| format!("{error:#}"));
     Ok(Announced {
         refresh_error,
+        record_error,
         before,
         after,
     })
@@ -424,6 +478,12 @@ impl fmt::Display for Look {
                 if let Some(error) = &announced.refresh_error {
                     write!(f, "; could not refresh {to} first: {error}")?;
                 }
+                if let Some(error) = &announced.record_error {
+                    write!(
+                        f,
+                        "; the seat was not recorded, so its token will not be renewed: {error}"
+                    )?;
+                }
                 Ok(())
             }
             Outcome::Failed { to, message } => {
@@ -464,9 +524,10 @@ pub async fn consider(
     fleet: &Fleet,
     home: &CodexHome,
     seat: &Seat,
-    floors: MoveFloors,
+    terms: &Terms,
     dry_run: bool,
 ) -> Look {
+    let floors = terms.floors;
     let mut look = Look {
         home: home.path().to_path_buf(),
         seated: seat.name(fleet),
@@ -502,12 +563,11 @@ pub async fn consider(
         look.outcome = Outcome::WouldMove { to: landing };
         return look;
     }
-    let socket = appserver::control_socket_path(home.path());
     let account = others
         .iter()
         .find(|account| account.name == landing)
         .expect("the landing is one of the probed profiles");
-    look.outcome = match announce(client, account, &socket).await {
+    look.outcome = match announce(client, account, home, &terms.seats, terms.by).await {
         Ok(announced) => Outcome::Moved {
             to: landing,
             announced,
@@ -526,7 +586,7 @@ pub async fn look_at(
     client: &Client,
     fleet: &Fleet,
     home: &CodexHome,
-    floors: MoveFloors,
+    terms: &Terms,
     dry_run: bool,
 ) -> Look {
     let socket = appserver::control_socket_path(home.path());
@@ -534,7 +594,7 @@ pub async fn look_at(
         return Look::idle(home, Outcome::NoSocket);
     }
     match Seat::read_at(&socket).await {
-        Ok(seat) => consider(client, fleet, home, &seat, floors, dry_run).await,
+        Ok(seat) => consider(client, fleet, home, &seat, terms, dry_run).await,
         Err(error) => Look::idle(
             home,
             Outcome::Unreachable {
@@ -549,12 +609,12 @@ pub async fn sweep(
     client: &Client,
     fleet: &Fleet,
     homes: &[CodexHome],
-    floors: MoveFloors,
+    terms: &Terms,
     dry_run: bool,
 ) -> Vec<Look> {
     let mut looks = Vec::with_capacity(homes.len());
     for home in homes {
-        looks.push(look_at(client, fleet, home, floors, dry_run).await);
+        looks.push(look_at(client, fleet, home, terms, dry_run).await);
     }
     looks
 }
@@ -574,16 +634,23 @@ mod tests {
         }
     }
 
-    const FLOORS: MoveFloors = MoveFloors {
-        leave: Floors {
-            session: 0.20,
-            weekly: 0.20,
-        },
-        land: Floors {
-            session: 0.30,
-            weekly: 0.30,
-        },
-    };
+    /// The default floors, pushes recorded in a seat file under `dir`.
+    fn terms(dir: &Path) -> Terms {
+        Terms {
+            floors: MoveFloors {
+                leave: Floors {
+                    session: 0.20,
+                    weekly: 0.20,
+                },
+                land: Floors {
+                    session: 0.30,
+                    weekly: 0.30,
+                },
+            },
+            seats: Seats::at(dir.join("codex-seats.json")),
+            by: By::Daemon,
+        }
+    }
 
     /// Three profiles and a Codex running on the first one's account.
     fn running_on_a(dir: &Path, limits: serde_json::Value) -> (FakeAppServer, Fleet) {
@@ -603,11 +670,12 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_seat_is_left_alone_and_nothing_is_probed() {
         let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
         let (fake, fleet) = running_on_a(dir.path(), limits_answer(79.0, 50.0));
         let backend = Backend::default().usage_answers(vec![ok(usage_body(0.0, 0.0))]);
         let client = backend.client().await;
         let home = CodexHome::new(fake.home.path());
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         assert_eq!(look.outcome, Outcome::Healthy);
         assert_eq!(look.seated.as_deref(), Some("a"));
         let (remaining, span) = look.tightest.unwrap();
@@ -621,6 +689,7 @@ mod tests {
     #[tokio::test]
     async fn a_seat_below_its_floor_moves_to_the_best_profile_with_landing_room() {
         let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
         let (fake, fleet) = running_on_a(dir.path(), limits_answer(85.0, 50.0));
         // b has 25% of its 5h window left: over the leaving floor, under the
         // landing floor. c has room.
@@ -634,7 +703,7 @@ mod tests {
         let home = CodexHome::new(fake.home.path());
 
         // A dry run decides the same and touches nothing.
-        let dry = look_at(&client, &fleet, &home, FLOORS, true).await;
+        let dry = look_at(&client, &fleet, &home, &terms, true).await;
         assert_eq!(dry.outcome, Outcome::WouldMove { to: "c".into() });
         assert_eq!(dry.probed.len(), 2);
         assert!(fake.logins().is_empty());
@@ -644,7 +713,7 @@ mod tests {
             "the seated account is not probed"
         );
 
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         let Outcome::Moved { to, announced } = &look.outcome else {
             panic!("{look}");
         };
@@ -668,6 +737,13 @@ mod tests {
             })]
         );
         assert_eq!(fake.account_id(), "acct-c");
+        // The push is on record, so the daemon renews that token.
+        assert_eq!(announced.record_error, None);
+        let pushed = terms.seats.on(&tilde(fake.home.path())).unwrap();
+        assert_eq!(pushed.account, "c");
+        assert_eq!(pushed.account_id, "acct-c");
+        assert_eq!(pushed.token, Fingerprint::of("access-c"));
+        assert_eq!(pushed.by, By::Daemon);
         assert!(
             backend.requests("/token").is_empty(),
             "a fresh bundle is not refreshed"
@@ -685,7 +761,7 @@ mod tests {
         );
 
         // The next look sees c's own windows and stays.
-        let after = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let after = look_at(&client, &fleet, &home, &terms, false).await;
         assert_eq!(after.outcome, Outcome::Healthy);
         assert_eq!(after.seated.as_deref(), Some("c"));
         assert_eq!(fake.logins().len(), 1);
@@ -694,13 +770,14 @@ mod tests {
     #[tokio::test]
     async fn a_low_seat_drains_when_nowhere_has_landing_room_and_a_spent_one_takes_scraps() {
         let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
         let (fake, mut fleet) = running_on_a(dir.path(), limits_answer(85.0, 50.0));
         // c is parked: only b is a landing, and it has 25% left.
         fleet.codex[2].parked = true;
         let backend = Backend::default().usage_answers(vec![ok(usage_body(75.0, 10.0))]);
         let client = backend.client().await;
         let home = CodexHome::new(fake.home.path());
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         assert_eq!(look.outcome, Outcome::Draining);
         assert!(fake.logins().is_empty());
         assert_eq!(
@@ -713,7 +790,7 @@ mod tests {
         let mut refused = limits_answer(100.0, 50.0);
         refused["rateLimits"]["rateLimitReachedType"] = json!("rate_limit_reached");
         fake.set_limits(refused);
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         assert!(
             matches!(&look.outcome, Outcome::Moved { to, .. } if to == "b"),
             "{look}"
@@ -724,13 +801,14 @@ mod tests {
     #[tokio::test]
     async fn a_landing_that_cannot_be_read_is_no_landing_and_a_dead_socket_is_reported() {
         let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
         let (fake, mut fleet) = running_on_a(dir.path(), limits_answer(95.0, 50.0));
         fleet.codex.truncate(2);
         let backend =
             Backend::default().usage_answers(vec![status(StatusCode::UNAUTHORIZED, "{}")]);
         let client = backend.client().await;
         let home = CodexHome::new(fake.home.path());
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         assert_eq!(look.outcome, Outcome::Draining);
 
         // No socket at all is quiet; a socket nobody answers is said.
@@ -742,7 +820,7 @@ mod tests {
             &client,
             &fleet,
             &CodexHome::new(empty.path()),
-            FLOORS,
+            &terms,
             false,
         )
         .await;
@@ -754,7 +832,7 @@ mod tests {
             &client,
             &fleet,
             &CodexHome::new(empty.path()),
-            FLOORS,
+            &terms,
             false,
         )
         .await;
@@ -768,6 +846,7 @@ mod tests {
     #[tokio::test]
     async fn the_same_account_in_another_home_is_not_a_landing() {
         let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
         let (fake, mut fleet) = running_on_a(dir.path(), limits_answer(95.0, 50.0));
         // `copy` is profile a's login in a second directory.
         let copy = dir.path().join("copy");
@@ -784,7 +863,7 @@ mod tests {
         let backend = Backend::default().usage_answers(vec![ok(usage_body(0.0, 0.0))]);
         let client = backend.client().await;
         let home = CodexHome::new(fake.home.path());
-        let look = look_at(&client, &fleet, &home, FLOORS, false).await;
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
         assert_eq!(look.outcome, Outcome::Draining);
         assert!(backend.requests("/usage").is_empty());
         assert!(fake.logins().is_empty());

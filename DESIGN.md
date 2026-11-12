@@ -96,6 +96,10 @@ src/
     mover.rs     moving a running Codex: Seat (what its app-server reports), consider (leave below the Codex
                  floors for the best profile above the landing floors, via policy::relocate), announce, Look;
                  the only writer of codex-moves.jsonl. Shared by the daemon and `codex watch`
+    seats.rs     Pushed: the seats tokeman pushed (home, account, token fingerprint, expiry, last Trouble); the
+                 only writer of codex-seats.json, locked
+    keep.rs      keeping a pushed seat alive: tend (renew through refresh.rs a day before expiry or when the token
+                 is dead, push again; forget a seat whose Codex is gone), freshen, RENEW_WITHIN_SECS
   providers/
     mod.rs       ServiceAccount; read (dispatch by service) -> Reading, read_all (concurrent, each read bounded)
     zai.rs       GLM Coding Plan
@@ -123,8 +127,9 @@ src/
     services.rs  the service-quota poll: its own task every services_interval_secs; rotation never waits on it
     notify.rs    the notification round: its own task every two minutes; the ledger of what was told (the only writer
                  of notified.json); the bounded osascript / notify-send delivery
-    codex.rs     the Codex mover: codex::mover's look at every control socket, its own bounded task every five
-                 minutes; Standing (on / off / paused / fewer than two profiles)
+    codex.rs     the Codex mover: codex::keep's tending of every pushed seat, then codex::mover's look at every
+                 control socket, in its own bounded task every five minutes; Standing (on / off / paused / fewer
+                 than two profiles) gates the moving, only a pause the tending
     service.rs   the launchd plist, install/uninstall (macOS)
   commands/      what each command does, returning data; nothing here prints or reads the terminal
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
@@ -243,7 +248,15 @@ pub enum Outcome { NoSocket, Unreachable, NoWindows, Healthy, Draining, WouldMov
                    Failed { to, message } }
 pub struct Look { home, seated, tightest, probed /* the caller keeps these */, outcome }
 pub struct Move { at, home, from, to, remaining, span, by: By /* daemon | watch | use */ }   // codex-moves.jsonl
-pub async fn consider(&Client, &Fleet, &CodexHome, &Seat, MoveFloors, dry_run) -> Look   // probes only a low seat
+pub struct Terms { floors: MoveFloors, seats: Seats, by: By }
+pub async fn consider(&Client, &Fleet, &CodexHome, &Seat, &Terms, dry_run) -> Look   // probes only a low seat
+pub async fn announce(&Client, &CodexAccount, &CodexHome, &Seats, By) -> Result<Announced>   // push, then Seats::put
+
+// codex/seats.rs, codex/keep.rs
+pub struct Pushed { home, account, account_id, email, token: Fingerprint, expires_at, pushed_at, by, trouble }
+pub enum Cause { Refused, RefreshFailed, Unanswered, PushFailed, ProfileGone, Unknown }
+pub enum Tended { Fine, Renewed { expires_at }, Ended, Troubled(Trouble) }
+pub async fn tend(&Client, &Fleet, &Seats, &Pushed, now) -> Tend
 
 // launch.rs
 pub struct Launch { service, account, room, program, args, env: Vec<EnvVar { name, value, secret }>, unset }
@@ -294,7 +307,9 @@ impl Overview { fn build(&Fleet, Facts, only: Option<Service>, now) -> Self }
 pub enum Within { OneDay, ThreeDays }
 pub enum Attention { DaemonStopped, BelowFloor { service }, RunsDry { service, at },
                      LoginRefused { account }, LoginEnds { account, ends_at, within }, LoginAgeing { account },
-                     ResetExpires { service, account, expires_at, within } }   // serde: tag "kind"
+                     ResetExpires { service, account, expires_at, within },
+                     CodexSeatExpires { home, account, profile_home, expires_at, why: Unkept } }   // serde: tag "kind"
+pub enum Unkept { Tried(seats::Cause), Paused, NoDaemon, Overdue }
 impl Attention { fn key(&self) -> String ; fn level(&self) -> Level }
 pub fn find(&Overview, now: i64) -> Vec<Attention>
 
@@ -368,7 +383,8 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
 - **One writer per file.** `claude/settings.rs` for settings.json,
   `account.rs` for tokens.toml, `daemon/cadence.rs` for the cycle state,
   `observe.rs` for the admission state, `history.rs` for the JSONL,
-  `claims.rs` for claims.json, `drift.rs` for drift.json, `daemon/notify.rs`
+  `claims.rs` for claims.json, `codex/seats.rs` for codex-seats.json,
+  `codex/mover.rs` for codex-moves.jsonl, `drift.rs` for drift.json, `daemon/notify.rs`
   for notified.json, `store.rs` for snapshots.db.
 - **Printing and reading the terminal.** Nothing outside `ui/text.rs`
   prints, and nothing outside `ui/prompt.rs` reads the terminal.
@@ -384,6 +400,11 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   the Codex mover and every `launch` only choose among accounts.
 - **What the daemon moves.** Claude Code's default (the cycle) and a running
   Codex (the mover). It never switches agy: a running agy cannot be told.
+- **A pushed token has a keeper.** Whatever pushes a token to a running
+  Codex (`mover::announce`, the only place that does) records the seat, and
+  the daemon renews every recorded seat a day before its token ends. A seat
+  nothing renewed is an `Attention::CodexSeatExpires` with its expiry, so a
+  session never fails unannounced.
 - **An uncertain claim is never retried as another.** With a claim pending,
   `Journal::begin` returns it with its request id or refuses a different
   grant or credit.
@@ -448,6 +469,10 @@ owner-only.
   each with when and on which account's read it was first seen, and the
   version that judged them. Another version's file reads as empty: its
   known sets differ.
+- `codex-seats.json`: one entry per CODEX_HOME whose running Codex holds a
+  token tokeman pushed (`home`, `account`, `account_id`, `email`, `token` as
+  a fingerprint, `expires_at`, `pushed_at`, `by`, `trouble`). Dropped when
+  that Codex is gone or on another account.
 - `codex-moves.jsonl`: one line per move of a running Codex (`at`, `home`,
   `from`, `to`, `remaining`, `span`, `by`), by the daemon, `codex watch` or
   `codex use`. Past 256 KiB the newest 200 are kept.
@@ -487,7 +512,18 @@ owner-only.
   windows under `rateLimits` (`primary`, `secondary`, each with
   `usedPercent` and `windowDurationMins`), the per-feature buckets under
   `rateLimitsByLimitId`, and `accountId` (codex 0.167.0 schema). Its
-  `account/rateLimits/updated` push is sparse.
+  `account/rateLimits/updated` push is sparse. It fetches the usage from the
+  backend for each read.
+- A token given to a Codex app-server with `account/login/start`
+  (`chatgptAuthTokens`) is held in memory by an `ExternalAuthBridge`
+  (codex 0.167.0, `app-server/src/request_processors/account_processor.rs`,
+  `app-server/src/external_auth.rs`). `AuthManager::auth`
+  (`login/src/auth/manager.rs`) renews ahead of expiry only auth it manages
+  itself, so the pushed token is used until a 401. Then the bridge sends
+  `account/chatgptAuthTokens/refresh` to every initialized connection and
+  waits ten seconds; with no client connected the turn fails. A later
+  `account/login/start` replaces the token. Codex access tokens live ten
+  days.
 - z.ai and Kimi serve Claude Code from an Anthropic-compatible endpoint
   (bearer token and API key respectively), and Claude Code 2.1.322 sends a
   key from its environment in preference to a `CLAUDE_CODE_OAUTH_TOKEN` in

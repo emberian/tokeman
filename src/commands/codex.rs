@@ -12,10 +12,11 @@ use crate::account::{CodexAccount, Fleet};
 use crate::codex::Client;
 use crate::codex::appserver::{self, AccountInfo, AppServer};
 use crate::codex::auth::{self, CodexHome, IdClaims};
-use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Seat};
+use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Seat, Terms};
 use crate::codex::probe::{self, State};
 use crate::codex::refresh::{self, DEFAULT_MAX_AGE_DAYS, RefreshError};
 use crate::codex::resets::{self, CreditList};
+use crate::codex::seats::Seats;
 use crate::daemon::codex::Standing;
 use crate::paths::{expand_tilde, tilde};
 use crate::quota::{ReadError, Reading};
@@ -366,6 +367,9 @@ pub enum Warning {
     },
     /// `--force` moved onto an account that is not viable.
     Forced { account: String, state: State },
+    /// The push was not written to the seat file: nothing will renew the
+    /// token the running Codex now holds.
+    Unrecorded { message: String },
 }
 
 impl fmt::Display for Warning {
@@ -374,6 +378,10 @@ impl fmt::Display for Warning {
             Self::RefreshFailed { account, error } => {
                 write!(f, "could not refresh {account} first: {error}")
             }
+            Self::Unrecorded { message } => write!(
+                f,
+                "the seat was not recorded, so its token will not be renewed before it expires: {message}"
+            ),
             Self::Forced { account, state } => {
                 write!(
                     f,
@@ -468,6 +476,7 @@ pub async fn reseat(
         client,
         fleet,
         &target_home(codex_home)?,
+        &Seats::default(),
         account,
         dry_run,
         force,
@@ -479,6 +488,7 @@ async fn reseat_home(
     client: &Client,
     fleet: &Fleet,
     target: &CodexHome,
+    seats: &Seats,
     account: Option<&str>,
     dry_run: bool,
     force: bool,
@@ -523,12 +533,15 @@ async fn reseat_home(
     let account = fleet
         .codex_account(&chosen.account)
         .context("chosen account vanished from the fleet")?;
-    let announced = mover::announce(client, account, &socket).await?;
+    let announced = mover::announce(client, account, target, seats, By::Use).await?;
     if let Some(error) = announced.refresh_error {
         result.warnings.push(Warning::RefreshFailed {
             account: chosen.account.clone(),
             error,
         });
+    }
+    if let Some(message) = announced.record_error {
+        result.warnings.push(Warning::Unrecorded { message });
     }
     result.moved = Some(Moved {
         before: announced.before,
@@ -586,10 +599,16 @@ fn floors_for(fleet: &Fleet, min_remaining: Option<f64>) -> Result<MoveFloors> {
 pub async fn watch(
     client: &Client,
     fleet: &Fleet,
+    seats: &Seats,
     options: &WatchOptions,
     mut on_event: impl FnMut(WatchEvent),
 ) -> Result<()> {
     let floors = floors_for(fleet, options.min_remaining)?;
+    let terms = Terms {
+        floors,
+        seats: seats.clone(),
+        by: By::Watch,
+    };
     let unparked = mover::landings(fleet).len();
     if unparked < 2 {
         on_event(WatchEvent::NowhereToMove { unparked });
@@ -600,7 +619,7 @@ pub async fn watch(
             Some(home) => vec![target_home(Some(home))?],
             None => mover::homes(fleet),
         };
-        for look in mover::sweep(client, fleet, &homes, floors, true).await {
+        for look in mover::sweep(client, fleet, &homes, &terms, true).await {
             on_event(WatchEvent::Look(look));
         }
         return Ok(());
@@ -631,7 +650,7 @@ pub async fn watch(
         } else {
             server = Some(connected);
         }
-        let look = mover::consider(client, fleet, &target, &seat, floors, false).await;
+        let look = mover::consider(client, fleet, &target, &seat, &terms, false).await;
         let moved = matches!(look.outcome, Outcome::Moved { .. });
         on_event(WatchEvent::Look(look));
         if options.once {
@@ -747,17 +766,23 @@ pub async fn watch_running(
             on_event(WatchEvent::LastMove(last));
         }
     }
-    watch(&Client::new()?, fleet, options, |event| {
-        if let WatchEvent::Look(look) = &event
-            && !options.dry_run
-        {
-            view::record(&look.probed);
-            if let Some(moved) = look.moved(By::Watch, super::now()) {
-                keep_move(&moved);
+    watch(
+        &Client::new()?,
+        fleet,
+        &Seats::default(),
+        options,
+        |event| {
+            if let WatchEvent::Look(look) = &event
+                && !options.dry_run
+            {
+                view::record(&look.probed);
+                if let Some(moved) = look.moved(By::Watch, super::now()) {
+                    keep_move(&moved);
+                }
             }
-        }
-        on_event(event)
-    })
+            on_event(event)
+        },
+    )
     .await
 }
 
@@ -918,11 +943,14 @@ mod tests {
         let backend = Backend::default().usage_answers(vec![ok(weekly_only_body(5.0))]);
         let client = backend.client().await;
         let home = fake.home.path().display().to_string();
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
         let run = async |options: WatchOptions| {
             let mut events = Vec::new();
-            watch(&client, &fleet, &options, |event| events.push(event))
-                .await
-                .unwrap();
+            watch(&client, &fleet, &seats, &options, |event| {
+                events.push(event)
+            })
+            .await
+            .unwrap();
             events
         };
 
@@ -977,14 +1005,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut fleet = fleet_of(vec![profile(dir.path(), "only", "r")]);
         let client = Backend::default().client().await;
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
         let mut events = Vec::new();
         let options = WatchOptions {
             dry_run: true,
             ..WatchOptions::default()
         };
-        watch(&client, &fleet, &options, |event| events.push(event))
-            .await
-            .unwrap();
+        watch(&client, &fleet, &seats, &options, |event| {
+            events.push(event)
+        })
+        .await
+        .unwrap();
         assert_eq!(events, vec![WatchEvent::NowhereToMove { unparked: 1 }]);
         // A parked second profile is not somewhere to move.
         fleet.codex.push(CodexAccount {
@@ -992,7 +1023,7 @@ mod tests {
             ..profile(dir.path(), "parked", "r")
         });
         events.clear();
-        watch(&client, &fleet, &WatchOptions::default(), |event| {
+        watch(&client, &fleet, &seats, &WatchOptions::default(), |event| {
             events.push(event)
         })
         .await
@@ -1002,7 +1033,7 @@ mod tests {
             min_remaining: Some(1.5),
             ..WatchOptions::default()
         };
-        assert!(watch(&client, &fleet, &bad, |_| {}).await.is_err());
+        assert!(watch(&client, &fleet, &seats, &bad, |_| {}).await.is_err());
     }
 
     #[tokio::test]
@@ -1013,12 +1044,13 @@ mod tests {
         let backend = Backend::default().usage_answers(vec![ok(usage_body(10.0, 10.0))]);
         let client = backend.client().await;
         let target = CodexHome::new(fake.home.path());
-        let dry = reseat_home(&client, &fleet, &target, Some("b"), true, false)
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
+        let dry = reseat_home(&client, &fleet, &target, &seats, Some("b"), true, false)
             .await
             .unwrap();
         assert_eq!(dry.moved, None);
         assert!(fake.logins().is_empty());
-        let moved = reseat_home(&client, &fleet, &target, Some("b"), false, false)
+        let moved = reseat_home(&client, &fleet, &target, &seats, Some("b"), false, false)
             .await
             .unwrap();
         let reported = moved.moved.unwrap();
@@ -1026,6 +1058,8 @@ mod tests {
         assert_eq!(reported.after.unwrap().email.as_deref(), Some("b@x.y"));
         assert_eq!(fake.logins()[0]["accessToken"], "access-b");
         assert!(moved.warnings.is_empty());
+        let pushed = seats.on(&tilde(fake.home.path())).unwrap();
+        assert_eq!((pushed.account.as_str(), pushed.by), ("b", By::Use));
     }
 
     #[test]

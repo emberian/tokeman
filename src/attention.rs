@@ -7,6 +7,9 @@
 
 use serde::Serialize;
 
+use crate::codex::keep::RENEW_WITHIN_SECS;
+use crate::codex::mover;
+use crate::codex::seats::Cause;
 use crate::forecast::Outlook;
 use crate::quota::{Level, Service};
 use crate::ui::overview::{Monitor, Overview};
@@ -44,6 +47,31 @@ impl Within {
     }
 }
 
+/// Why a pushed Codex seat was not renewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unkept {
+    /// The background service tried and could not.
+    Tried(Cause),
+    /// Rotation is paused: the service renews nothing.
+    Paused,
+    /// No background service runs: nothing renews it.
+    NoDaemon,
+    /// The service runs and has not renewed it yet.
+    Overdue,
+}
+
+impl Unkept {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tried(cause) => cause.name(),
+            Self::Paused => "paused",
+            Self::NoDaemon => "no-daemon",
+            Self::Overdue => "overdue",
+        }
+    }
+}
+
 /// One thing that needs the user.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -75,6 +103,17 @@ pub enum Attention {
         expires_at: i64,
         within: Within,
     },
+    /// The Codex running on `home` holds a token tokeman pushed, which it
+    /// cannot renew itself, and nothing has renewed it: its requests fail
+    /// from `expires_at` (now, when the backend already rejects the token).
+    CodexSeatExpires {
+        home: String,
+        account: String,
+        /// Where the account's profile logs in, when it is registered.
+        profile_home: Option<String>,
+        expires_at: Option<i64>,
+        why: Unkept,
+    },
 }
 
 impl Attention {
@@ -100,6 +139,16 @@ impl Attention {
                 service.name(),
                 within.name()
             ),
+            Self::CodexSeatExpires {
+                home,
+                expires_at,
+                why,
+                ..
+            } => format!(
+                "codex-seat:{home}:{}:{}",
+                expires_at.unwrap_or(0),
+                why.name()
+            ),
         }
     }
 
@@ -110,6 +159,7 @@ impl Attention {
             Self::DaemonStopped
             | Self::BelowFloor { .. }
             | Self::RunsDry { .. }
+            | Self::CodexSeatExpires { .. }
             | Self::LoginRefused { .. } => Level::Critical,
             Self::LoginEnds { within, .. } | Self::ResetExpires { within, .. } => match within {
                 Within::OneDay => Level::Critical,
@@ -204,6 +254,38 @@ pub fn find(overview: &Overview, now: i64) -> Vec<Attention> {
             });
         }
     }
+    for view in &overview.codex_seats {
+        let seat = &view.seat;
+        let left = seat.expires_at.map(|at| at - now);
+        // Long past its end, the session has failed already and the entry
+        // only waits for a service to forget it.
+        if left.is_some_and(|left| left < -DAY_SECS) {
+            continue;
+        }
+        let due = left.is_some_and(|left| left <= RENEW_WITHIN_SECS);
+        let why = match (&seat.trouble, overview.monitor) {
+            (Some(trouble), _) => Unkept::Tried(trouble.cause),
+            (None, _) if !due => continue,
+            (None, Monitor::Paused) => Unkept::Paused,
+            (None, Monitor::Stopped | Monitor::NotInstalled) => Unkept::NoDaemon,
+            // The service renews at its next look; a few looks later it
+            // should have.
+            (None, Monitor::Running) => {
+                let grace = 3 * mover::INTERVAL.as_secs() as i64;
+                if left.is_some_and(|left| left > RENEW_WITHIN_SECS - grace) {
+                    continue;
+                }
+                Unkept::Overdue
+            }
+        };
+        found.push(Attention::CodexSeatExpires {
+            home: seat.home.clone(),
+            account: seat.account.clone(),
+            profile_home: view.profile_home.clone(),
+            expires_at: seat.expires_at,
+            why,
+        });
+    }
     // Stable: within a level the order above stands.
     found.sort_by_key(|item| item.level() != Level::Critical);
     found
@@ -240,6 +322,87 @@ mod tests {
 
     fn keys(found: &[Attention]) -> Vec<String> {
         found.iter().map(Attention::key).collect()
+    }
+
+    #[test]
+    fn a_pushed_codex_seat_nothing_renewed_needs_the_user_before_it_ends() {
+        use crate::codex::seats::Trouble;
+        use crate::codex::seats::tests::pushed;
+        let fleet = Fleet {
+            codex: vec![codex_account("b", "~/.codex-homes/b")],
+            ..Fleet::default()
+        };
+        let found = |seat: crate::codex::seats::Pushed, monitor: Monitor| {
+            let facts = Facts {
+                codex_seats: vec![seat],
+                monitor,
+                ..Facts::default()
+            };
+            view(&fleet, facts)
+        };
+        let seat = |left: i64| pushed("~/.codex", "b", Some(NOW + left));
+        let why = |found: &[Attention]| match found {
+            [Attention::CodexSeatExpires { why, .. }] => Some(*why),
+            [] => None,
+            other => panic!("{other:?}"),
+        };
+
+        // Days left: nothing, whoever runs.
+        assert_eq!(found(seat(5 * DAY_SECS), Monitor::NotInstalled), []);
+        // Inside the renewal margin the running service gets a few looks.
+        assert_eq!(found(seat(RENEW_WITHIN_SECS - 60), Monitor::Running), []);
+        assert_eq!(
+            why(&found(seat(RENEW_WITHIN_SECS - HOUR), Monitor::Running)),
+            Some(Unkept::Overdue)
+        );
+        // Nobody to renew it is said as soon as it is due.
+        assert_eq!(
+            why(&found(seat(RENEW_WITHIN_SECS - 60), Monitor::Paused)),
+            Some(Unkept::Paused)
+        );
+        for monitor in [Monitor::Stopped, Monitor::NotInstalled] {
+            let found = found(seat(3 * HOUR), monitor);
+            let seats: Vec<_> = found
+                .iter()
+                .filter(|item| matches!(item, Attention::CodexSeatExpires { .. }))
+                .cloned()
+                .collect();
+            assert_eq!(why(&seats), Some(Unkept::NoDaemon), "{monitor:?}");
+        }
+
+        // A renewal that failed is said with its cause, even days before
+        // the expiry: the token may be dead already.
+        let mut refused = seat(5 * DAY_SECS);
+        refused.trouble = Some(Trouble {
+            cause: Cause::Refused,
+            at: NOW,
+            message: "revoked".into(),
+        });
+        let items = found(refused.clone(), Monitor::Running);
+        assert_eq!(
+            items,
+            [Attention::CodexSeatExpires {
+                home: "~/.codex".into(),
+                account: "b".into(),
+                profile_home: Some("~/.codex-homes/b".into()),
+                expires_at: Some(NOW + 5 * DAY_SECS),
+                why: Unkept::Tried(Cause::Refused),
+            }]
+        );
+        assert_eq!(items[0].level(), Level::Critical);
+        assert_eq!(
+            items[0].key(),
+            format!("codex-seat:~/.codex:{}:refused", NOW + 5 * DAY_SECS)
+        );
+        // Another cause is another key, so it is notified again.
+        refused.trouble.as_mut().unwrap().cause = Cause::Unanswered;
+        assert_ne!(found(refused, Monitor::Running)[0].key(), items[0].key());
+        // More than a day past its end the session is over.
+        assert_eq!(found(seat(-2 * DAY_SECS), Monitor::NotInstalled), []);
+        assert_eq!(
+            why(&found(seat(-HOUR), Monitor::Paused)),
+            Some(Unkept::Paused)
+        );
     }
 
     #[test]
