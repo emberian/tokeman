@@ -503,7 +503,7 @@ pub(crate) async fn call(
         })?;
         if is_edge_challenge(&response) && attempt < CHALLENGE_RETRIES {
             attempt += 1;
-            tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+            tokio::time::sleep(client.challenge_backoff() * attempt).await;
             continue;
         }
         break response;
@@ -677,6 +677,7 @@ pub(crate) mod tests {
             )
             .unwrap()
             .with_credits_url(format!("{base}/credits"))
+            .with_challenge_backoff(Duration::from_millis(1))
         }
     }
 
@@ -1243,5 +1244,88 @@ pub(crate) mod tests {
                 "usage.spend_control.team_limit",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_403_that_looks_like_the_edge_is_a_challenge() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = profile(dir.path(), "one", "r1");
+        let with = |code: StatusCode, name: &'static str, value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            (code, headers, "<html>no</html>".to_owned())
+        };
+        // (the answer, whether it is the edge's, how many requests it costs)
+        for (answer, edge, requests) in [
+            // The backend's own refusal: not retried, and not the edge's.
+            (
+                with(StatusCode::FORBIDDEN, "content-type", "application/json"),
+                false,
+                1,
+            ),
+            // A gateway's HTML error page is not a challenge either.
+            (
+                with(StatusCode::BAD_GATEWAY, "content-type", "text/html"),
+                false,
+                1,
+            ),
+            (
+                with(StatusCode::FORBIDDEN, "cf-mitigated", "challenge"),
+                true,
+                CHALLENGE_RETRIES + 1,
+            ),
+            (
+                with(
+                    StatusCode::FORBIDDEN,
+                    "content-type",
+                    "text/html; charset=UTF-8",
+                ),
+                true,
+                CHALLENGE_RETRIES + 1,
+            ),
+        ] {
+            let code = answer.0.as_u16();
+            let backend = Backend::default().usage_answers(vec![answer]);
+            let client = backend.client().await;
+            let error = probe(&client, &account).await.error.unwrap();
+            assert_eq!(
+                matches!(error, ReadError::Edge { .. }),
+                edge,
+                "{code}: {error}"
+            );
+            if !edge {
+                assert!(
+                    matches!(error, ReadError::Http { status, .. } if status == code),
+                    "{error}"
+                );
+            }
+            assert_eq!(backend.requests("/usage").len(), requests as usize);
+        }
+    }
+
+    #[test]
+    fn a_window_past_its_limit_reads_over_one_and_an_answer_without_windows_offers_no_room() {
+        // Over 100%: kept as sent, and no room at any floor.
+        let over = decode(&weekly_only_body(104.0), 0);
+        assert!((over.weekly().unwrap().used - 1.04).abs() < 1e-9);
+        assert_eq!(over.least_remaining(), Some(0.0));
+        assert!(!over.above(0.0, 0.0, None));
+
+        // `rate_limit: null`, a window that says no percentage, and an error
+        // envelope sent with HTTP 200: none has a window, so none is a
+        // landing, and nothing claims the backend allowed the account.
+        let mut null = weekly_only_body(10.0);
+        null["rate_limit"] = Value::Null;
+        let mut blank = weekly_only_body(10.0);
+        blank["rate_limit"]["primary_window"] = json!({"limit_window_seconds": 604_800});
+        let envelope = json!({"detail": "Something went wrong"});
+        for (body, allowed) in [(&null, None), (&blank, Some(true)), (&envelope, None)] {
+            let reading = decode(body, 0);
+            assert_eq!(reading.limits, [], "{body}");
+            assert!(!reading.has_quota() && !reading.above(0.0, 0.0, None));
+            assert_eq!(reading.least_remaining(), None);
+            assert_eq!(reading.codex().unwrap().allowed, allowed);
+        }
+        assert_eq!(decode(&envelope, 0).unrecognized, ["usage.detail"]);
     }
 }

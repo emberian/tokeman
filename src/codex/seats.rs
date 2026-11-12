@@ -218,6 +218,15 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(dir.path().join("codex-seats.json")).unwrap();
         assert!(text.contains(r#""by": "daemon""#), "{text}");
         assert!(!text.contains("token-c"), "only a fingerprint is stored");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("codex-seats.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         // An entry in another shape is dropped alone.
         std::fs::write(
             dir.path().join("codex-seats.json"),
