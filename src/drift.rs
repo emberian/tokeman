@@ -328,6 +328,15 @@ mod tests {
             .record(Service::Claude, "first@example.com", &items, 10)
             .unwrap();
         assert_eq!(new, items);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("drift.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let again = [items[1].clone(), "usage.c".to_owned()];
         let new = ledger
             .record(Service::Claude, "second@example.com", &again, 20)

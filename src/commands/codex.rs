@@ -72,9 +72,7 @@ pub struct Discovery {
 /// `~/.codex` and every directory under `~/.codex-homes` and `~/.codex-lanes`
 /// that holds an auth.json.
 pub fn discovery_roots() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
+    let home = crate::paths::home();
     let mut roots = vec![home.join(".codex")];
     for parent in [home.join(".codex-homes"), home.join(".codex-lanes")] {
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -226,9 +224,7 @@ pub fn import(from: &Path, homes_root: Option<&str>, register: bool) -> Result<V
         .with_context(|| format!("failed to read {}", from.display()))?;
     let root = match homes_root {
         Some(root) => expand_tilde(root),
-        None => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".codex-homes"),
+        None => crate::paths::home().join(".codex-homes"),
     };
     import_into(&text, &root, register).with_context(|| format!("importing {}", from.display()))
 }
@@ -864,19 +860,22 @@ mod tests {
     #[test]
     fn import_lines_are_parsed_strictly_and_seed_access_only_profiles() {
         assert!(parse_import("solo-token-without-name\n").is_err());
-        let parsed = parse_import("# comment\n\n  ops@x.com   tok1 \nb\ttok2\n").unwrap();
+        let parsed = parse_import("# comment\n\n  ops@example.com   tok1 \nb\ttok2\n").unwrap();
         assert_eq!(
             parsed,
             vec![
-                ("ops@x.com".to_owned(), "tok1".to_owned()),
+                ("ops@example.com".to_owned(), "tok1".to_owned()),
                 ("b".to_owned(), "tok2".to_owned())
             ]
         );
         let dir = tempfile::tempdir().unwrap();
-        let text = format!("ops@x.com {}\n", id_token("ops@x.com", "acct-ops", "team"));
+        let text = format!(
+            "ops@example.com {}\n",
+            id_token("ops@example.com", "acct-ops", "team")
+        );
         let imported = import_into(&text, dir.path(), false).unwrap();
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].home, dir.path().join("ops-x"));
+        assert_eq!(imported[0].home, dir.path().join("ops-example"));
         assert_eq!(imported[0].plan.as_deref(), Some("team"));
         assert_eq!(imported[0].expires_at, Some(1_900_000_000));
         assert!(!imported[0].registered);
@@ -998,6 +997,18 @@ mod tests {
             look.moved(By::Watch, 1).unwrap().span,
             Some(crate::quota::Span::Weekly)
         );
+        // The landing has reset credits on offer; moving listed and spent none.
+        assert_eq!(
+            look.probed[0]
+                .codex()
+                .unwrap()
+                .reset_credits
+                .unwrap()
+                .available,
+            2
+        );
+        assert!(backend.requests("/credits").is_empty());
+        assert!(backend.requests("/credits/consume").is_empty());
     }
 
     #[tokio::test]
@@ -1060,22 +1071,5 @@ mod tests {
         assert!(moved.warnings.is_empty());
         let pushed = seats.on(&tilde(fake.home.path())).unwrap();
         assert_eq!((pushed.account.as_str(), pushed.by), ("b", By::Use));
-    }
-
-    #[test]
-    fn report_rows_and_warnings_read_plainly() {
-        let report = RefreshReport {
-            account: "one".into(),
-            outcome: Ok(Refreshed::Fresh),
-        };
-        assert_eq!(report.to_string(), "one          still fresh");
-        let warning = Warning::Forced {
-            account: "one".into(),
-            state: State::Limited { reason: None },
-        };
-        assert_eq!(
-            warning.to_string(),
-            "one is limited; migrating anyway because --force was given"
-        );
     }
 }

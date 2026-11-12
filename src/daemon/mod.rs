@@ -235,3 +235,96 @@ pub fn default_account(fleet: &Fleet) -> Result<Option<String>> {
         .and_then(|value| fleet.account_holding(value))
         .map(|account| account.name.clone()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    fn sources(dir: &Path, into: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, into);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                into.push(path);
+            }
+        }
+    }
+
+    /// A source file up to its test module.
+    fn shipped(text: &str) -> &str {
+        [
+            "\nmod tests {",
+            "\npub(crate) mod tests {",
+            "\npub(super) mod tests {",
+        ]
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+        .map_or(text, |end| &text[..end])
+    }
+
+    /// What reaches a reset claim, and the only files that may name it:
+    /// the two claims, the journal entry a claim opens, the requests that
+    /// send one, and the two commands that call them.
+    const CLAIM_PATH: [(&str, &[&str]); 6] = [
+        (
+            "resets::claim(",
+            &["commands/claude.rs", "commands/codex.rs"],
+        ),
+        (
+            "reset_claim(",
+            &["commands/claude.rs", "commands/codex.rs", "main.rs"],
+        ),
+        (".begin(", &["anthropic/resets.rs", "codex/resets.rs"]),
+        ("consume_url(", &["codex/mod.rs", "codex/resets.rs"]),
+        ("reset_rate_limits", &["anthropic/resets.rs"]),
+        ("oauth_post(", &["anthropic/mod.rs", "anthropic/resets.rs"]),
+    ];
+
+    /// The rotation cycle and `launch` talk to a live endpoint, so that they
+    /// claim nothing is pinned on the source: nothing outside the reset
+    /// commands names a step of a claim. The Codex mover's side is pinned by
+    /// behaviour in `daemon::codex` and `commands::codex`.
+    #[test]
+    fn nothing_but_the_reset_commands_can_reach_a_claim() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        let mut named = [0usize; CLAIM_PATH.len()];
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let name = file.strip_prefix(&root).unwrap().to_string_lossy();
+            for (index, (step, allowed)) in CLAIM_PATH.iter().enumerate() {
+                if shipped(&text).contains(step) {
+                    assert!(
+                        allowed.contains(&name.as_ref()),
+                        "{name} names {step}: only {allowed:?} may"
+                    );
+                    named[index] += 1;
+                }
+            }
+        }
+        for ((step, allowed), count) in CLAIM_PATH.iter().zip(named) {
+            assert_eq!(count, allowed.len(), "{step} is no longer where it was");
+        }
+
+        // `main` sends a claim only after `--yes` or a yes at the prompt.
+        let main = std::fs::read_to_string(root.join("main.rs")).unwrap();
+        let calls: Vec<usize> = main
+            .match_indices("reset_claim(&plan)")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 2, "one claim per service");
+        for at in calls {
+            let before = &main[at.saturating_sub(400)..at];
+            let asked = before
+                .rfind("if !yes && !prompt::confirm(")
+                .expect("a claim follows the confirmation");
+            assert!(
+                before[asked..].contains("return Ok(());"),
+                "a refusal returns before the claim"
+            );
+        }
+    }
+}

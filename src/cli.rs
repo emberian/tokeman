@@ -105,7 +105,7 @@ pub enum Command {
         /// The limit to draw: a window by length (5h, weekly, monthly,
         /// daily), `overage`, or a limit by its model or group (fable,
         /// "Opus 4.8", gemini, "gemini 5h", spark). Default: the service's
-        /// first account-wide window
+        /// shortest account-wide window
         #[arg(long)]
         metric: Option<String>,
         /// Also save the PNG here
@@ -643,6 +643,10 @@ pub const REMOVED: &[(&[&str], &str)] = &[
     (&["add"], "tokeman claude add <name> <key>"),
     (&["remove"], "tokeman claude remove <name>"),
     (&["refresh"], "tokeman claude refresh [<account>]"),
+    (
+        &["tray"],
+        "the macOS menu-bar app: in the tokeman checkout, cd macos/tray && bash build.sh && open Tokeman.app",
+    ),
 ];
 
 /// The replacement for a removed spelling, when `args` (the words after the
@@ -799,6 +803,61 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_is_confirmed_only_by_yes_and_clear_goes_with_no_claim() {
+        let Some(Command::Claude {
+            action:
+                ClaudeAction::Reset {
+                    name,
+                    grant,
+                    session,
+                    yes,
+                    clear,
+                },
+        }) = parse("tokeman claude reset work").unwrap().command
+        else {
+            panic!("not a claude reset");
+        };
+        assert_eq!(
+            (name.as_deref(), grant, session, yes, clear),
+            (Some("work"), None, false, false, false)
+        );
+        let Some(Command::Codex {
+            action:
+                CodexAction::Reset {
+                    account,
+                    credit,
+                    yes,
+                    clear,
+                },
+        }) = parse("tokeman codex reset work").unwrap().command
+        else {
+            panic!("not a codex reset");
+        };
+        assert_eq!(
+            (account.as_str(), credit, yes, clear),
+            ("work", None, false, false)
+        );
+        for line in [
+            // Nothing is claimed without naming the account.
+            "tokeman claude reset --yes",
+            "tokeman claude reset --grant g1",
+            "tokeman claude reset --session",
+            "tokeman codex reset",
+            "tokeman codex reset --yes",
+            // One reset at a time.
+            "tokeman claude reset work --session --grant g1",
+            // Forgetting a claim never sends one.
+            "tokeman claude reset work --clear --yes",
+            "tokeman claude reset work --clear --grant g1",
+            "tokeman claude reset work --clear --session",
+            "tokeman codex reset work --clear --yes",
+            "tokeman codex reset work --clear --credit c1",
+        ] {
+            assert!(parse(line).is_err(), "{line} parses");
+        }
+    }
+
+    #[test]
     fn a_removed_spelling_does_not_parse_and_names_its_replacement() {
         let old = [
             ("launch", "tokeman claude launch"),
@@ -831,6 +890,7 @@ mod tests {
             ("services import antigravity", "tokeman agy import"),
             ("services use a@example.com", "tokeman agy use"),
             ("services best antigravity", "tokeman agy best"),
+            ("tray", "the macOS menu-bar app"),
         ];
         for (line, replacement) in old {
             let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
@@ -846,6 +906,17 @@ mod tests {
             assert!(
                 parse(&format!("tokeman {line}")).is_err(),
                 "{line} still parses"
+            );
+        }
+        // Every row of the table is refused by clap and found by `removed`.
+        for (old, new) in REMOVED {
+            let line = old.join(" ");
+            assert!(parse(&format!("tokeman {line}")).is_err(), "{line} parses");
+            let args: Vec<String> = old.iter().map(|word| (*word).to_owned()).collect();
+            assert_eq!(
+                removed(&args),
+                Some((format!("tokeman {line}"), *new)),
+                "{line}"
             );
         }
         // The new tree is never mistaken for an old spelling.

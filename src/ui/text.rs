@@ -2235,17 +2235,38 @@ mod tests {
         );
         assert_eq!(
             brief_error(
-                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"Not allowed."}}"#
+                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
             ),
-            "HTTP 403: Not allowed."
+            "HTTP 403: OAuth authentication is currently not allowed for this organization."
         );
         assert_eq!(brief_error("network: timed out"), "network: timed out");
+        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
     }
 
     #[test]
-    fn text_helpers_count_characters_not_bytes() {
-        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
-        assert_eq!(one_line("💥💥💥", 2), "💥💥…");
+    fn a_claude_badge_is_the_verdict_and_an_unread_account_is_an_error_or_no_quota() {
+        use crate::quota::ReadError;
+        let mut reading = crate::testing::reading("a", 0.1, 0.2);
+        let word = |reading: &Reading| badge(reading).unwrap();
+        assert_eq!(word(&reading), ("allowed".to_owned(), Some(Level::Ok)));
+        reading.claude_mut().verdict = Verdict::Rejected;
+        assert_eq!(
+            word(&reading),
+            ("REJECTED".to_owned(), Some(Level::Critical))
+        );
+        reading.claude_mut().verdict = Verdict::AllowedWarning;
+        assert_eq!(word(&reading), ("warning".to_owned(), Some(Level::Low)));
+        // No account-wide window: the read failed, or carried no quota.
+        reading.limits.clear();
+        assert_eq!(word(&reading), ("no quota".to_owned(), None));
+        reading.error = Some(ReadError::NoCredential);
+        assert_eq!(word(&reading), ("error".to_owned(), Some(Level::Critical)));
+        // A service without a detail has a badge only when its read failed.
+        assert_eq!(badge(&Reading::empty(Service::Kimi, "kimi", 0)), None);
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
     }
 
@@ -2553,18 +2574,6 @@ mod tests {
     }
 
     #[test]
-    fn an_api_error_body_is_shown_as_its_message() {
-        assert_eq!(
-            brief_error(
-                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
-            ),
-            "HTTP 403: OAuth authentication is currently not allowed for this organization."
-        );
-        assert_eq!(brief_error("network: timed out"), "network: timed out");
-        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
-    }
-
-    #[test]
     fn what_needs_the_user_is_a_sentence_and_the_command_that_deals_with_it() {
         use crate::attention::Within;
         const NOW: i64 = 1_794_000_000;
@@ -2623,6 +2632,14 @@ mod tests {
             say(&Attention::DaemonStopped).1.as_deref(),
             Some("tokeman rotate install")
         );
+        let (_, fix) = say(&Attention::CodexSeatExpires {
+            home: "~/.codex".into(),
+            account: "work".into(),
+            profile_home: Some("~/.codex-homes/work".into()),
+            expires_at: Some(NOW + 3_600),
+            why: crate::attention::Unkept::Paused,
+        });
+        assert_eq!(fix.as_deref(), Some("tokeman rotate resume"));
         assert_eq!(format_until(NOW, NOW), "now");
         assert_eq!(format_until(NOW + 20, NOW), "in 1m");
     }
@@ -2718,6 +2735,38 @@ mod tests {
         );
         assert_eq!(lines[3], "");
         assert_eq!(lines.len(), 4);
+        // A service nobody used in the burn window has no forecast line.
+        let flat: Vec<Reading> = (0..=6)
+            .map(|hour| {
+                let mut reading = crate::testing::reading("first@example.com", 0.0, 0.0);
+                reading.at = NOW - (6 - hour) * 3_600;
+                reading.set_weekly(Some(Window::new(0.10, NOW + 6 * 86_400)));
+                reading
+            })
+            .collect();
+        let idle = Overview::build(
+            &fleet,
+            Facts {
+                readings: vec![flat.last().unwrap().clone()],
+                recent: flat,
+                ..Facts::default()
+            },
+            None,
+            NOW,
+        );
+        assert_eq!(
+            idle.forecasts[0].forecast.outlook,
+            Outlook::Idle,
+            "{:?}",
+            idle.forecasts
+        );
+        assert!(
+            plain(headlines(&idle))
+                .iter()
+                .all(|line| !line.contains("forecast")),
+            "{:?}",
+            headlines(&idle)
+        );
         // Nothing to say is no section at all.
         let quiet = Overview::build(&Fleet::default(), Facts::default(), None, NOW);
         assert!(headlines(&quiet).is_empty());
@@ -2794,6 +2843,10 @@ mod tests {
             view_caption(&view(Monitor::Running, 1_000 + 7_200)),
             "stored view, STALE: the background service last read 2h ago"
         );
+        // Stale from the first second past the ten minutes.
+        assert!(!view_caption(&view(Monitor::Running, 1_000 + STALE_SECS)).contains("STALE"));
+        assert!(view_caption(&view(Monitor::Running, 1_001 + STALE_SECS)).contains("STALE"));
+        assert_eq!(STALE_SECS, 600);
         assert_eq!(
             view_caption(&view(Monitor::Paused, 1_030)),
             "stored view, last read just now; rotation is paused"

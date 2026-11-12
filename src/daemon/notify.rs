@@ -330,8 +330,13 @@ mod tests {
         let mut ledger = Ledger::default();
         let three = [login_ends("a", Within::ThreeDays)];
         assert_eq!(keys(&ledger.due(&three, NOW)), ["login-ends:a:3d"]);
-        for later in [NOW + 120, NOW + 86_400] {
-            assert!(ledger.due(&three, later).is_empty(), "told already");
+        // Standing for two days, looked at every hour: still told once.
+        for hour in 1..48 {
+            let later = NOW + hour * 3_600;
+            assert!(
+                ledger.due(&three, later).is_empty(),
+                "told again at +{hour}h"
+            );
         }
         let one = [login_ends("a", Within::OneDay)];
         assert_eq!(
