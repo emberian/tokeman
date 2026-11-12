@@ -6,15 +6,34 @@
 
 use std::path::PathBuf;
 
+/// Where every location resolves in a unit test: a home that does not
+/// exist, whatever the environment says. A test that needs a file passes its
+/// own path; one that forgets fails to open this instead of reading or
+/// writing the user's files.
+#[cfg(test)]
+pub(crate) const TEST_HOME: &str = "/nonexistent/tokeman-test-home";
+
+#[cfg(not(test))]
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[cfg(test)]
+fn home() -> PathBuf {
+    PathBuf::from(TEST_HOME)
+}
+
+#[cfg(not(test))]
 fn xdg(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(default))
         .join("tokeman")
+}
+
+#[cfg(test)]
+fn xdg(_var: &str, default: &str) -> PathBuf {
+    home().join(default).join("tokeman")
 }
 
 pub fn config_dir() -> PathBuf {
@@ -182,10 +201,16 @@ pub fn claude_dir() -> PathBuf {
 }
 
 /// `~/.claude/settings.json`, or `$CLAUDE_SETTINGS` for tests and odd layouts.
+#[cfg(not(test))]
 pub fn claude_settings() -> PathBuf {
     std::env::var_os("CLAUDE_SETTINGS")
         .map(PathBuf::from)
         .unwrap_or_else(|| claude_dir().join("settings.json"))
+}
+
+#[cfg(test)]
+pub fn claude_settings() -> PathBuf {
+    claude_dir().join("settings.json")
 }
 
 /// Expand a leading `~/` to the home directory.
@@ -203,5 +228,36 @@ pub fn tilde(path: &std::path::Path) -> String {
     match display.strip_prefix(&home) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => display,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_location_of_a_test_run_is_under_a_home_that_does_not_exist() {
+        let home = std::path::Path::new(TEST_HOME);
+        assert!(!home.exists());
+        for path in [
+            accounts_file(),
+            profile_cache(),
+            claims_journal(),
+            rotation_log(),
+            codex_moves(),
+            snapshots_db(),
+            agy_homes(),
+            default_chart(),
+            launch_agent_plist(),
+            claude_settings(),
+            expand_tilde("~/x"),
+        ] {
+            assert!(
+                path.starts_with(home),
+                "{} is outside the test home",
+                path.display()
+            );
+        }
+        assert_eq!(tilde(&home.join(".codex")), "~/.codex");
     }
 }
