@@ -51,7 +51,14 @@ Prebuilt binaries for macOS and Linux are on the
 Upgrading from 0.3: the account file, the settings.json keys and the hook are
 unchanged, and an installed service keeps working. The command spellings
 changed; an old one fails naming its replacement, and
-[CHANGELOG.md](CHANGELOG.md) has the table.
+[CHANGELOG.md](CHANGELOG.md) has the table. The reads 0.3 stored are not shown
+until `tokeman history compact` has rewritten them, once: it keeps the
+database as it was beside it (`snapshots.db.pre-0.4`), compares every
+account's history before and after, and only then drops the old tables.
+`--dry-run` counts what it would keep. It can be interrupted and run again,
+and no other tokeman reads or writes the history while it runs (the
+background service keeps rotating; the reads it makes meanwhile are not
+recorded).
 
 ## Everything at once
 
@@ -60,8 +67,9 @@ tokeman                  # the fleet view: every account of every service
 tokeman --fresh          # read every account now, then show it
 tokeman --watch          # the same as a live dashboard
 tokeman list             # one line per account, from stored reads
-tokeman list --json      # the fleet view as JSON (what the trays read)
+tokeman list --json      # the fleet view as JSON (what the tray reads)
 tokeman history [--service S] [--last N | --since HOURS] [--account NAME] [--json]
+tokeman history compact [--dry-run]       # once after upgrading from 0.3: bring the old reads in
 tokeman stats   [--service S]             # burn rate and time to depletion, per limit; the forecast
 tokeman notify  [--test]                  # what needs you now; --test sends one notification
 tokeman chart   [--service S] [--metric M] [--hours N]   # PNG, inline in iTerm2
@@ -70,13 +78,13 @@ tokeman settings [set <key> <value>]      # launch settings and the Codex mover'
 
 **Who reads the accounts.** While the background service runs
 (`tokeman rotate install`), it is the only reader: bare `tokeman`,
-`tokeman --watch` and both trays show the stored view and send no request.
+`tokeman --watch` and the tray show the stored view and send no request.
 Every view says that it is stored and how old it is, and says STALE when the
 service has not read for ten minutes. The service counts as running while its
 daemon holds `daemon.lock`, however it was started; an installed service whose
 daemon has died shows as not running. Without a running service (or while
 rotation is paused) those surfaces read every account themselves. `--fresh`, `r` in
-`--watch` and the trays' reload button read now either way. `tokeman list`
+`--watch` and the tray's reload button read now either way. `tokeman list`
 never sends a request; `tokeman <service> list` always reads that service.
 
 **What needs you.** `tokeman`, `tokeman list` and the macOS tray open with a
@@ -393,7 +401,7 @@ exits 0 when nothing is wrong and 1 otherwise, and every problem comes with
 the command that fixes it. A tool at another version is stated, not counted
 as a problem.
 
-## Trays
+## Tray
 
 The macOS menu-bar app is a separate Swift package:
 
@@ -401,20 +409,13 @@ The macOS menu-bar app is a separate Swift package:
 cd macos/tray && bash build.sh && open Tokeman.app
 ```
 
-The cross-platform tray is the `tray` feature:
-
-```sh
-cargo install --path . --features tray
-tokeman tray
-```
-
-Both draw the fleet view: a card per account of every service with a gauge
+It draws the fleet view: a card per account of every service with a gauge
 per limit, each login's end date, the resets on offer, and whether the view
-is stored and how old it is. Both launch claude in a new terminal on a chosen
-or the best account and expose the launch settings and the dangerous-mode
+is stored and how old it is. It launches claude in a new terminal on a chosen
+or the best account and exposes the launch settings and the dangerous-mode
 toggle.
 
-The macOS app runs `tokeman list --json`, `tokeman history --json` and
+It runs `tokeman list --json`, `tokeman history --json` and
 `tokeman settings show`, none of which sends a request; it never opens
 tokens.toml. Its reload button, and its timer when no service is running, run
 `tokeman --fresh --json`. Its settings go through `tokeman settings set` and
@@ -445,6 +446,7 @@ fleet view gives it.
 | `~/.config/tokeman/codex-moves.jsonl` | Each move of a running Codex: when, which home, from and to which account, who asked |
 | `~/.local/share/tokeman/agy-homes/<account>/` | The home of a `tokeman agy run` session: its login file and conversations |
 | `~/.local/share/tokeman/snapshots.db` | Read history (sqlite): one row per reading that differs from the last, or per ten minutes |
+| `~/.local/share/tokeman/snapshots.db.pre-0.4` | The history as 0.3 left it, kept by `tokeman history compact`; delete it when you no longer want it |
 
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` are honoured, and
 `CLAUDE_SETTINGS` points at another settings.json. Every file is owner-only;
@@ -454,12 +456,11 @@ single-use and a save from a stale copy would lose the account.
 
 ## Development
 
-The gates CI runs, plus the tray feature:
+The gates CI runs, plus the tray:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo clippy --all-targets --locked --features tray -- -D warnings
 cargo test --locked                      # unit tests, all in-process (loopback servers, temp dirs)
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 macos/tray/build.sh                      # the Swift tray
