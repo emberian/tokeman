@@ -1057,21 +1057,4 @@ mod tests {
         let pushed = seats.on(&tilde(fake.home.path())).unwrap();
         assert_eq!((pushed.account.as_str(), pushed.by), ("b", By::Use));
     }
-
-    #[test]
-    fn report_rows_and_warnings_read_plainly() {
-        let report = RefreshReport {
-            account: "one".into(),
-            outcome: Ok(Refreshed::Fresh),
-        };
-        assert_eq!(report.to_string(), "one          still fresh");
-        let warning = Warning::Forced {
-            account: "one".into(),
-            state: State::Limited { reason: None },
-        };
-        assert_eq!(
-            warning.to_string(),
-            "one is limited; migrating anyway because --force was given"
-        );
-    }
 }

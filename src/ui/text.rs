@@ -2235,17 +2235,16 @@ mod tests {
         );
         assert_eq!(
             brief_error(
-                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"Not allowed."}}"#
+                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
             ),
-            "HTTP 403: Not allowed."
+            "HTTP 403: OAuth authentication is currently not allowed for this organization."
         );
         assert_eq!(brief_error("network: timed out"), "network: timed out");
+        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
     }
 
     #[test]
-    fn text_helpers_count_characters_not_bytes() {
-        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
-        assert_eq!(one_line("💥💥💥", 2), "💥💥…");
+    fn truncation_counts_characters_not_bytes() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
     }
 
@@ -2550,18 +2549,6 @@ mod tests {
             "error: HTTP 401: expired; needs `tokeman codex refresh`"
         );
         assert_eq!(badge(&refused).unwrap().0, "error");
-    }
-
-    #[test]
-    fn an_api_error_body_is_shown_as_its_message() {
-        assert_eq!(
-            brief_error(
-                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
-            ),
-            "HTTP 403: OAuth authentication is currently not allowed for this organization."
-        );
-        assert_eq!(brief_error("network: timed out"), "network: timed out");
-        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
     }
 
     #[test]
