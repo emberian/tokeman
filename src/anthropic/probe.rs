@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::{CLAUDE_CODE_IDENTITY, Client, http_error, network_error, profile};
 use crate::account::{Account, Credential};
+use crate::drift::Unrecognized;
 use crate::quota::{
     Family, Grace, Limit, ModelKey, Overage, ReadError, Reading, Scope, Service, SessionLimit,
     Signals, SlowLane, Source, Span, Verdict, Window, WindowStatus, parse_wire,
@@ -23,6 +24,136 @@ pub const PROBE_MODEL_LABEL: &str = "Haiku 4.5";
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Families whose weekly limit appears only in the headers of requests to them.
 const HEADER_ONLY_FAMILIES: &[Family] = &[Family::Fable];
+
+const PREFIX: &str = "anthropic-ratelimit-unified";
+
+// The known sets of the rate-limit headers. A header that starts with
+// `anthropic-ratelimit-unified-` is known when the rest of its name is
+// `{window}-{field}` for a known window and field, or one of KNOWN_HEADERS.
+// Sources: what this parser reads, and the header list of the Claude Code
+// 2.1.322 binary (research/anthropic.md section 1, research/prior-art.md
+// section 6).
+
+/// The windows the headers describe: 5-hour, weekly, the requested model's
+/// own weekly (Fable), and usage credits.
+const KNOWN_WINDOWS: &[&str] = &["5h", "7d", "7d_oi", "overage"];
+const KNOWN_WINDOW_FIELDS: &[&str] = &["utilization", "reset", "status", "surpassed-threshold"];
+const KNOWN_HEADERS: &[&str] = &[
+    "status",
+    "representative-claim",
+    "reset",
+    "claim",
+    "fallback",
+    "fallback-percentage",
+    "upgrade-paths",
+    // Usage credits. Seen and not read: scope, daily-cap-paused, period*.
+    "overage-disabled-reason",
+    "overage-in-use",
+    "overage-scope",
+    "overage-daily-cap-paused",
+    "overage-period",
+    "overage-period-monthly-utilization",
+    "overage-period-channel-utilization",
+    "grace-status",
+    "grace-5h-utilization",
+    "grace-7d-utilization",
+    "slow-status",
+    "slow-offer",
+    "slow-budget-utilization",
+    "slow-budget-reset",
+    "slow-retry-after",
+    "slow-max-wait",
+];
+/// `status`, each window's `-status` and `overage-status`.
+const KNOWN_VERDICTS: &[&str] = &["allowed", "allowed_warning", "rejected"];
+/// `representative-claim` and `claim`: Claude Code's `rateLimitType`.
+const KNOWN_CLAIMS: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_overage_included",
+    "overage",
+];
+/// `overage-disabled-reason`, from Claude Code 2.1.322's status schema.
+const KNOWN_OVERAGE_DISABLED_REASONS: &[&str] = &[
+    "overage_not_provisioned",
+    "org_level_disabled",
+    "org_level_disabled_until",
+    "out_of_credits",
+    "seat_tier_level_disabled",
+    "member_level_disabled",
+    "seat_tier_zero_credit_limit",
+    "group_zero_credit_limit",
+    "member_zero_credit_limit",
+    "org_service_level_disabled",
+    "no_limits_configured",
+    "fetch_error",
+    "unknown",
+];
+const KNOWN_OVERAGE_SCOPES: &[&str] = &["service", "channel", "group_pool"];
+const KNOWN_UPGRADE_PATHS: &[&str] = &["overage", "upgrade_plan"];
+const KNOWN_FALLBACKS: &[&str] = &["available"];
+const KNOWN_SLOW_STATUSES: &[&str] = &[
+    "active",
+    "not_needed",
+    "slot_busy",
+    "weekly_limit",
+    "budget_exhausted",
+    "ineligible",
+    "off",
+];
+const KNOWN_SLOW_OFFERS: &[&str] = &["treatment", "control"];
+
+/// The words a header's value may hold, for the headers that hold one (or a
+/// comma list) of a fixed set. `rest` is the name after the prefix.
+fn known_words(rest: &str) -> Option<&'static [&'static str]> {
+    Some(match rest {
+        "status" | "overage-status" => KNOWN_VERDICTS,
+        "representative-claim" | "claim" => KNOWN_CLAIMS,
+        "overage-disabled-reason" => KNOWN_OVERAGE_DISABLED_REASONS,
+        "overage-scope" => KNOWN_OVERAGE_SCOPES,
+        "upgrade-paths" => KNOWN_UPGRADE_PATHS,
+        "fallback" => KNOWN_FALLBACKS,
+        "slow-status" => KNOWN_SLOW_STATUSES,
+        "slow-offer" => KNOWN_SLOW_OFFERS,
+        _ => {
+            let (window, field) = rest.split_once('-')?;
+            (KNOWN_WINDOWS.contains(&window) && field == "status").then_some(KNOWN_VERDICTS)?
+        }
+    })
+}
+
+/// The unified rate-limit headers this build does not know, by name, and
+/// the words it does not know in the ones that hold a fixed set.
+fn unrecognized(headers: &HeaderMap) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    for (name, value) in headers {
+        let name = name.as_str();
+        let Some(rest) = name
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix('-'))
+        else {
+            continue;
+        };
+        let known = KNOWN_HEADERS.contains(&rest)
+            || rest.split_once('-').is_some_and(|(window, field)| {
+                KNOWN_WINDOWS.contains(&window) && KNOWN_WINDOW_FIELDS.contains(&field)
+            });
+        if !known {
+            seen.add(format!("header {name}"));
+            continue;
+        }
+        if let Some(words) = known_words(rest)
+            && let Ok(value) = value.to_str()
+        {
+            for word in value.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+                seen.text(&format!("header {name}"), word, words);
+            }
+        }
+    }
+    seen.into_vec()
+}
 
 /// What the unified rate-limit headers of one response say. Wire shape:
 /// private to this parser, which turns it into a [`Reading`].
@@ -41,6 +172,8 @@ struct Quota {
     overage: Option<Overage>,
     overage_window: Option<Window>,
     signals: Signals,
+    /// Headers and header words outside the known sets.
+    unrecognized: Vec<String>,
 }
 
 fn header_str(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -138,7 +271,6 @@ fn signals(headers: &HeaderMap, prefix: &str) -> Signals {
 
 /// `None` without a `unified-status` header; a 429 still carries them.
 fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
-    const PREFIX: &str = "anthropic-ratelimit-unified";
     let status = header_str(headers, &format!("{PREFIX}-status"))?;
     let overage_status = header_str(headers, &format!("{PREFIX}-overage-status"));
     let overage_window = header_window(headers, &format!("{PREFIX}-overage"));
@@ -161,6 +293,7 @@ fn parse_quota(headers: &HeaderMap) -> Option<Quota> {
         overage,
         overage_window,
         signals: signals(headers, PREFIX),
+        unrecognized: unrecognized(headers),
     })
 }
 
@@ -257,6 +390,7 @@ fn reading_of(account: &str, now: i64, quota: &Option<Quota>) -> Reading {
         if quota.session.is_some() {
             claude.session_limit = SessionLimit::Present;
         }
+        reading.unrecognized = quota.unrecognized.clone();
     }
     reading
 }
@@ -812,5 +946,132 @@ mod tests {
             "{reading:?}"
         );
         assert!(!reading.is_refused());
+    }
+
+    #[test]
+    fn every_header_seen_or_read_by_claude_code_is_known() {
+        // The live 200 and 429 shapes of 2026-10-31 and 2026-11-11, the
+        // Fable window, and the headers Claude Code 2.1.322 reads.
+        let quota = parse_quota(&headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day",
+            ),
+            (
+                "anthropic-ratelimit-unified-claim",
+                "seven_day_overage_included",
+            ),
+            ("anthropic-ratelimit-unified-reset", "1794657600"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.0"),
+            ("anthropic-ratelimit-unified-5h-reset", "1793461200"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.8"),
+            ("anthropic-ratelimit-unified-7d-reset", "1794657600"),
+            ("anthropic-ratelimit-unified-7d-surpassed-threshold", "0.75"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "1794657600"),
+            (
+                "anthropic-ratelimit-unified-7d_oi-surpassed-threshold",
+                "1.0",
+            ),
+            ("anthropic-ratelimit-unified-fallback", "available"),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+            (
+                "anthropic-ratelimit-unified-upgrade-paths",
+                "overage, upgrade_plan",
+            ),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "out_of_credits",
+            ),
+            ("anthropic-ratelimit-unified-overage-in-use", "false"),
+            ("anthropic-ratelimit-unified-overage-utilization", "0.1"),
+            ("anthropic-ratelimit-unified-overage-reset", "1794657600"),
+            (
+                "anthropic-ratelimit-unified-overage-surpassed-threshold",
+                "0.5",
+            ),
+            ("anthropic-ratelimit-unified-overage-scope", "group_pool"),
+            (
+                "anthropic-ratelimit-unified-overage-daily-cap-paused",
+                "true",
+            ),
+            ("anthropic-ratelimit-unified-overage-period", "monthly"),
+            (
+                "anthropic-ratelimit-unified-overage-period-monthly-utilization",
+                "0.2",
+            ),
+            (
+                "anthropic-ratelimit-unified-overage-period-channel-utilization",
+                "0.2",
+            ),
+            ("anthropic-ratelimit-unified-grace-status", "active"),
+            ("anthropic-ratelimit-unified-grace-5h-utilization", "0.1"),
+            ("anthropic-ratelimit-unified-grace-7d-utilization", "0.1"),
+            ("anthropic-ratelimit-unified-slow-status", "slot_busy"),
+            ("anthropic-ratelimit-unified-slow-offer", "treatment"),
+            ("anthropic-ratelimit-unified-slow-budget-utilization", "0.3"),
+            (
+                "anthropic-ratelimit-unified-slow-budget-reset",
+                "1794657600",
+            ),
+            ("anthropic-ratelimit-unified-slow-retry-after", "20"),
+            ("anthropic-ratelimit-unified-slow-max-wait", "1200"),
+            // Not a unified rate-limit header: none of this parser's business.
+            ("anthropic-ratelimit-requests-remaining", "49"),
+            ("request-id", "req_1"),
+        ]))
+        .unwrap();
+        assert_eq!(quota.unrecognized, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_header_a_window_or_a_word_it_does_not_know_lands_in_the_reading() {
+        let quota = parse_quota(&headers(&[
+            ("anthropic-ratelimit-unified-status", "throttled"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_haiku",
+            ),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-burn-rate", "2"),
+            ("anthropic-ratelimit-unified-7d_haiku-utilization", "0.5"),
+            ("anthropic-ratelimit-unified-7d_haiku-status", "allowed"),
+            ("anthropic-ratelimit-unified-queue-depth", "3"),
+            (
+                "anthropic-ratelimit-unified-upgrade-paths",
+                "overage,team_seat",
+            ),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "region_blocked",
+            ),
+            ("anthropic-ratelimit-unified-slow-status", "draining"),
+        ]))
+        .unwrap();
+        let expected = [
+            "header anthropic-ratelimit-unified-7d-burn-rate",
+            "header anthropic-ratelimit-unified-7d_haiku-status",
+            "header anthropic-ratelimit-unified-7d_haiku-utilization",
+            "header anthropic-ratelimit-unified-overage-disabled-reason=region_blocked",
+            "header anthropic-ratelimit-unified-queue-depth",
+            "header anthropic-ratelimit-unified-representative-claim=seven_day_haiku",
+            "header anthropic-ratelimit-unified-slow-status=draining",
+            "header anthropic-ratelimit-unified-status=throttled",
+            "header anthropic-ratelimit-unified-upgrade-paths=team_seat",
+        ];
+        assert_eq!(quota.unrecognized, expected);
+        let reading = reading_of("a", 0, &Some(quota));
+        assert_eq!(reading.unrecognized, expected);
+        // A stored reading keeps them, and one without any stores no key.
+        let json = serde_json::to_string(&reading).unwrap();
+        assert_eq!(serde_json::from_str::<Reading>(&json).unwrap(), reading);
+        let quiet = serde_json::to_string(&Reading::empty(Service::Claude, "a", 0)).unwrap();
+        assert!(!quiet.contains("unrecognized"));
     }
 }

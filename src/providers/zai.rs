@@ -9,8 +9,10 @@
 //! See research/zai-kimi.md.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{ServiceAccount, credential, decode, network};
+use crate::drift::Unrecognized;
 use crate::quota::{Amount, Limit, ReadError, Reading, Service, Span, Window};
 use crate::util::one_line;
 
@@ -62,9 +64,10 @@ pub(crate) async fn read_from(
         });
     }
     match parse(&body, now) {
-        Ok((plan, limits)) => Reading {
+        Ok((plan, limits, unrecognized)) => Reading {
             plan,
             limits,
+            unrecognized,
             ..Reading::empty(Service::Zai, &account.name, now)
         },
         Err(error) => failed(error),
@@ -182,14 +185,68 @@ impl RawLimit {
     }
 }
 
-/// The plan level and one meter per known limit, shortest window first.
-fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Limit>), ReadError> {
-    let envelope: Envelope = serde_json::from_str(body).map_err(|error| {
+// The known sets of the answer: what this parser reads, then what has been
+// seen and is not read (research/zai-kimi.md).
+
+const KNOWN_ENVELOPE_KEYS: &[&str] = &["code", "msg", "success", "data"];
+const KNOWN_DATA_KEYS: &[&str] = &["limits", "level"];
+/// `data.level`: `max` seen live, the others from the plan names.
+const KNOWN_LEVELS: &[&str] = &["lite", "pro", "max"];
+const KNOWN_LIMIT_KEYS: &[&str] = &[
+    "type",
+    "unit",
+    "number",
+    "usage",
+    "currentValue",
+    "remaining",
+    "percentage",
+    "nextResetTime",
+    // Per-tool counts on a `TIME_LIMIT` entry.
+    "usageDetails",
+];
+const KNOWN_TYPES: &[&str] = &["CREDIT_LIMIT", "TOKENS_LIMIT", "TIME_LIMIT"];
+/// `unit`: day, hour, minute, week.
+const KNOWN_UNITS: &[i64] = &[1, 3, 5, 6];
+const KNOWN_USAGE_DETAIL_KEYS: &[&str] = &["modelCode", "usage"];
+
+/// The keys and words of an answer that are outside the known sets.
+fn unrecognized(body: &Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    seen.keys("quota", body, KNOWN_ENVELOPE_KEYS);
+    let data = &body["data"];
+    seen.keys("quota.data", data, KNOWN_DATA_KEYS);
+    seen.value("quota.data.level", data.get("level"), KNOWN_LEVELS);
+    seen.row_keys("quota.data.limits", &data["limits"], KNOWN_LIMIT_KEYS);
+    for limit in data["limits"].as_array().into_iter().flatten() {
+        seen.value("quota.data.limits[].type", limit.get("type"), KNOWN_TYPES);
+        if let Some(unit) = limit.get("unit").and_then(Value::as_i64)
+            && !KNOWN_UNITS.contains(&unit)
+        {
+            seen.add(format!("quota.data.limits[].unit={unit}"));
+        }
+        seen.row_keys(
+            "quota.data.limits[].usageDetails",
+            &limit["usageDetails"],
+            KNOWN_USAGE_DETAIL_KEYS,
+        );
+    }
+    seen.into_vec()
+}
+
+/// What an answer holds: the plan level, one meter per known limit
+/// (shortest window first), and what was not recognised.
+type Parsed = (Option<String>, Vec<Limit>, Vec<String>);
+
+fn parse(body: &str, now: i64) -> Result<Parsed, ReadError> {
+    let unreadable = |error: serde_json::Error| {
         decode(format!(
             "unreadable answer ({error}): {}",
             one_line(body, 160)
         ))
-    })?;
+    };
+    let value: Value = serde_json::from_str(body).map_err(unreadable)?;
+    let unrecognized = unrecognized(&value);
+    let envelope: Envelope = serde_json::from_value(value).map_err(unreadable)?;
     if !envelope.success || envelope.code != Some(200) {
         let message = envelope.msg.as_deref().unwrap_or("no message");
         // The envelope carries the HTTP status the transport did not.
@@ -223,7 +280,11 @@ fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Limit>), ReadError
             meter.span.seconds().unwrap_or(i64::MAX),
         )
     });
-    Ok((quota.level.filter(|level| !level.is_empty()), meters))
+    Ok((
+        quota.level.filter(|level| !level.is_empty()),
+        meters,
+        unrecognized,
+    ))
 }
 
 #[cfg(test)]
@@ -247,7 +308,8 @@ mod tests {
 
     #[test]
     fn credit_windows_read_used_over_limit_with_their_resets() {
-        let (plan, meters) = parse(LIVE, NOW).unwrap();
+        let (plan, meters, unrecognized) = parse(LIVE, NOW).unwrap();
+        assert!(unrecognized.is_empty(), "{unrecognized:?}");
         assert_eq!(plan.as_deref(), Some("max"));
         assert_eq!(meters.len(), 2);
         let session = &meters[0];
@@ -274,14 +336,15 @@ mod tests {
 
     #[test]
     fn an_idle_window_has_no_reset_pending() {
-        let (_, meters) = parse(IDLE, NOW + 500).unwrap();
+        let (_, meters, unrecognized) = parse(IDLE, NOW + 500).unwrap();
+        assert!(unrecognized.is_empty(), "{unrecognized:?}");
         assert_eq!(meters[0].window, Window::new(0.0, 0));
     }
 
     #[test]
     fn a_reset_beyond_the_window_length_is_dropped() {
         let far = LIVE.replace("1794429533576", &((NOW + 10 * HOUR) * 1000).to_string());
-        let (_, meters) = parse(&far, NOW).unwrap();
+        let (_, meters, _) = parse(&far, NOW).unwrap();
         assert_eq!(meters[0].window.resets_at, 0);
         assert_eq!(meters[1].window.resets_at, 1_794_879_119);
     }
@@ -292,9 +355,10 @@ mod tests {
             {"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":250,"remaining":750,"percentage":25,"nextResetTime":1796000000000},
             {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":40,"nextResetTime":1794430000000},
             {"type":"SOMETHING_NEW","unit":3,"number":5,"percentage":99}]}}"#;
-        let (plan, meters) = parse(body, NOW).unwrap();
+        let (plan, meters, unrecognized) = parse(body, NOW).unwrap();
         assert_eq!(plan, None);
         assert_eq!(meters.len(), 2, "an unknown limit type is skipped");
+        assert_eq!(unrecognized, ["quota.data.limits[].type=SOMETHING_NEW"]);
         assert_eq!(meters[0].label, "5h");
         assert_eq!(meters[0].group(), None);
         assert!((meters[0].window.used - 0.40).abs() < 1e-12);
@@ -376,6 +440,26 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("/nonexistent/zai-key")
+        );
+    }
+
+    #[test]
+    fn keys_units_and_levels_it_does_not_know_are_reported() {
+        let body = r#"{"code":200,"success":true,"traceId":"t","data":{"level":"ultra","renewal":1,"limits":[
+            {"type":"CREDIT_LIMIT","unit":7,"number":1,"usage":10,"currentValue":1,"scope":"team"},
+            {"type":"TIME_LIMIT","unit":5,"number":1,"usage":10,"currentValue":1,
+             "usageDetails":[{"modelCode":"search-prime","usage":1,"cost":2}]}]}}"#;
+        let (_, _, unrecognized) = parse(body, NOW).unwrap();
+        assert_eq!(
+            unrecognized,
+            [
+                "quota.data.level=ultra",
+                "quota.data.limits[].scope",
+                "quota.data.limits[].unit=7",
+                "quota.data.limits[].usageDetails[].cost",
+                "quota.data.renewal",
+                "quota.traceId",
+            ]
         );
     }
 }

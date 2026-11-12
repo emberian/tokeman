@@ -27,6 +27,7 @@ use super::profile::{Cache, Endpoint};
 use super::{Client, describe};
 use crate::account::Account;
 use crate::claims::{Conflict, Journal};
+use crate::drift::Unrecognized;
 use crate::quota::Service;
 use crate::util::one_line;
 
@@ -226,6 +227,171 @@ pub struct ResetStatus {
     /// Why a program's read failed, when one did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Keys and words of the answers outside the known sets
+    /// ([`crate::drift`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecognized: Vec<String>,
+}
+
+// The known sets of the two program blocks: what this parser reads, then
+// what has been seen and is not read. Sources: Claude Code 2.1.322's schema
+// (research/anthropic.md section 3), the captures in research/prior-art.md,
+// and the answers in tokeman's own cache through 2026-11-11 (`paused_held`,
+// a grant's `arm`, `juniper_tide.event_props`, `not_at_wall`).
+
+const KNOWN_GRANT_PROGRAM_KEYS: &[&str] = &[
+    "eligible",
+    "ineligible_reason",
+    "at_limit",
+    "exhausted",
+    "grants",
+    "next_grant_id",
+    "weekly_resets_at",
+    "cooldown_until",
+    "paused_held",
+    "event_props",
+];
+const KNOWN_SESSION_PROGRAM_KEYS: &[&str] = &[
+    "eligible",
+    "ineligible_reason",
+    "available",
+    "next_available_at",
+    "weekly_resets_at",
+    "resets_per_week",
+    "arm",
+    "in_experiment",
+    "event_props",
+];
+const KNOWN_INELIGIBLE_REASONS: &[&str] = &[
+    "config_off",
+    "tier",
+    "seat",
+    "mobile",
+    "surface",
+    "cli_version",
+    "no_grant",
+    "tenure",
+    "other_experiment",
+    "unavailable",
+    "unknown",
+    "not_at_wall",
+];
+const KNOWN_GRANT_KEYS: &[&str] = &[
+    "id",
+    "label",
+    "type",
+    "resets_total",
+    "resets_left",
+    "starts_at",
+    "ends_at",
+    "clears",
+    "gives_back_weekly",
+    "paused",
+    "usable_now",
+    "use_requires_limit",
+    "unavailable_reason",
+    "blocking",
+    "percent_used",
+    "arm",
+];
+const KNOWN_GRANT_TYPES: &[&str] = &["session", "weekly", "full"];
+const KNOWN_UNAVAILABLE_REASONS: &[&str] = &[
+    "cooldown",
+    "blocked_five_hour",
+    "blocked_seven_day",
+    "blocked_opus",
+    "blocked_sonnet",
+    "blocked_other",
+    "cannot_clear",
+    "needs_limit",
+    "unavailable",
+];
+/// The windows a grant can clear: `clears`, `exhausted`, and the keys of
+/// `percent_used`.
+const KNOWN_WINDOWS: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_overage_included",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_cowork",
+    "seven_day_omelette",
+    "seven_day_oauth_apps",
+];
+const KNOWN_EVENT_PROPS_KEYS: &[&str] = &[
+    "surface",
+    "tier",
+    "tenure_bucket",
+    "billing_path",
+    "billing_period",
+    "extra_usage_state",
+];
+const KNOWN_TIERS: &[&str] = &[
+    "claude_pro",
+    "claude_max_5x",
+    "claude_max_20x",
+    "claude_team",
+];
+const KNOWN_SESSION_ARMS: &[&str] = &["control", "reset"];
+
+/// The keys and words of the program blocks of a usage body that are
+/// outside the known sets. A null block was not evaluated and says nothing.
+pub fn unrecognized(body: &serde_json::Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    let cedar = &body["cedar_ember"];
+    let at = "usage.cedar_ember";
+    seen.keys(at, cedar, KNOWN_GRANT_PROGRAM_KEYS);
+    seen.value(
+        &format!("{at}.ineligible_reason"),
+        cedar.get("ineligible_reason"),
+        KNOWN_INELIGIBLE_REASONS,
+    );
+    seen.values(
+        &format!("{at}.exhausted"),
+        cedar.get("exhausted"),
+        KNOWN_WINDOWS,
+    );
+    let props = &cedar["event_props"];
+    seen.keys(&format!("{at}.event_props"), props, KNOWN_EVENT_PROPS_KEYS);
+    seen.value(
+        &format!("{at}.event_props.tier"),
+        props.get("tier"),
+        KNOWN_TIERS,
+    );
+    let grants = format!("{at}.grants");
+    seen.row_keys(&grants, &cedar["grants"], KNOWN_GRANT_KEYS);
+    for grant in cedar["grants"].as_array().into_iter().flatten() {
+        seen.value(
+            &format!("{grants}[].type"),
+            grant.get("type"),
+            KNOWN_GRANT_TYPES,
+        );
+        seen.value(
+            &format!("{grants}[].unavailable_reason"),
+            grant.get("unavailable_reason"),
+            KNOWN_UNAVAILABLE_REASONS,
+        );
+        seen.values(
+            &format!("{grants}[].clears"),
+            grant.get("clears"),
+            KNOWN_WINDOWS,
+        );
+        seen.keys(
+            &format!("{grants}[].percent_used"),
+            &grant["percent_used"],
+            KNOWN_WINDOWS,
+        );
+    }
+    let juniper = &body["juniper_tide"];
+    let at = "usage.juniper_tide";
+    seen.keys(at, juniper, KNOWN_SESSION_PROGRAM_KEYS);
+    seen.value(
+        &format!("{at}.ineligible_reason"),
+        juniper.get("ineligible_reason"),
+        KNOWN_INELIGIBLE_REASONS,
+    );
+    seen.value(&format!("{at}.arm"), juniper.get("arm"), KNOWN_SESSION_ARMS);
+    seen.into_vec()
 }
 
 /// What a claim did.
@@ -308,6 +474,11 @@ pub async fn status(
                 continue;
             }
         };
+        crate::drift::merge(
+            &mut status.unrecognized,
+            super::profile::unrecognized(&body),
+        );
+        crate::drift::merge(&mut status.unrecognized, unrecognized(&body));
         let read: ResetStatus = match serde_json::from_value(body) {
             Ok(read) => read,
             Err(error) => {
@@ -892,5 +1063,57 @@ mod tests {
                 .is_err()
         );
         assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
+    }
+
+    #[test]
+    fn the_program_blocks_seen_so_far_carry_nothing_unrecognised() {
+        for body in [CEDAR_STATUS, AT_WALL_STATUS] {
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(unrecognized(&body), Vec::<String>::new());
+        }
+        // The fields of today's cached answers that this build does not read.
+        let body = serde_json::json!({
+            "cedar_ember": {"eligible": true, "paused_held": false, "cooldown_until": null,
+                "event_props": {"surface": "claude_code_cli", "tier": "claude_max_20x",
+                    "tenure_bucket": "365+", "billing_path": "stripe",
+                    "billing_period": "unknown", "extra_usage_state": "enabled"},
+                "grants": [{"id": "g", "resets_left": 1, "type": "weekly", "arm": null,
+                    "gives_back_weekly": true, "unavailable_reason": "needs_limit",
+                    "blocking": ["blocked_seven_day"], "starts_at": null}]},
+            "juniper_tide": {"eligible": false, "arm": "control", "event_props": null,
+                "next_available_at": null, "weekly_resets_at": null}
+        });
+        assert_eq!(unrecognized(&body), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_program_field_a_grant_type_or_a_window_it_does_not_know_is_reported() {
+        let body = serde_json::json!({
+            "cedar_ember": {"eligible": false, "ineligible_reason": "region",
+                "exhausted": ["seven_day", "seven_day_haiku"], "queue": 3,
+                "event_props": {"tier": "claude_ultra", "cohort": "b"},
+                "grants": [{"id": "g", "resets_left": 1, "type": "monthly",
+                    "unavailable_reason": "blocked_haiku", "transferable": true,
+                    "clears": ["five_hour", "thirty_day"],
+                    "percent_used": {"five_hour": 1, "thirty_day": 2}}]},
+            "juniper_tide": {"eligible": false, "arm": "double", "price": 1}
+        });
+        assert_eq!(
+            unrecognized(&body),
+            [
+                "usage.cedar_ember.event_props.cohort",
+                "usage.cedar_ember.event_props.tier=claude_ultra",
+                "usage.cedar_ember.exhausted=seven_day_haiku",
+                "usage.cedar_ember.grants[].clears=thirty_day",
+                "usage.cedar_ember.grants[].percent_used.thirty_day",
+                "usage.cedar_ember.grants[].transferable",
+                "usage.cedar_ember.grants[].type=monthly",
+                "usage.cedar_ember.grants[].unavailable_reason=blocked_haiku",
+                "usage.cedar_ember.ineligible_reason=region",
+                "usage.cedar_ember.queue",
+                "usage.juniper_tide.arm=double",
+                "usage.juniper_tide.price",
+            ]
+        );
     }
 }
