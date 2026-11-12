@@ -936,6 +936,132 @@ mod tests {
     }
 
     #[test]
+    fn the_growth_rule_case_by_case() {
+        let kept = |closing, row| Kept { closing, row };
+        // The first read of an account is a row.
+        assert_eq!(keep(None, false, None, 100), kept(None, true));
+        // The same value is held until its row is ten minutes old.
+        assert_eq!(keep(Some(100), true, Some(680), 699), kept(None, false));
+        assert_eq!(keep(Some(100), true, Some(680), 700), kept(None, true));
+        // The same value after a time with no read: one row, and nothing
+        // to close, since the value stood on both sides.
+        assert_eq!(keep(Some(100), true, Some(160), 5_000), kept(None, true));
+        // A change is a row, after the old value at its last confirmation.
+        assert_eq!(
+            keep(Some(100), false, Some(680), 700),
+            kept(Some(680), true)
+        );
+        // Nothing closes when the newest row is that confirmation, when
+        // nothing was confirmed, or when the confirmation is this instant.
+        assert_eq!(keep(Some(100), false, Some(100), 120), kept(None, true));
+        assert_eq!(keep(Some(100), false, None, 120), kept(None, true));
+        assert_eq!(keep(Some(100), false, Some(700), 700), kept(None, true));
+    }
+
+    #[test]
+    fn a_hold_is_one_accounts_of_one_service_and_its_confirmation_never_moves_back() {
+        let (dir, store) = open();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("s.db"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the history is the owner's alone");
+        }
+        // The same account name under two services, saying the same thing.
+        let read = |service, at| Reading {
+            at,
+            ..usage(service, "same", 100, 0.1)
+        };
+        let times = |service, since| -> Vec<i64> {
+            store
+                .since(service, None, since)
+                .unwrap()
+                .iter()
+                .map(|reading| reading.at)
+                .collect()
+        };
+        store.insert(&read(Service::Zai, 100)).unwrap();
+        store.insert(&read(Service::Zai, 400)).unwrap();
+        store.insert(&read(Service::Kimi, 200)).unwrap();
+        assert_eq!(times(Service::Zai, 0), [100, 400]);
+        assert_eq!(times(Service::Kimi, 0), [200], "the other service's hold");
+        assert_eq!(
+            store.recent(Service::Kimi, None, 5).unwrap(),
+            [read(Service::Kimi, 200)]
+        );
+        // The held value is no part of a history that starts after it.
+        assert_eq!(times(Service::Zai, 401), [] as [i64; 0]);
+        // A read dated before the last one does not make the view older.
+        store.insert(&read(Service::Zai, 300)).unwrap();
+        assert_eq!(
+            latest(&store, &[(Service::Zai, "same")]),
+            [read(Service::Zai, 400)]
+        );
+        // Two failures that differ are two values.
+        let failed = |at, message: &str| {
+            Reading::failed(
+                Service::Zai,
+                "same",
+                at,
+                crate::quota::ReadError::Network {
+                    message: message.into(),
+                },
+            )
+        };
+        store.insert(&failed(500, "timed out")).unwrap();
+        store.insert(&failed(520, "connection refused")).unwrap();
+        store.insert(&failed(540, "connection refused")).unwrap();
+        assert_eq!(times(Service::Zai, 450), [500, 520, 540]);
+        let written: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM readings WHERE service = 'zai' AND at >= 500",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(written, 2, "the repeated failure is held");
+    }
+
+    #[test]
+    fn a_burn_rate_counts_only_use_inside_one_reset_window() {
+        let at = |hour: i64, used: f64, reset: i64| {
+            let mut reading = weekly_at(hour * 3_600, used);
+            reading.limits[0].window = Window::new(used, reset);
+            // The model's limit is listed first, as the profile lists it.
+            reading.limits.reverse();
+            reading
+        };
+        // The window resets between the second and third read and the new
+        // one reads higher; the fifth read is lower than the fourth.
+        let readings = [
+            at(0, 0.10, 1),
+            at(1, 0.20, 1),
+            at(2, 0.50, 2),
+            at(3, 0.60, 2),
+            at(4, 0.55, 2),
+            at(5, 0.60, 2),
+        ];
+        let stats = Stats::compute("acct", &readings);
+        let labels: Vec<&str> = stats.limits.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["weekly", "Fable"], "account-wide limits first");
+        let weekly = &stats.limits[0];
+        assert_eq!(weekly.series, Series::weekly());
+        let close = |got: Option<f64>, want: f64| {
+            let got = got.unwrap();
+            assert!((got - want).abs() < 1e-9, "{got} is not {want}");
+        };
+        // Three hours count: 0.10, 0.10 and 0.05.
+        close(weekly.mean, 0.25 / 3.0);
+        close(weekly.peak, 0.10);
+        close(weekly.latest, 0.05);
+        close(weekly.hours_left, 0.40 / 0.05);
+    }
+
+    #[test]
     fn burn_rates_are_the_same_from_dense_and_sparse_rows() {
         // One account's use, read every 20 s for an hour: idle for 20
         // minutes, burning 0.001 per read for 10, idle for 15, a burst, then

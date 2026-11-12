@@ -1012,6 +1012,12 @@ mod tests {
         assert_eq!(report.bytes_after, size(&path));
         assert_eq!(files(dir.path()), ["old.db", "old.db.pre-0.4"]);
         assert_eq!(tables(&path), ["readings"]);
+        #[cfg(unix)]
+        for file in [path.clone(), original_of(&path)] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+        }
 
         let store = Store::open_read_only_at(&path).unwrap();
         assert!(!store.has_old_tables());
@@ -1757,6 +1763,36 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
             std::fs::remove_file(original_of(&path)).unwrap();
         }
+    }
+
+    #[test]
+    fn old_rows_out_of_time_order_stop_the_run_with_nothing_dropped() {
+        // `snapshots` is walked in the order of its text timestamps. The
+        // second row sorts after the first as text and is ninety minutes
+        // before it as a time.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = OLD_SNAPSHOTS.split_once("INSERT").unwrap().0;
+        let path = old_database(
+            dir.path(),
+            &format!(
+                "{schema}
+                 INSERT INTO snapshots (token_name, probed_at, utilization_7d, reset_7d)
+                 VALUES ('acct', '2026-01-01T00:00:00+00:00', 0.5, 9);
+                 INSERT INTO snapshots (token_name, probed_at, utilization_7d, reset_7d)
+                 VALUES ('acct', '2026-01-01T00:30:00+02:00', 0.4, 9);"
+            ),
+        );
+        let error = compact(&path, &QUICK, &mut |_, _| Ok(())).unwrap_err();
+        let said = format!("{error:#}");
+        assert!(said.contains("not in time order"), "{said}");
+        assert!(tables(&path).contains(&"snapshots".to_owned()));
+        assert!(!tables(&path).contains(&"readings".to_owned()));
+        let store = Store::open_read_only_at(&path).unwrap();
+        let old: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old, 2);
     }
 
     #[test]
