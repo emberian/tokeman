@@ -68,6 +68,7 @@ impl Poller {
     }
 
     fn record(&self, usages: &[Reading]) {
+        super::log::log_drift(usages);
         let Ok(store) = Store::open_at(&self.store) else {
             return;
         };

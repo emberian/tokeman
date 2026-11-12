@@ -36,6 +36,7 @@ use serde_json::Value;
 pub use self::grant::discover;
 use self::grant::{TOKEN_URL, exchange};
 use super::{ServiceAccount, decode, limit, network};
+use crate::drift::Unrecognized;
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::history::Fingerprint;
 use crate::paths;
@@ -105,8 +106,12 @@ async fn poll(
     let mut session = Session::start(client, endpoints, account, now_ms).await?;
 
     // The plan is decoration: a failed loadCodeAssist still reads quota.
+    let mut seen = Unrecognized::new();
     let (plan, project) = match session.post("loadCodeAssist", &load_body()).await {
-        Ok(value) => plan_and_project(&value),
+        Ok(value) => {
+            seen.keys("loadCodeAssist", &value, KNOWN_LOAD_KEYS);
+            plan_and_project(&value)
+        }
         Err(_) => (None, None),
     };
     let project = project.unwrap_or_else(|| CONSUMER_PROJECT.into());
@@ -116,9 +121,11 @@ async fn poll(
             &serde_json::json!({ "project": project }),
         )
         .await?;
+    seen.extend(unrecognized(&summary));
     Ok(Reading {
         plan,
         limits: meters(&summary, now)?,
+        unrecognized: seen.into_vec(),
         ..Reading::empty(Service::Antigravity, &account.name, now)
     })
 }
@@ -197,6 +204,59 @@ struct Bucket {
     disabled: bool,
     #[serde(default)]
     reset_time: Option<String>,
+}
+
+// The known sets of the two answers: what this parser reads, then what has
+// been seen and is not read (research/antigravity.md, sections 1 and 2).
+
+/// Top-level keys of `loadCodeAssist`.
+const KNOWN_LOAD_KEYS: &[&str] = &[
+    "paidTier",
+    "currentTier",
+    "cloudaicompanionProject",
+    "allowedTiers",
+    "gcpManaged",
+    // Live 2026-11-11.
+    "upgradeSubscriptionUri",
+];
+/// `RetrieveUserQuotaSummaryResponse`; `buckets` is the deprecated flat list.
+const KNOWN_SUMMARY_KEYS: &[&str] = &["groups", "buckets", "description"];
+const KNOWN_GROUP_KEYS: &[&str] = &["displayName", "description", "buckets"];
+const KNOWN_BUCKET_KEYS: &[&str] = &[
+    "bucketId",
+    "displayName",
+    "description",
+    "window",
+    "remainingFraction",
+    "remainingAmount",
+    "disabled",
+    "resetTime",
+];
+const KNOWN_WINDOWS: &[&str] = &["5h", "weekly"];
+
+/// The keys and words of a quota summary that are outside the known sets.
+fn unrecognized(value: &Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    let body = value.get("response").unwrap_or(value);
+    seen.keys("quota", body, KNOWN_SUMMARY_KEYS);
+    seen.row_keys("quota.groups", &body["groups"], KNOWN_GROUP_KEYS);
+    let buckets = body["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|group| ("quota.groups[].buckets", &group["buckets"]))
+        .chain([("quota.buckets", &body["buckets"])]);
+    for (at, buckets) in buckets {
+        seen.row_keys(at, buckets, KNOWN_BUCKET_KEYS);
+        for bucket in buckets.as_array().into_iter().flatten() {
+            seen.value(
+                &format!("{at}[].window"),
+                bucket.get("window"),
+                KNOWN_WINDOWS,
+            );
+        }
+    }
+    seen.into_vec()
 }
 
 /// Limits from a `retrieveUserQuotaSummary` answer (bare, or wrapped in
@@ -293,7 +353,7 @@ fn user_agent() -> &'static str {
 }
 
 /// `CFBundleShortVersionString` of the installed Antigravity app.
-fn installed_app_version() -> Option<String> {
+pub(crate) fn installed_app_version() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -887,6 +947,34 @@ mod tests {
         for account in accounts {
             let usage = read_with(&Client::new(), &endpoints, &account, now).await;
             assert_eq!(usage.error, None);
+        }
+    }
+
+    #[test]
+    fn the_live_answers_carry_nothing_unrecognised_and_a_new_key_or_window_is_reported() {
+        assert_eq!(unrecognized(&live_summary()), Vec::<String>::new());
+        let mut seen = Unrecognized::new();
+        seen.keys("loadCodeAssist", &load_answer(), KNOWN_LOAD_KEYS);
+        assert!(seen.is_empty());
+
+        let mut summary = live_summary();
+        summary["notice"] = serde_json::json!("x");
+        summary["groups"][0]["tier"] = serde_json::json!("pro");
+        summary["groups"][1]["buckets"][0]["window"] = serde_json::json!("daily");
+        summary["groups"][1]["buckets"][1]["burnRate"] = serde_json::json!(2);
+        summary["buckets"] = serde_json::json!([{"bucketId": "flat", "window": "monthly"}]);
+        // The same answer wrapped in `response` reads the same.
+        for body in [summary.clone(), serde_json::json!({"response": summary})] {
+            assert_eq!(
+                unrecognized(&body),
+                [
+                    "quota.buckets[].window=monthly",
+                    "quota.groups[].buckets[].burnRate",
+                    "quota.groups[].buckets[].window=daily",
+                    "quota.groups[].tier",
+                    "quota.notice",
+                ]
+            );
         }
     }
 }

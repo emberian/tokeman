@@ -104,6 +104,7 @@ pub async fn maintenance(fleet: &Fleet, state: &mut MaintenanceState) -> Vec<Mai
         },
     };
     let (probes, events) = sweep_probed(client, &fleet.codex, needs_login).await;
+    crate::daemon::log::log_drift(&probes);
     record(&probes);
     events
 }

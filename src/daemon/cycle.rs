@@ -122,7 +122,11 @@ pub(crate) async fn probe_fleet(
         ));
     }
     cadence.apply_samples(&mut readings, now);
+    fold_sample_drift(&mut readings, samples);
     observe::apply(&mut readings);
+    if store {
+        super::log::log_drift(&readings);
+    }
     if store && let Ok(store) = Store::open() {
         for reading in &readings {
             let _ = store.insert(reading);
@@ -140,6 +144,19 @@ pub(crate) async fn probe_fleet(
             .position(|account| account.name == reading.account)
     });
     readings
+}
+
+/// What a sample's headers carried that no parser knows belongs to the
+/// account's read: the sample itself is kept only as its model window.
+fn fold_sample_drift(readings: &mut [Reading], samples: Vec<Reading>) {
+    for sample in samples {
+        if let Some(reading) = readings
+            .iter_mut()
+            .find(|reading| reading.account == sample.account)
+        {
+            crate::drift::merge(&mut reading.unrecognized, sample.unrecognized);
+        }
+    }
 }
 
 /// `n/m quota readings; unavailable [cause: a, b; cause: c]`.
@@ -491,5 +508,37 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
                 message,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quota::Service;
+
+    #[test]
+    fn what_a_sample_did_not_recognise_joins_its_accounts_read() {
+        let mut probed = Reading::empty(Service::Claude, "first@example.com", 10);
+        probed.unrecognized = vec!["usage.zinc_parrot".to_owned()];
+        let mut readings = vec![
+            probed,
+            Reading::empty(Service::Claude, "second@example.com", 10),
+        ];
+        let mut sample = Reading::empty(Service::Claude, "first@example.com", 10);
+        sample.unrecognized = vec![
+            "header anthropic-ratelimit-unified-7d_oi-burn-rate".to_owned(),
+            "usage.zinc_parrot".to_owned(),
+        ];
+        let mut stray = Reading::empty(Service::Claude, "gone@example.com", 10);
+        stray.unrecognized = vec!["header x".to_owned()];
+        fold_sample_drift(&mut readings, vec![sample, stray]);
+        assert_eq!(
+            readings[0].unrecognized,
+            [
+                "header anthropic-ratelimit-unified-7d_oi-burn-rate",
+                "usage.zinc_parrot"
+            ]
+        );
+        assert!(readings[1].unrecognized.is_empty());
     }
 }

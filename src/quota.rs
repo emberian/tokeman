@@ -864,6 +864,12 @@ pub struct Reading {
     pub error: Option<ReadError>,
     #[serde(default, skip_serializing_if = "Detail::is_none")]
     pub detail: Detail,
+    /// What the read carried that this build does not know: header names,
+    /// body keys, and words of enumerated fields, as [`crate::drift`] names
+    /// them. Sorted and unique; empty on a read of a service that has not
+    /// changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecognized: Vec<String>,
 }
 
 impl Reading {
@@ -882,6 +888,7 @@ impl Reading {
                 Service::Codex => Detail::Codex(CodexDetail::default()),
                 Service::Antigravity | Service::Zai | Service::Kimi => Detail::None,
             },
+            unrecognized: Vec::new(),
         }
     }
 

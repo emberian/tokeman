@@ -17,6 +17,7 @@ use std::time::Duration;
 use super::auth::{AuthFile, CodexHome};
 use super::{Client, is_edge_challenge};
 use crate::account::CodexAccount;
+use crate::drift::Unrecognized;
 use crate::quota::{
     CodexDetail, Credits, Detail, Limit, ModelKey, ModelUsage, ReadError, Reading,
     ResetCreditCount, Scope, Service, Source, Span, SpendControl, SpendLimit, Verdict, Window,
@@ -234,6 +235,129 @@ struct RawResetCredits {
     applicable_available_count: Option<i64>,
 }
 
+// The known sets of the usage body: what this parser reads, then what has
+// been seen and is not read (research/codex.md, live 2026-11-11).
+
+/// Top-level keys.
+const KNOWN_KEYS: &[&str] = &[
+    "plan_type",
+    "email",
+    "rate_limit",
+    "additional_rate_limits",
+    "model_usage",
+    "credits",
+    "spend_control",
+    "rate_limit_reset_credits",
+    "rate_limit_reached_type",
+    // Seen and not read.
+    "code_review_rate_limit",
+    "promo",
+    "rate_limit_upsell",
+    // Whose answer it is (live 2026-11-11); never kept.
+    "user_id",
+    "account_id",
+];
+/// `rate_limit`, `code_review_rate_limit` and an additional limit's
+/// `rate_limit`.
+const KNOWN_RATE_LIMIT_KEYS: &[&str] = &[
+    "allowed",
+    "limit_reached",
+    "primary_window",
+    "secondary_window",
+];
+const KNOWN_WINDOW_KEYS: &[&str] = &[
+    "used_percent",
+    "limit_window_seconds",
+    "reset_after_seconds",
+    "reset_at",
+];
+const KNOWN_CREDITS_KEYS: &[&str] = &[
+    "has_credits",
+    "unlimited",
+    "overage_limit_reached",
+    "balance",
+    "approx_local_messages",
+    "approx_cloud_messages",
+];
+/// A row of `additional_rate_limits`.
+const KNOWN_EXTRA_LIMIT_KEYS: &[&str] = &[
+    "limit_name",
+    "metered_feature",
+    "normal_model_slug",
+    "rate_limit",
+];
+/// An entry of `model_usage`; its keys are model slugs.
+const KNOWN_MODEL_USAGE_KEYS: &[&str] = &["available", "available_at", "credits_would_enable"];
+const KNOWN_SPEND_CONTROL_KEYS: &[&str] = &["reached", "individual_limit"];
+const KNOWN_SPEND_LIMIT_KEYS: &[&str] = &[
+    "source",
+    "limit",
+    "used",
+    "remaining",
+    "used_percent",
+    "reset_at",
+    // In the client's types (openai/codex backend-client) and not read.
+    "remaining_percent",
+    "reset_after_seconds",
+];
+const KNOWN_RESET_CREDITS_KEYS: &[&str] = &["available_count", "applicable_available_count"];
+const KNOWN_REACHED_TYPE_KEYS: &[&str] = &["type"];
+
+fn unrecognized_rate_limit(seen: &mut Unrecognized, at: &str, block: &Value) {
+    seen.keys(at, block, KNOWN_RATE_LIMIT_KEYS);
+    for window in ["primary_window", "secondary_window"] {
+        seen.keys(&format!("{at}.{window}"), &block[window], KNOWN_WINDOW_KEYS);
+    }
+}
+
+/// The keys of a usage body that are outside the known sets.
+fn unrecognized(body: &Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    seen.keys("usage", body, KNOWN_KEYS);
+    for block in ["rate_limit", "code_review_rate_limit"] {
+        unrecognized_rate_limit(&mut seen, &format!("usage.{block}"), &body[block]);
+    }
+    let extras = &body["additional_rate_limits"];
+    seen.row_keys(
+        "usage.additional_rate_limits",
+        extras,
+        KNOWN_EXTRA_LIMIT_KEYS,
+    );
+    for extra in extras.as_array().into_iter().flatten() {
+        unrecognized_rate_limit(
+            &mut seen,
+            "usage.additional_rate_limits[].rate_limit",
+            &extra["rate_limit"],
+        );
+    }
+    for model in body["model_usage"]
+        .as_object()
+        .into_iter()
+        .flat_map(|models| models.values())
+    {
+        seen.keys("usage.model_usage{}", model, KNOWN_MODEL_USAGE_KEYS);
+    }
+    seen.keys("usage.credits", &body["credits"], KNOWN_CREDITS_KEYS);
+    let spend = &body["spend_control"];
+    seen.keys("usage.spend_control", spend, KNOWN_SPEND_CONTROL_KEYS);
+    seen.keys(
+        "usage.spend_control.individual_limit",
+        &spend["individual_limit"],
+        KNOWN_SPEND_LIMIT_KEYS,
+    );
+    seen.keys(
+        "usage.rate_limit_reset_credits",
+        &body["rate_limit_reset_credits"],
+        KNOWN_RESET_CREDITS_KEYS,
+    );
+    seen.keys(
+        "usage.rate_limit_reached_type",
+        &body["rate_limit_reached_type"],
+        KNOWN_REACHED_TYPE_KEYS,
+    );
+    seen.into_vec()
+}
+
 /// A number or string the backend may send either way, as text.
 fn text_of(value: Option<Value>) -> Option<String> {
     match value? {
@@ -339,6 +463,7 @@ pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Read
                 })
             }),
         }),
+        unrecognized: unrecognized(&value),
         ..Reading::empty(Service::Codex, account, at.timestamp())
     })
 }
@@ -1070,5 +1195,51 @@ pub(crate) mod tests {
         assert!(probes.iter().all(|probe| probe.service == Service::Codex));
         assert!(backend.requests("/usage").is_empty());
         assert!(probe_all(&client, &[]).await.is_empty());
+    }
+
+    #[test]
+    fn the_bodies_seen_so_far_carry_nothing_unrecognised() {
+        for body in [
+            usage_body(10.0, 20.0),
+            weekly_only_body(42.0),
+            limited_body(),
+        ] {
+            assert_eq!(decode(&body, 0).unrecognized, Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn a_key_it_does_not_know_is_reported_wherever_it_sits() {
+        let mut body = weekly_only_body(10.0);
+        body["burst_rate_limit"] = json!({"allowed": true});
+        body["rate_limit"]["tier"] = json!("gold");
+        body["rate_limit"]["primary_window"]["used_tokens"] = json!(5);
+        body["code_review_rate_limit"] =
+            json!({"allowed": true, "tertiary_window": {"used_percent": 1}});
+        body["model_usage"]["gpt-6-astra"]["queue_depth"] = json!(3);
+        body["credits"]["expires_at"] = json!(1);
+        body["spend_control"] = json!({"reached": false, "team_limit": null,
+            "individual_limit": {"limit": "5", "currency": "USD"}});
+        body["rate_limit_reset_credits"]["pending_count"] = json!(0);
+        body["rate_limit_reached_type"] = json!({"type": "x", "since": 1});
+        body["additional_rate_limits"] = json!([{"limit_name": "spark", "priority": 1,
+            "rate_limit": {"allowed": true, "primary_window": {"used_percent": 1, "burst": true}}}]);
+        assert_eq!(
+            decode(&body, 0).unrecognized,
+            [
+                "usage.additional_rate_limits[].priority",
+                "usage.additional_rate_limits[].rate_limit.primary_window.burst",
+                "usage.burst_rate_limit",
+                "usage.code_review_rate_limit.tertiary_window",
+                "usage.credits.expires_at",
+                "usage.model_usage{}.queue_depth",
+                "usage.rate_limit.primary_window.used_tokens",
+                "usage.rate_limit.tier",
+                "usage.rate_limit_reached_type.since",
+                "usage.rate_limit_reset_credits.pending_count",
+                "usage.spend_control.individual_limit.currency",
+                "usage.spend_control.team_limit",
+            ]
+        );
     }
 }

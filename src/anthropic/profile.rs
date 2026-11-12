@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Client, describe, retry_after_secs};
 use crate::account::Account;
+use crate::drift::Unrecognized;
 use crate::fs::write_atomic;
 use crate::paths;
 use crate::quota::{Limit, ModelKey, Reading, Scope, SessionLimit, Source, Span, Window};
@@ -401,6 +402,119 @@ pub struct ProfileUsage {
     pub session_limit: SessionLimit,
     /// The per-model weekly limits.
     pub models: Vec<Limit>,
+    /// Keys and words of the body outside the known sets.
+    pub unrecognized: Vec<String>,
+}
+
+// The known sets of the usage body: what this parser reads, then what has
+// been seen and is not read.
+
+/// Top-level keys.
+const KNOWN_KEYS: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "limits",
+    "weekly_scoped_shares",
+    // Windows that are null where a plan has no such limit, and the dollar
+    // windows (research/anthropic.md section 2, research/prior-art.md).
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_oauth_apps",
+    "seven_day_cowork",
+    "seven_day_omelette",
+    "seven_day_routines",
+    "cinder_cove",
+    "wattle_ember",
+    "iguana_necktie",
+    // Spend, and what describes the account rather than a limit.
+    "extra_usage",
+    "spend",
+    "promo_credits",
+    "pace",
+    "seven_day_breakdown",
+    "member_dashboard_available",
+    // Null in every answer in tokeman's cache through 2026-11-11.
+    "indicator",
+    // Programs: the two reset programs are read by `resets`; the rest are
+    // offers and experiments, null unless asked for.
+    "cedar_ember",
+    "juniper_tide",
+    "starry_waterfall",
+    "amber_cistern",
+    "amber_cistern_offer",
+    "amber_gauge",
+    "amber_ladder",
+    "brass_thimble",
+    "copper_kite",
+    "granite_teacup",
+    "harbor_lantern",
+    "nimbus_quill",
+    "tangelo",
+    "omelette_promotional",
+];
+/// `five_hour` and `seven_day`.
+const KNOWN_WINDOW_KEYS: &[&str] = &[
+    "utilization",
+    "resets_at",
+    "limit_dollars",
+    "used_dollars",
+    "remaining_dollars",
+    "locked_reason",
+];
+/// A `limits[]` row.
+const KNOWN_LIMIT_KEYS: &[&str] = &[
+    "kind",
+    "group",
+    "percent",
+    "resets_at",
+    "severity",
+    "is_active",
+    "scope",
+];
+const KNOWN_KINDS: &[&str] = &["session", "weekly_all", "weekly_scoped"];
+const KNOWN_GROUPS: &[&str] = &["session", "weekly"];
+const KNOWN_SEVERITIES: &[&str] = &["normal", "warning", "critical"];
+const KNOWN_SCOPE_KEYS: &[&str] = &["model", "surface"];
+/// `scope.model` and `scope.surface`.
+const KNOWN_SCOPE_NAME_KEYS: &[&str] = &["display_name", "id"];
+const KNOWN_SHARE_KEYS: &[&str] = &[
+    "limit_index",
+    "allowance_percent_of_weekly",
+    "used_percent_of_weekly",
+];
+
+/// The keys and words of a usage body that are outside the known sets.
+pub fn unrecognized(body: &serde_json::Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    seen.keys("usage", body, KNOWN_KEYS);
+    for window in ["five_hour", "seven_day"] {
+        seen.keys(&format!("usage.{window}"), &body[window], KNOWN_WINDOW_KEYS);
+    }
+    seen.row_keys("usage.limits", &body["limits"], KNOWN_LIMIT_KEYS);
+    for row in body["limits"].as_array().into_iter().flatten() {
+        seen.value("usage.limits[].kind", row.get("kind"), KNOWN_KINDS);
+        seen.value("usage.limits[].group", row.get("group"), KNOWN_GROUPS);
+        seen.value(
+            "usage.limits[].severity",
+            row.get("severity"),
+            KNOWN_SEVERITIES,
+        );
+        let scope = &row["scope"];
+        seen.keys("usage.limits[].scope", scope, KNOWN_SCOPE_KEYS);
+        for name in KNOWN_SCOPE_KEYS {
+            seen.keys(
+                &format!("usage.limits[].scope.{name}"),
+                &scope[*name],
+                KNOWN_SCOPE_NAME_KEYS,
+            );
+        }
+    }
+    seen.row_keys(
+        "usage.weekly_scoped_shares",
+        &body["weekly_scoped_shares"],
+        KNOWN_SHARE_KEYS,
+    );
+    seen.into_vec()
 }
 
 /// Percent to fraction, once, at the boundary. Over 100 stays over 1.0.
@@ -504,7 +618,10 @@ pub fn usage_of(usage: &UsageResponse) -> ProfileUsage {
 }
 
 pub fn parse(body: &serde_json::Value) -> std::result::Result<ProfileUsage, serde_json::Error> {
-    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| usage_of(&usage))
+    serde_json::from_value::<UsageResponse>(body.clone()).map(|usage| ProfileUsage {
+        unrecognized: unrecognized(body),
+        ..usage_of(&usage)
+    })
 }
 
 /// The account's profile usage, through the cache. `None` when the account
@@ -533,6 +650,7 @@ pub async fn usage(
 pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<ProfileUsage, String>>) {
     match outcome {
         Some(Ok(profile)) => {
+            crate::drift::merge(&mut reading.unrecognized, profile.unrecognized);
             for limit in profile.models {
                 reading.set_limit(limit);
             }
@@ -1153,5 +1271,95 @@ mod tests {
             .model_limit(&ModelKey::family_wide(Family::Fable))
             .unwrap();
         assert_eq!((fable.window.used, fable.share), (1.02, Some(0.5)));
+    }
+
+    /// The top-level keys of the answers in tokeman's cache on 2026-11-11,
+    /// with the values that are not null there.
+    fn todays_body() -> serde_json::Value {
+        let mut body = ultra_body();
+        for key in [
+            "amber_cistern",
+            "amber_cistern_offer",
+            "amber_gauge",
+            "amber_ladder",
+            "brass_thimble",
+            "cedar_ember",
+            "cinder_cove",
+            "copper_kite",
+            "granite_teacup",
+            "harbor_lantern",
+            "iguana_necktie",
+            "indicator",
+            "juniper_tide",
+            "nimbus_quill",
+            "omelette_promotional",
+            "pace",
+            "promo_credits",
+            "seven_day_cowork",
+            "seven_day_oauth_apps",
+            "seven_day_omelette",
+            "seven_day_sonnet",
+            "starry_waterfall",
+            "tangelo",
+            "wattle_ember",
+        ] {
+            body[key] = serde_json::Value::Null;
+        }
+        body["member_dashboard_available"] = serde_json::json!(false);
+        body["seven_day"] = serde_json::json!({"utilization": 80.0,
+            "resets_at": "2026-11-13T09:00:00Z", "limit_dollars": null, "used_dollars": null,
+            "remaining_dollars": null, "locked_reason": null});
+        body["limits"][0]["kind"] = serde_json::json!("session");
+        body["limits"][0]["group"] = serde_json::json!("session");
+        body["extra_usage"] = serde_json::json!({"is_enabled": false, "anything": 1});
+        body["spend"] = serde_json::json!({"enabled": false});
+        body["seven_day_breakdown"] = serde_json::json!({"rows": []});
+        body
+    }
+
+    #[test]
+    fn todays_body_carries_nothing_unrecognised() {
+        assert_eq!(unrecognized(&todays_body()), Vec::<String>::new());
+        assert_eq!(
+            parse(&todays_body()).unwrap().unrecognized,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_key_a_kind_or_a_scope_it_does_not_know_is_reported_and_lands_in_the_reading() {
+        let mut body = todays_body();
+        body["zinc_parrot"] = serde_json::json!({"utilization": 3});
+        body["seven_day"]["burst"] = serde_json::json!(true);
+        body["limits"][0]["kind"] = serde_json::json!("daily_all");
+        body["limits"][0]["group"] = serde_json::json!("daily");
+        body["limits"][0]["severity"] = serde_json::json!("blocked");
+        body["limits"][0]["window_seconds"] = serde_json::json!(86400);
+        body["limits"][2]["scope"]["project"] = serde_json::json!({"display_name": "x"});
+        body["limits"][2]["scope"]["model"]["family"] = serde_json::json!("fable");
+        body["weekly_scoped_shares"][0]["borrowed_percent"] = serde_json::json!(1);
+        let expected = [
+            "usage.limits[].group=daily",
+            "usage.limits[].kind=daily_all",
+            "usage.limits[].scope.model.family",
+            "usage.limits[].scope.project",
+            "usage.limits[].severity=blocked",
+            "usage.limits[].window_seconds",
+            "usage.seven_day.burst",
+            "usage.weekly_scoped_shares[].borrowed_percent",
+            "usage.zinc_parrot",
+        ];
+        let usage = parse(&body).unwrap();
+        assert_eq!(usage.unrecognized, expected);
+
+        // Merged into a reading beside what its headers did not know.
+        let mut reading = Reading::empty(Service::Claude, "a", 0);
+        reading.unrecognized = vec!["header anthropic-ratelimit-unified-8h-reset".to_owned()];
+        merge(&mut reading, Some(Ok(usage)));
+        assert_eq!(reading.unrecognized.len(), expected.len() + 1);
+        assert_eq!(
+            reading.unrecognized[0],
+            "header anthropic-ratelimit-unified-8h-reset"
+        );
     }
 }

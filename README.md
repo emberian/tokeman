@@ -296,6 +296,30 @@ launchd starts the new one.
 configured arguments and without a token in its environment or command line.
 `--auto` keeps rotating on the fast cadence while claude runs.
 
+## When a service changes
+
+```sh
+tokeman doctor [--json]
+```
+
+Every parser keeps the names it knows: the rate-limit headers, the keys of
+each usage body, and the words of fields such as a limit's `kind`. Anything
+else a service sends is kept with the read as an unrecognised item
+(`usage.limits[].kind=daily_all`), by name only. The background service logs
+each item the first time it sees it (`drift.json` holds the list).
+
+`doctor` reads every account once and reports, per account, whether the
+service answered, the state of the credential and the unrecognised items
+(also those of the reset programs and the Codex credit list, and what the
+service has logged). It then states the installed Claude Code, codex, agy
+and Antigravity app against the versions this build was verified with
+(2.1.322, 0.167.0, 1.5.6, 2.31.2), the SessionStart hook, whether the
+background service runs, the modes of the config directory and tokens.toml,
+whether agy's Keychain login reads, and reset claims without an answer. It
+exits 0 when nothing is wrong and 1 otherwise, and every problem comes with
+the command that fixes it. A tool at another version is stated, not counted
+as a problem.
+
 ## Trays
 
 The macOS menu-bar app is a separate Swift package:
@@ -335,6 +359,7 @@ once into a PNG.
 | `~/.config/tokeman/claude-rotate-state.json` | Cadence, mode, backoffs, carried samples |
 | `~/.config/tokeman/claude-rotate.log` | Rotation events (names and headroom only) |
 | `~/.config/tokeman/claims.json` | Reset claims (Claude grants, Codex credits) sent without a definite answer |
+| `~/.config/tokeman/drift.json` | Header names, body keys and enum words the services sent that this version does not know |
 | `~/.config/tokeman/claude-login-keychain-backup.json` | The `/login` Keychain record set aside while managed |
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.config/tokeman/antigravity-access-tokens.json` | Access tokens minted from the Antigravity grants |

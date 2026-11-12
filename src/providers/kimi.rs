@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{ServiceAccount, credential, decode, limit, network};
+use crate::drift::Unrecognized;
 use crate::quota::{Balance, Limit, ReadError, Reading, Service, Window};
 use crate::util::one_line;
 
@@ -50,13 +51,18 @@ pub(crate) async fn read_from(
     let (usages, me) = futures::join!(get(client, &usages_url, &key), get(client, &me_url, &key),);
     let parsed = usages.and_then(|body| parse_usages(&body));
     match parsed {
-        Ok((limits, balances)) => Reading {
+        Ok((limits, balances, mut unrecognized)) => {
             // The plan is optional: a failed `/me` costs only the name.
-            plan: me.ok().and_then(|body| parse_plan(&body)),
-            limits,
-            balances,
-            ..Reading::empty(Service::Kimi, &account.name, now)
-        },
+            let (plan, me_unrecognized) = me.ok().map(|body| parse_me(&body)).unwrap_or_default();
+            crate::drift::merge(&mut unrecognized, me_unrecognized);
+            Reading {
+                plan,
+                limits,
+                balances,
+                unrecognized,
+                ..Reading::empty(Service::Kimi, &account.name, now)
+            }
+        }
         Err(error) => failed(error),
     }
 }
@@ -169,13 +175,137 @@ fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
     ))
 }
 
-fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), ReadError> {
-    let parsed: UsagesBody = serde_json::from_str(body).map_err(|error| {
+// The known sets of `/usages` and `/me`: what this parser reads, then what
+// has been seen and is not read (research/zai-kimi.md).
+
+const KNOWN_KEYS: &[&str] = &[
+    "usages",
+    "booster_wallet",
+    "boosterWallet",
+    // The legacy shape: the same numbers as 0-100 strings.
+    "usage",
+    "limits",
+];
+/// An entry of `usages`.
+const KNOWN_POOL_KEYS: &[&str] = &["used_ratio", "reset_time"];
+/// The legacy `usage`, and a legacy row's `detail`.
+const KNOWN_LEGACY_USAGE_KEYS: &[&str] = &["limit", "used", "remaining", "resetTime"];
+const KNOWN_LEGACY_LIMIT_KEYS: &[&str] = &["window", "detail"];
+const KNOWN_LEGACY_WINDOW_KEYS: &[&str] = &["duration", "timeUnit"];
+const KNOWN_TIME_UNITS: &[&str] = &["TIME_UNIT_MINUTE", "TIME_UNIT_HOUR", "TIME_UNIT_DAY"];
+const KNOWN_WALLET_KEYS: &[&str] = &[
+    "id",
+    "userId",
+    "balance",
+    "status",
+    "allowTopup",
+    "topupLimit",
+    "monthlyChargeLimitEnabled",
+    "monthlyChargeLimit",
+    "monthlyUsed",
+    // Live 2026-11-11.
+    "autoRefillCharge",
+    "autoRefillThreshold",
+    "createdAt",
+    "updatedAt",
+];
+const KNOWN_WALLET_BALANCE_KEYS: &[&str] = &[
+    "id",
+    "feature",
+    "type",
+    "amount",
+    "amountLeft",
+    "unit",
+    "periodStart",
+    "periodEnd",
+    "domain",
+    // Live 2026-11-11.
+    "userId",
+    "subscriptionId",
+    "createTime",
+    "updateTime",
+];
+const KNOWN_WALLET_BALANCE_TYPES: &[&str] = &["BOOSTER"];
+/// `topupLimit`, `monthlyChargeLimit`, `monthlyUsed`.
+const KNOWN_MONEY_KEYS: &[&str] = &["currency", "priceInCents"];
+/// `/me`. Only `user_level_name` is read; the rest describe the person.
+const KNOWN_ME_KEYS: &[&str] = &[
+    "user_level",
+    "user_level_name",
+    "user_id",
+    "nickname",
+    "avatar",
+    "phone",
+    "global_id",
+    // Live 2026-11-11.
+    "region",
+    "status",
+    "goods_version",
+    "created_time",
+    "last_login_time",
+];
+
+/// The keys and words of a `/usages` answer that are outside the known sets.
+fn unrecognized(body: &Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    seen.keys("usages", body, KNOWN_KEYS);
+    let windows: Vec<&str> = KNOWN.iter().map(|(key, _, _)| *key).collect();
+    seen.keys("usages.usages", &body["usages"], &windows);
+    for pool in body["usages"]
+        .as_object()
+        .into_iter()
+        .flat_map(|pools| pools.values())
+    {
+        seen.keys("usages.usages{}", pool, KNOWN_POOL_KEYS);
+    }
+    seen.keys("usages.usage", &body["usage"], KNOWN_LEGACY_USAGE_KEYS);
+    seen.row_keys("usages.limits", &body["limits"], KNOWN_LEGACY_LIMIT_KEYS);
+    for row in body["limits"].as_array().into_iter().flatten() {
+        let window = &row["window"];
+        seen.keys("usages.limits[].window", window, KNOWN_LEGACY_WINDOW_KEYS);
+        seen.value(
+            "usages.limits[].window.timeUnit",
+            window.get("timeUnit"),
+            KNOWN_TIME_UNITS,
+        );
+        seen.keys(
+            "usages.limits[].detail",
+            &row["detail"],
+            KNOWN_LEGACY_USAGE_KEYS,
+        );
+    }
+    for spelling in ["booster_wallet", "boosterWallet"] {
+        let wallet = &body[spelling];
+        let at = format!("usages.{spelling}");
+        seen.keys(&at, wallet, KNOWN_WALLET_KEYS);
+        let balance = &wallet["balance"];
+        seen.keys(&format!("{at}.balance"), balance, KNOWN_WALLET_BALANCE_KEYS);
+        seen.value(
+            &format!("{at}.balance.type"),
+            balance.get("type"),
+            KNOWN_WALLET_BALANCE_TYPES,
+        );
+        for money in ["topupLimit", "monthlyChargeLimit", "monthlyUsed"] {
+            seen.keys(&format!("{at}.{money}"), &wallet[money], KNOWN_MONEY_KEYS);
+        }
+    }
+    seen.into_vec()
+}
+
+/// What `/usages` holds: the windows, the booster balance, and what was not
+/// recognised.
+type Parsed = (Vec<Limit>, Vec<Balance>, Vec<String>);
+
+fn parse_usages(body: &str) -> Result<Parsed, ReadError> {
+    let unreadable = |error: serde_json::Error| {
         decode(format!(
             "unreadable answer ({error}): {}",
             one_line(body, 160)
         ))
-    })?;
+    };
+    let value: Value = serde_json::from_str(body).map_err(unreadable)?;
+    let unrecognized = unrecognized(&value);
+    let parsed: UsagesBody = serde_json::from_value(value).map_err(unreadable)?;
     let mut pools = parsed.usages.unwrap_or_default();
     let mut meters: Vec<Limit> = KNOWN
         .iter()
@@ -193,7 +323,7 @@ fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), ReadError> {
         .and_then(booster)
         .into_iter()
         .collect();
-    Ok((meters, balances))
+    Ok((meters, balances, unrecognized))
 }
 
 fn booster(wallet: &Wallet) -> Option<Balance> {
@@ -222,16 +352,19 @@ fn booster(wallet: &Wallet) -> Option<Balance> {
 }
 
 /// `user_level_name` and nothing else: `/me` also carries personal details.
-fn parse_plan(body: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Me {
-        #[serde(default)]
-        user_level_name: Option<String>,
-    }
-    serde_json::from_str::<Me>(body)
-        .ok()?
-        .user_level_name
+/// With it, the names of the keys of `/me` that are outside the known set.
+fn parse_me(body: &str) -> (Option<String>, Vec<String>) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (None, Vec::new());
+    };
+    let mut seen = Unrecognized::new();
+    seen.keys("me", &value, KNOWN_ME_KEYS);
+    let plan = value
+        .get("user_level_name")
+        .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned);
+    (plan, seen.into_vec())
 }
 
 #[cfg(test)]
@@ -261,7 +394,8 @@ mod tests {
 
     #[test]
     fn the_usages_map_becomes_meters_and_the_legacy_fields_are_ignored() {
-        let (meters, balances) = parse_usages(LIVE).unwrap();
+        let (meters, balances, unrecognized) = parse_usages(LIVE).unwrap();
+        assert!(unrecognized.is_empty(), "{unrecognized:?}");
         let summary: Vec<_> = meters
             .iter()
             .map(|m| (m.label.as_str(), m.window.used, m.span))
@@ -300,7 +434,7 @@ mod tests {
             "limit_future":{"used_ratio":0.9},
             "limit_broken":{"used_ratio":null}},
           "boosterWallet":{"balance":{"type":"BOOSTER","amount":2000000,"amountLeft":400000}}}"#;
-        let (meters, balances) = parse_usages(body).unwrap();
+        let (meters, balances, _) = parse_usages(body).unwrap();
         let labels: Vec<_> = meters.iter().map(|m| m.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -329,8 +463,9 @@ mod tests {
 
     #[test]
     fn the_plan_is_the_level_name_only() {
-        assert_eq!(parse_plan(ME).as_deref(), Some("Vivace"));
-        assert_eq!(parse_plan(r#"{"user_level_name":""}"#), None);
+        assert_eq!(parse_me(ME), (Some("Vivace".to_owned()), Vec::new()));
+        assert_eq!(parse_me(r#"{"user_level_name":""}"#).0, None);
+        assert_eq!(parse_me("not json"), (None, Vec::new()));
     }
 
     #[tokio::test]
@@ -383,5 +518,32 @@ mod tests {
         let base = format!("{}/coding/v1", crate::testing::serve(app).await);
         let usage = read_from(&reqwest::Client::new(), &base, &account(), NOW).await;
         assert_eq!(usage.plan.as_deref(), Some("Vivace"));
+    }
+
+    #[test]
+    fn a_window_a_wallet_field_or_a_profile_key_it_does_not_know_is_reported_by_name() {
+        let body = r#"{"usages":{"limit_5h":{"used_ratio":0.1,"reset_time":"2026-11-11T23:40:17Z","burst":true},
+            "limit_day":{"used_ratio":0.5}},
+            "limits":[{"window":{"duration":1,"timeUnit":"TIME_UNIT_WEEK"},"detail":{"limit":"100"}}],
+            "booster_wallet":{"balance":{"type":"GIFT","amount":"1","frozen":"0"},"tier":"gold"},
+            "notices":[]}"#;
+        let (meters, _, unrecognized) = parse_usages(body).unwrap();
+        assert_eq!(meters.len(), 2, "the unknown window is still shown");
+        assert_eq!(
+            unrecognized,
+            [
+                "usages.booster_wallet.balance.frozen",
+                "usages.booster_wallet.balance.type=GIFT",
+                "usages.booster_wallet.tier",
+                "usages.limits[].window.timeUnit=TIME_UNIT_WEEK",
+                "usages.notices",
+                "usages.usages.limit_day",
+                "usages.usages{}.burst",
+            ]
+        );
+        // A name only: what `/me` says about the person is never kept.
+        let (_, unrecognized) =
+            parse_me(r#"{"user_level_name":"Vivace","home_address":"1 Secret St"}"#);
+        assert_eq!(unrecognized, ["me.home_address"]);
     }
 }

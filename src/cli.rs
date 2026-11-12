@@ -125,6 +125,19 @@ pub enum Command {
         #[arg(long, default_value = "680")]
         height: u32,
     },
+    /// Check tokeman against the services and this machine
+    ///
+    /// Reads every account once, then reports per account whether it was
+    /// reached, the state of its credential and anything in the answers this
+    /// build does not know; the installed tools against the versions this
+    /// build was verified with; the SessionStart hook, the background
+    /// service, file modes, agy's login and unanswered reset claims. Exits 1
+    /// when there is a problem, each stated with the command that fixes it.
+    Doctor {
+        /// The report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or change the launch settings in tokens.toml
     Settings {
         #[command(subcommand)]

@@ -1613,6 +1613,156 @@ pub fn print_chart(chart: &crate::ui::chart::Rendered) {
     }
 }
 
+// ---- doctor ----
+
+fn doctor_account_line(account: &crate::commands::doctor::AccountCheck) -> String {
+    use crate::commands::doctor::{CredentialState, Reach};
+    let reach = match account.reach {
+        Reach::Answered => "reached",
+        Reach::NoAnswer => "not reached",
+        Reach::NotAsked => "not asked",
+    };
+    let credential = match account.credential {
+        CredentialState::Accepted => "credential accepted",
+        CredentialState::Missing => "no credential",
+        CredentialState::Unusable => "credential unusable",
+        CredentialState::Refused => "credential refused",
+        CredentialState::Unknown => "credential not judged",
+    };
+    let drift = match account.unrecognized.len() {
+        0 => "nothing unrecognised".to_owned(),
+        count => format!("{count} unrecognised"),
+    };
+    format!(
+        "  {:<12} {:<28} {reach}, {credential}, {drift}",
+        account.service.label(),
+        account.name
+    )
+}
+
+/// The report of `tokeman doctor`, one line each: what was checked, then
+/// the problems with their fixes.
+pub fn doctor_lines(report: &crate::commands::doctor::Report) -> Vec<String> {
+    use crate::commands::doctor::{AgySlot, Hook, ModeState, VersionState};
+    let mut lines = vec!["Accounts (read just now)".to_owned()];
+    if report.accounts.is_empty() {
+        lines.push("  none configured".to_owned());
+    }
+    for account in &report.accounts {
+        lines.push(doctor_account_line(account));
+        if let Some(error) = &account.error {
+            lines.push(format!("      {}", brief_error(&error.to_string())));
+        }
+        if let Some(error) = &account.login_error {
+            lines.push(format!("      login refused: {}", one_line(error, 120)));
+        }
+        for note in &account.notes {
+            lines.push(format!("      {}", one_line(note, 160)));
+        }
+        for item in &account.unrecognized {
+            lines.push(format!("      not known: {item}"));
+        }
+    }
+    if !report.seen_by_daemon.is_empty() {
+        lines.push("Seen by the background service and not in these reads".to_owned());
+        for entry in &report.seen_by_daemon {
+            lines.push(format!(
+                "  {:<12} {} (first {}, read of {})",
+                entry.service.label(),
+                entry.item,
+                format_age(entry.seen.first_seen, report.at),
+                entry.seen.account
+            ));
+        }
+    }
+    lines.push("Tools".to_owned());
+    for tool in &report.tools {
+        let installed = tool.installed.as_deref().unwrap_or("not found");
+        let state = match tool.state {
+            VersionState::Verified => "the verified version".to_owned(),
+            VersionState::Newer => format!("newer than {}, the verified version", tool.verified),
+            VersionState::Older => format!("older than {}, the verified version", tool.verified),
+            VersionState::NotFound => format!("verified with {}", tool.verified),
+        };
+        lines.push(format!("  {:<16} {installed:<10} {state}", tool.tool));
+    }
+    lines.push("This machine".to_owned());
+    lines.push(format!(
+        "  SessionStart hook   {}",
+        match &report.hook {
+            Hook::Installed { .. } => "installed".to_owned(),
+            Hook::Dangling { binary, .. } => format!("runs {binary}, which is not there"),
+            Hook::Missing => "not installed".to_owned(),
+            Hook::Unreadable { .. } => "settings unreadable".to_owned(),
+        }
+    ));
+    lines.push(format!(
+        "  background service  {}",
+        match report.daemon {
+            Monitor::Running => "running",
+            Monitor::Paused => "running, rotation paused (`tokeman rotate resume`)",
+            Monitor::Stopped => "installed, not running",
+            Monitor::NotInstalled => "not installed (`tokeman rotate install`)",
+        }
+    ));
+    for file in &report.files {
+        let state = match (file.state, file.mode) {
+            (ModeState::Private, Some(mode)) => format!("mode {mode:o}"),
+            (ModeState::TooOpen, Some(mode)) => {
+                format!("mode {mode:o}, wider than {:o}", file.expected)
+            }
+            _ => "missing".to_owned(),
+        };
+        lines.push(format!("  {:<19} {state}", tilde(&file.path)));
+    }
+    match &report.agy_slot {
+        AgySlot::NotChecked => {}
+        slot => lines.push(format!(
+            "  agy's login         {}",
+            match slot {
+                AgySlot::Readable {
+                    account,
+                    registered: true,
+                } => format!("readable, holds {account}"),
+                AgySlot::Readable { account, .. } => format!(
+                    "readable, holds {account}, which tokeman does not know (`tokeman agy import`)"
+                ),
+                AgySlot::Empty => "agy is signed out".to_owned(),
+                AgySlot::Unreadable { .. } => "unreadable".to_owned(),
+                AgySlot::NotChecked => String::new(),
+            }
+        )),
+    }
+    lines.push(format!(
+        "  reset claims        {}",
+        match report.pending_claims.len() {
+            0 => "none unanswered".to_owned(),
+            count => format!("{count} unanswered"),
+        }
+    ));
+    lines.push(String::new());
+    if report.healthy {
+        lines.push("No problems.".to_owned());
+    } else {
+        lines.push(format!(
+            "{} problem{}:",
+            report.problems.len(),
+            if report.problems.len() == 1 { "" } else { "s" }
+        ));
+        for problem in &report.problems {
+            lines.push(format!("  {}", problem.what));
+            lines.push(format!("      fix: {}", problem.fix));
+        }
+    }
+    lines
+}
+
+pub fn print_doctor(report: &crate::commands::doctor::Report) {
+    for line in doctor_lines(report) {
+        println!("{line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2046,5 +2196,68 @@ mod tests {
 
     fn probe_from(body: &serde_json::Value, name: &str, at: DateTime<Utc>) -> Reading {
         crate::codex::probe::decode_usage(name, &body.to_string(), at).unwrap()
+    }
+
+    #[test]
+    fn the_doctor_report_lists_what_was_checked_then_each_problem_with_its_fix() {
+        use crate::commands::doctor::{
+            AccountCheck, AgySlot, FileCheck, Findings, Hook, Report, ToolCheck,
+        };
+        use crate::quota::ReadError;
+        let mut drifted = Reading::empty(Service::Kimi, "kimi", 100);
+        drifted.unrecognized = vec!["usages.usages.limit_day".into()];
+        let findings = Findings {
+            at: 1_000,
+            accounts: vec![
+                AccountCheck::of(&Reading::empty(Service::Claude, "first@example.com", 100)),
+                AccountCheck::of(&drifted),
+                AccountCheck::of(&Reading::failed(
+                    Service::Codex,
+                    "work",
+                    100,
+                    ReadError::Http {
+                        status: 401,
+                        body: "token has expired".into(),
+                    },
+                )),
+            ],
+            tools: vec![
+                ToolCheck::of("codex", "0.167.0", Some("0.170.0".into())),
+                ToolCheck::of("agy", "1.5.6", None),
+            ],
+            hook: Hook::Installed {
+                command: "tokeman rotate observe-session".into(),
+            },
+            daemon: Monitor::Running,
+            files: vec![FileCheck::of("/c/tokens.toml".into(), Some(0o600), 0o600)],
+            agy_slot: AgySlot::Empty,
+            claims: Ok(Vec::new()),
+            ledger: Vec::new(),
+        };
+        let lines = doctor_lines(&Report::assemble(findings.clone()));
+        let text = lines.join("\n");
+        assert!(text.contains(
+            "first@example.com            reached, credential accepted, nothing unrecognised"
+        ));
+        assert!(text.contains("reached, credential accepted, 1 unrecognised"));
+        assert!(text.contains("      not known: usages.usages.limit_day"));
+        assert!(text.contains("reached, credential refused, nothing unrecognised"));
+        assert!(text.contains("0.170.0    newer than 0.167.0, the verified version"));
+        assert!(text.contains("not found  verified with 1.5.6"));
+        assert!(text.contains("  SessionStart hook   installed"));
+        assert!(text.contains("  background service  running"));
+        assert!(text.contains("/c/tokens.toml      mode 600"));
+        assert!(text.contains("  agy's login         agy is signed out"));
+        assert!(text.contains("2 problems:"));
+        let fix = lines
+            .iter()
+            .position(|line| line.contains("work (Codex): the service refused"))
+            .unwrap();
+        assert!(lines[fix + 1].starts_with("      fix: tokeman codex refresh work"));
+
+        let mut healthy = findings;
+        healthy.accounts.truncate(1);
+        let lines = doctor_lines(&Report::assemble(healthy));
+        assert_eq!(lines.last().unwrap(), "No problems.");
     }
 }

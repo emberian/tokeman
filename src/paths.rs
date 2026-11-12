@@ -106,6 +106,11 @@ pub fn claims_journal() -> PathBuf {
     config_dir().join("claims.json")
 }
 
+/// The unrecognised items the daemon has logged; written only by `drift`.
+pub fn drift_ledger() -> PathBuf {
+    config_dir().join("drift.json")
+}
+
 pub fn claims_lock() -> PathBuf {
     config_dir().join("claims.lock")
 }

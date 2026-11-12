@@ -14,6 +14,7 @@ pub mod cli;
 pub mod codex;
 pub mod commands;
 pub mod daemon;
+pub mod drift;
 pub mod fs;
 pub mod history;
 pub mod launch;

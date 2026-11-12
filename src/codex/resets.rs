@@ -16,6 +16,7 @@ use super::auth::CodexHome;
 use super::probe::{self, State, epoch_of};
 use crate::account::CodexAccount;
 use crate::claims::{Conflict, Journal, Pending};
+use crate::drift::Unrecognized;
 use crate::quota::{ReadError, Reading, Service};
 
 /// Where a credit stands. Spellings the backend adds later are kept.
@@ -77,6 +78,59 @@ pub struct ResetCredit {
 pub struct CreditList {
     pub available: i64,
     pub credits: Vec<ResetCredit>,
+    /// Keys and words of the answer outside the known sets
+    /// ([`crate::drift`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecognized: Vec<String>,
+}
+
+// The known sets of the credit list: what this parser reads, then the
+// fields the live answer of 2026-11-11 carried beyond the client source
+// (research/codex.md, "Reset credits").
+
+const KNOWN_LIST_KEYS: &[&str] = &[
+    "available_count",
+    "credits",
+    "total_earned_count",
+    "immediate_reset_purchase_eligible",
+    "history_enabled",
+];
+const KNOWN_CREDIT_KEYS: &[&str] = &[
+    "id",
+    "reset_type",
+    "status",
+    "granted_at",
+    "expires_at",
+    "title",
+    "description",
+    "is_supported_by_plan",
+    "redeem_started_at",
+    "redeemed_at",
+    "profile_image_url",
+    "profile_user_id",
+];
+const KNOWN_CREDIT_STATUSES: &[&str] = &["available", "redeeming", "redeemed"];
+const KNOWN_RESET_TYPES: &[&str] = &["codex_rate_limits"];
+
+/// The keys and words of a credit list that are outside the known sets.
+fn unrecognized(body: &Value) -> Vec<String> {
+    let mut seen = Unrecognized::new();
+    seen.keys("reset-credits", body, KNOWN_LIST_KEYS);
+    let credits = &body["credits"];
+    seen.row_keys("reset-credits.credits", credits, KNOWN_CREDIT_KEYS);
+    for credit in credits.as_array().into_iter().flatten() {
+        seen.value(
+            "reset-credits.credits[].status",
+            credit.get("status"),
+            KNOWN_CREDIT_STATUSES,
+        );
+        seen.value(
+            "reset-credits.credits[].reset_type",
+            credit.get("reset_type"),
+            KNOWN_RESET_TYPES,
+        );
+    }
+    seen.into_vec()
 }
 
 impl CreditList {
@@ -105,9 +159,12 @@ struct RawCreditList {
 }
 
 pub fn decode_credit_list(body: &str) -> Result<CreditList, ReadError> {
-    let raw: RawCreditList = serde_json::from_str(body).map_err(|error| ReadError::Decode {
+    let decode = |error: serde_json::Error| ReadError::Decode {
         message: format!("failed to decode reset credit list: {error}"),
-    })?;
+    };
+    let value: Value = serde_json::from_str(body).map_err(decode)?;
+    let unrecognized = unrecognized(&value);
+    let raw: RawCreditList = serde_json::from_value(value).map_err(decode)?;
     let credits: Vec<ResetCredit> = raw
         .credits
         .into_iter()
@@ -128,7 +185,11 @@ pub fn decode_credit_list(body: &str) -> Result<CreditList, ReadError> {
             .filter(|credit| credit.status == CreditStatus::Available)
             .count() as i64
     });
-    Ok(CreditList { available, credits })
+    Ok(CreditList {
+        available,
+        credits,
+        unrecognized,
+    })
 }
 
 /// List an account's reset credits. The endpoint is less reliable than the
@@ -759,5 +820,32 @@ mod tests {
         assert_eq!(journal.pending(Service::Codex, "one").unwrap(), None);
         // The other account's old claim is still there.
         assert!(journal.pending(Service::Codex, "two").unwrap().is_some());
+    }
+
+    #[test]
+    fn the_list_reports_keys_statuses_and_reset_types_it_does_not_know() {
+        let list = decode_credit_list(&credit_list_body().to_string()).unwrap();
+        assert_eq!(list.unrecognized, Vec::<String>::new());
+
+        let mut body = credit_list_body();
+        body["next_page"] = json!(null);
+        body["credits"][0]["source"] = json!("promo");
+        body["credits"][0]["status"] = json!("expired");
+        body["credits"][1]["reset_type"] = json!("codex_weekly_only");
+        let list = decode_credit_list(&body.to_string()).unwrap();
+        assert_eq!(
+            list.unrecognized,
+            [
+                "reset-credits.credits[].reset_type=codex_weekly_only",
+                "reset-credits.credits[].source",
+                "reset-credits.credits[].status=expired",
+                "reset-credits.next_page",
+            ]
+        );
+        assert_eq!(
+            list.credits[0].status,
+            CreditStatus::Other("expired".into()),
+            "and the list still reads"
+        );
     }
 }

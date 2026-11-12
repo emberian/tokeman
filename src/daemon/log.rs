@@ -20,3 +20,15 @@ pub fn log(message: &str) {
     let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let _ = append_line(&path, &format!("{stamp} {message}"));
 }
+
+/// Log each item `readings` did not recognise that is not on the drift
+/// ledger yet, and put it there. Tests never write the real ledger.
+pub fn log_drift(readings: &[crate::quota::Reading]) {
+    if cfg!(test) {
+        return;
+    }
+    let ledger = crate::drift::Ledger::default();
+    for line in crate::drift::new_items(&ledger, readings, chrono::Utc::now().timestamp()) {
+        log(&line);
+    }
+}

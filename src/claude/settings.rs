@@ -207,6 +207,20 @@ pub fn is_observer_hook(command: &str) -> bool {
     command.contains(" rotate observe-session ") || command.ends_with(" rotate observe-session")
 }
 
+/// The command of tokeman's observer hook, when settings carry one.
+pub fn observer_hook(settings: &Settings) -> Option<String> {
+    settings
+        .get("hooks")?
+        .get("SessionStart")?
+        .as_array()?
+        .iter()
+        .filter_map(|group| group.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|hook| hook.get("command")?.as_str())
+        .find(|command| is_observer_hook(command))
+        .map(str::to_owned)
+}
+
 /// Replace any earlier observer hook with one for `binary`; other hooks stay.
 pub fn install_observer_hook(settings: &mut Settings, binary: &Path) {
     remove_observer_hook(settings);
