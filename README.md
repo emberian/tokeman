@@ -50,7 +50,14 @@ Prebuilt binaries for macOS and Linux are on the
 Upgrading from 0.3: the account file, the settings.json keys and the hook are
 unchanged, and an installed service keeps working. The command spellings
 changed; an old one fails naming its replacement, and
-[CHANGELOG.md](CHANGELOG.md) has the table.
+[CHANGELOG.md](CHANGELOG.md) has the table. The reads 0.3 stored are not shown
+until `tokeman history compact` has rewritten them, once: it keeps the
+database as it was beside it (`snapshots.db.pre-0.4`), compares every
+account's history before and after, and only then drops the old tables.
+`--dry-run` counts what it would keep. It can be interrupted and run again,
+and no other tokeman reads or writes the history while it runs (the
+background service keeps rotating; the reads it makes meanwhile are not
+recorded).
 
 ## Everything at once
 
@@ -61,6 +68,7 @@ tokeman --watch          # the same as a live dashboard
 tokeman list             # one line per account, from stored reads
 tokeman list --json      # the fleet view as JSON (what the tray reads)
 tokeman history [--service S] [--last N | --since HOURS] [--account NAME] [--json]
+tokeman history compact [--dry-run]       # once after upgrading from 0.3: bring the old reads in
 tokeman stats   [--service S]             # burn rate and time to depletion, per limit
 tokeman chart   [--service S] [--metric M] [--hours N]   # PNG, inline in iTerm2
 tokeman settings [set <key> <value>]      # launch settings; the tray writes through this
@@ -334,6 +342,7 @@ once into a PNG.
 | `~/.config/tokeman/agy-login-backup.json` | The agy login the last `agy use` replaced |
 | `~/.local/share/tokeman/agy-homes/<account>/` | The home of a `tokeman agy run` session: its login file and conversations |
 | `~/.local/share/tokeman/snapshots.db` | Read history (sqlite): one row per reading that differs from the last, or per ten minutes |
+| `~/.local/share/tokeman/snapshots.db.pre-0.4` | The history as 0.3 left it, kept by `tokeman history compact`; delete it when you no longer want it |
 
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` are honoured, and
 `CLAUDE_SETTINGS` points at another settings.json. Every file is owner-only;

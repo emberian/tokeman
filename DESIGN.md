@@ -68,8 +68,10 @@ src/
                  installs; the library never writes to the terminal
   util.rs        pure helpers shared across domains, once each: one_line, shell_quote, parse_reset, backoff_secs
   store.rs       sqlite read history: Store (insert, latest, recent, since), Series, Stats; a read-only open that
-                 creates no file, table or row
-  store/legacy.rs  the tables earlier builds wrote, converted to Readings as they are read; never altered or written
+                 creates no file, table or row. It reads `readings` and nothing else
+  store/compact.rs  `history compact`: the one-time rewrite of the tables builds before 0.4 wrote into `readings`
+                 (database held exclusively, original kept, batched and resumable, compared before anything is dropped)
+  store/legacy.rs  the shapes those builds stored, decoded to Readings; read only by compact
   observe.rs     ObservedLimit, session bindings, the SessionStart hook input, the transcript scan
   anthropic/
     mod.rs       the HTTP client that identifies as Claude Code; error classification
@@ -122,7 +124,7 @@ src/
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
     view.rs      probe (read now, record), stored / fresh / overview (the fleet view), ranked and best, history,
-                 stats, settings
+                 history compact, stats, settings
   ui/
     overview.rs  Overview, AccountView, Facts: the one fleet view, and what it is built from
     text.rs      what things are called and said (limit_name, limit_note, badge, summary, notes, view_caption), the
@@ -221,7 +223,11 @@ impl Store {
     fn insert(&self, &Reading)                             // the growth rule below
     fn latest(&self, accounts: &[(Service, &str)]) -> Vec<Reading>
     fn recent(&self, Service, account: Option<&str>, limit) / since(&self, Service, account, since) -> Vec<Reading>
+    fn has_old_tables(&self) -> bool                       // reads from before 0.4 wait for `history compact`
 }
+// store/compact.rs
+pub fn run(dry_run: bool) -> Result<Report { outcome, path, tables: Vec<Table { table, rows, unreadable, kept,
+                                             accounts }>, original, bytes_before, bytes_after }>
 pub struct Stats { account, readings, limits: Vec<Burn { series, label, latest, mean, stddev, peak, hours_left }> }
 
 // claims.rs
@@ -338,10 +344,30 @@ owner-only.
     interval weighted by its length) are what one row per read would give.
     `since` and `recent` end each account's rows with the value it holds
     now.
-  - `snapshots`, `codex_readings`, `service_readings`: written by earlier
-    builds. Read where they are, by column name, and never altered, migrated
-    or written; a row that no longer reads is left out. `latest` asks them
-    only for an account with no row in `readings`.
+  - `snapshots`, `codex_readings`, `service_readings`: written by builds
+    before 0.4, and read by nothing but `tokeman history compact`. While one
+    exists, every view of the history says to run it. The compaction:
+    - holds the database exclusively (sqlite's exclusive locking mode): a
+      process that has it open makes it refuse, and one that opens it
+      meanwhile is refused. The lock is the process's, and closing any
+      descriptor of the file gives it up, so the descriptor the copy reads
+      through stays open until the connection is closed;
+    - copies the file to `snapshots.db.pre-0.4` before it changes anything;
+    - walks each old table one account after another, oldest row first,
+      through the growth rule into a staging table, a transaction per batch
+      with the place reached in `compact_progress`, so the next run
+      continues a run that was killed; each account ends with its last read;
+    - reads the old rows again and requires, per account, the same step
+      function (the same value from the same instant), kept rows only where
+      old rows stand, the same last time, and no value held past the hold;
+    - then, in one transaction, appends the rows `readings` already has,
+      makes the staging table `readings` and drops the old tables; and
+      vacuums.
+
+    A row that does not read (an unparseable time, a document in an unknown
+    shape) is counted and left out, as it was by every read before.
+- `snapshots.db.pre-0.4`: the database as it was before
+  `history compact`, byte for byte. Nothing reads it.
 - `claude-rotate-state.json` (cadence), `claude-admission-state.json`
   (session bindings, rejections on record), `claude-profile-reads.json`
   (cached profile answers and their backoff): each loads entry by entry, and
