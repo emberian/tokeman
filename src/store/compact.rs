@@ -1766,6 +1766,49 @@ mod tests {
     }
 
     #[test]
+    fn the_errors_old_snapshots_held_as_text_keep_their_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = OLD_SNAPSHOTS.split_once("INSERT").unwrap().0;
+        let row = |account: &str, error: &str| {
+            format!(
+                "INSERT INTO snapshots (token_name, probed_at, unified_status, error)
+                 VALUES ('{account}', '2026-01-01T00:00:00+00:00', 'unknown', '{error}');"
+            )
+        };
+        let path = old_database(
+            dir.path(),
+            &[
+                schema.to_owned(),
+                row("none", "no usable credential"),
+                row("offline", "network: timed out"),
+                row("odd", "something this build has no kind for"),
+            ]
+            .concat(),
+        );
+        assert_eq!(go(&path).tables, [table("snapshots", 3, 0, 3, 3)]);
+        let store = Store::open_read_only_at(&path).unwrap();
+        let error = |account: &str| {
+            let mut rows = store.recent(Service::Claude, Some(account), 1).unwrap();
+            rows.remove(0).error.unwrap()
+        };
+        // A missing credential stays a refusal; a timeout stays transient.
+        assert_eq!(error("none"), ReadError::NoCredential);
+        assert!(error("none").is_definitive());
+        assert_eq!(
+            error("offline"),
+            ReadError::Network {
+                message: "timed out".into()
+            }
+        );
+        assert_eq!(
+            error("odd"),
+            ReadError::Other {
+                message: "something this build has no kind for".into()
+            }
+        );
+    }
+
+    #[test]
     fn old_rows_out_of_time_order_stop_the_run_with_nothing_dropped() {
         // `snapshots` is walked in the order of its text timestamps. The
         // second row sorts after the first as text and is ninety minutes

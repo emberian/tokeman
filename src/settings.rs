@@ -384,6 +384,10 @@ mod tests {
         assert!(settings.launch_args.is_empty());
         settings.set("dangerous_mode", "true").unwrap();
         assert!(settings.dangerous_mode);
+        settings.set("dangerous_mode", "0").unwrap();
+        assert!(!settings.dangerous_mode);
+        settings.set("dangerous_mode", "on").unwrap();
+        assert!(settings.dangerous_mode);
         assert!(settings.set("dangerous_mode", "maybe").is_err());
         settings.set("terminal", "iTerm2").unwrap();
         assert_eq!(settings.terminal.as_deref(), Some("iTerm2"));

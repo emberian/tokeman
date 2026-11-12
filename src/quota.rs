@@ -1513,6 +1513,12 @@ mod tests {
             serde_json::to_string(&shared).unwrap(),
             r#"{"span":{"other":86400},"scope":"all","window":{"utilization":0.1,"reset":0},"source":"poll"}"#
         );
+        // The spans as every stored row spells them.
+        let spans = [Span::FiveHour, Span::Weekly, Span::Monthly, Span::Unknown];
+        assert_eq!(
+            serde_json::to_string(&spans).unwrap(),
+            r#"["five_hour","weekly","monthly","unknown"]"#
+        );
         let group = Scope::Group("Gemini Models".into());
         assert_eq!(
             serde_json::to_string(&group).unwrap(),
