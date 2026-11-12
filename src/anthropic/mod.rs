@@ -51,9 +51,13 @@ pub fn user_agent() -> &'static str {
 }
 
 /// The first dotted-number word of `claude --version`, waiting at most
-/// [`VERSION_QUERY_TIMEOUT`] for it.
+/// [`VERSION_QUERY_TIMEOUT`] for it. A unit test runs no installed program
+/// and identifies as the fallback version.
 fn installed_cli_version() -> Option<String> {
     use std::io::Read;
+    if cfg!(test) {
+        return None;
+    }
     use std::process::{Command, Stdio};
     let binary = std::env::var("TOKEMAN_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut child = Command::new(binary)
@@ -86,8 +90,14 @@ fn installed_cli_version() -> Option<String> {
     if !status.success() {
         return None;
     }
-    let text = reader.join().ok()?;
-    text.split_whitespace()
+    version_word(&reader.join().ok()?)
+}
+
+/// The version in `claude --version` output (`2.1.322 (Claude Code)`): its
+/// first word, when that is digits and dots.
+fn version_word(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
         .next()
         .filter(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
         .map(str::to_owned)
@@ -250,14 +260,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_user_agent_is_claude_codes_shape() {
-        let agent = user_agent();
-        let version = agent
-            .strip_prefix("claude-cli/")
-            .and_then(|rest| rest.strip_suffix(" (external, cli)"))
-            .expect("claude-cli/<version> (external, cli)");
-        assert!(!version.is_empty());
-        assert!(version.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    fn the_user_agent_carries_the_installed_version_or_the_fallback() {
+        assert_eq!(
+            version_word("2.1.322 (Claude Code)\n").as_deref(),
+            Some("2.1.322")
+        );
+        // Anything else `claude --version` could print is not a version.
+        assert_eq!(version_word("error: unknown option '--version'"), None);
+        assert_eq!(version_word("v2.1.322"), None);
+        assert_eq!(version_word(""), None);
+        assert_eq!(
+            user_agent(),
+            format!("claude-cli/{FALLBACK_CLI_VERSION} (external, cli)")
+        );
     }
 
     #[test]
@@ -266,7 +281,8 @@ mod tests {
         struct Outer(std::io::Error);
         impl std::fmt::Display for Outer {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("request failed")
+                // reqwest repeats its source's text in its own.
+                f.write_str("request failed: timed out")
             }
         }
         impl std::error::Error for Outer {
