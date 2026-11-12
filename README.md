@@ -70,8 +70,10 @@ tokeman settings [set <key> <value>]      # launch settings; the trays write thr
 (`tokeman rotate install`), it is the only reader: bare `tokeman`,
 `tokeman --watch` and both trays show the stored view and send no request.
 Every view says that it is stored and how old it is, and says STALE when the
-service has not read for ten minutes. Without the service (or while rotation
-is paused) those surfaces read every account themselves. `--fresh`, `r` in
+service has not read for ten minutes. The service counts as running while its
+daemon holds `daemon.lock`, however it was started; an installed service whose
+daemon has died shows as not running. Without a running service (or while
+rotation is paused) those surfaces read every account themselves. `--fresh`, `r` in
 `--watch` and the trays' reload button read now either way. `tokeman list`
 never sends a request; `tokeman <service> list` always reads that service.
 

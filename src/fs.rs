@@ -93,6 +93,18 @@ impl FileLock {
         }
     }
 
+    /// Whether another process holds the lock at `path` exclusively. Opens
+    /// the file read-only and never creates it: a missing file is not held.
+    pub fn is_held(path: &Path) -> bool {
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => false,
+            Err(error) => error.kind() == fs2::lock_contended_error().kind(),
+        }
+    }
+
     /// Take the lock, saying so (a notice) when another process holds it, so a
     /// command that has to wait never looks hung.
     pub fn acquire_announced(path: &Path, holder: &str) -> Result<Self> {

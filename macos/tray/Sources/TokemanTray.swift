@@ -232,7 +232,7 @@ struct Overview: Decodable {
     let origin: String
     /// Epoch seconds of the newest reading in the view.
     let read_at: Int64?
-    /// `running`, `paused` or `not-installed`.
+    /// `running`, `paused`, `stopped` or `not-installed`.
     let monitor: String
     let default_account: String?
     let target_model: String?
@@ -375,6 +375,7 @@ class TokemanViewModel: ObservableObject {
             return isStale ? "stored view · STALE, service last read \(age)"
                            : "stored view · read \(age) by the service"
         case "paused": return "stored view · read \(age) · rotation paused"
+        case "stopped": return "stored view · read \(age) · service not running"
         default: return "stored view · read \(age) · no service"
         }
     }

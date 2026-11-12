@@ -52,6 +52,12 @@ pub fn admission_lock() -> PathBuf {
     config_dir().join("claude-admission-state.lock")
 }
 
+/// Held by the daemon for as long as it runs; whether it is held is how a
+/// surface knows the background service is alive.
+pub fn daemon_lock() -> PathBuf {
+    config_dir().join("daemon.lock")
+}
+
 /// Serializes every change to Claude's settings and to rotation state.
 pub fn rotation_lock() -> PathBuf {
     config_dir().join("claude-rotate.lock")

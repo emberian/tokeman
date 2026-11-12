@@ -94,7 +94,9 @@ rewrites the plist, launcher and hook for the new binary.
   trays read.
 - Bare `tokeman`, `tokeman --watch` and both trays are viewers while the
   background service runs: they show the stored view and send no request.
-  Without the service they read every account themselves. `tokeman
+  The service counts as running while its daemon holds `daemon.lock`, on
+  macOS and under any other supervisor; a second daemon refuses to start.
+  Without a running service they read every account themselves. `tokeman
   --fresh`, `r` in `--watch` and the trays' reload button read now. Every
   view says whether it is stored and how old it is, and says STALE when the
   service has not read for ten minutes.

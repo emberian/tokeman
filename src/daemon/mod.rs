@@ -43,6 +43,9 @@ const TICK: Duration = Duration::from_secs(20);
 
 /// The loop `tokeman rotate daemon` runs until the binary is replaced.
 pub async fn run() -> Result<()> {
+    let Some(_alive) = lock::DaemonLock::take()? else {
+        anyhow::bail!("another tokeman daemon is already running");
+    };
     let started_as = executable_identity();
     let mut wake = tokio::time::interval(TICK);
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

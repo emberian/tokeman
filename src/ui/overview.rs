@@ -29,18 +29,29 @@ pub enum Monitor {
     Running,
     /// The service is installed and rotation is paused: Claude is not read.
     Paused,
+    /// The service is installed and no daemon is running: nothing reads.
+    Stopped,
     /// No background service: only explicit reads add readings.
     NotInstalled,
 }
 
 impl Monitor {
     pub fn now() -> Self {
-        if !service::is_installed() {
-            Self::NotInstalled
-        } else if lock::is_paused() {
-            Self::Paused
-        } else {
-            Self::Running
+        Self::of(
+            lock::daemon_alive(),
+            lock::is_paused(),
+            service::is_installed(),
+        )
+    }
+
+    /// A daemon that is alive reads, however it was started (launchd, or a
+    /// supervisor of the user's own where there is no launchd).
+    pub fn of(alive: bool, paused: bool, installed: bool) -> Self {
+        match (alive, paused, installed) {
+            (true, false, _) => Self::Running,
+            (true, true, _) => Self::Paused,
+            (false, _, true) => Self::Stopped,
+            (false, _, false) => Self::NotInstalled,
         }
     }
 
@@ -468,6 +479,20 @@ mod tests {
 
     fn build(facts: Facts) -> Overview {
         Overview::build(&fleet(), facts, None, NOW)
+    }
+
+    #[test]
+    fn a_live_daemon_keeps_views_fresh_however_it_was_started() {
+        assert_eq!(Monitor::of(true, false, true), Monitor::Running);
+        // Under the user's own supervisor there is no launchd plist.
+        assert_eq!(Monitor::of(true, false, false), Monitor::Running);
+        assert_eq!(Monitor::of(true, true, true), Monitor::Paused);
+        // An installed service whose daemon died reads nothing.
+        assert_eq!(Monitor::of(false, false, true), Monitor::Stopped);
+        assert_eq!(Monitor::of(false, false, false), Monitor::NotInstalled);
+        assert!(Monitor::Running.keeps_fresh());
+        assert!(!Monitor::Stopped.keeps_fresh());
+        assert!(!Monitor::Paused.keeps_fresh());
     }
 
     #[test]

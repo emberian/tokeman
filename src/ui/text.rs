@@ -559,6 +559,9 @@ pub fn view_caption(overview: &Overview) -> String {
         }
         Monitor::Running => format!("stored view, last read {age} by the background service"),
         Monitor::Paused => format!("stored view, last read {age}; rotation is paused"),
+        Monitor::Stopped => format!(
+            "stored view, last read {age}; the background service is not running (`tokeman rotate install`)"
+        ),
         Monitor::NotInstalled => format!("stored view, last read {age}; no background service"),
     }
 }
@@ -820,8 +823,9 @@ pub fn print_status(overview: &Overview) {
     println!(
         "monitor: {}",
         match overview.monitor {
-            Monitor::Running => "running (service installed)",
-            Monitor::Paused => "paused (service installed)",
+            Monitor::Running => "running",
+            Monitor::Paused => "paused",
+            Monitor::Stopped => "installed but not running (`tokeman rotate install` restarts it)",
             Monitor::NotInstalled => "no background service",
         }
     );

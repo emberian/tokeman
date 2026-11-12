@@ -105,7 +105,7 @@ src/
     mod.rs       the loop; install, uninstall, pause, resume, activate
     cycle.rs     one rotation cycle: refresh due grants, probe, observe, decide, install, record
     cadence.rs   typed on-disk cycle state: last probe, mode, interval, backoff, carried samples
-    lock.rs      the rotation lock and the pause marker
+    lock.rs      the rotation lock, the pause marker, and the daemon's lifetime lock (held = service alive)
     log.rs       the rotation log
     refresh.rs   the login refresh sweep
     services.rs  the service-quota poll: its own task every services_interval_secs; rotation never waits on it
@@ -344,6 +344,9 @@ owner-only.
   an entry in a shape this build does not read is dropped alone.
 - `claude-credential-history.jsonl`: which credential settings offered when,
   as fingerprints.
+- `daemon.lock`: held exclusively by the daemon while it runs. A surface
+  tests it with a shared, read-only, non-creating try-lock to decide
+  whether to show the stored view or read for itself.
 - `claims.json`: reset claims sent without a known outcome. An entry is
   dropped only by a read answer or `reset <account> --clear`.
   `reset-claims/<account>.pending` and `codex-reset-pending.json` from 0.3
