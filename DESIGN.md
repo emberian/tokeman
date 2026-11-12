@@ -89,6 +89,9 @@ src/
     refresh.rs   token refresh
     resets.rs    reset credits: list, plan, claim (through the claim journal)
     maintenance.rs  the service's half-hour sweep: probe, record, refresh what is due or rejected
+    mover.rs     moving a running Codex: Seat (what its app-server reports), consider (leave below the Codex
+                 floors for the best profile above the landing floors, via policy::relocate), announce, Look;
+                 the only writer of codex-moves.jsonl. Shared by the daemon and `codex watch`
   providers/
     mod.rs       ServiceAccount; read (dispatch by service) -> Reading, read_all (concurrent, each read bounded)
     zai.rs       GLM Coding Plan
@@ -114,10 +117,14 @@ src/
     log.rs       the rotation log
     refresh.rs   the login refresh sweep
     services.rs  the service-quota poll: its own task every services_interval_secs; rotation never waits on it
+    codex.rs     the Codex mover: codex::mover's look at every control socket, its own bounded task every five
+                 minutes; Standing (on / off / paused / fewer than two profiles)
     service.rs   the launchd plist, install/uninstall (macOS)
   commands/      what each command does, returning data; nothing here prints or reads the terminal
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
     codex.rs     add, remove, discover, import, list, refresh, use, watch, reset plan / claim / clear
+    launch.rs    `<service> launch`: codex on the best profile's CODEX_HOME, agy run on the best account, claude on
+                 a GLM or Kimi plan (Endpoint: base URL, key variable, models)
     services.rs  agy / glm / kimi: add, remove, import, the account agy holds, agy use, agy run
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
@@ -133,7 +140,8 @@ src/
     tray.rs      the egui tray (feature "tray")
   cli.rs         clap definitions, and REMOVED: the 0.3 spellings and what replaced each
   main.rs        dispatch: parse, call commands/, hand the result to ui/text
-  launch.rs      the claude launch command and terminal handoff
+  launch.rs      `claude launch` (one cycle, then claude) and the terminal handoff; Launch: a program, its
+                 arguments and the environment that seats an account, exec'd by main
 macos/tray/      the Swift menu-bar app: a viewer of `tokeman list --json`
 ```
 
@@ -215,6 +223,22 @@ pub enum Decision<'a> { Hold(Hold), Stay { healthy }, Switch { to: &'a Reading, 
 pub fn decide<'a>(&Situation<'a>, &PolicySettings) -> Decision<'a>
 pub fn rank_above(readings: &[Reading], floors: Floors, model: Option<&ModelKey>) -> Vec<&Reading>
     // the one ranking: Claude's landing and every `tokeman <service> best`. Never matches on Service.
+pub enum Relocation<'a> { Stay, Drain, Move(&'a Reading) }
+pub fn relocate<'a>(seat: &Reading, others: &'a [Reading], leave: Floors, land: Floors) -> Relocation<'a>
+    // a tool that can be moved between turns: leaves at `leave` for the best of `others` above `land`; a seat
+    // that takes no work leaves for any room. The Codex mover's decision.
+
+// codex/mover.rs
+pub struct Seat { reading /* the account-wide windows the running Codex reports */, info, account_id }
+pub enum Outcome { NoSocket, Unreachable, NoWindows, Healthy, Draining, WouldMove { to }, Moved { to, announced },
+                   Failed { to, message } }
+pub struct Look { home, seated, tightest, probed /* the caller keeps these */, outcome }
+pub struct Move { at, home, from, to, remaining, span, by: By /* daemon | watch | use */ }   // codex-moves.jsonl
+pub async fn consider(&Client, &Fleet, &CodexHome, &Seat, MoveFloors, dry_run) -> Look   // probes only a low seat
+
+// launch.rs
+pub struct Launch { service, account, room, program, args, env: Vec<EnvVar { name, value, secret }>, unset }
+impl Launch { fn exec(self) -> anyhow::Error }   // replaces the process; a secret is named, never printed
 
 // store.rs
 pub struct Series { pub span: Span, pub scope: Scope }     // one limit followed through the history
@@ -274,9 +298,10 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   word (`badge`), its one-line form (`summary`) and how a view describes
   itself (`view_caption`) are each one function in `ui/text.rs`.
 - **Who sends a quota request.** The service's loop (the rotation cycle,
-  the services poll, the Codex sweep); `commands::view::probe`, behind every
-  `<service> list` and `best`, `--fresh`, and the surfaces when no service
-  reads; `tokeman rotate status` and `rotate run`, which read Claude the way
+  the services poll, the Codex sweep, and the Codex mover for the other
+  profiles once a running Codex is below its floor); `commands::view::probe`,
+  behind every `<service> list`, `best` and `launch`, `--fresh`, and the
+  surfaces when no service reads; `tokeman rotate status` and `rotate run`, which read Claude the way
   a cycle does; and the commands that act on one account (`codex use`,
   `codex watch`, the two `reset`s, `glm|kimi add`, `agy import`). Nothing in
   `ui/` sends a request: a surface calls `commands::view::overview`, which
@@ -302,6 +327,11 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
 - **Dry run means no write anywhere**, and the cycle says what it would have
   done.
 - **No credential is printed or logged**, in any form.
+- **Nothing spends a reset by itself.** A grant or a credit is claimed only
+  by `tokeman claude reset` or `tokeman codex reset`. The rotation cycle,
+  the Codex mover and every `launch` only choose among accounts.
+- **What the daemon moves.** Claude Code's default (the cycle) and a running
+  Codex (the mover). It never switches agy: a running agy cannot be told.
 - **An uncertain claim is never retried as another.** With a claim pending,
   `Journal::begin` returns it with its request id or refuses a different
   grant or credit.
@@ -319,7 +349,8 @@ owner-only.
   `refresh_token`, `expires_at`, `obtained_at`, `logged_in_at`,
   `refresh_expires_at`, `scopes`, `login_error`), `[settings]` (the launch
   settings and `services_interval_secs`), `[rotation]` (the floors and
-  intervals), `[[codex_accounts]]`, `[[services]]` (`name`, `service`, `key`
+  intervals; `codex_auto_move` and the Codex leaving and landing floors
+  `codex_min_*` / `codex_land_min_*`), `[[codex_accounts]]`, `[[services]]` (`name`, `service`, `key`
   or `key_file`, Antigravity's grant, `label`). Comments survive every
   write; keys added later are optional.
 - `~/.claude/settings.json` (or `$CLAUDE_SETTINGS`): the env keys
@@ -357,6 +388,9 @@ owner-only.
   `reset-claims/<account>.pending` and `codex-reset-pending.json` from 0.3
   are read where they are; the first change to the journal folds them in and
   renames each to `<name>.imported`.
+- `codex-moves.jsonl`: one line per move of a running Codex (`at`, `home`,
+  `from`, `to`, `remaining`, `span`, `by`), by the daemon, `codex watch` or
+  `codex use`. Past 256 KiB the newest 200 are kept.
 - `antigravity-access-tokens.json`, `agy-login-backup.json`,
   `claude-login-keychain-backup.json`, `claude-rotate.log`, the lock files,
   `claude-rotate.paused`, and the launchd launcher script and log.
@@ -389,6 +423,15 @@ owner-only.
   HTTP/1.1 with one jar.
 - Codex's 401 recovery refuses an `auth.json` whose account id changed; the
   app-server `reload` path does not.
+- A Codex app-server answers `account/rateLimits/read` with the account-wide
+  windows under `rateLimits` (`primary`, `secondary`, each with
+  `usedPercent` and `windowDurationMins`), the per-feature buckets under
+  `rateLimitsByLimitId`, and `accountId` (codex 0.167.0 schema). Its
+  `account/rateLimits/updated` push is sparse.
+- z.ai and Kimi serve Claude Code from an Anthropic-compatible endpoint
+  (bearer token and API key respectively), and Claude Code 2.1.322 sends a
+  key from its environment in preference to a `CLAUDE_CODE_OAUTH_TOKEN` in
+  settings.json.
 - The Codex usage body puts whichever window exists first in
   `primary_window`, so windows are named by `limit_window_seconds`.
 - A running agy does not pick up a swapped Keychain login and writes its own

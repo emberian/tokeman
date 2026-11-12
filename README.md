@@ -27,8 +27,9 @@ its window is.
 ```
 
 Commands are service first: `tokeman claude|codex|agy|glm|kimi <verb>`, with
-the same verbs (`add`, `remove`, `list`, `use`, `best`, `reset`) wherever
-they apply. The shape of the code is written down in [DESIGN.md](DESIGN.md).
+the same verbs (`add`, `remove`, `list`, `use`, `best`, `launch`, `reset`)
+wherever they apply. `tokeman <service> launch` starts the tool that spends
+that service's quota on its best account. The shape of the code is written down in [DESIGN.md](DESIGN.md).
 
 ## Install
 
@@ -63,7 +64,7 @@ tokeman list --json      # the fleet view as JSON (what the trays read)
 tokeman history [--service S] [--last N | --since HOURS] [--account NAME] [--json]
 tokeman stats   [--service S]             # burn rate and time to depletion, per limit
 tokeman chart   [--service S] [--metric M] [--hours N]   # PNG, inline in iTerm2
-tokeman settings [set <key> <value>]      # launch settings; the trays write through this
+tokeman settings [set <key> <value>]      # launch settings and the Codex mover's; the tray writes through this
 ```
 
 **Who reads the accounts.** While the background service runs
@@ -100,7 +101,7 @@ tokeman claude list                      # read every account now
 tokeman claude best                      # the accounts ranked as the rotation would land
 tokeman claude use <name>                # make an account the default now
 tokeman claude reset [<name>]            # usage-limit resets on offer; with a name, use one (asks first)
-tokeman launch [--auto] [-- claude args] # pick the default, then start claude
+tokeman claude launch [--auto] [-- claude args]   # pick the default, then start claude
 ```
 
 Each login round prints a claude.com URL; sign in as that account and paste
@@ -207,7 +208,8 @@ tokeman codex refresh                   # renew OAuth tokens before they rot int
 tokeman codex best [--limit spark]      # the CODEX_HOME with the most headroom
 tokeman codex use [<account>]           # move a running Codex onto an account (default: the best)
 tokeman codex use <account> --into <dir>   # copy its credentials into another profile instead
-tokeman codex watch                     # follow a running Codex and move it in time
+tokeman codex watch [--dry-run]         # follow a running Codex and move it in time
+tokeman codex launch [--limit spark] [-- codex args]   # start codex on the profile with the most headroom
 tokeman codex reset <account> [--credit <id>] [--yes]   # spend one reset credit at a limit
 ```
 
@@ -219,6 +221,21 @@ credit (`--clear` forgets the claim). A migration is announced to the running
 Codex over its app-server socket. The service probes and refreshes every
 registered profile on a half-hour sweep.
 
+The service also moves a running Codex by itself. Every five minutes it asks
+each control socket it finds (`~/.codex` and every registered profile) for
+the account-wide windows, which costs no request. A Codex with less than 20%
+left in one (`codex_min_5h_remaining`, `codex_min_7d_remaining` in
+`[rotation]`) is moved between turns onto the best other profile with at
+least 30% left (`codex_land_min_5h_remaining`, `codex_land_min_7d_remaining`).
+With nowhere to land it stays where it is; a Codex the backend refuses
+outright takes any profile with room. Parked profiles are never landed on,
+and no reset credit is spent. This needs two unparked profiles and a control
+socket, stops while rotation is paused, and is turned off with
+`tokeman settings set codex_auto_move false`. Each move is a line in the
+rotation log and in `codex-moves.jsonl`. `tokeman codex watch` does the same
+in the foreground on every update Codex pushes; `--dry-run` says what the
+service would do now and moves nothing.
+
 ## Antigravity
 
 ```sh
@@ -229,6 +246,7 @@ tokeman agy best [--group claude]  # rank them by room left (on one model group,
 tokeman agy use <account>          # sign the agy CLI in as that account (macOS)
 tokeman agy use --previous         # put back the login the last `use` replaced
 tokeman agy run <account> [-- …]   # start agy as that account beside your normal login (macOS)
+tokeman agy launch [--group claude] [-- …]   # `agy run` on the account with the most room
 ```
 
 Antigravity meters each model group apart, each with a weekly and a five-hour
@@ -267,10 +285,22 @@ tokeman kimi add <name> --key-file ~/.kimi-key   # Kimi Code
 tokeman glm|kimi remove <name>
 tokeman glm|kimi list                            # read now
 tokeman glm|kimi best [--group <text>]           # rank by room left
+tokeman glm|kimi launch [--model <id>] [-- claude args]   # Claude Code on the plan
 ```
 
 These are read, not rotated. The key file is read on every poll, so the key
 never enters tokens.toml.
+
+`launch` starts Claude Code on the plan's account with the most room, through
+the vendor's Anthropic-compatible endpoint (`https://api.z.ai/api/anthropic`,
+`https://api.kimi.com/coding/`). The endpoint, the key and the model for each
+of Claude Code's tiers (`glm-5.3` with `glm-5.3-flash` for background work;
+`kimi-for-coding`; `--model` names another for every tier) are set in that
+one claude's environment. `~/.claude/settings.json` is not written, so every
+other session keeps its Anthropic account, and the launched one does not
+send it: Claude Code prefers the key in its environment over the settings
+token. A model set in the `env` block of settings.json would override the
+vendor's.
 
 ## The background service
 
@@ -292,7 +322,7 @@ sweep that also refreshes tokens. It renews Claude logins before they expire
 and keeps every read in the history. It exits when its binary is replaced, so
 launchd starts the new one.
 
-`tokeman launch` runs one rotation cycle, then starts claude with the
+`tokeman claude launch` runs one rotation cycle, then starts claude with the
 configured arguments and without a token in its environment or command line.
 `--auto` keeps rotating on the fast cadence while claude runs.
 
@@ -321,7 +351,8 @@ The macOS app runs `tokeman list --json`, `tokeman history --json` and
 `tokeman settings show`, none of which sends a request; it never opens
 tokens.toml. Its reload button, and its timer when no service is running, run
 `tokeman --fresh --json`. Its settings go through `tokeman settings set` and
-its Launch buttons through `tokeman claude use`.
+its Launch buttons through `tokeman claude use` (one account) and
+`tokeman claude launch` (the best one).
 `Tokeman.app/Contents/MacOS/TokemanTray --render out.png` draws the popover
 once into a PNG.
 
@@ -339,6 +370,7 @@ once into a PNG.
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.config/tokeman/antigravity-access-tokens.json` | Access tokens minted from the Antigravity grants |
 | `~/.config/tokeman/agy-login-backup.json` | The agy login the last `agy use` replaced |
+| `~/.config/tokeman/codex-moves.jsonl` | Each move of a running Codex: when, which home, from and to which account, who asked |
 | `~/.local/share/tokeman/agy-homes/<account>/` | The home of a `tokeman agy run` session: its login file and conversations |
 | `~/.local/share/tokeman/snapshots.db` | Read history (sqlite): one row per reading that differs from the last, or per ten minutes |
 

@@ -9,7 +9,8 @@ import Charts
 // when it is not running, or when the reload button asks, does the app have
 // tokeman read the accounts (`tokeman --fresh --json`, which prints the same
 // view). It changes things only through `tokeman settings set` and, for a
-// Launch button, `tokeman claude use`.
+// Launch button, `tokeman claude use` (one account) or `tokeman claude launch`
+// (the best one).
 
 // MARK: - JSON models (match `tokeman list --json`)
 
@@ -532,7 +533,7 @@ class TokemanViewModel: ObservableObject {
 
     /// Open Claude on whichever account the rotation policy picks.
     func launchBest() {
-        launchTerminal(cmd: "\(shellQuote(findTokeman())) launch", terminal: settings.terminal)
+        launchTerminal(cmd: "\(shellQuote(findTokeman())) claude launch", terminal: settings.terminal)
     }
 
     // --- helpers ---
@@ -1147,7 +1148,7 @@ struct PopoverContent: View {
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .disabled(!overview.accounts.contains(where: { $0.isClaude }))
-                        .help("Runs `tokeman launch`: Claude on the account the policy picks")
+                        .help("Runs `tokeman claude launch`: Claude on the account the policy picks")
 
                         Text("default: \(overview.default_account ?? "/login")"
                              + (overview.target_model.map { " · \($0)" } ?? ""))
