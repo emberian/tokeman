@@ -7,6 +7,7 @@
 | [antigravity.md](antigravity.md) | `retrieveUserQuotaSummary`, credentials for both accounts, refresh, switching |
 | [zai-kimi.md](zai-kimi.md) | z.ai `quota/limit` and Kimi `/coding/v1/usages`, both read live |
 | [prior-art.md](prior-art.md) | ~30 external sources (CodexBar, jcode, oh-my-pi, OmniRoute, claude-go, support articles) |
+| [test-audit.md](test-audit.md) | the 0.4.0 test audit: every unit test classified, 757 mutations and what survived, tests deleted and added, what is still untested |
 
 ## Headline facts
 
