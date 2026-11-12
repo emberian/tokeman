@@ -266,7 +266,12 @@ async fn agy_command(action: AgyAction) -> Result<()> {
             services::remove(Service::Antigravity, &name)?;
             text::print_removed(&name);
         }
-        AgyAction::List { json } => service_list(Service::Antigravity, json).await?,
+        AgyAction::List { json } => {
+            service_list(Service::Antigravity, json).await?;
+            if !json {
+                text::print_agy_sessions(&services::agy_sessions(&Fleet::load()?).await);
+            }
+        }
         AgyAction::Use {
             name,
             previous,
@@ -282,6 +287,11 @@ async fn agy_command(action: AgyAction) -> Result<()> {
             }
         }
         AgyAction::Best { group } => best(Service::Antigravity, group.as_deref()).await?,
+        AgyAction::Run { name, args } => {
+            let launch = services::agy_run(&Fleet::load()?, &name, args).await?;
+            text::print_agy_run(&launch);
+            return Err(launch.exec());
+        }
     }
     Ok(())
 }

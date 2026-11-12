@@ -222,7 +222,7 @@ struct SlotToken<'a> {
 }
 
 /// The slot value (and the fallback file's text) for a freshly minted grant.
-fn slot_values(
+pub(super) fn slot_values(
     grant: &Grant,
     refresh_token: &str,
     email: &str,
@@ -760,7 +760,7 @@ fn email_of(raw: &str) -> Option<String> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use super::super::clients::tests::{CSRF, Proc, Server, hub_file, lookout, proc};
     use super::*;
     use axum::routing::post;
@@ -804,7 +804,7 @@ esac
     }
 
     /// A token endpoint that answers each refresh token with its account.
-    async fn token_server() -> String {
+    pub(in crate::providers::antigravity) async fn token_server() -> String {
         async fn token(
             Form(form): Form<Vec<(String, String)>>,
         ) -> (reqwest::StatusCode, Json<Value>) {
@@ -845,7 +845,7 @@ esac
         (place, dir)
     }
 
-    fn account(name: &str, refresh: &str) -> ServiceAccount {
+    pub(in crate::providers::antigravity) fn account(name: &str, refresh: &str) -> ServiceAccount {
         ServiceAccount {
             name: name.into(),
             service: Service::Antigravity,

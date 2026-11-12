@@ -306,6 +306,19 @@ pub enum AgyAction {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Start agy signed in to an account, beside the normal login (macOS)
+    ///
+    /// The account gets a home of its own under tokeman's data directory:
+    /// its token file, conversations and logs, with links to the rest of
+    /// your home. agy's shared login is not read or written. The account agy
+    /// is already signed in as runs plain agy.
+    Run {
+        /// The account to run as
+        name: String,
+        /// Arguments passed through to agy
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// The verbs of a service whose accounts are an API key.
@@ -560,6 +573,9 @@ mod tests {
             "tokeman agy use a@example.com --dry-run",
             "tokeman agy use --previous --force",
             "tokeman agy best --group claude",
+            "tokeman agy run a@example.com",
+            "tokeman agy run a@example.com -- -c",
+            "tokeman agy run a@example.com models",
             "tokeman glm add glm --key-file ~/.zai-key --label x",
             "tokeman glm remove glm",
             "tokeman glm list",
