@@ -814,6 +814,11 @@ esac
                 .map(|(_, value)| value.as_str())
                 .unwrap_or_default();
             match refresh {
+                // A grant whose answer carries no id_token.
+                "1//anonymous" => (
+                    reqwest::StatusCode::OK,
+                    Json(serde_json::json!({"access_token": "ya29.anonymous", "expires_in": 3599})),
+                ),
                 "1//a" | "1//b" => (
                     reqwest::StatusCode::OK,
                     Json(serde_json::json!({
@@ -1004,14 +1009,21 @@ esac
         let mut keyless = account("a@example.com", "1//a");
         keyless.refresh_token = None;
         assert!(seat_at(&client, place.clone(), &keyless).await.is_err());
+        // Google names no account and the registered name is not an email:
+        // nothing says whom the login would sign in.
+        let nameless = seat_at(&client, place.clone(), &account("work", "1//anonymous"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(nameless.contains("did not say which account"), "{nameless}");
         assert_eq!(calls(dir.path()), "");
     }
 
     #[tokio::test]
     async fn a_write_the_keychain_does_not_keep_puts_the_old_login_back() {
-        // This `security` drops every second write.
+        // This `security` stores something else on its second write.
         let (place, dir) = place(
-            r#"n=$(cat "$dir/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$dir/n"; [ $n -eq 2 ] && exit 0"#,
+            r#"n=$(cat "$dir/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$dir/n"; [ $n -eq 2 ] && { printf 'go-keyring-base64:e30=' > "$dir/item"; exit 0; }"#,
         )
         .await;
         let client = Client::new();

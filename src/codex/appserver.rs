@@ -369,20 +369,31 @@ pub(crate) mod tests {
         let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
             return;
         };
+        // Codex takes `chatgptAuthTokens` only from a connection that
+        // initialized with the experimental capability.
+        let mut experimental = false;
         while let Some(Ok(frame)) = socket.next().await {
             let Message::Text(payload) = frame else {
                 continue;
             };
             let request: Value = serde_json::from_str(&payload).unwrap();
+            if request["method"] == "initialize" {
+                experimental = request["params"]["capabilities"]["experimentalApi"] == true;
+            }
             let Some(id) = request.get("id").cloned() else {
                 continue;
             };
             let failed =
                 request["method"] == "account/rateLimits/read" && state.lock().unwrap().limits_fail;
-            if failed {
+            let gated = request["method"] == "account/login/start" && !experimental;
+            if failed || gated {
                 let answer = json!({"id": id, "error": {
                     "code": -32603,
-                    "message": "failed to fetch codex rate limits: 401 Unauthorized",
+                    "message": if gated {
+                        "account/login/start.chatgptAuthTokens requires experimentalApi capability"
+                    } else {
+                        "failed to fetch codex rate limits: 401 Unauthorized"
+                    },
                 }});
                 if socket
                     .send(Message::Text(answer.to_string()))

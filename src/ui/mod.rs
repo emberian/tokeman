@@ -1,11 +1,9 @@
-//! Every surface: text output, charts, the TUI, the tray.
+//! Every surface in this crate: text output, charts, the TUI.
 
 pub mod chart;
 pub mod overview;
 pub mod prompt;
 pub mod text;
-#[cfg(feature = "tray")]
-pub mod tray;
 pub mod tui;
 
 /// The colour a level is drawn in, from a surface's own `[ok, low, critical]`

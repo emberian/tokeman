@@ -188,13 +188,13 @@ rewrites the plist, launcher and hook for the new binary.
   agy, and claude on a GLM or Kimi plan.
 - `tokeman list` shows every account of every service from stored reads,
   with no request and no write; `tokeman list --json` is the fleet view the
-  trays read.
-- Bare `tokeman`, `tokeman --watch` and both trays are viewers while the
+  tray reads.
+- Bare `tokeman`, `tokeman --watch` and the tray are viewers while the
   background service runs: they show the stored view and send no request.
   The service counts as running while its daemon holds `daemon.lock`, on
   macOS and under any other supervisor; a second daemon refuses to start.
   Without a running service they read every account themselves. `tokeman
-  --fresh`, `r` in `--watch` and the trays' reload button read now. Every
+  --fresh`, `r` in `--watch` and the tray's reload button read now. Every
   view says whether it is stored and how old it is, and says STALE when the
   service has not read for ten minutes.
 - `tokeman history`, `stats` and `chart` take `--service`. `chart --metric`
@@ -246,19 +246,31 @@ rewrites the plist, launcher and hook for the new binary.
 - Chart lines from before 0.3 (the Opus/Sonnet columns) and credential
   events reconstructed from the old rotation log are no longer read, and
   the `usage_key` spelling in tokens.toml is no longer accepted.
+- The reads 0.3 stored (`snapshots`, `codex_readings`, `service_readings`)
+  are no longer read where they are. `tokeman history compact` rewrites
+  them into `readings` once, under the rule a live read is stored by; until
+  then `tokeman`, `list`, `history`, `stats` and `chart` show only what 0.4
+  read and say to run it. It holds the database exclusively, keeps the file
+  as it was as `snapshots.db.pre-0.4`, works in batches and continues where
+  an interrupted run stopped, compares every account's history before and
+  after (the same value from the same instant, ending at the same time)
+  before it drops the old tables, and vacuums. `--dry-run` counts what it
+  would keep. A chart of rewritten history has a marker per kept row
+  instead of one per read.
+- The egui tray (the `tray` cargo feature and `tokeman tray`) is removed.
+  The macOS menu-bar app in `macos/tray` is the tray.
 
 ### Internals
 
 - `quota::{Service, Span, Scope, Limit, Reading, ReadError, Detail}` is the
   one model; every reader returns a `Reading`, and `policy::rank_above` is
   the one ranking behind the rotation's landing and every `best`.
-- History: every read is one JSON row in `readings`. The tables of earlier
-  builds are read where they are and never altered. A reading that says
-  what the account's last row says adds no row for ten minutes; the last
-  confirmation is kept apart, and a change is written after a row that
-  closes the hold, so charts draw a held value as a step and burn rates are
-  the same as from one row per read. `tokeman list` asks the old tables only
-  for an account that has no new row.
+- History: every read is one JSON row in `readings`, the only table the
+  history is read from. A reading that says what the account's last row
+  says adds no row for ten minutes; the last confirmation is kept apart, and
+  a change is written after a row that closes the hold, so charts draw a
+  held value as a step and burn rates are the same as from one row per
+  read.
 - `ui::overview::Overview` is the one fleet view; each surface has one limit
   renderer. `commands/` returns data, every print is in `ui/text.rs`, every
   terminal read in `ui/prompt.rs`; the library reports progress through

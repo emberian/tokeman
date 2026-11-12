@@ -66,6 +66,8 @@ struct Endpoints {
     api: String,
     token_url: String,
     cache: PathBuf,
+    /// The `User-Agent` of every API request.
+    agent: String,
 }
 
 impl Endpoints {
@@ -74,6 +76,7 @@ impl Endpoints {
             api: API.into(),
             token_url: TOKEN_URL.into(),
             cache: paths::antigravity_tokens(),
+            agent: user_agent().to_owned(),
         }
     }
 }
@@ -331,25 +334,30 @@ fn parse_time(text: &str) -> Option<i64> {
 fn user_agent() -> &'static str {
     use std::sync::OnceLock;
     static AGENT: OnceLock<String> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let version = installed_app_version()
-            .filter(|version| {
-                parse_version(version).is_some_and(|v| {
-                    v >= MIN_GEMINI_HUB_VERSION && Some(v) > parse_version(PINNED_HUB_VERSION)
-                })
+    AGENT.get_or_init(|| agent_for(installed_app_version()))
+}
+
+/// The identity to announce when the installed app's version is
+/// `installed`: that version when it is newer than the pinned one, else the
+/// pinned one.
+fn agent_for(installed: Option<String>) -> String {
+    let version = installed
+        .filter(|version| {
+            parse_version(version).is_some_and(|v| {
+                v >= MIN_GEMINI_HUB_VERSION && Some(v) > parse_version(PINNED_HUB_VERSION)
             })
-            .unwrap_or_else(|| PINNED_HUB_VERSION.into());
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            other => other,
-        };
-        let arch = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "amd64",
-            other => other,
-        };
-        format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch})")
-    })
+        })
+        .unwrap_or_else(|| PINNED_HUB_VERSION.into());
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch})")
 }
 
 /// `CFBundleShortVersionString` of the installed Antigravity app.
@@ -464,7 +472,7 @@ impl<'a> Session<'a> {
                 .client
                 .post(format!("{}/v1internal:{method}", self.endpoints.api))
                 .bearer_auth(&self.access_token)
-                .header(header::USER_AGENT, user_agent())
+                .header(header::USER_AGENT, &self.endpoints.agent)
                 .timeout(REQUEST_TIMEOUT)
                 .json(body)
                 .send()
@@ -684,13 +692,23 @@ mod tests {
 
     #[test]
     fn the_user_agent_is_a_hub_client_new_enough_for_the_gemini_group() {
-        let agent = user_agent();
-        let version = agent
-            .strip_prefix("antigravity/hub/")
-            .and_then(|rest| rest.split(' ').next())
-            .unwrap();
-        assert!(parse_version(version).unwrap() >= MIN_GEMINI_HUB_VERSION);
-        assert!(agent.contains("aidev_client"));
+        let version = |installed: Option<&str>| {
+            let agent = agent_for(installed.map(str::to_owned));
+            assert!(agent.ends_with(")") && agent.contains(" (aidev_client; os_type="));
+            agent
+                .strip_prefix("antigravity/hub/")
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap()
+                .to_owned()
+        };
+        assert!(parse_version(PINNED_HUB_VERSION).unwrap() >= MIN_GEMINI_HUB_VERSION);
+        assert_eq!(version(None), PINNED_HUB_VERSION);
+        // An installed app older than the pinned version (2.0.1 gets no
+        // Gemini group) or unreadable is not announced; a newer one is.
+        assert_eq!(version(Some("2.0.1")), PINNED_HUB_VERSION);
+        assert_eq!(version(Some("2.9")), PINNED_HUB_VERSION);
+        assert_eq!(version(Some("beta")), PINNED_HUB_VERSION);
+        assert_eq!(version(Some("3.1.0")), "3.1.0");
         assert_eq!(parse_version("2.9"), Some((2, 9, 0)));
         assert_eq!(parse_version("2.x"), None);
         let plist = "<dict>\n<key>CFBundleShortVersionString</key>\n\t<string>2.0.1</string>";
@@ -717,6 +735,8 @@ mod tests {
         /// Bearer tokens the API accepts.
         valid: Vec<&'static str>,
         summary: Value,
+        /// `loadCodeAssist` answers 500.
+        load_down: bool,
     }
 
     fn bearer(headers: &HeaderMap) -> String {
@@ -788,6 +808,10 @@ mod tests {
                 "/v1internal:loadCodeAssist",
                 post(
                     |State(f): State<Fake>, h: HeaderMap, Json(b): Json<Value>| async move {
+                        if f.load_down {
+                            let down = serde_json::json!({"error": {"message": "backend error"}});
+                            return (StatusCode::INTERNAL_SERVER_ERROR, Json(down));
+                        }
                         api(&f, "load", &h, b, load_answer()).await
                     },
                 ),
@@ -808,6 +832,7 @@ mod tests {
             api: base.clone(),
             token_url: format!("{base}/token"),
             cache: dir.path().join("antigravity-access-tokens.json"),
+            agent: agent_for(None),
         };
         (endpoints, dir)
     }
@@ -818,6 +843,7 @@ mod tests {
             token_status: StatusCode::OK,
             valid,
             summary: live_summary(),
+            load_down: false,
         }
     }
 
@@ -877,11 +903,19 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
+        // Inside the margin before Google's expiry the cached token is not
+        // used: one more refresh.
+        let late = NOW + 3599 - EXPIRY_MARGIN_MS / 1000 + 1;
+        read_with(&client, &endpoints, &grant("a@example.com"), late - 2).await;
+        assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 1);
+        read_with(&client, &endpoints, &grant("a@example.com"), late).await;
+        assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 2);
+
         // A re-imported grant (different refresh token) ignores the cache.
         let mut other = grant("a@example.com");
         other.refresh_token = Some("1//other".into());
-        read_with(&client, &endpoints, &other, NOW + 120).await;
-        assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 2);
+        read_with(&client, &endpoints, &other, late + 120).await;
+        assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 3);
     }
 
     #[tokio::test]
@@ -930,6 +964,42 @@ mod tests {
                 .contains("no refresh token")
         );
         assert!(fake.seen.lock().unwrap().refreshes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_token_rejected_even_after_a_refresh_is_an_error_after_one_refresh() {
+        // The API accepts nothing, so the minted token is rejected too.
+        let fake = fake(vec![]);
+        let (endpoints, _dir) = serve(fake.clone()).await;
+        let client = Client::new();
+        let account = grant("e@example.com");
+        let poll = read_with(&client, &endpoints, &account, NOW);
+        let usage = tokio::time::timeout(Duration::from_secs(20), poll)
+            .await
+            .expect("a rejected token is not refreshed again and again");
+        assert!(
+            matches!(usage.error, Some(ReadError::Http { status: 401, .. })),
+            "{:?}",
+            usage.error
+        );
+        assert!(usage.limits.is_empty());
+        assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_is_read_without_the_plan_when_load_code_assist_is_down() {
+        let mut fake = fake(vec!["minted"]);
+        fake.load_down = true;
+        let (endpoints, _dir) = serve(fake.clone()).await;
+        let usage = read_with(&Client::new(), &endpoints, &grant("f@example.com"), NOW).await;
+        assert_eq!(usage.error, None);
+        assert_eq!(usage.plan, None);
+        assert_eq!(usage.limits.len(), 4);
+        // With no project from the server, the consumer one is named.
+        assert_eq!(
+            fake.seen.lock().unwrap().summary_bodies,
+            [serde_json::json!({"project": "aicode-consumers"})]
+        );
     }
 
     /// Reads every Antigravity login on this machine against the live API,

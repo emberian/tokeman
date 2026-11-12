@@ -15,7 +15,7 @@ use crate::daemon::notify::{self, Delivery};
 use crate::policy::{self, Floors};
 use crate::providers::{self, ServiceAccount};
 use crate::quota::{ModelKey, Reading, Service};
-use crate::store::{Stats, Store};
+use crate::store::{Stats, Store, compact};
 use crate::ui::overview::{Facts, ForecastView, Monitor, Overview};
 
 /// No floor: any counted window with something left can take work.
@@ -347,6 +347,23 @@ pub fn history(
         Some(hours) => store.since(service, account, now() - (hours * 3_600.0) as i64),
         None => store.recent(service, account, last),
     }
+}
+
+/// Whether the history still has reads in the tables builds before 0.4
+/// wrote, which nothing shows until `tokeman history compact` rewrites them.
+pub fn uncompacted() -> bool {
+    Store::open_read_only().is_ok_and(|store| store.has_old_tables())
+}
+
+/// `tokeman history compact`: rewrite those tables into the one this build
+/// reads, or with `dry_run` count what that would keep.
+pub fn compact(dry_run: bool) -> Result<compact::Report> {
+    if !dry_run && crate::daemon::lock::daemon_alive() {
+        crate::notice::notice(
+            "the background service is running: what it reads while this runs is not recorded",
+        );
+    }
+    compact::run(dry_run)
 }
 
 /// Burn rates of each account of `service` over the last week, in

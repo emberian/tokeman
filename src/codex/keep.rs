@@ -575,6 +575,24 @@ pub(crate) mod tests {
         assert_eq!(seats.load(), []);
         assert!(fake.logins().is_empty());
         assert!(backend.requests("/token").is_empty());
+
+        // Either sign is enough. A seat recorded without an email is told
+        // by the account id its limits carry...
+        let by_id = Pushed {
+            email: None,
+            ..stale.clone()
+        };
+        seats.put(by_id.clone()).unwrap();
+        let tended = tend(&client, &fleet, &seats, &by_id, NOW).await;
+        assert_eq!(tended.outcome, Tended::Ended);
+        // ...and a Codex whose limits cannot be read, by its email.
+        fake.running.lock().unwrap().limits_fail = true;
+        seats.put(stale.clone()).unwrap();
+        let tended = tend(&client, &fleet, &seats, &stale, NOW).await;
+        assert_eq!(tended.outcome, Tended::Ended);
+        assert_eq!(seats.load(), []);
+        assert!(fake.logins().is_empty());
+        assert!(backend.requests("/token").is_empty());
     }
 
     #[tokio::test]
