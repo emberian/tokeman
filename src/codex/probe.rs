@@ -2,18 +2,26 @@
 //! exist, how full they are, when they reset, and whether the backend accepts
 //! the account at all. It is the only liveness check: `codex login status`
 //! reads the local file and reports a revoked account as logged in.
+//!
+//! The answer becomes a [`Reading`]: the account-wide windows as
+//! account-wide limits named by their length, each additional limit as
+//! limits scoped to its model or metered feature, and the rest in
+//! [`CodexDetail`].
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::auth::{AuthFile, CodexHome};
 use super::{Client, is_edge_challenge};
 use crate::account::CodexAccount;
-use crate::quota::Window;
+use crate::quota::{
+    CodexDetail, Credits, Detail, Limit, ModelKey, ModelUsage, ReadError, Reading,
+    ResetCreditCount, Scope, Service, Source, Span, SpendControl, SpendLimit, Verdict, Window,
+    WindowStatus,
+};
 
 /// Codex identifies itself this way; the backend varies behaviour by originator.
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -21,314 +29,85 @@ const ORIGINATOR: &str = "codex_cli_rs";
 /// `__cf_bm` cookie the challenge set, which is usually enough.
 const CHALLENGE_RETRIES: u32 = 3;
 
-/// A ChatGPT plan, with the backend's spelling kept for the ones not named.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "String", into = "String")]
-pub enum Plan {
-    Free,
-    Go,
-    Plus,
-    Pro,
-    Team,
-    Business,
-    Enterprise,
-    Edu,
-    Other(String),
-}
-
-impl Plan {
-    pub fn parse(raw: &str) -> Self {
-        match raw.to_ascii_lowercase().as_str() {
-            "free" => Self::Free,
-            "go" => Self::Go,
-            "plus" => Self::Plus,
-            "pro" => Self::Pro,
-            "team" => Self::Team,
-            "business" => Self::Business,
-            "enterprise" => Self::Enterprise,
-            "edu" => Self::Edu,
-            _ => Self::Other(raw.to_owned()),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Free => "free",
-            Self::Go => "go",
-            Self::Plus => "plus",
-            Self::Pro => "pro",
-            Self::Team => "team",
-            Self::Business => "business",
-            Self::Enterprise => "enterprise",
-            Self::Edu => "edu",
-            Self::Other(raw) => raw,
-        }
-    }
-}
-
-impl From<String> for Plan {
-    fn from(raw: String) -> Self {
-        Self::parse(&raw)
-    }
-}
-
-impl From<Plan> for String {
-    fn from(plan: Plan) -> Self {
-        plan.as_str().to_owned()
-    }
-}
-
-impl fmt::Display for Plan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// How long a window lasts, which is what names it. The backend moves
-/// windows between `primary_window` and `secondary_window` (an account
-/// whose only window is the weekly one reports it as primary), so position
-/// says nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Span {
-    FiveHour,
-    Weekly,
-    /// Any other length, in seconds.
-    Seconds(i64),
-    /// The backend did not say.
-    Unknown,
-}
-
-impl Span {
-    pub const FIVE_HOUR_SECS: i64 = 5 * 3_600;
-    pub const WEEK_SECS: i64 = 7 * 86_400;
-
-    pub fn from_seconds(seconds: Option<i64>) -> Self {
-        match seconds {
-            Some(Self::FIVE_HOUR_SECS) => Self::FiveHour,
-            Some(Self::WEEK_SECS) => Self::Weekly,
-            Some(seconds) if seconds > 0 => Self::Seconds(seconds),
-            _ => Self::Unknown,
-        }
-    }
-
-    /// `5h`, `weekly`, or the span in its largest whole unit (`1d`, `90m`).
-    pub fn label(&self) -> String {
-        match *self {
-            Self::FiveHour => "5h".to_owned(),
-            Self::Weekly => "weekly".to_owned(),
-            Self::Seconds(seconds) => {
-                let unit = [(86_400, "d"), (3_600, "h"), (60, "m")]
-                    .into_iter()
-                    .find(|(size, _)| seconds % size == 0);
-                match unit {
-                    Some((size, suffix)) => format!("{}{suffix}", seconds / size),
-                    None => format!("{seconds}s"),
-                }
-            }
-            Self::Unknown => "window".to_owned(),
-        }
-    }
-}
-
-impl fmt::Display for Span {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.label())
-    }
-}
-
-/// One window of a limit, named by its length.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct SpanWindow {
-    pub span: Span,
-    #[serde(flatten)]
-    pub window: Window,
-}
-
-/// One metered limit and the windows it is measured over, in the order the
-/// backend sent them.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct RateLimit {
+/// One limit block with its windows named by length, in the order the
+/// backend sent them. The backend moves windows between `primary_window`
+/// and `secondary_window` (an account whose only window is the weekly one
+/// reports it as primary), so position says nothing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct Block {
     pub allowed: Option<bool>,
     pub limit_reached: Option<bool>,
-    pub windows: Vec<SpanWindow>,
+    pub windows: Vec<(Span, Window)>,
 }
 
-impl RateLimit {
-    /// The window of this length, if the limit has one.
-    pub fn window(&self, span: Span) -> Option<Window> {
-        self.windows
-            .iter()
-            .find(|window| window.span == span)
-            .map(|window| window.window)
-    }
-
-    /// The smallest remaining fraction over every window: whichever bites first.
-    pub fn remaining(&self) -> Option<f64> {
-        self.windows
-            .iter()
-            .map(|window| window.window.remaining().clamp(0.0, 1.0))
-            .reduce(f64::min)
-    }
-
-    /// The window with the least left.
-    pub fn tightest(&self) -> Option<&SpanWindow> {
-        self.windows
-            .iter()
-            .min_by(|a, b| a.window.remaining().total_cmp(&b.window.remaining()))
-    }
-
+impl Block {
     /// `allowed` is authoritative when present; absence is not a rejection.
-    pub fn allows(&self) -> bool {
+    pub(crate) fn allows(&self) -> bool {
         self.limit_reached != Some(true) && self.allowed.unwrap_or(true)
     }
 }
 
 /// A per-feature or per-model limit (e.g. a separate bucket for
 /// Codex-Spark), metered apart from the account-wide windows.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ExtraLimit {
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct Extra {
     pub name: Option<String>,
     pub feature: Option<String>,
     /// The model whose ordinary limit this one stands in for.
     pub model: Option<String>,
-    pub limit: Option<RateLimit>,
+    pub block: Option<Block>,
 }
 
-impl ExtraLimit {
-    /// Loose match on the name, the metered feature or the model, so a
-    /// caller can say "spark".
-    pub fn matches(&self, needle: &str) -> bool {
-        let needle = needle.to_ascii_lowercase();
-        [&self.name, &self.feature, &self.model]
-            .into_iter()
-            .flatten()
-            .any(|text| text.to_ascii_lowercase().contains(&needle))
-    }
-
-    pub fn is_limited(&self) -> bool {
-        self.limit.as_ref().is_some_and(|limit| !limit.allows())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Credits {
-    pub has_credits: Option<bool>,
-    pub unlimited: Option<bool>,
-    pub overage_limit_reached: Option<bool>,
-    /// The backend sends `null`, `"0"` or a number here; kept as text.
-    pub balance: Option<String>,
-}
-
-/// Whether the account may use one model right now (`model_usage`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ModelUsage {
-    pub slug: String,
-    pub available: Option<bool>,
-    /// Epoch seconds when the model becomes available again.
-    pub available_at: Option<i64>,
-    /// Buying credits would make the model available.
-    pub credits_would_enable: Option<bool>,
-}
-
-impl ModelUsage {
-    pub fn is_unavailable(&self) -> bool {
-        self.available == Some(false)
-    }
-}
-
-/// The workspace's cap on credit spending (`spend_control`). The amounts are
-/// decimal strings, kept as sent.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct SpendControl {
-    pub reached: Option<bool>,
-    pub limit: Option<SpendLimit>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct SpendLimit {
-    pub limit: Option<String>,
-    pub used: Option<String>,
-    pub remaining: Option<String>,
-    pub used_percent: Option<f64>,
-    /// Epoch seconds.
-    pub reset_at: Option<i64>,
-    pub source: Option<String>,
-}
-
-/// Reset credits held by the account, as the usage body counts them.
-/// `applicable` is how many would clear a limit the account is at now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ResetCreditCount {
-    pub available: i64,
-    pub applicable: Option<i64>,
-}
-
-/// What the usage endpoint said about an account.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Usage {
-    pub user_id: Option<String>,
-    pub account_id: Option<String>,
-    pub email: Option<String>,
-    pub plan: Option<Plan>,
-    pub limit: Option<RateLimit>,
-    pub credits: Option<Credits>,
-    /// The backend's name for the limit it is enforcing, when it is.
-    pub limit_reason: Option<String>,
-    pub extra: Vec<ExtraLimit>,
-    /// Per-model availability, by slug.
-    pub models: Vec<ModelUsage>,
-    pub spend_control: Option<SpendControl>,
-    pub reset_credits: Option<ResetCreditCount>,
-}
-
-/// Why a probe produced no usage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProbeError {
-    /// auth.json is missing or unreadable.
-    AuthFile {
-        message: String,
-    },
-    AuthFileHasNoAccessToken,
-    Network {
-        message: String,
-    },
-    /// Every attempt was answered by the edge, not the API.
-    Challenged {
-        status: u16,
-        attempts: u32,
-    },
-    Http {
-        status: u16,
-        body: String,
-    },
-    Decode {
-        message: String,
-    },
-}
-
-impl ProbeError {
-    /// The backend rejected the token: the caller should refresh.
-    pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Http { status: 401, .. })
-    }
-}
-
-impl fmt::Display for ProbeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AuthFile { message } => f.write_str(message),
-            Self::AuthFileHasNoAccessToken => f.write_str("auth.json has no access_token"),
-            Self::Network { message } => f.write_str(message),
-            Self::Challenged { status, attempts } => write!(
-                f,
-                "HTTP {status}: Cloudflare challenge after {attempts} attempts, not an auth failure"
+/// The limits of a usage answer. The account-wide block's windows are
+/// account-wide limits; whether the backend accepts work under it is
+/// [`CodexDetail::allowed`]. An additional limit's windows are scoped to its
+/// model when it names one, else to its metered feature, carry its name as
+/// their label, and are marked rejected when the backend refuses it.
+pub(crate) fn limits_of(shared: Option<&Block>, extras: &[Extra]) -> Vec<Limit> {
+    let mut limits: Vec<Limit> = shared
+        .into_iter()
+        .flat_map(|block| &block.windows)
+        .map(|(span, window)| Limit::new(*span, Scope::All, *window, Source::Poll))
+        .collect();
+    for extra in extras {
+        let Some(block) = &extra.block else {
+            continue;
+        };
+        let name = extra.name.as_deref().unwrap_or("?");
+        let (scope, label) = match (&extra.model, &extra.feature) {
+            (Some(model), _) => (
+                Scope::Model(ModelKey::new(model)),
+                format!("{name} ({model})"),
             ),
-            Self::Http { status, body } => write!(f, "HTTP {status}: {body}"),
-            Self::Decode { message } => f.write_str(message),
-        }
+            (None, Some(feature)) => (Scope::Group(feature.clone()), name.to_owned()),
+            (None, None) => (Scope::Group(name.to_owned()), name.to_owned()),
+        };
+        let status = (!block.allows()).then_some(WindowStatus {
+            verdict: Verdict::Rejected,
+            surpassed_threshold: None,
+        });
+        limits.extend(block.windows.iter().map(|(span, window)| Limit {
+            label: label.clone(),
+            status,
+            ..Limit::new(*span, scope.clone(), *window, Source::Poll)
+        }));
     }
+    limits
+}
+
+/// Whether the backend would accept work on this account. A 200 with no
+/// limit block means no limit is being enforced.
+pub fn is_viable(reading: &Reading) -> bool {
+    reading.error.is_none() && reading.allows()
+}
+
+/// Least remaining across the account-wide windows: whichever bites first.
+/// `None` is no reading, which differs from no headroom.
+pub fn remaining(reading: &Reading) -> Option<f64> {
+    reading
+        .shared()
+        .map(|limit| limit.window.remaining().clamp(0.0, 1.0))
+        .reduce(f64::min)
 }
 
 /// Whether an account can take work right now.
@@ -336,7 +115,24 @@ impl fmt::Display for ProbeError {
 pub enum State {
     Ok,
     Limited { reason: Option<String> },
-    Error { error: ProbeError },
+    Error { error: ReadError },
+}
+
+impl State {
+    pub fn of(reading: &Reading) -> Self {
+        if let Some(error) = &reading.error {
+            return Self::Error {
+                error: error.clone(),
+            };
+        }
+        if is_viable(reading) {
+            Self::Ok
+        } else {
+            Self::Limited {
+                reason: reading.codex().and_then(|codex| codex.limit_reason.clone()),
+            }
+        }
+    }
 }
 
 impl fmt::Display for State {
@@ -355,144 +151,6 @@ impl fmt::Display for State {
     }
 }
 
-/// One probe of one account. Local signals are filled even when the request
-/// fails.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Probe {
-    pub account: String,
-    pub codex_home: PathBuf,
-    /// Epoch seconds.
-    pub at: i64,
-    pub usage: Option<Usage>,
-    pub error: Option<ProbeError>,
-    pub last_refresh: Option<DateTime<Utc>>,
-    pub email_hint: Option<String>,
-}
-
-impl Probe {
-    fn new(
-        account: &CodexAccount,
-        auth: Option<&AuthFile>,
-        outcome: Result<Usage, ProbeError>,
-        at: DateTime<Utc>,
-    ) -> Self {
-        let (usage, error) = match outcome {
-            Ok(usage) => (Some(usage), None),
-            Err(error) => (None, Some(error)),
-        };
-        Self {
-            account: account.name.clone(),
-            codex_home: account.home(),
-            at: at.timestamp(),
-            usage,
-            error,
-            last_refresh: auth.and_then(AuthFile::last_refresh),
-            email_hint: auth
-                .and_then(AuthFile::claims)
-                .and_then(|claims| claims.email),
-        }
-    }
-
-    pub fn limit(&self) -> Option<&RateLimit> {
-        self.usage.as_ref()?.limit.as_ref()
-    }
-
-    /// The account-wide window of this length.
-    pub fn window(&self, span: Span) -> Option<Window> {
-        self.limit()?.window(span)
-    }
-
-    /// Account-wide windows of a length other than 5h or weekly.
-    pub fn other_windows(&self) -> impl Iterator<Item = &SpanWindow> {
-        self.limit()
-            .into_iter()
-            .flat_map(|limit| &limit.windows)
-            .filter(|window| !matches!(window.span, Span::FiveHour | Span::Weekly))
-    }
-
-    /// Least remaining across the reported windows. `None` is no reading,
-    /// which differs from no headroom.
-    pub fn remaining(&self) -> Option<f64> {
-        self.limit()?.remaining()
-    }
-
-    /// Headroom in the named per-model bucket.
-    pub fn remaining_for(&self, limit: &str) -> Option<f64> {
-        self.extra()
-            .iter()
-            .find(|extra| extra.matches(limit))?
-            .limit
-            .as_ref()?
-            .remaining()
-    }
-
-    pub fn extra(&self) -> &[ExtraLimit] {
-        self.usage
-            .as_ref()
-            .map(|usage| usage.extra.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn models(&self) -> &[ModelUsage] {
-        self.usage
-            .as_ref()
-            .map(|usage| usage.models.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn spend_control(&self) -> Option<&SpendControl> {
-        self.usage.as_ref()?.spend_control.as_ref()
-    }
-
-    pub fn reset_credits(&self) -> Option<ResetCreditCount> {
-        self.usage.as_ref()?.reset_credits
-    }
-
-    /// Whether the backend would accept work on this account. A 200 with no
-    /// limit block means no limit is being enforced.
-    pub fn is_viable(&self) -> bool {
-        match (&self.usage, self.limit()) {
-            (None, _) => false,
-            (Some(_), None) => true,
-            (Some(_), Some(limit)) => limit.allows(),
-        }
-    }
-
-    pub fn is_unauthorized(&self) -> bool {
-        self.error.as_ref().is_some_and(ProbeError::is_unauthorized)
-    }
-
-    pub fn state(&self) -> State {
-        if let Some(error) = &self.error {
-            return State::Error {
-                error: error.clone(),
-            };
-        }
-        if self.is_viable() {
-            State::Ok
-        } else {
-            State::Limited {
-                reason: self.limit_reason().map(str::to_owned),
-            }
-        }
-    }
-
-    pub fn limit_reason(&self) -> Option<&str> {
-        self.usage.as_ref()?.limit_reason.as_deref()
-    }
-
-    pub fn email(&self) -> Option<&str> {
-        self.usage
-            .as_ref()
-            .and_then(|usage| usage.email.as_deref())
-            .or(self.email_hint.as_deref())
-    }
-
-    pub fn plan(&self) -> Option<&Plan> {
-        self.usage.as_ref()?.plan.as_ref()
-    }
-}
-
 // The endpoint's shapes, as sent. Every field is optional: this is not a
 // stable contract.
 
@@ -505,16 +163,16 @@ struct RawWindow {
 }
 
 impl RawWindow {
-    fn window(&self, at: DateTime<Utc>) -> Option<SpanWindow> {
+    fn window(&self, at: DateTime<Utc>) -> Option<(Span, Window)> {
         let used = self.used_percent? / 100.0;
         let resets_at = self
             .reset_at
             .or_else(|| self.reset_after_seconds.map(|after| at.timestamp() + after))
             .unwrap_or(0);
-        Some(SpanWindow {
-            span: Span::from_seconds(self.limit_window_seconds),
-            window: Window::new(used, resets_at),
-        })
+        Some((
+            Span::from_seconds(self.limit_window_seconds),
+            Window::new(used, resets_at),
+        ))
     }
 }
 
@@ -527,8 +185,8 @@ struct RawRateLimit {
 }
 
 impl RawRateLimit {
-    fn limit(&self, at: DateTime<Utc>) -> RateLimit {
-        RateLimit {
+    fn block(&self, at: DateTime<Utc>) -> Block {
+        Block {
             allowed: self.allowed,
             limit_reached: self.limit_reached,
             windows: [&self.primary_window, &self.secondary_window]
@@ -611,16 +269,17 @@ pub(crate) fn epoch_of(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-/// Decode a usage body field by field. `rate_limit` is what rotation rests
-/// on, so a malformed one fails the decode; any other field that changed
-/// shape is dropped alone, so a cosmetic change does not park a working
-/// account or hide the rest of the body.
-pub fn decode_usage(body: &str, at: DateTime<Utc>) -> Result<Usage, ProbeError> {
-    let value: Value = serde_json::from_str(body).map_err(|error| ProbeError::Decode {
+/// Decode a usage body field by field into a reading of `account`.
+/// `rate_limit` is what rotation rests on, so a malformed one fails the
+/// decode; any other field that changed shape is dropped alone, so a
+/// cosmetic change does not park a working account or hide the rest of the
+/// body.
+pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Reading, ReadError> {
+    let value: Value = serde_json::from_str(body).map_err(|error| ReadError::Decode {
         message: format!("failed to parse usage response as JSON: {error}"),
     })?;
     let Some(object) = value.as_object() else {
-        return Err(ProbeError::Decode {
+        return Err(ReadError::Decode {
             message: "usage response is not a JSON object".to_owned(),
         });
     };
@@ -633,7 +292,7 @@ pub fn decode_usage(body: &str, at: DateTime<Utc>) -> Result<Usage, ProbeError> 
     let rate_limit = match object.get("rate_limit") {
         None | Some(Value::Null) => None,
         Some(raw) => Some(serde_json::from_value::<RawRateLimit>(raw.clone()).map_err(
-            |error| ProbeError::Decode {
+            |error| ReadError::Decode {
                 message: format!("failed to decode usage rate_limit: {error}"),
             },
         )?),
@@ -645,56 +304,57 @@ pub fn decode_usage(body: &str, at: DateTime<Utc>) -> Result<Usage, ProbeError> 
     let spend: Option<RawSpendControl> = field(object, "spend_control");
     let resets: Option<RawResetCredits> = field(object, "rate_limit_reset_credits");
     let reached: Option<RawReachedType> = field(object, "rate_limit_reached_type");
-    Ok(Usage {
-        user_id: field(object, "user_id"),
-        account_id: field(object, "account_id"),
-        email: field(object, "email"),
-        plan: field::<String>(object, "plan_type")
-            .as_deref()
-            .map(Plan::parse),
-        limit: rate_limit.as_ref().map(|limit| limit.limit(at)),
-        credits: credits.map(|credits| Credits {
-            has_credits: credits.has_credits,
-            unlimited: credits.unlimited,
-            overage_limit_reached: credits.overage_limit_reached,
-            balance: text_of(credits.balance),
-        }),
-        limit_reason: reached.and_then(|reached| reached.kind),
-        extra: extra
-            .into_iter()
-            .map(|extra| ExtraLimit {
-                name: extra.limit_name,
-                feature: extra.metered_feature,
-                model: extra.normal_model_slug,
-                limit: extra.rate_limit.as_ref().map(|limit| limit.limit(at)),
-            })
-            .collect(),
-        models: models
-            .into_iter()
-            .map(|(slug, model)| ModelUsage {
-                slug,
-                available: model.available,
-                available_at: epoch_of(model.available_at.as_ref()),
-                credits_would_enable: model.credits_would_enable,
-            })
-            .collect(),
-        spend_control: spend.map(|spend| SpendControl {
-            reached: spend.reached,
-            limit: spend.individual_limit.map(|limit| SpendLimit {
-                limit: text_of(limit.limit),
-                used: text_of(limit.used),
-                remaining: text_of(limit.remaining),
-                used_percent: limit.used_percent,
-                reset_at: limit.reset_at,
-                source: limit.source,
+    let shared = rate_limit.as_ref().map(|limit| limit.block(at));
+    let extras: Vec<Extra> = extra
+        .into_iter()
+        .map(|extra| Extra {
+            name: extra.limit_name,
+            feature: extra.metered_feature,
+            model: extra.normal_model_slug,
+            block: extra.rate_limit.as_ref().map(|limit| limit.block(at)),
+        })
+        .collect();
+    Ok(Reading {
+        plan: field(object, "plan_type"),
+        limits: limits_of(shared.as_ref(), &extras),
+        detail: Detail::Codex(CodexDetail {
+            email: field(object, "email"),
+            allowed: shared.as_ref().map(Block::allows),
+            limit_reason: reached.and_then(|reached| reached.kind),
+            credits: credits.map(|credits| Credits {
+                has_credits: credits.has_credits,
+                unlimited: credits.unlimited,
+                overage_limit_reached: credits.overage_limit_reached,
+                balance: text_of(credits.balance),
+            }),
+            models: models
+                .into_iter()
+                .map(|(slug, model)| ModelUsage {
+                    slug,
+                    available: model.available,
+                    available_at: epoch_of(model.available_at.as_ref()),
+                    credits_would_enable: model.credits_would_enable,
+                })
+                .collect(),
+            spend_control: spend.map(|spend| SpendControl {
+                reached: spend.reached,
+                limit: spend.individual_limit.map(|limit| SpendLimit {
+                    limit: text_of(limit.limit),
+                    used: text_of(limit.used),
+                    remaining: text_of(limit.remaining),
+                    used_percent: limit.used_percent,
+                    reset_at: limit.reset_at,
+                    source: limit.source,
+                }),
+            }),
+            reset_credits: resets.and_then(|resets| {
+                Some(ResetCreditCount {
+                    available: resets.available_count?,
+                    applicable: resets.applicable_available_count,
+                })
             }),
         }),
-        reset_credits: resets.and_then(|resets| {
-            Some(ResetCreditCount {
-                available: resets.available_count?,
-                applicable: resets.applicable_available_count,
-            })
-        }),
+        ..Reading::empty(Service::Codex, account, at.timestamp())
     })
 }
 
@@ -708,10 +368,10 @@ pub(crate) async fn call(
     method: reqwest::Method,
     url: &str,
     json: Option<&Value>,
-) -> Result<String, ProbeError> {
-    let access_token = auth
-        .access_token()
-        .ok_or(ProbeError::AuthFileHasNoAccessToken)?;
+) -> Result<String, ReadError> {
+    let access_token = auth.access_token().ok_or_else(|| ReadError::Credential {
+        message: "auth.json has no access_token".to_owned(),
+    })?;
     let account_id = auth.effective_account_id();
     let mut attempt = 0;
     let response = loop {
@@ -727,7 +387,7 @@ pub(crate) async fn call(
         if let Some(json) = json {
             request = request.json(json);
         }
-        let response = request.send().await.map_err(|error| ProbeError::Network {
+        let response = request.send().await.map_err(|error| ReadError::Network {
             message: error.to_string(),
         })?;
         if is_edge_challenge(&response) && attempt < CHALLENGE_RETRIES {
@@ -753,62 +413,65 @@ pub(crate) async fn call(
         }
         let body = response.text().await.unwrap_or_default();
         return Err(if challenged {
-            ProbeError::Challenged {
+            ReadError::Edge {
                 status: status.as_u16(),
                 attempts: attempt + 1,
             }
         } else {
-            ProbeError::Http {
+            ReadError::Http {
                 status: status.as_u16(),
                 body: super::one_line(&body, 160),
             }
         });
     }
-    response.text().await.map_err(|error| ProbeError::Network {
+    response.text().await.map_err(|error| ReadError::Network {
         message: error.to_string(),
     })
 }
 
-async fn fetch_usage(
-    client: &Client,
-    account: &str,
-    auth: &AuthFile,
-    at: DateTime<Utc>,
-) -> Result<Usage, ProbeError> {
-    let body = call(
-        client,
-        account,
-        auth,
-        reqwest::Method::GET,
-        client.usage_url(),
-        None,
-    )
-    .await?;
-    decode_usage(&body, at)
-}
-
-/// Probe one account. A dead account is data, not an error.
-pub async fn probe(client: &Client, account: &CodexAccount) -> Probe {
+/// Probe one account. A dead account is data, not an error: the reading
+/// carries why, and the email the stored id token names.
+pub async fn probe(client: &Client, account: &CodexAccount) -> Reading {
     let at = Utc::now();
-    match CodexHome::new(account.home()).read() {
+    let auth = CodexHome::new(account.home()).read();
+    let outcome = match &auth {
         Ok(auth) => {
-            let outcome = fetch_usage(client, &account.name, &auth, at).await;
-            Probe::new(account, Some(&auth), outcome, at)
+            match call(
+                client,
+                &account.name,
+                auth,
+                reqwest::Method::GET,
+                client.usage_url(),
+                None,
+            )
+            .await
+            {
+                Ok(body) => decode_usage(&account.name, &body, at),
+                Err(error) => Err(error),
+            }
         }
-        Err(error) => Probe::new(
-            account,
-            None,
-            Err(ProbeError::AuthFile {
-                message: format!("{error:#}"),
-            }),
-            at,
-        ),
+        Err(error) => Err(ReadError::Credential {
+            message: format!("{error:#}"),
+        }),
+    };
+    let mut reading = outcome.unwrap_or_else(|error| {
+        Reading::failed(Service::Codex, &account.name, at.timestamp(), error)
+    });
+    if let Detail::Codex(codex) = &mut reading.detail
+        && codex.email.is_none()
+    {
+        codex.email = auth
+            .ok()
+            .as_ref()
+            .and_then(AuthFile::claims)
+            .and_then(|claims| claims.email);
     }
+    reading
 }
 
 /// Probe every account through one client. The first request goes alone so
 /// a challenge settles and seeds the cookie jar; the rest run concurrently.
-pub async fn probe_all(client: &Client, accounts: &[CodexAccount]) -> Vec<Probe> {
+pub async fn probe_all(client: &Client, accounts: &[CodexAccount]) -> Vec<Reading> {
     let Some((first, rest)) = accounts.split_first() else {
         return Vec::new();
     };
@@ -1076,57 +739,74 @@ pub(crate) mod tests {
         codex_account(name, &home.path().display().to_string())
     }
 
+    fn decode(body: &Value, at: i64) -> Reading {
+        decode_usage(
+            "a",
+            &body.to_string(),
+            DateTime::from_timestamp(at, 0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn scoped_names(reading: &Reading) -> Vec<String> {
+        reading
+            .scoped()
+            .into_iter()
+            .map(|(_, limits)| limits[0].label.clone())
+            .collect()
+    }
+
     #[test]
-    fn a_full_body_decodes_to_typed_usage() {
-        let at = DateTime::from_timestamp(1_000, 0).unwrap();
-        let usage = decode_usage(&usage_body(40.0, 75.0).to_string(), at).unwrap();
-        assert_eq!(usage.plan, Some(Plan::Plus));
-        let limit = usage.limit.as_ref().unwrap();
-        assert_eq!(limit.window(Span::FiveHour), Some(Window::new(0.4, 4_600)));
+    fn a_full_body_decodes_to_a_reading() {
+        let reading = decode(&usage_body(40.0, 75.0), 1_000);
+        assert_eq!((reading.service, reading.at), (Service::Codex, 1_000));
+        assert_eq!(reading.account, "a");
+        assert_eq!(reading.plan.as_deref(), Some("plus"));
+        assert_eq!(reading.session(), Some(Window::new(0.4, 4_600)));
+        assert_eq!(reading.weekly(), Some(Window::new(0.75, 1_800_000_000)));
+        assert_eq!(remaining(&reading), Some(0.25));
+        assert_eq!(reading.tightest().unwrap().span, Span::Weekly);
+        assert!(reading.allows() && is_viable(&reading));
+        let codex = reading.codex().unwrap();
+        assert_eq!(codex.allowed, Some(true));
+        assert_eq!(codex.email.as_deref(), Some("a@b.c"));
         assert_eq!(
-            limit.window(Span::Weekly),
-            Some(Window::new(0.75, 1_800_000_000))
-        );
-        assert_eq!(limit.remaining(), Some(0.25));
-        assert_eq!(limit.tightest().unwrap().span, Span::Weekly);
-        assert!(limit.allows());
-        assert_eq!(
-            usage.credits.as_ref().unwrap().balance.as_deref(),
+            codex.credits.as_ref().unwrap().balance.as_deref(),
             Some("0")
         );
-        assert_eq!(usage.limit_reason, None);
-        assert_eq!(usage.extra.len(), 1);
-        assert!(usage.extra[0].matches("SPARK"));
-        assert!(usage.extra[0].is_limited());
+        assert_eq!(codex.limit_reason, None);
+        let scoped = reading.scoped();
+        assert_eq!(scoped.len(), 1);
+        let (scope, spark) = &scoped[0];
+        assert_eq!(**scope, Scope::Group("gpt-5.3-codex-spark".into()));
+        assert_eq!(spark[0].label, "codex_spark");
+        assert!(spark[0].matches("SPARK") && spark[0].matches("gpt-5.3"));
+        assert!(spark[0].is_rejected());
+        assert_eq!(spark[0].window.remaining(), 0.0);
         assert_eq!(
-            usage.extra[0].limit.as_ref().unwrap().remaining(),
-            Some(0.0)
-        );
-        assert_eq!(
-            usage.extra[0].limit.as_ref().unwrap().windows[0].span,
+            spark[0].span,
             Span::Unknown,
             "a window without limit_window_seconds is not guessed from its position"
         );
-        assert!(usage.models.is_empty());
-        assert_eq!(usage.reset_credits, None);
+        assert!(
+            reading.above(0.0, 0.0, None),
+            "a spent feature limit is metered apart from the account"
+        );
+        assert!(codex.models.is_empty());
+        assert_eq!(codex.reset_credits, None);
     }
 
     #[test]
     fn todays_weekly_only_body_names_its_one_window_weekly() {
-        let at = DateTime::from_timestamp(1_000, 0).unwrap();
-        let usage = decode_usage(&weekly_only_body(42.0).to_string(), at).unwrap();
-        assert_eq!(usage.plan, Some(Plan::Other("promax".into())));
-        let limit = usage.limit.as_ref().unwrap();
-        assert_eq!(limit.window(Span::FiveHour), None);
+        let reading = decode(&weekly_only_body(42.0), 1_000);
+        assert_eq!(reading.plan.as_deref(), Some("promax"));
+        assert_eq!(reading.session(), None);
+        assert_eq!(reading.weekly(), Some(Window::new(0.42, 1_794_607_293)));
+        assert_eq!(reading.limits.len(), 1, "additional_rate_limits: null");
+        assert!((remaining(&reading).unwrap() - 0.58).abs() < 1e-9);
+        let codex = reading.codex().unwrap();
         assert_eq!(
-            limit.window(Span::Weekly),
-            Some(Window::new(0.42, 1_794_607_293))
-        );
-        assert_eq!(limit.windows.len(), 1);
-        assert!((limit.remaining().unwrap() - 0.58).abs() < 1e-9);
-        assert!(usage.extra.is_empty(), "additional_rate_limits: null");
-        assert_eq!(
-            usage.models,
+            codex.models,
             vec![ModelUsage {
                 slug: "gpt-6-astra".into(),
                 available: Some(true),
@@ -1135,28 +815,27 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(
-            usage.spend_control,
+            codex.spend_control,
             Some(SpendControl {
                 reached: Some(false),
                 limit: None
             })
         );
         assert_eq!(
-            usage.reset_credits,
+            codex.reset_credits,
             Some(ResetCreditCount {
                 available: 2,
                 applicable: Some(0)
             })
         );
         assert_eq!(
-            usage.credits.as_ref().unwrap().balance.as_deref(),
+            codex.credits.as_ref().unwrap().balance.as_deref(),
             Some("0")
         );
     }
 
     #[test]
     fn newer_fields_decode_with_their_alternative_spellings() {
-        let at = DateTime::from_timestamp(0, 0).unwrap();
         let mut body = weekly_only_body(10.0);
         body["rate_limit"]["secondary_window"] =
             json!({"used_percent": 50, "limit_window_seconds": 86400, "reset_at": 99});
@@ -1171,15 +850,15 @@ pub(crate) mod tests {
             "normal_model_slug": "gpt-6-astra-spark",
             "rate_limit": {"allowed": true, "limit_reached": false,
                            "primary_window": {"used_percent": 20, "limit_window_seconds": 18000}}}]);
-        let usage = decode_usage(&body.to_string(), at).unwrap();
-        let limit = usage.limit.as_ref().unwrap();
+        let reading = decode(&body, 0);
         assert_eq!(
-            limit.windows.iter().map(|w| w.span).collect::<Vec<_>>(),
-            vec![Span::Weekly, Span::Seconds(86_400)]
+            reading.shared().map(|limit| limit.span).collect::<Vec<_>>(),
+            vec![Span::Weekly, Span::Other(86_400)]
         );
-        assert_eq!(limit.tightest().unwrap().span, Span::Seconds(86_400));
+        assert_eq!(reading.tightest().unwrap().span, Span::Other(86_400));
+        let codex = reading.codex().unwrap();
         assert_eq!(
-            usage
+            codex
                 .models
                 .iter()
                 .map(|m| (m.slug.as_str(), m.available_at))
@@ -1189,39 +868,23 @@ pub(crate) mod tests {
                 ("b-model", Some(1_794_441_600))
             ]
         );
-        assert!(usage.models.iter().all(ModelUsage::is_unavailable));
-        let spend = usage.spend_control.unwrap();
+        assert!(codex.models.iter().all(ModelUsage::is_unavailable));
+        let spend = codex.spend_control.clone().unwrap();
         assert_eq!(spend.reached, Some(true));
         let cap = spend.limit.unwrap();
         assert_eq!(cap.limit.as_deref(), Some("50.00"));
         assert_eq!(cap.used.as_deref(), Some("50"));
         assert_eq!(cap.used_percent, Some(100.0));
-        assert_eq!(usage.extra[0].model.as_deref(), Some("gpt-6-astra-spark"));
-        assert!(usage.extra[0].matches("astra-spark"));
-        assert_eq!(
-            usage.extra[0]
-                .limit
-                .as_ref()
-                .unwrap()
-                .window(Span::FiveHour),
-            Some(Window::new(0.2, 0))
-        );
-    }
-
-    #[test]
-    fn spans_are_named_by_length() {
-        assert_eq!(Span::from_seconds(Some(18_000)), Span::FiveHour);
-        assert_eq!(Span::from_seconds(Some(604_800)), Span::Weekly);
-        assert_eq!(Span::from_seconds(None), Span::Unknown);
-        assert_eq!(Span::from_seconds(Some(0)), Span::Unknown);
-        assert_eq!(Span::FiveHour.label(), "5h");
-        assert_eq!(Span::Weekly.label(), "weekly");
-        assert_eq!(Span::Seconds(86_400).label(), "1d");
-        assert_eq!(Span::Seconds(2_592_000).label(), "30d");
-        assert_eq!(Span::Seconds(5_400).label(), "90m");
-        assert_eq!(Span::Seconds(3_600).label(), "1h");
-        assert_eq!(Span::Seconds(61).label(), "61s");
-        assert_eq!(Span::Unknown.to_string(), "window");
+        // A limit that stands in for a model's ordinary one is scoped to it.
+        let spark = reading
+            .limit(
+                Span::FiveHour,
+                &Scope::Model(ModelKey::new("gpt-6-astra-spark")),
+            )
+            .unwrap();
+        assert_eq!(spark.label, "spark (gpt-6-astra-spark)");
+        assert!(spark.matches("astra-spark") && !spark.is_rejected());
+        assert_eq!(spark.window, Window::new(0.2, 0));
     }
 
     #[test]
@@ -1230,111 +893,91 @@ pub(crate) mod tests {
         let mut body = usage_body(10.0, 20.0);
         body["additional_rate_limits"] = json!("surprise");
         body["rate_limit_reached_type"] = json!({"type": "secondary_window"});
-        let usage = decode_usage(&body.to_string(), at).unwrap();
-        assert_eq!(usage.email.as_deref(), Some("a@b.c"));
-        assert_eq!(usage.limit.as_ref().unwrap().remaining(), Some(0.8));
-        assert_eq!(usage.limit_reason.as_deref(), Some("secondary_window"));
-        assert!(usage.extra.is_empty());
+        let reading = decode(&body, 0);
+        let codex = reading.codex().unwrap();
+        assert_eq!(codex.email.as_deref(), Some("a@b.c"));
+        assert_eq!(remaining(&reading), Some(0.8));
+        assert_eq!(codex.limit_reason.as_deref(), Some("secondary_window"));
+        assert!(scoped_names(&reading).is_empty());
         assert_eq!(
-            usage.credits.as_ref().unwrap().balance.as_deref(),
+            codex.credits.as_ref().unwrap().balance.as_deref(),
             Some("0"),
             "a broken field does not take its neighbours with it"
         );
-        assert!(matches!(
-            decode_usage("[1, 2]", at),
-            Err(ProbeError::Decode { .. })
-        ));
-        assert!(matches!(
-            decode_usage(r#"{"rate_limit": 5}"#, at),
-            Err(ProbeError::Decode { .. })
-        ));
-        assert!(matches!(
-            decode_usage("not json", at),
-            Err(ProbeError::Decode { .. })
-        ));
-    }
-
-    #[test]
-    fn plans_keep_unknown_spellings_and_round_trip() {
-        assert_eq!(Plan::parse("Pro"), Plan::Pro);
-        assert_eq!(Plan::parse("team-plus"), Plan::Other("team-plus".into()));
-        let json = serde_json::to_string(&Plan::Other("odd".into())).unwrap();
-        assert_eq!(json, r#""odd""#);
-        assert_eq!(
-            serde_json::from_str::<Plan>(r#""enterprise""#).unwrap(),
-            Plan::Enterprise
-        );
+        for broken in ["[1, 2]", r#"{"rate_limit": 5}"#, "not json"] {
+            assert!(matches!(
+                decode_usage("a", broken, at),
+                Err(ReadError::Decode { .. })
+            ));
+        }
     }
 
     #[test]
     fn viability_follows_the_limit_block() {
-        let account = codex_account("a", "/nowhere");
-        let at = Utc::now();
-        let with = |limit: Option<RateLimit>, reason: Option<&str>| {
-            Probe::new(
-                &account,
-                None,
-                Ok(Usage {
-                    limit,
-                    limit_reason: reason.map(str::to_owned),
-                    ..Usage::default()
-                }),
-                at,
-            )
+        let with = |block: Option<Block>, reason: Option<&str>| {
+            let mut reading = Reading::empty(Service::Codex, "a", 0);
+            reading.limits = limits_of(block.as_ref(), &[]);
+            reading.detail = Detail::Codex(CodexDetail {
+                allowed: block.as_ref().map(Block::allows),
+                limit_reason: reason.map(str::to_owned),
+                ..CodexDetail::default()
+            });
+            reading
         };
         assert!(
-            with(None, None).is_viable(),
+            is_viable(&with(None, None)),
             "no limit block: nothing enforced"
         );
-        assert_eq!(with(None, None).state(), State::Ok);
+        assert_eq!(State::of(&with(None, None)), State::Ok);
         let reached = with(
-            Some(RateLimit {
+            Some(Block {
                 limit_reached: Some(true),
-                ..RateLimit::default()
+                ..Block::default()
             }),
             Some("primary_window"),
         );
-        assert!(!reached.is_viable());
-        assert_eq!(reached.state().to_string(), "limited (primary_window)");
+        assert!(!is_viable(&reached));
+        assert_eq!(State::of(&reached).to_string(), "limited (primary_window)");
         let refused = with(
-            Some(RateLimit {
+            Some(Block {
                 allowed: Some(false),
-                ..RateLimit::default()
+                ..Block::default()
             }),
             None,
         );
-        assert_eq!(refused.state().to_string(), "limited");
-        let failed = Probe::new(
-            &account,
-            None,
-            Err(ProbeError::Http {
+        assert_eq!(State::of(&refused).to_string(), "limited");
+        let failed = Reading::failed(
+            Service::Codex,
+            "a",
+            0,
+            ReadError::Http {
                 status: 401,
                 body: "nope".into(),
-            }),
-            at,
+            },
         );
-        assert!(failed.is_unauthorized());
-        assert!(!failed.is_viable());
+        assert!(failed.is_refused());
+        assert!(!is_viable(&failed));
         assert_eq!(
-            failed.state().to_string(),
+            State::of(&failed).to_string(),
             "ERROR: HTTP 401: nope, needs `tokeman codex refresh`"
         );
     }
 
     #[tokio::test]
-    async fn a_probe_sends_codex_identity_and_reads_typed_usage() {
+    async fn a_probe_sends_codex_identity_and_reads_a_reading() {
         let dir = tempfile::tempdir().unwrap();
         let account = profile(dir.path(), "one", "r1");
         let backend = Backend::default().usage_answers(vec![ok(usage_body(30.0, 60.0))]);
         let client = backend.client().await;
         let probe = probe(&client, &account).await;
         assert_eq!(probe.error, None);
-        assert_eq!(probe.remaining(), Some(0.4));
-        assert_eq!(probe.remaining_for("spark"), Some(0.0));
-        assert_eq!(probe.remaining_for("nothing"), None);
-        assert_eq!(probe.email(), Some("a@b.c"));
-        assert_eq!(probe.plan(), Some(&Plan::Plus));
-        assert!(probe.last_refresh.is_some());
+        assert_eq!(probe.account, "one");
+        assert_eq!(remaining(&probe), Some(0.4));
+        let spark = probe.scoped_to(Some("spark")).unwrap();
+        assert_eq!(remaining(&spark), Some(0.0));
+        assert_eq!(probe.scoped_to(Some("nothing")), None);
+        assert_eq!(probe.codex().unwrap().email.as_deref(), Some("a@b.c"));
+        assert_eq!(probe.plan.as_deref(), Some("plus"));
         let seen = backend.requests("/usage");
         assert_eq!(seen.len(), 1);
         let header = |name: &str| {
@@ -1365,17 +1008,17 @@ pub(crate) mod tests {
         let client = backend.client().await;
         let probes = probe_all(&client, &[first, second]).await;
         assert_eq!(probes[0].error, None);
-        assert_eq!(probes[0].remaining(), Some(1.0));
+        assert_eq!(remaining(&probes[0]), Some(1.0));
         assert_eq!(
             probes[1].error,
-            Some(ProbeError::Http {
+            Some(ReadError::Http {
                 status: 401,
                 body: r#"{"detail": "token expired"}"#.into()
             })
         );
-        assert!(probes[1].is_unauthorized());
+        assert!(probes[1].error.as_ref().unwrap().is_unauthorized());
         assert_eq!(
-            probes[1].email(),
+            probes[1].codex().unwrap().email.as_deref(),
             Some("second@x.y"),
             "the id_token still names the account"
         );
@@ -1405,12 +1048,12 @@ pub(crate) mod tests {
         let probe = probe(&client, &account).await;
         assert_eq!(
             probe.error,
-            Some(ProbeError::Challenged {
+            Some(ReadError::Edge {
                 status: 403,
                 attempts: CHALLENGE_RETRIES + 1
             })
         );
-        assert!(!probe.is_unauthorized());
+        assert!(!probe.is_refused());
         assert_eq!(
             backend.requests("/usage").len(),
             (CHALLENGE_RETRIES + 1) as usize
@@ -1428,8 +1071,15 @@ pub(crate) mod tests {
         std::fs::write(no_token.auth_path(), r#"{"tokens":{"refresh_token":"r"}}"#).unwrap();
         let no_token = codex_account("no-token", &no_token.path().display().to_string());
         let probes = probe_all(&client, &[missing, no_token]).await;
-        assert!(matches!(probes[0].error, Some(ProbeError::AuthFile { .. })));
-        assert_eq!(probes[1].error, Some(ProbeError::AuthFileHasNoAccessToken));
+        assert!(matches!(
+            probes[0].error,
+            Some(ReadError::Credential { .. })
+        ));
+        assert_eq!(
+            probes[1].error.as_ref().unwrap().to_string(),
+            "auth.json has no access_token"
+        );
+        assert!(probes.iter().all(|probe| probe.service == Service::Codex));
         assert!(backend.requests("/usage").is_empty());
         assert!(probe_all(&client, &[]).await.is_empty());
     }

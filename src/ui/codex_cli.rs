@@ -201,8 +201,12 @@ pub async fn run(action: CodexAction) -> Result<()> {
             yes,
         } => reset(&account, credit.as_deref(), yes).await?,
         CodexAction::Best { limit } => {
-            let probe = commands::best(&Client::new()?, &Fleet::load()?, limit.as_deref()).await?;
-            println!("{}", probe.codex_home.display());
+            let fleet = Fleet::load()?;
+            let best = commands::best(&Client::new()?, &fleet, limit.as_deref()).await?;
+            let account = fleet
+                .codex_account(&best.account)
+                .with_context(|| format!("no codex account named {}", best.account))?;
+            println!("{}", account.home().display());
         }
     }
     Ok(())

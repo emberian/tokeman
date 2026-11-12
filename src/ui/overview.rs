@@ -9,10 +9,10 @@ use crate::account::{Account, CodexAccount, Fleet};
 use crate::anthropic::profile::Cache;
 use crate::anthropic::resets;
 use crate::claude::settings as claude_settings;
-use crate::codex::probe::{Probe, ResetCreditCount, SpanWindow};
+use crate::codex::probe::{self as codex_probe, State};
 use crate::daemon::{lock, service};
 use crate::providers::{ServiceAccount, Usage};
-use crate::quota::{Limit, Reading, Service, SessionLimit, Source, Window};
+use crate::quota::{Limit, Reading, ResetCreditCount, Service, SessionLimit, Source, Window};
 use crate::store::{Series, Store};
 use crate::ui::text;
 
@@ -143,9 +143,8 @@ pub struct ServiceView {
 /// What the stores hold, gathered before the view is built.
 #[derive(Debug, Clone, Default)]
 pub struct Stored {
-    /// The newest Claude reading of each account.
-    pub snapshots: Vec<Reading>,
-    pub codex: Vec<Probe>,
+    /// The newest reading of each Claude and Codex account.
+    pub readings: Vec<Reading>,
     pub usages: Vec<Usage>,
     /// Per account: when its reset offers were read, and the usable ones.
     pub offers: Vec<(String, i64, Vec<String>)>,
@@ -154,6 +153,12 @@ pub struct Stored {
 }
 
 impl Stored {
+    fn reading(&self, service: Service, account: &str) -> Option<&Reading> {
+        self.readings
+            .iter()
+            .find(|reading| reading.service == service && reading.account == account)
+    }
+
     /// Read the history, the reset cache and Claude's settings. Nothing is
     /// created or written; a store that does not exist yet reads as empty.
     pub fn load(fleet: &Fleet, now: i64) -> Self {
@@ -161,16 +166,9 @@ impl Stored {
         let cache = Cache::default();
         let settings = claude_settings::load().ok();
         Self {
-            snapshots: store
+            readings: store
                 .as_ref()
                 .and_then(|store| store.latest().ok())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|reading| reading.service == Service::Claude)
-                .collect(),
-            codex: store
-                .as_ref()
-                .and_then(|store| store.latest_codex().ok())
                 .unwrap_or_default(),
             usages: store
                 .as_ref()
@@ -221,10 +219,7 @@ impl Overview {
                 .map(|account| {
                     claude_view(
                         account,
-                        stored
-                            .snapshots
-                            .iter()
-                            .find(|snapshot| snapshot.account == account.name),
+                        stored.reading(Service::Claude, &account.name),
                         stored.default_account.as_deref() == Some(account.name.as_str()),
                         now_ms,
                     )
@@ -244,15 +239,7 @@ impl Overview {
             codex: fleet
                 .codex
                 .iter()
-                .map(|account| {
-                    codex_view(
-                        account,
-                        stored
-                            .codex
-                            .iter()
-                            .find(|probe| probe.account == account.name),
-                    )
-                })
+                .map(|account| codex_view(account, stored.reading(Service::Codex, &account.name)))
                 .collect(),
             services: fleet
                 .services
@@ -351,46 +338,38 @@ pub fn bucket_view(bucket: &Limit, weekly: Option<&Window>) -> BucketView {
     }
 }
 
-fn named(window: &SpanWindow) -> NamedWindow {
+fn named(limit: &Limit) -> NamedWindow {
     NamedWindow {
-        label: window.span.label().to_uppercase(),
-        window: window.window,
+        label: limit.span.label().to_uppercase(),
+        window: limit.window,
     }
 }
 
-fn codex_view(account: &CodexAccount, probe: Option<&Probe>) -> CodexView {
+fn codex_view(account: &CodexAccount, probe: Option<&Reading>) -> CodexView {
     CodexView {
         name: account.name.clone(),
         label: account.label.clone(),
         parked: account.parked,
-        reading: probe.map(|probe| CodexReading {
-            at: probe.at,
-            email: probe.email().map(str::to_owned),
-            plan: probe.plan().map(|plan| plan.as_str().to_owned()),
-            state: probe.state().to_string(),
-            viable: probe.is_viable(),
-            windows: probe
-                .limit()
-                .map(|limit| limit.windows.iter().map(named).collect())
-                .unwrap_or_default(),
-            extra: probe
-                .extra()
-                .iter()
-                .map(|extra| CodexExtra {
-                    name: extra
-                        .name
-                        .clone()
-                        .or_else(|| extra.model.clone())
-                        .unwrap_or_else(|| "?".into()),
-                    limited: extra.is_limited(),
-                    windows: extra
-                        .limit
-                        .as_ref()
-                        .map(|limit| limit.windows.iter().map(named).collect())
-                        .unwrap_or_default(),
-                })
-                .collect(),
-            reset_credits: probe.reset_credits(),
+        reading: probe.map(|probe| {
+            let codex = probe.codex();
+            CodexReading {
+                at: probe.at,
+                email: codex.and_then(|codex| codex.email.clone()),
+                plan: probe.plan.clone(),
+                state: State::of(probe).to_string(),
+                viable: codex_probe::is_viable(probe),
+                windows: probe.shared().map(named).collect(),
+                extra: probe
+                    .scoped()
+                    .into_iter()
+                    .map(|(_, limits)| CodexExtra {
+                        name: limits[0].label.clone(),
+                        limited: limits.iter().any(|limit| limit.is_rejected()),
+                        windows: limits.into_iter().map(named).collect(),
+                    })
+                    .collect(),
+                reset_credits: codex.and_then(|codex| codex.reset_credits),
+            }
         }),
     }
 }
@@ -408,9 +387,8 @@ fn service_view(account: &ServiceAccount, usage: Option<&Usage>) -> ServiceView 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::probe::{RateLimit, Span, Usage as CodexUsage};
     use crate::providers::Meter;
-    use crate::quota::Service;
+    use crate::quota::Span;
     use crate::testing::{codex_account, login_account, setup_account};
 
     const NOW: i64 = 1_794_000_000;
@@ -449,7 +427,7 @@ mod tests {
         fable.share = Some(0.5);
         absent.limits.push(fable);
         let stored = Stored {
-            snapshots: vec![absent, snapshot("plain", 0.9)],
+            readings: vec![absent, snapshot("plain", 0.9)],
             default_account: Some("ultra".into()),
             ..Stored::default()
         };
@@ -514,38 +492,32 @@ mod tests {
 
     #[test]
     fn codex_windows_are_named_by_length_and_carry_the_credit_count() {
-        let probe = Probe {
-            account: "work".into(),
-            codex_home: "/tmp/work".into(),
-            at: NOW - 600,
-            usage: Some(CodexUsage {
-                email: Some("a@b.c".into()),
-                limit: Some(RateLimit {
-                    allowed: Some(true),
-                    limit_reached: Some(false),
-                    windows: vec![
-                        SpanWindow {
-                            span: Span::Weekly,
-                            window: Window::new(0.42, NOW + 86_400),
-                        },
-                        SpanWindow {
-                            span: Span::FiveHour,
-                            window: Window::new(0.1, NOW + 3_600),
-                        },
-                    ],
-                }),
-                reset_credits: Some(ResetCreditCount {
-                    available: 2,
-                    applicable: Some(0),
-                }),
-                ..CodexUsage::default()
-            }),
-            error: None,
-            last_refresh: None,
-            email_hint: None,
+        let shared = |span, used, reset| {
+            Limit::new(
+                span,
+                crate::quota::Scope::All,
+                Window::new(used, reset),
+                Source::Poll,
+            )
         };
+        let mut probe = Reading::empty(Service::Codex, "work", NOW - 600);
+        probe.limits = vec![
+            shared(Span::Weekly, 0.42, NOW + 86_400),
+            shared(Span::FiveHour, 0.1, NOW + 3_600),
+        ];
+        probe.detail = crate::quota::Detail::Codex(crate::quota::CodexDetail {
+            email: Some("a@b.c".into()),
+            allowed: Some(true),
+            reset_credits: Some(ResetCreditCount {
+                available: 2,
+                applicable: Some(0),
+            }),
+            ..Default::default()
+        });
+        // A Claude account of the same name is another account.
+        let namesake = snapshot("work", 0.5);
         let stored = Stored {
-            codex: vec![probe],
+            readings: vec![namesake, probe],
             ..Stored::default()
         };
         let view = Overview::build(&fleet(), stored, Monitor::Paused, NOW);

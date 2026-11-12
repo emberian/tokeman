@@ -10,12 +10,13 @@
 
 mod legacy;
 
+use legacy::Rows;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::time::Duration;
 
-use crate::codex::probe::Probe;
 use crate::paths;
 use crate::providers::Usage;
 use crate::quota::{ModelKey, Reading, Service, Window};
@@ -117,15 +118,7 @@ impl Store {
                 usage TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_service_readings_account_time
-                ON service_readings(service, account, at);
-            CREATE TABLE IF NOT EXISTS codex_readings (
-                id INTEGER PRIMARY KEY,
-                account TEXT NOT NULL,
-                at INTEGER NOT NULL,
-                probe TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_codex_readings_account_time
-                ON codex_readings(account, at);",
+                ON service_readings(service, account, at);",
         )?;
         Ok(())
     }
@@ -150,17 +143,14 @@ impl Store {
             "WHERE id IN (SELECT MAX(id) FROM readings GROUP BY service, account)",
             [],
         )?;
-        let older = legacy::snapshots(
-            &self.conn,
-            "WHERE id IN (SELECT MAX(id) FROM snapshots GROUP BY token_name)",
-            [],
-        )?;
-        for reading in older {
-            let newer = latest
-                .iter()
-                .any(|new| new.service == reading.service && new.account == reading.account);
-            if !newer {
-                latest.push(reading);
+        for service in [Service::Claude, Service::Codex] {
+            for reading in legacy::read(&self.conn, service, Rows::Latest)? {
+                let newer = latest
+                    .iter()
+                    .any(|new| new.service == reading.service && new.account == reading.account);
+                if !newer {
+                    latest.push(reading);
+                }
             }
         }
         Ok(latest)
@@ -175,29 +165,22 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Reading>> {
         let count = limit as i64;
-        let (mut readings, older) = match account {
-            Some(name) => (
-                self.query(
-                    "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT ?3",
-                    params![service.name(), name, count],
-                )?,
-                self.legacy(
-                    service,
-                    "WHERE token_name = ?1 ORDER BY probed_at DESC LIMIT ?2",
-                    params![name, count],
-                )?,
-            ),
-            None => (
-                self.query(
-                    "WHERE service = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
-                    params![service.name(), count],
-                )?,
-                self.legacy(service, "ORDER BY probed_at DESC LIMIT ?1", params![count])?,
-            ),
+        let mut readings = match account {
+            Some(name) => self.query(
+                "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT ?3",
+                params![service.name(), name, count],
+            )?,
+            None => self.query(
+                "WHERE service = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
+                params![service.name(), count],
+            )?,
         };
-        // Both halves are newest first, and every new row is at least as new
-        // as the rows that predate the table.
-        readings.extend(older);
+        readings.extend(legacy::read(
+            &self.conn,
+            service,
+            Rows::Recent { account, limit },
+        )?);
+        // Stable: at one instant, a row of this table stays ahead of an old one.
         readings.sort_by_key(|reading| std::cmp::Reverse(reading.at));
         readings.truncate(limit);
         Ok(readings)
@@ -211,32 +194,17 @@ impl Store {
         account: Option<&str>,
         since: i64,
     ) -> Result<Vec<Reading>> {
-        let time = legacy::snapshot_time(since);
-        let (mut readings, newer) = match account {
-            Some(name) => (
-                self.legacy(
-                    service,
-                    "WHERE token_name = ?1 AND probed_at >= ?2 ORDER BY probed_at ASC",
-                    params![name, time],
-                )?,
-                self.query(
-                    "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
-                    params![service.name(), name, since],
-                )?,
-            ),
-            None => (
-                self.legacy(
-                    service,
-                    "WHERE probed_at >= ?1 ORDER BY probed_at ASC",
-                    params![time],
-                )?,
-                self.query(
-                    "WHERE service = ?1 AND at >= ?2 ORDER BY at ASC, id ASC",
-                    params![service.name(), since],
-                )?,
-            ),
-        };
-        readings.extend(newer);
+        let mut readings = legacy::read(&self.conn, service, Rows::Since { account, since })?;
+        readings.extend(match account {
+            Some(name) => self.query(
+                "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
+                params![service.name(), name, since],
+            )?,
+            None => self.query(
+                "WHERE service = ?1 AND at >= ?2 ORDER BY at ASC, id ASC",
+                params![service.name(), since],
+            )?,
+        });
         readings.sort_by_key(|reading| reading.at);
         Ok(readings)
     }
@@ -257,20 +225,6 @@ impl Store {
             .iter()
             .filter_map(|json| serde_json::from_str(json).ok())
             .collect())
-    }
-
-    /// Rows of `service` written before the `readings` table, selected by
-    /// `tail` over that service's old table.
-    fn legacy(
-        &self,
-        service: Service,
-        tail: &str,
-        params: impl rusqlite::Params,
-    ) -> Result<Vec<Reading>> {
-        Ok(match service {
-            Service::Claude => legacy::snapshots(&self.conn, tail, params)?,
-            _ => Vec::new(),
-        })
     }
 
     pub fn insert_usage(&self, usage: &Usage) -> Result<()> {
@@ -325,30 +279,6 @@ impl Store {
             .prepare(&format!("SELECT usage FROM service_readings {tail}"))?;
         let rows = stmt
             .query_map(params, |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .iter()
-            .filter_map(|json| serde_json::from_str(json).ok())
-            .collect())
-    }
-
-    pub fn insert_codex(&self, probe: &Probe) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO codex_readings (account, at, probe) VALUES (?1, ?2, ?3)",
-            params![probe.account, probe.at, serde_json::to_string(probe)?],
-        )?;
-        Ok(())
-    }
-
-    /// The newest probe of each Codex account, in no particular order. Rows
-    /// that no longer parse are skipped.
-    pub fn latest_codex(&self) -> Result<Vec<Probe>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT probe FROM codex_readings
-             WHERE id IN (SELECT MAX(id) FROM codex_readings GROUP BY account)",
-        )?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .iter()
@@ -741,19 +671,10 @@ mod tests {
             later.at += 60;
             later.set_weekly(Some(Window::new(0.6, 20)));
             store.insert(&later).unwrap();
-            let probe = crate::codex::probe::Probe {
-                account: "work".into(),
-                codex_home: "/tmp/work".into(),
-                at: 5,
-                usage: None,
-                error: None,
-                last_refresh: None,
-                email_hint: Some("a@b.c".into()),
-            };
-            store.insert_codex(&probe).unwrap();
-            store
-                .insert_codex(&crate::codex::probe::Probe { at: 9, ..probe })
-                .unwrap();
+            // Another service's account of the same name is its own.
+            let probe = Reading::empty(Service::Codex, "acct", 5);
+            store.insert(&probe).unwrap();
+            store.insert(&Reading { at: 9, ..probe }).unwrap();
         }
         let files = |dir: &std::path::Path| {
             let mut names: Vec<_> = std::fs::read_dir(dir)
@@ -766,12 +687,17 @@ mod tests {
         // The writer checkpointed and removed its sidecars when it closed.
         assert_eq!(files(dir.path()), ["s.db"]);
         let store = Store::open_read_only_at(&path).unwrap();
-        let latest = store.latest().unwrap();
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].weekly(), Some(Window::new(0.6, 20)));
-        let codex = store.latest_codex().unwrap();
-        assert_eq!(codex.len(), 1);
-        assert_eq!((codex[0].at, codex[0].email()), (9, Some("a@b.c")));
+        let of = |store: &Store, service| -> Reading {
+            let mut latest = store.latest().unwrap();
+            latest.retain(|reading| reading.service == service);
+            assert_eq!(latest.len(), 1);
+            latest.remove(0)
+        };
+        assert_eq!(
+            of(&store, Service::Claude).weekly(),
+            Some(Window::new(0.6, 20))
+        );
+        assert_eq!(of(&store, Service::Codex).at, 9);
         assert!(
             store.insert(&reading()).is_err(),
             "read-only refuses a write"
@@ -787,7 +713,7 @@ mod tests {
         writer.insert(&newest).unwrap();
         let reader = Store::open_read_only_at(&path).unwrap();
         assert_eq!(
-            reader.latest().unwrap()[0].weekly(),
+            of(&reader, Service::Claude).weekly(),
             Some(Window::new(0.7, 20))
         );
         drop(reader);
@@ -801,7 +727,6 @@ mod tests {
             .unwrap();
         let store = Store::open_read_only_at(&old).unwrap();
         assert!(store.latest().unwrap().is_empty());
-        assert!(store.latest_codex().is_err());
         assert!(store.latest_usage().is_err());
     }
 }

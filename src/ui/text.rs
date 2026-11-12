@@ -878,8 +878,7 @@ mod tests {
 
     #[test]
     fn a_codex_probe_reads_as_named_windows_credits_and_trouble() {
-        use crate::codex::probe::ResetCreditCount;
-        use crate::quota::Window;
+        use crate::quota::{ResetCreditCount, Window};
         use crate::ui::overview::{CodexReading, NamedWindow};
         let mut reading = CodexReading {
             at: 0,

@@ -14,9 +14,10 @@ use std::path::PathBuf;
 
 use super::Client;
 use super::auth::CodexHome;
-use super::probe::{self, Probe, ProbeError, State, epoch_of};
+use super::probe::{self, State, epoch_of};
 use crate::account::CodexAccount;
 use crate::fs::{FileLock, read_if_present, write_atomic};
+use crate::quota::{ReadError, Reading};
 
 /// Where a credit stands. Spellings the backend adds later are kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,8 +105,8 @@ struct RawCreditList {
     credits: Vec<RawCredit>,
 }
 
-pub fn decode_credit_list(body: &str) -> Result<CreditList, ProbeError> {
-    let raw: RawCreditList = serde_json::from_str(body).map_err(|error| ProbeError::Decode {
+pub fn decode_credit_list(body: &str) -> Result<CreditList, ReadError> {
+    let raw: RawCreditList = serde_json::from_str(body).map_err(|error| ReadError::Decode {
         message: format!("failed to decode reset credit list: {error}"),
     })?;
     let credits: Vec<ResetCredit> = raw
@@ -133,11 +134,11 @@ pub fn decode_credit_list(body: &str) -> Result<CreditList, ProbeError> {
 
 /// List an account's reset credits. The endpoint is less reliable than the
 /// usage body (it has answered 500); callers fall back to
-/// [`Probe::reset_credits`].
-pub async fn list(client: &Client, account: &CodexAccount) -> Result<CreditList, ProbeError> {
+/// `reset_credits` in the reading's Codex detail.
+pub async fn list(client: &Client, account: &CodexAccount) -> Result<CreditList, ReadError> {
     let auth = CodexHome::new(account.home())
         .read()
-        .map_err(|error| ProbeError::AuthFile {
+        .map_err(|error| ReadError::Credential {
             message: format!("{error:#}"),
         })?;
     let body = probe::call(
@@ -311,7 +312,7 @@ fn request_id() -> Result<String> {
 /// Why a reset is not offered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
-    Unreadable(ProbeError),
+    Unreadable(ReadError),
     /// Nothing to clear: a credit spent now would be wasted.
     NotLimited {
         state: State,
@@ -373,10 +374,10 @@ impl std::error::Error for Refusal {}
 #[derive(Debug, Clone)]
 pub struct ResetPlan {
     pub account: CodexAccount,
-    pub probe: Probe,
+    pub probe: Reading,
     /// The list endpoint's answer; the count in the usage body stands in
     /// when it fails.
-    pub credits: Result<CreditList, ProbeError>,
+    pub credits: Result<CreditList, ReadError>,
     /// The credit asked for; `None` lets the backend choose.
     pub credit_id: Option<String>,
     /// An earlier claim without a definite answer; this one retries it.
@@ -425,12 +426,12 @@ pub async fn plan(
     if let Some(error) = &plan.probe.error {
         bail!(Refusal::Unreadable(error.clone()));
     }
-    if plan.probe.is_viable() {
+    if probe::is_viable(&plan.probe) {
         bail!(Refusal::NotLimited {
-            state: plan.probe.state()
+            state: State::of(&plan.probe)
         });
     }
-    let count = plan.probe.reset_credits();
+    let count = plan.probe.codex().and_then(|codex| codex.reset_credits);
     let applicable = count.and_then(|count| count.applicable);
     if applicable.is_none_or(|applicable| applicable <= 0) {
         bail!(Refusal::NoApplicableCredit {
@@ -467,7 +468,7 @@ pub enum Claim {
     /// this account resends it.
     Uncertain {
         redeem_request_id: String,
-        error: ProbeError,
+        error: ReadError,
     },
 }
 
@@ -485,7 +486,7 @@ pub async fn claim(
         body["credit_id"] = json!(credit_id);
     }
     let answer = match CodexHome::new(account.home()).read() {
-        Err(error) => Err(ProbeError::AuthFile {
+        Err(error) => Err(ReadError::Credential {
             message: format!("{error:#}"),
         }),
         Ok(auth) => probe::call(
@@ -498,7 +499,7 @@ pub async fn claim(
         )
         .await
         .and_then(|text| {
-            serde_json::from_str::<Consumed>(&text).map_err(|error| ProbeError::Decode {
+            serde_json::from_str::<Consumed>(&text).map_err(|error| ReadError::Decode {
                 message: format!("unreadable reset answer: {error}"),
             })
         }),
@@ -792,7 +793,7 @@ mod tests {
         };
         assert_eq!(
             error,
-            ProbeError::Http {
+            ReadError::Http {
                 status: 502,
                 body: "upstream".into()
             }
@@ -848,7 +849,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Claim::Uncertain {
-                error: ProbeError::Decode { .. },
+                error: ReadError::Decode { .. },
                 ..
             }
         ));

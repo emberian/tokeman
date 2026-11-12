@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
-use super::probe::Span;
+use crate::quota::Span;
 
 const CONTROL_SOCKET_DIR: &str = "app-server-control";
 const CONTROL_SOCKET_FILE: &str = "app-server-control.sock";
