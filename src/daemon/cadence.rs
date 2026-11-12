@@ -354,6 +354,14 @@ mod tests {
             .unwrap();
         assert_eq!(carried.source, Source::Carried);
         assert_eq!(carried.window, Window::new(0.6, 5_000));
+        // A limit the probe itself read is not replaced by an older sample.
+        let mut read_now = [fine("s")];
+        read_now[0].set_limit(model_limit("fable", "Fable", 0.9, Source::Headers));
+        cadence.apply_samples(&mut read_now, 100.0);
+        let kept = read_now[0]
+            .model_limit(&ModelKey::family_wide(Family::Fable))
+            .unwrap();
+        assert_eq!((kept.source, kept.window.used), (Source::Headers, 0.9));
         let mut after_reset = [fine("s")];
         cadence.apply_samples(&mut after_reset, 6_000.0);
         assert_eq!(after_reset[0].models().count(), 0);

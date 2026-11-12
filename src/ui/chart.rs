@@ -61,7 +61,8 @@ fn span_named(word: &str) -> Option<Span> {
 /// window of that length; `overage` is Claude's extra usage; anything else
 /// names a scoped limit by its model, group or label (`fable`, `"Opus 4.8"`,
 /// `gemini`, `spark`), optionally followed by a length (`"gemini 5h"`). With
-/// no metric: the first account-wide limit, or the first limit of any kind.
+/// no metric: the shortest account-wide window in the history, whichever
+/// account was read last; with none, the first limit of any kind.
 pub fn resolve(metric: Option<&str>, readings: &[Reading]) -> Result<Series> {
     let known = Series::known(readings);
     let names = || {
@@ -75,7 +76,8 @@ pub fn resolve(metric: Option<&str>, readings: &[Reading]) -> Result<Series> {
     let Some(metric) = metric.map(str::trim) else {
         return known
             .iter()
-            .find(|(series, _)| series.scope == Scope::All)
+            .filter(|(series, _)| series.scope == Scope::All)
+            .min_by_key(|(series, _)| series.span.seconds().unwrap_or(i64::MAX))
             .or(known.first())
             .map(|(series, _)| series.clone())
             .context("no chartable history in this range; run `tokeman --fresh` to read once");
@@ -763,6 +765,36 @@ mod tests {
         );
         assert_eq!(series_name(&of("gemini 5h"), &agy), "Gemini Models 5h");
         assert!(resolve(None, &[]).is_err());
+    }
+
+    #[test]
+    fn the_default_metric_does_not_depend_on_which_account_was_read_last() {
+        // One account has a 5-hour limit; the other has the weekly alone.
+        let both = |at: i64| {
+            let mut reading = crate::testing::reading("a", 0.2, 0.4);
+            reading.at = at;
+            reading
+        };
+        let weekly_only = |at: i64| {
+            let mut reading = crate::testing::reading("b", 0.0, 0.3);
+            reading.set_session(None);
+            reading.at = at;
+            reading
+        };
+        assert_eq!(
+            resolve(None, &[weekly_only(10), both(20)]).unwrap(),
+            Series::session()
+        );
+        assert_eq!(
+            resolve(None, &[both(10), weekly_only(20)]).unwrap(),
+            Series::session()
+        );
+        // Nor on the order a reading lists its limits in.
+        let mut reversed = both(30);
+        reversed.limits.reverse();
+        assert_eq!(resolve(None, &[reversed]).unwrap(), Series::session());
+        // A history of weekly-only accounts charts the weekly.
+        assert_eq!(resolve(None, &[weekly_only(10)]).unwrap(), Series::weekly());
     }
 
     #[test]

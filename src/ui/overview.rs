@@ -880,6 +880,77 @@ mod tests {
     }
 
     #[test]
+    fn an_account_that_cannot_take_work_is_not_room() {
+        // The most weekly room is on an account whose last answer was a rejection.
+        let mut rejected = claude("ultra", 0.1);
+        rejected.claude_mut().verdict = Verdict::Rejected;
+        let mut codex = Reading::empty(Service::Codex, "work", NOW);
+        codex.limits = vec![Limit::new(
+            Span::Weekly,
+            Scope::All,
+            Window::new(0.2, NOW + 86_400),
+            Source::Poll,
+        )];
+        codex.detail = Detail::Codex(CodexDetail {
+            allowed: Some(false),
+            ..Default::default()
+        });
+        let kimi = Reading {
+            limits: vec![crate::providers::limit(
+                None,
+                "weekly",
+                Some(Span::WEEK_SECS),
+                Window::new(1.0, 0),
+                None,
+            )],
+            ..Reading::empty(Service::Kimi, "kimi", NOW)
+        };
+        let view = build(Facts {
+            readings: vec![rejected, claude("plain", 0.6), codex, kimi],
+            ..Facts::default()
+        });
+        assert!((view.best_weekly_remaining.unwrap() - 0.4).abs() < 1e-12);
+        assert_eq!(view.accounts[2].viable, Some(false), "Codex refuses work");
+        assert_eq!(view.accounts[3].viable, Some(false), "Kimi's week is spent");
+    }
+
+    #[test]
+    fn a_parked_profile_is_not_counted_in_a_forecast() {
+        let codex_at = |name: &str, hour: i64| {
+            let mut reading = Reading::empty(Service::Codex, name, NOW - (6 - hour) * 3_600);
+            reading.limits = vec![Limit::new(
+                Span::Weekly,
+                Scope::All,
+                Window::new(0.30 + 0.05 * hour as f64, NOW + 5 * 86_400),
+                Source::Poll,
+            )];
+            reading.detail = Detail::Codex(CodexDetail {
+                allowed: Some(true),
+                ..Default::default()
+            });
+            reading
+        };
+        let mut fleet = fleet();
+        fleet.codex.push(crate::account::CodexAccount {
+            parked: true,
+            ..codex_account("spare", "~/.codex-homes/spare")
+        });
+        let recent: Vec<Reading> = ["work", "spare"]
+            .into_iter()
+            .flat_map(|name| (0..=6).map(move |hour| codex_at(name, hour)))
+            .collect();
+        let facts = Facts {
+            readings: vec![codex_at("work", 6), codex_at("spare", 6)],
+            recent,
+            ..Facts::default()
+        };
+        let view = Overview::build(&fleet, facts, Some(Service::Codex), NOW);
+        let forecast = &view.forecasts[0].forecast;
+        assert_eq!((forecast.accounts, forecast.measured), (1, 1));
+        assert!((forecast.room - 0.40).abs() < 1e-9, "{}", forecast.room);
+    }
+
+    #[test]
     fn a_login_near_its_end_warns_and_an_unread_account_has_no_reading() {
         let view = build(Facts::default());
         let ultra = &view.accounts[0];

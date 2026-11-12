@@ -97,9 +97,18 @@ impl CodexHome {
 }
 
 /// The parsed contents of an `auth.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthFile {
     raw: Value,
+}
+
+impl std::fmt::Debug for AuthFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthFile")
+            .field("account_id", &self.effective_account_id())
+            .field("last_refresh", &self.last_refresh())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthFile {
@@ -169,13 +178,22 @@ impl AuthFile {
 }
 
 /// The ChatGPT OAuth material tokeman moves between profiles.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TokenBundle {
     pub access_token: String,
     pub refresh_token: String,
     pub id_token: Option<String>,
     pub account_id: Option<String>,
     pub last_refresh: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for TokenBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBundle")
+            .field("account_id", &self.account_id)
+            .field("last_refresh", &self.last_refresh)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The claims Codex reads out of the id_token.
@@ -400,5 +418,25 @@ pub(crate) mod tests {
         assert_eq!(slugify("ops@example.com"), "ops-example");
         assert_eq!(slugify("plain name"), "plain-name");
         assert_eq!(slugify("a.b@c"), "a-b-c");
+    }
+
+    #[test]
+    fn debug_output_of_a_bundle_or_an_auth_file_shows_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = CodexHome::new(dir.path());
+        let bundle = TokenBundle {
+            id_token: Some(id_token("a@b.c", "acct-1", "plus")),
+            account_id: Some("acct-1".into()),
+            ..bundle("access-secret", "refresh-secret")
+        };
+        home.write_tokens(&bundle).unwrap();
+        let auth = home.read().unwrap();
+        let shown = format!("{bundle:?} {auth:?} {:?}", Some(&bundle));
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(
+            !shown.contains(bundle.id_token.as_deref().unwrap()),
+            "{shown}"
+        );
+        assert!(shown.contains("acct-1"), "{shown}");
     }
 }

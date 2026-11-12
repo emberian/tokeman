@@ -84,7 +84,7 @@ pub async fn read_all(
 /// How a service account authenticates. One `[[services]]` table in
 /// tokens.toml; the secret is either inline (tokens.toml is 0600) or read
 /// from a file the user already keeps, such as `~/.zai-key`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceAccount {
     /// Unique across services; usually the account's email or the service name.
     pub name: String,
@@ -107,6 +107,26 @@ pub struct ServiceAccount {
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// `<set>` for a secret that is held; never the secret.
+pub(crate) fn held<T>(secret: &Option<T>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<set>")
+}
+
+impl std::fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccount")
+            .field("name", &self.name)
+            .field("service", &self.service)
+            .field("key", &held(&self.key))
+            .field("key_file", &self.key_file)
+            .field("refresh_token", &held(&self.refresh_token))
+            .field("access_token", &held(&self.access_token))
+            .field("expires_at", &self.expires_at)
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 impl ServiceAccount {
@@ -251,5 +271,24 @@ mod tests {
         );
         assert!(usages.iter().all(|usage| usage.error.is_some()));
         assert!(usages.iter().all(|usage| usage.limits.is_empty()));
+    }
+
+    #[test]
+    fn debug_output_names_which_secrets_are_held_and_shows_none() {
+        let account = ServiceAccount {
+            key: Some("sk-inline-secret".into()),
+            refresh_token: Some("1//refresh-secret".into()),
+            access_token: Some("ya29.access-secret".into()),
+            expires_at: Some(5),
+            ..ServiceAccount::with_key_file(Service::Antigravity, "first@example.com", "~/.key")
+        };
+        let shown = format!("{account:?} {:?}", Some(&account));
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(
+            shown.contains(r#"name: "first@example.com""#)
+                && shown.contains(r#"refresh_token: Some("<set>")"#)
+                && shown.contains(r#"key_file: Some("~/.key")"#),
+            "{shown}"
+        );
     }
 }
