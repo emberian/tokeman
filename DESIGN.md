@@ -97,7 +97,10 @@ src/
                  daemon never seats
       clients.rs the running clients of that slot: the hub app (its daemon file), `agy acp`, interactive agy, print-mode
                  agy. Bounded read-only ps/lsof census; GetUserStatus and GetAuthStatus on loopback; the resume command
-                 from agy's history. Never a signal, never a logout
+                 from agy's history. Never a signal, never a logout. An agy whose HOME (ps -E) is a per-account home
+                 is a Session, not a client
+      run.rs     `tokeman agy run`: a per-account home under paths::agy_homes (token file from tokeman's grant, links
+                 to the real home but .gemini and Library), HOME + SSH_TTY so agy keeps its login in that file; exec
   daemon/
     mod.rs       the loop
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record
@@ -109,7 +112,7 @@ src/
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
     codex.rs     add, remove, discover, import, list, refresh, use (move a running Codex, or copy into a profile), watch,
                  reset plan / claim
-    services.rs  agy / glm / kimi: add, remove, import, list, the account agy holds, agy use
+    services.rs  agy / glm / kimi: add, remove, import, list, the account agy holds, agy use, agy run
     rotate.rs    run, status, pause, resume, install, uninstall, quarantine, clear-quarantine, the hook's record
     view.rs      probe (read every service now, record), stored, ranked (the one ranking behind every `best`), best,
                  history, stats, settings
@@ -220,6 +223,10 @@ pub struct UseReport { email, previous, outcome: Written | Unchanged | Refused, 
 pub struct ClientReport { kind: Hub | Acp | Interactive | Print, pid, cwd, account, conversation, result: ClientResult }
 pub fn slot() -> Result<Option<Slot>> ; pub async fn use_account(&Client, UseTarget, UseOptions) -> Result<UseReport>
     // a refusal (an interactive agy runs, no --force) is Ok(report) with nothing written; lines() is what to say
+// providers/antigravity/run.rs
+pub enum Login { Normal /* the slot holds it: plain agy */, Own { home } }
+pub struct Launch { account, login, .. }  impl Launch { fn exec(self) -> anyhow::Error }
+pub async fn prepare(&Client, &ServiceAccount, seated: bool, args) -> Result<Launch> ; pub async fn sessions(&[ServiceAccount]) -> Result<Vec<Session>>
 
 // claims.rs
 pub struct Pending { service, account, item: Option<String> /* grant or credit; None = the backend's choice */, request_id, sent_at }
