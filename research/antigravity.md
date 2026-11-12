@@ -323,9 +323,9 @@ Findings:
   create it when it does not; with the file rewritten, `agy models` signed in from the Keychain.
 - The client is shared and the refresh token does not rotate, so seating a grant never
   invalidates tokeman's copy, and seating the other one back restores the first account.
-- Not done, on purpose: running `agy` in file-storage mode (`SSH_TTY`). The binary contains
-  `Failed to clear stale keyring credential after file fallback`, so such a run may delete the
-  shared Keychain item.
+- File-storage mode (`SSH_TTY`) was not used in this experiment. "Side by side" below tested it
+  afterwards: file mode never reaches the Keychain, and the delete behind `Failed to clear stale
+  keyring credential after file fallback` happens only in keyring mode.
 - Switching is manual. The daemon does not seat accounts. Expect the cost of a Claude switch:
   server-side caches are per account.
 
@@ -445,6 +445,105 @@ That app's state has not been touched since May. Treat the IDE grant as a source
 **Quota for both accounts needs no switching.** tokeman can hold both refresh tokens, refresh each
 (stateless), and call `retrieveUserQuotaSummary` per account. Today's readings were taken this
 way. **[live]**
+
+### Side by side: a second account in its own home **[live + code, 2026-11-11, `agy` 1.5.6]**
+
+Question: can `agy` run as `second@example.com` while every other client stays on
+`first@example.com`, without touching the shared slot? Yes. Built as `tokeman agy run`
+(`src/providers/antigravity/run.rs`).
+
+**How agy picks its token store [code, disassembled from the 1.5.6 binary].** Every token store in
+agy is a `codeassistclient.compositeTokenStorage`, built by `NewCompositeTokenStorage` (callers: the
+CLI backend, ACP auth, remote-control `SeedToken`, the feature provider, the hub's auth client). The
+constructor sets a `useFileStatic` flag, and the store is then file-only for its whole life, when:
+
+1. the caller asks for it (`Using file-based token storage because the caller requested it`);
+2. `shouldBypassKeyring` reports an environment (`... because %s detected`). It runs five detectors
+   in order in a goroutine: Android (`GOOS == "android"`), **SSH (`SSH_TTY`, `SSH_CLIENT` or
+   `SSH_CONNECTION` non-empty)**, WSL, container (`/.dockerenv`, or `docker`/`containerd`/`kubepods`
+   in `/proc/1/cgroup`), D-Bus (always false on macOS);
+3. a keyring-timeout marker newer than one hour exists at
+   `os.UserHomeDir()/.gemini/cache/<name>-keyring-unavailable` (`... because a keyring timeout was
+   recorded within the last %v`).
+
+With the flag set, `SaveToken`, `LoadToken`, `LoadStoredToken`, `UpdateStoredToken` and
+`RemoveToken` (which is what `/logout` and ACP `logout` call) go straight to the file store,
+`<gemini dir>/antigravity-cli/antigravity-oauth-token`; nothing reaches go-keyring. Every Keychain
+delete in the binary (`removeKeyringQuietly`, which logs `Failed to clear stale keyring credential
+after file fallback`, and `purgeTokenStorage`) sits in the keyring-mode branches: a keyring-mode
+save when a file token exists (`saveTokenWithExistingFileState`), a failed keyring write
+(`fallbackSaveTokenToFile`), and a migration. That keyring-mode save is the mechanism behind
+antigravity-cli #1514 and its mirror image: a keyring-mode agy next to a file token deletes the
+Keychain item.
+
+**The detection has a 500 ms timer [code].** `shouldBypassKeyring` waits on the detector goroutine
+with `time.NewTimer(500ms)`. If the timer wins, it returns false (`detection timeout`) and the store
+is a **keyring** store. A process that is descheduled for half a second at startup (heavy load,
+sleep) can therefore come up in keyring mode even with `SSH_TTY` set, and every store construction
+runs the race again (an `agy acp` built two at `session/new`). `SSH_TTY` alone is a strong default,
+not a guarantee.
+
+**A HOME without `Library` hides the login keychain [live].** go-keyring drives `/usr/bin/security`,
+and `security` finds the user's keychains through `$HOME/Library`: with `HOME` set to a directory
+without `Library`, `security list-keychains` shows only `/Library/Keychains/System.keychain`,
+`security default-keychain` finds none, and `find-generic-password -s gemini -a antigravity` exits
+44 (not found). A keyring-mode agy in such a home cannot read, write or delete the slot.
+
+**What was run.** The slot was backed up (839 bytes, read back equal), along with the small files in
+`~/.gemini/antigravity-cli/` and `~/.gemini/`. The hub app was running and had written the slot
+last (its value carries `writer_id`); no `agy` CLI process was running. The second account's token
+file was minted from tokeman's stored grant in agy's own JSON shape. After every step the slot was
+compared byte for byte with the backup and the real files were hashed.
+
+| run (throwaway home) | storage | account | slot | real `~/.gemini` |
+|---|---|---|---|---|
+| `HOME` + `SSH_TTY`, fresh token, `agy models` | file (`SSH session detected`) | second | identical | unchanged |
+| same, expired token (forced refresh) | file; `token refreshed`; the file was rewritten with the new expiry and the same refresh token | second | identical | unchanged |
+| `HOME` + `SSH_TTY` only (no other variable) | file; agy also spawned its background updater once (the update check is per home) | second | identical | unchanged |
+| `HOME` alone, fresh token | **keyring mode**, token loaded from the file because the keychain was unreachable | second | identical | unchanged |
+| `HOME` alone, expired token | keyring mode; refreshed, then `Keyring SaveToken timed out after 5s` | second | identical | unchanged |
+| real `HOME` + `SSH_TTY` + `--gemini_dir=<dir>` | file, everything under `<dir>` | second | identical | unchanged (no new log there) |
+| `HOME` = links to every real-home entry but `.gemini` and `Library`, + `SSH_TTY`, expired token | file; refreshed | second | identical | unchanged; git saw the user's identity |
+
+Interaction [live]: an `agy acp` server for the second account (file mode, own home, PID file) was
+started with a token that expired 12 minutes later. While it ran, `agy models` in the real home
+signed in as the first account from the Keychain (`ChainedAuth: authenticated via keyring`), and the
+server's `GetUserStatus` answered the second account. At its expiry the idle server refreshed by
+itself (`token refreshed`, 17:28:35) and rewrote only its own file (still 0600); the slot stayed
+identical. Then, with that server and a `tokeman agy run` session (both second account) still
+running, an interactive `agy` in the real home (not started by the test) refreshed the first
+account at 17:52:22: the slot then held the same refresh token with the new expiry and a
+`writer_id` (so CLI-mode agy writes `writer_id` too, not only the hub), and `agy models` in the
+real home signed in as the first account. Both test sessions still answered as the second account.
+Stopping them (by PID file) left the slot as it was and their token files in place.
+
+**Findings**
+
+- `SSH_TTY` set and a `HOME` of its own are both needed. `SSH_TTY` keeps agy away from the Keychain
+  by design; the `HOME` without `Library` keeps it away when the 500 ms detection loses. `HOME`
+  alone works, but in keyring mode: each save stalls 5 s on a keychain `security` cannot find, and
+  whether a dialog appears was not checked.
+- `--gemini_dir=<dir>` moves agy's whole data directory and the token file with it, and would let
+  the user's `HOME` stay. It gives up the second guard, and the timeout marker cannot replace it: the
+  marker is under the real `HOME`, so writing it would put the normal agy in file mode for an hour.
+- A file-mode refresh rewrites the file with the same refresh token: Google does not rotate it, so
+  tokeman's stored grant stays valid while a session runs, and a later `tokeman agy run` keeps the
+  file agy refreshed.
+- A per-account home lacks the user's dotfiles, which the commands agy runs need (git identity,
+  ssh, toolchains). Linking every entry of the real home except `.gemini` and `Library` restores
+  them and keeps the keychain hidden. Shared from the real `~/.gemini` by link: `GEMINI.md`, `skills`,
+  `antigravity-cli/settings.json`, `config/mcp_config.json`; agy read the linked settings (`CLI
+  settings initialized`) and left the links in place. Not shared: the token file, conversations and
+  `conversation_summaries.db`, history, logs, `installation_id`. So `agy -c` in a per-account home
+  resumes that home's last conversation, not the normal one's.
+- agy's background updater runs once per home (it writes `last_check.timestamp` there) and updates
+  the one binary on `PATH`, as it would from the normal home.
+- `ps -E` shows a process's environment to its owner, so a census can tell a per-account session
+  (`HOME=` under tokeman's homes) from a client of the slot.
+
+Left behind: the throwaway homes in the experiment's scratch directory. At the end the slot held
+the first account with the backup's refresh token; its access token was the one the real-home
+interactive agy refreshed at 17:52:22.
 
 ## Prior art
 

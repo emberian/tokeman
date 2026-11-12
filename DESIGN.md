@@ -96,11 +96,16 @@ src/
     antigravity/
       mod.rs     the quota read -> Limits scoped to their model group; its own access-token cache
       grant.rs   the Google OAuth refresh exchange; discover() from agy's Keychain item or token file and the app's
-                 state database (read-only decode)
-      seat.rs    agy's login slot through `/usr/bin/security -i` (locked, previous value backed up 0600, read back);
-                 use_account -> UseReport. Only `tokeman agy use` calls it
-      clients.rs the running clients of that slot (the app, `agy acp`, interactive agy): a bounded read-only census,
-                 loopback status calls, the resume command. Never a signal, never a logout
+                 state.vscdb (read-only protobuf decode)
+      seat.rs    agy's login slot through `/usr/bin/security -i` (locked, previous value backed up 0600, read back,
+                 written once more if it reads empty); use_account -> UseReport. Manual only (`tokeman agy use`); the
+                 daemon never seats
+      clients.rs the running clients of that slot: the hub app (its daemon file), `agy acp`, interactive agy, print-mode
+                 agy. Bounded read-only ps/lsof census; GetUserStatus and GetAuthStatus on loopback; the resume command
+                 from agy's history. Never a signal, never a logout. An agy whose HOME (ps -E) is a per-account home
+                 is a Session, not a client
+      run.rs     `tokeman agy run`: a per-account home under paths::agy_homes (token file from tokeman's grant, links
+                 to the real home but .gemini and Library), HOME + SSH_TTY so agy keeps its login in that file; exec
   daemon/
     mod.rs       the loop; install, uninstall, pause, resume, activate
     cycle.rs     one rotation cycle: refresh due grants, probe, observe, decide, install, record
@@ -113,7 +118,7 @@ src/
   commands/      what each command does, returning data; nothing here prints or reads the terminal
     claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
     codex.rs     add, remove, discover, import, list, refresh, use, watch, reset plan / claim / clear
-    services.rs  agy / glm / kimi: add, remove, import, the account agy holds, agy use
+    services.rs  agy / glm / kimi: add, remove, import, the account agy holds, agy use, agy run
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
     view.rs      probe (read now, record), stored / fresh / overview (the fleet view), ranked and best, history,

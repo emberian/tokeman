@@ -16,6 +16,10 @@
 //! absent on some lines); the last id recorded for a working directory is
 //! the conversation to resume there.
 //!
+//! An `agy` whose environment sets `HOME` to a per-account home under
+//! [`paths::agy_homes`] was started by `tokeman agy run`: it keeps its login in
+//! a file there, never in the slot, so it is a [`Session`], not a client.
+//!
 //! Everything here reads: `ps` and `lsof` with bounded waits, the daemon
 //! files, and those two RPCs. No process is signalled, and no RPC that logs a
 //! client out is ever sent (a logout deletes the slot for every client).
@@ -89,6 +93,8 @@ pub(super) struct Lookout {
     pub daemon_dir: PathBuf,
     /// `agy`'s prompt history.
     pub history: PathBuf,
+    /// Where `tokeman agy run` keeps its per-account homes.
+    pub homes: PathBuf,
 }
 
 impl Lookout {
@@ -98,6 +104,7 @@ impl Lookout {
             lsof: "/usr/sbin/lsof".into(),
             daemon_dir: paths::expand_tilde("~/.gemini/antigravity/daemon"),
             history: paths::expand_tilde("~/.gemini/antigravity-cli/history.jsonl"),
+            homes: paths::agy_homes(),
         }
     }
 }
@@ -261,9 +268,41 @@ async fn listening_ports(lookout: &Lookout, pid: u32) -> Vec<u16> {
     ports
 }
 
+/// An `agy` started by `tokeman agy run`, signed in from its own home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub pid: u32,
+    pub kind: ClientKind,
+    /// The per-account home's directory name under [`paths::agy_homes`].
+    pub home: String,
+    pub cwd: Option<PathBuf>,
+}
+
+/// The per-account home named by a `ps -E` line: the directory under `homes`
+/// that the environment's `HOME` points into. The environment follows the
+/// arguments, so the last `HOME=` wins.
+fn own_home(line: &str, homes: &Path) -> Option<String> {
+    let prefix = format!(" HOME={}/", homes.display());
+    let start = line.rfind(&prefix)? + prefix.len();
+    let name: String = line[start..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '/')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Every running client of the slot, hubs first, then `agy` processes by pid.
 /// An error is a census that could not be taken, never an empty list.
 pub(super) async fn census(lookout: &Lookout) -> Result<Vec<Running>> {
+    Ok(take(lookout).await?.0)
+}
+
+/// The `agy` processes running on a per-account home, by pid.
+pub(super) async fn sessions(lookout: &Lookout) -> Result<Vec<Session>> {
+    Ok(take(lookout).await?.1)
+}
+
+async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
     let everything = output(&lookout.ps, &["-axo", "pid=,comm="], CENSUS_TIMEOUT).await?;
     let alive: Vec<u32> = pid_lines(&everything).map(|(pid, _)| pid).collect();
     let agy: Vec<u32> = pid_lines(&everything)
@@ -271,22 +310,35 @@ pub(super) async fn census(lookout: &Lookout) -> Result<Vec<Running>> {
         .map(|(pid, _)| pid)
         .collect();
     let mut clients = hubs(&lookout.daemon_dir, &alive);
+    let mut sessions = Vec::new();
     if agy.is_empty() {
-        return Ok(clients);
+        return Ok((clients, sessions));
     }
     let pids = agy.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let lines = output(
-        &lookout.ps,
-        &["-ww", "-o", "pid=,args=", "-p", &pids],
-        CENSUS_TIMEOUT,
-    )
-    .await?;
-    let mut processes: Vec<(u32, ClientKind)> = pid_lines(&lines)
+    // macOS `ps -E` appends the environment of the user's own processes.
+    let environment: &[&str] = if cfg!(target_os = "macos") {
+        &["-E"]
+    } else {
+        &[]
+    };
+    let mut args = environment.to_vec();
+    args.extend(["-ww", "-o", "pid=,args=", "-p", &pids]);
+    let lines = output(&lookout.ps, &args, CENSUS_TIMEOUT).await?;
+    let mut processes: Vec<(u32, ClientKind, Option<String>)> = pid_lines(&lines)
         .filter(|(pid, _)| agy.contains(pid))
-        .map(|(pid, args)| (pid, classify(args)))
+        .map(|(pid, line)| (pid, classify(line), own_home(line, &lookout.homes)))
         .collect();
-    processes.sort_by_key(|(pid, _)| *pid);
-    for (pid, kind) in processes {
+    processes.sort_by_key(|(pid, _, _)| *pid);
+    for (pid, kind, home) in processes {
+        if let Some(home) = home {
+            sessions.push(Session {
+                pid,
+                kind,
+                home,
+                cwd: cwd(lookout, pid).await,
+            });
+            continue;
+        }
         clients.push(Running {
             kind,
             pid,
@@ -298,7 +350,7 @@ pub(super) async fn census(lookout: &Lookout) -> Result<Vec<Running>> {
             csrf: None,
         });
     }
-    Ok(clients)
+    Ok((clients, sessions))
 }
 
 /// A client for loopback RPCs only: no proxy, short waits.
@@ -544,6 +596,7 @@ cat "$dir/$kind-$pid"
             lsof: dir.join("lsof"),
             daemon_dir,
             history: dir.join("history.jsonl"),
+            homes: dir.join("agy-homes"),
         }
     }
 
@@ -635,9 +688,63 @@ cat "$dir/$kind-$pid"
         assert!(tools.lines().all(|line| {
             line.starts_with("ps -axo pid=,comm=")
                 || line.starts_with("ps -ww -o pid=,args= -p ")
+                || line.starts_with("ps -E -ww -o pid=,args= -p ")
                 || line.starts_with("lsof -a -p ")
                 || line.starts_with("lsof -nP -a -p ")
         }));
+    }
+
+    #[tokio::test]
+    async fn an_agy_on_a_per_account_home_is_a_session_not_a_client_of_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookout = lookout(
+            dir.path(),
+            &[
+                Proc {
+                    cwd: Some("/work/repo"),
+                    ..proc(20, "agy")
+                },
+                proc(30, "agy acp"),
+                proc(40, "agy"),
+            ],
+        );
+        let homes = lookout.homes.display().to_string();
+        // What `ps -E` prints: the arguments, then the environment.
+        std::fs::write(
+            dir.path().join("ps-args"),
+            format!(
+                "   20 agy -c PATH=/bin HOME={homes}/second@example.com SSH_TTY=/dev/tty\n\
+                 \x20  30 agy acp HOME={homes}/second@example.com/.gemini PWD=/x\n\
+                 \x20  40 agy --print=HOME={homes}/fake PATH=/bin HOME=/Users/first\n"
+            ),
+        )
+        .unwrap();
+        let clients = census(&lookout).await.unwrap();
+        assert_eq!(
+            clients.iter().map(|c| (c.kind, c.pid)).collect::<Vec<_>>(),
+            vec![(ClientKind::Print, 40)],
+            "only the agy on the real home shares the slot"
+        );
+        let sessions = super::sessions(&lookout).await.unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                Session {
+                    pid: 20,
+                    kind: ClientKind::Interactive,
+                    home: "second@example.com".into(),
+                    cwd: Some("/work/repo".into()),
+                },
+                Session {
+                    pid: 30,
+                    kind: ClientKind::Acp,
+                    home: "second@example.com".into(),
+                    cwd: None,
+                },
+            ]
+        );
+        assert_eq!(own_home(" HOME=/h/", Path::new("/h")), None);
+        assert_eq!(own_home("agy HOME=/other/x", Path::new("/h")), None);
     }
 
     #[test]

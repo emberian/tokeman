@@ -1431,6 +1431,55 @@ pub fn print_agy_use(report: &crate::providers::antigravity::seat::UseReport) {
     }
 }
 
+/// The line before `tokeman agy run` hands the terminal to agy, on stderr so
+/// agy's own output stays alone on stdout.
+pub fn print_agy_run(launch: &crate::providers::antigravity::run::Launch) {
+    use crate::providers::antigravity::run::Login;
+    match &launch.login {
+        Login::Normal => eprintln!(
+            "{DIM}agy is signed in as {}; running it as is{RESET}",
+            launch.account
+        ),
+        Login::Own { home } => eprintln!(
+            "{DIM}agy as {} (its own login in {}){RESET}",
+            launch.account,
+            crate::paths::tilde(home)
+        ),
+    }
+}
+
+/// After `tokeman agy list`'s gauges: the sessions on homes of their own, or
+/// the reason they could not be listed. Nothing when there are none.
+pub fn print_agy_sessions(
+    sessions: &anyhow::Result<Vec<crate::providers::antigravity::run::Session>>,
+) {
+    let sessions = match sessions {
+        Ok(sessions) if sessions.is_empty() => return,
+        Ok(sessions) => sessions,
+        Err(error) => {
+            println!("\n{DIM}agy sessions on their own login: not listed ({error:#}){RESET}");
+            return;
+        }
+    };
+    println!("\nagy on its own login (tokeman agy run):");
+    for session in sessions {
+        let account = session
+            .account
+            .clone()
+            .unwrap_or_else(|| format!("{} (no such account)", session.home));
+        let place = session
+            .cwd
+            .as_deref()
+            .map(|cwd| format!(" in {}", crate::paths::tilde(cwd)))
+            .unwrap_or_default();
+        println!(
+            "  {account}: {} pid {}{place}",
+            session.kind.label(),
+            session.pid
+        );
+    }
+}
+
 /// What `tokeman <service> list` says when the service has no account.
 pub fn print_no_accounts(service: Service) {
     println!(

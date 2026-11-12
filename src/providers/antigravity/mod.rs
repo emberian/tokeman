@@ -16,10 +16,11 @@
 //!
 //! [`grant`] holds the OAuth exchange and the discovery of logins on this
 //! machine, [`seat`] the `agy` login slot, [`clients`] the running clients
-//! that share that slot.
+//! that share that slot, [`run`] an `agy` on an account of its own beside it.
 
 pub mod clients;
 pub mod grant;
+pub mod run;
 pub mod seat;
 
 use std::collections::BTreeMap;

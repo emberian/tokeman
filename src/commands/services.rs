@@ -7,7 +7,7 @@ use std::path::Path;
 use super::view;
 use crate::account::Fleet;
 use crate::paths::tilde;
-use crate::providers::antigravity::seat;
+use crate::providers::antigravity::{run, seat};
 use crate::providers::{self, ServiceAccount};
 use crate::quota::{Reading, Service};
 
@@ -164,4 +164,30 @@ pub async fn agy_use(
         None => seat::UseTarget::Previous,
     };
     seat::use_account(providers::client(), target, options).await
+}
+
+/// Get agy ready to run as `name` beside the normal login: plain `agy` when
+/// the slot already holds that account, otherwise on the account's own home
+/// with a token file from tokeman's grant. The caller execs it.
+pub async fn agy_run(fleet: &Fleet, name: &str, args: Vec<String>) -> Result<run::Launch> {
+    let account = fleet
+        .service_account(name)
+        .filter(|account| account.service == Service::Antigravity)
+        .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?;
+    // Shells out to `security` with its own bound; an unreadable slot is
+    // "not this account", which takes the home of its own.
+    let held = account.clone();
+    let seated = tokio::task::spawn_blocking(move || {
+        seat::slot()
+            .ok()
+            .flatten()
+            .is_some_and(|slot| slot.holds(&held))
+    })
+    .await?;
+    run::prepare(providers::client(), account, seated, args).await
+}
+
+/// The agy sessions `tokeman agy run` started that are still running.
+pub async fn agy_sessions(fleet: &Fleet) -> Result<Vec<run::Session>> {
+    run::sessions(&fleet.services).await
 }

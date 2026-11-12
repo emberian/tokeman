@@ -228,6 +228,7 @@ tokeman agy list                   # read every account now
 tokeman agy best [--group claude]  # rank them by room left (on one model group, or on all)
 tokeman agy use <account>          # sign the agy CLI in as that account (macOS)
 tokeman agy use --previous         # put back the login the last `use` replaced
+tokeman agy run <account> [-- …]   # start agy as that account beside your normal login (macOS)
 ```
 
 Antigravity meters each model group apart, each with a weekly and a five-hour
@@ -243,6 +244,18 @@ Keychain, and `agy use` looks at what is running before it writes:
   one runs, with each process's PID, directory and the command that resumes
   its conversation. Quit it, run the command again, resume. `--force`
   switches anyway; it lasts until that process refreshes, within the hour.
+
+`tokeman agy run <account>` avoids switching: it starts agy with a login of
+its own, so two accounts can work side by side. The session gets a home under
+`~/.local/share/tokeman/agy-homes/<account>` that links to everything in your
+real home except `.gemini` and `Library`, a token file written from tokeman's
+grant, and `SSH_TTY`, which makes agy keep its login in that file and leave
+the shared Keychain item alone. It has its own conversations (`agy -c` there
+resumes that account's last one) and shares your `GEMINI.md`, skills, CLI
+settings and MCP config. Commands agy runs in it cannot reach the macOS
+keychain (git's https credential helper, for example). The account agy
+already holds runs plain `agy`. `agy list` shows these sessions, and `agy use`
+does not count them as a reason to refuse.
 
 `--dry-run` says what is running and what would happen, and writes nothing.
 
@@ -326,6 +339,7 @@ once into a PNG.
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.config/tokeman/antigravity-access-tokens.json` | Access tokens minted from the Antigravity grants |
 | `~/.config/tokeman/agy-login-backup.json` | The agy login the last `agy use` replaced |
+| `~/.local/share/tokeman/agy-homes/<account>/` | The home of a `tokeman agy run` session: its login file and conversations |
 | `~/.local/share/tokeman/snapshots.db` | Read history (sqlite): one row per reading that differs from the last, or per ten minutes |
 
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` are honoured, and

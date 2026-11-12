@@ -80,6 +80,11 @@ rewrites the plist, launcher and hook for the new binary.
   told and writes its account back at its next token refresh, so the switch
   is refused while one runs unless `--force`. Nothing is signalled or
   logged out.
+- `tokeman agy run <account> [-- <agy args>]` starts agy as an account
+  beside the normal login (macOS): a home of its own with a token file from
+  tokeman's grant, and `SSH_TTY` so agy keeps its login in that file and
+  never touches the shared Keychain item. `agy list` shows these sessions;
+  `agy use` ignores them.
 - `tokeman agy|glm|kimi best [--group <text>]` ranks the accounts by room:
   weekly room expiring within 24 hours first, and an account with a spent
   limit is left out.
