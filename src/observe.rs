@@ -299,17 +299,26 @@ fn is_anthropic_base_url(url: &str) -> bool {
 /// endpoint session must not be bound to an Anthropic account, or its own
 /// provider's limit messages would be charged to one.
 fn spends_anthropic_quota() -> bool {
-    if let Some(explicit) = env_flag(SPENDS_ENV) {
+    spends(
+        env_flag(SPENDS_ENV),
+        ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
+            .into_iter()
+            .any(|flag| env_flag(flag).unwrap_or(false)),
+        std::env::var(BASE_URL_ENV).ok().as_deref(),
+    )
+}
+
+/// [`spends_anthropic_quota`] over what the environment said: the explicit
+/// declaration, whether a Bedrock or Vertex flag is on, and the base URL.
+fn spends(explicit: Option<bool>, other_provider: bool, base_url: Option<&str>) -> bool {
+    if let Some(explicit) = explicit {
         return explicit;
     }
-    if ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
-        .into_iter()
-        .any(|flag| env_flag(flag).unwrap_or(false))
-    {
+    if other_provider {
         return false;
     }
-    match std::env::var(BASE_URL_ENV) {
-        Ok(url) if !url.trim().is_empty() => is_anthropic_base_url(url.trim()),
+    match base_url.map(str::trim) {
+        Some(url) if !url.is_empty() => is_anthropic_base_url(url),
         _ => true,
     }
 }
@@ -706,17 +715,7 @@ pub fn quarantine(
     resets_at: i64,
 ) -> Result<()> {
     let now = Utc::now().timestamp();
-    if resets_at <= now {
-        bail!("quarantine reset must be in the future");
-    }
-    if let Some(model) = &model
-        && Family::of(model.as_str()) != family
-    {
-        bail!(
-            "model '{model}' does not belong to the {} family",
-            family.label()
-        );
-    }
+    check_quarantine(family, model.as_ref(), resets_at, now)?;
     let _lock = lock()?;
     let mut state = load_state();
     prune(&mut state, now);
@@ -736,15 +735,42 @@ pub fn quarantine(
     save_state(&state)
 }
 
+/// What a quarantine may record: a reset still ahead, and a model of the
+/// family it is filed under.
+fn check_quarantine(
+    family: Family,
+    model: Option<&ModelKey>,
+    resets_at: i64,
+    now: i64,
+) -> Result<()> {
+    if resets_at <= now {
+        bail!("quarantine reset must be in the future");
+    }
+    if let Some(model) = model
+        && Family::of(model.as_str()) != family
+    {
+        bail!(
+            "model '{model}' does not belong to the {} family",
+            family.label()
+        );
+    }
+    Ok(())
+}
+
+/// Drop an account's limits, or only one family's. Returns how many went.
+fn clear_limits(limits: &mut Vec<ObservedLimit>, account: &str, family: Option<Family>) -> usize {
+    let before = limits.len();
+    limits.retain(|limit| {
+        limit.account != account || family.is_some_and(|family| limit.family != family)
+    });
+    before - limits.len()
+}
+
 /// Remove an account's limits, or only one family's. Returns how many went.
 pub fn clear_quarantine(account: &str, family: Option<Family>) -> Result<usize> {
     let _lock = lock()?;
     let mut state = load_state();
-    let before = state.limits.len();
-    state.limits.retain(|limit| {
-        limit.account != account || family.is_some_and(|family| limit.family != family)
-    });
-    let removed = before - state.limits.len();
+    let removed = clear_limits(&mut state.limits, account, family);
     if removed > 0 {
         save_state(&state)?;
     }
@@ -754,9 +780,16 @@ pub fn clear_quarantine(account: &str, family: Option<Family>) -> Result<usize> 
 /// The hook's record for a live process, matched by pid and start time
 /// (within two seconds, the resolution `ps` reports).
 pub fn binding_for_pid(pid: u32, started_at: i64) -> Option<Binding> {
-    load_state()
-        .sessions
-        .into_values()
+    bound_to(load_state().sessions.into_values(), pid, started_at)
+}
+
+/// The newest of `sessions` recorded for this pid and start time.
+fn bound_to(
+    sessions: impl Iterator<Item = SessionBinding>,
+    pid: u32,
+    started_at: i64,
+) -> Option<Binding> {
+    sessions
         .filter(|binding| binding.pid == Some(pid))
         .filter(|binding| {
             binding
@@ -914,10 +947,30 @@ mod tests {
             ("http://localhost:8317/v1", false),
             ("https://api.anthropic.com.evil.test/v1", false),
             ("https://notanthropic.com", false),
+            // What precedes an `@` is a login, not the host.
+            ("https://api.anthropic.com@evil.test/v1", false),
+            ("https://user:secret@api.anthropic.com/v1", true),
+            ("http://[::1]:8317/v1", false),
         ];
         for (url, anthropic) in cases {
             assert_eq!(is_anthropic_base_url(url), anthropic, "{url}");
         }
+    }
+
+    #[test]
+    fn only_a_session_that_reaches_anthropic_is_bound_to_an_account() {
+        // Nothing set: Claude Code talks to Anthropic.
+        assert!(spends(None, false, None));
+        assert!(spends(None, false, Some("  ")));
+        // Bedrock, Vertex and a third-party endpoint spend someone else's quota.
+        assert!(!spends(None, true, None));
+        assert!(!spends(None, true, Some("https://api.anthropic.com")));
+        assert!(!spends(None, false, Some("https://api.z.ai/api/anthropic")));
+        assert!(spends(None, false, Some(" https://api.anthropic.com/v1 ")));
+        // TOKEMAN_SESSION_SPENDS overrides both ways: a gateway to
+        // Anthropic, and a session to be left out.
+        assert!(spends(Some(true), true, Some("http://127.0.0.1:8317")));
+        assert!(!spends(Some(false), false, None));
     }
 
     #[test]
@@ -965,8 +1018,25 @@ mod tests {
             local("session limit · resets 3pm (America/New_York)", afternoon),
             "2026-07-28 3pm"
         );
+        // A date already past this year is next year's.
+        let december = Local
+            .with_ymd_and_hms(2026, 12, 30, 16, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            local(
+                "weekly limit · resets Jan 2 at 9am (America/New_York)",
+                december
+            ),
+            "2027-01-02 9am"
+        );
         assert_eq!(parse_clock("12:30am"), NaiveTime::from_hms_opt(0, 30, 0));
+        assert_eq!(parse_clock("12pm"), NaiveTime::from_hms_opt(12, 0, 0));
+        assert_eq!(parse_clock("11:30PM"), NaiveTime::from_hms_opt(23, 30, 0));
+        assert_eq!(parse_clock("9am"), NaiveTime::from_hms_opt(9, 0, 0));
         assert_eq!(parse_clock("13pm"), None);
+        assert_eq!(parse_clock("9"), None);
     }
 
     #[test]
@@ -1018,8 +1088,13 @@ mod tests {
             &mut failed,
             &limit(Family::General, None, LimitWindow::Session),
         );
-        assert_eq!(failed.session(), None);
+        apply_limit(
+            &mut failed,
+            &limit(Family::General, None, LimitWindow::Weekly),
+        );
+        assert!(failed.limits.is_empty(), "a failed read gains no window");
         assert_eq!(failed.verdict(), Verdict::Unknown);
+        assert!(failed.is_refused());
     }
 
     #[test]
@@ -1050,6 +1125,8 @@ mod tests {
             unknown.resets_at,
             1_785_185_840 + WEEKLY_FALLBACK.num_seconds()
         );
+        let unknown = limit_from_message(&binding, "session limit reached", 1_785_185_840).unwrap();
+        assert_eq!(unknown.resets_at, 1_785_185_840 + 6 * 3_600);
     }
 
     #[test]
@@ -1138,10 +1215,40 @@ mod tests {
             session_id: Some("new".into()),
             ..limit(Family::Opus, None, LimitWindow::Weekly)
         };
-        assert!(merge_limit(&mut limits, replacement));
+        assert!(merge_limit(&mut limits, replacement.clone()));
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].resets_at, 3_000);
         assert_eq!(limits[0].session_id.as_deref(), Some("new"));
+
+        // A transcript scanned late: an older rejection of an earlier
+        // window does not replace the newer one.
+        let stale = ObservedLimit {
+            observed_at: 1_500,
+            resets_at: 1_800,
+            session_id: Some("late".into()),
+            ..replacement.clone()
+        };
+        assert!(!merge_limit(&mut limits, stale));
+        assert_eq!(limits[0].resets_at, 3_000);
+        // Another model's wall, another account's and another window's are
+        // each their own.
+        for other in [
+            ObservedLimit {
+                model: Some(ModelKey::new("claude-opus-4-8")),
+                ..replacement.clone()
+            },
+            ObservedLimit {
+                account: "second".into(),
+                ..replacement.clone()
+            },
+            ObservedLimit {
+                window: LimitWindow::Session,
+                ..replacement.clone()
+            },
+        ] {
+            assert!(merge_limit(&mut limits, other));
+        }
+        assert_eq!(limits.len(), 4);
     }
 
     #[test]
@@ -1183,6 +1290,25 @@ mod tests {
             })
         )
         .unwrap();
+        // Past the byte boundary: a record a fork carried over from before
+        // the session began, the same words said by the user and by the
+        // model, and another kind of error.
+        writeln!(transcript, "{}", rejection(observed_at - 30)).unwrap();
+        for (kind, error) in [
+            ("user", Some("rate_limit")),
+            ("assistant", None),
+            ("assistant", Some("overloaded")),
+        ] {
+            let mut record = rejection(observed_at + 1);
+            record["type"] = json!(kind);
+            match error {
+                Some(error) => record["error"] = json!(error),
+                None => {
+                    record.as_object_mut().unwrap().remove("error");
+                }
+            }
+            writeln!(transcript, "{record}").unwrap();
+        }
         writeln!(transcript, "{}", rejection(observed_at + 1)).unwrap();
         transcript.flush().unwrap();
 
@@ -1256,7 +1382,127 @@ mod tests {
     }
 
     #[test]
-    fn limits_describe_themselves_and_bindings_match_by_start_time() {
+    fn the_admission_state_forgets_passed_resets_and_old_sessions() {
+        let now = 1_794_000_000;
+        let session = |id: &str, observed_at| SessionBinding {
+            session_id: id.into(),
+            observed_at,
+            ..binding(None)
+        };
+        let until = |resets_at| ObservedLimit {
+            resets_at,
+            ..limit(Family::Opus, None, LimitWindow::Weekly)
+        };
+        let fortnight = SESSION_RETENTION.num_seconds();
+        assert_eq!(fortnight, 14 * 86_400);
+        let mut state = AdmissionState {
+            sessions: [
+                session("recent", now - 3_600),
+                session("edge", now - fortnight),
+                session("old", now - fortnight - 1),
+            ]
+            .into_iter()
+            .map(|session| (session.session_id.clone(), session))
+            .collect(),
+            limits: vec![until(now + 1), until(now), until(now - 1)],
+        };
+        prune(&mut state, now);
+        assert_eq!(
+            state.sessions.keys().collect::<Vec<_>>(),
+            ["edge", "recent"]
+        );
+        assert_eq!(
+            state.limits.iter().map(|l| l.resets_at).collect::<Vec<_>>(),
+            [now + 1]
+        );
+    }
+
+    #[test]
+    fn clearing_a_quarantine_takes_one_accounts_limits_or_one_family_of_them() {
+        let of = |account: &str, family| ObservedLimit {
+            account: account.into(),
+            ..limit(family, None, LimitWindow::Weekly)
+        };
+        let all = || {
+            vec![
+                of("ember", Family::Opus),
+                of("ember", Family::Fable),
+                of("ember", Family::General),
+                of("second", Family::Opus),
+            ]
+        };
+        let left = |limits: &[ObservedLimit]| -> Vec<(String, Family)> {
+            limits
+                .iter()
+                .map(|limit| (limit.account.clone(), limit.family))
+                .collect()
+        };
+        let mut limits = all();
+        assert_eq!(clear_limits(&mut limits, "ember", Some(Family::Opus)), 1);
+        assert_eq!(
+            left(&limits),
+            [
+                ("ember".to_owned(), Family::Fable),
+                ("ember".to_owned(), Family::General),
+                ("second".to_owned(), Family::Opus)
+            ]
+        );
+        let mut limits = all();
+        assert_eq!(clear_limits(&mut limits, "ember", None), 3);
+        assert_eq!(left(&limits), [("second".to_owned(), Family::Opus)]);
+        assert_eq!(clear_limits(&mut limits, "nobody", None), 0);
+    }
+
+    #[test]
+    fn a_quarantine_needs_a_reset_ahead_and_a_model_of_its_family() {
+        let opus48 = ModelKey::new("claude-opus-4-8");
+        assert!(check_quarantine(Family::Opus, Some(&opus48), 101, 100).is_ok());
+        assert!(check_quarantine(Family::General, None, 101, 100).is_ok());
+        let past = check_quarantine(Family::Opus, None, 100, 100).unwrap_err();
+        assert!(past.to_string().contains("in the future"), "{past}");
+        let wrong = check_quarantine(Family::Fable, Some(&opus48), 101, 100).unwrap_err();
+        assert!(wrong.to_string().contains("Fable family"), "{wrong}");
+    }
+
+    #[test]
+    fn a_live_process_is_matched_to_its_hook_record_by_pid_and_start_time() {
+        let record = |id: &str, pid, started, observed_at| SessionBinding {
+            session_id: id.into(),
+            pid: Some(pid),
+            process_started_at: Some(started),
+            observed_at,
+            ..binding(None)
+        };
+        let sessions = || {
+            vec![
+                record("first", 500, 1_000, 10),
+                // The same process after /clear: the newer record.
+                record("cleared", 500, 1_001, 20),
+                // The pid reused by a later process.
+                record("reused", 500, 9_000, 30),
+                record("other", 501, 1_000, 40),
+                SessionBinding {
+                    process_started_at: None,
+                    ..record("unknown-start", 502, 0, 50)
+                },
+            ]
+            .into_iter()
+        };
+        let found = |pid, started| bound_to(sessions(), pid, started).map(|b| b.session_id);
+        assert_eq!(found(500, 1_002).as_deref(), Some("cleared"));
+        assert_eq!(found(500, 9_001).as_deref(), Some("reused"));
+        assert_eq!(found(500, 5_000), None, "the pid alone is not the process");
+        assert_eq!(
+            found(500, 1_004),
+            None,
+            "three seconds apart is another start"
+        );
+        assert_eq!(found(502, 0), None);
+        assert_eq!(found(777, 1_000), None);
+    }
+
+    #[test]
+    fn limits_describe_themselves_and_the_command_line_names_the_model() {
         let limit = limit(Family::Opus, Some("claude-opus-4-8"), LimitWindow::Weekly);
         assert!(
             limit

@@ -40,6 +40,7 @@ mod tests {
         assert_eq!(one_line("a\n  b\tc", 10), "a b c");
         assert_eq!(one_line("  a\n  b\t c ", 10), "a b c");
         assert_eq!(one_line("ééééé", 3), "ééé…");
+        assert_eq!(one_line("ééé", 3), "ééé", "three characters, six bytes");
         assert_eq!(one_line("💥💥💥", 2), "💥💥…");
     }
 
@@ -52,6 +53,7 @@ mod tests {
     #[test]
     fn a_missing_or_unreadable_reset_is_none_pending() {
         assert_eq!(parse_reset(Some("1970-01-01T00:01:00Z")), 60);
+        assert_eq!(parse_reset(Some("1970-01-01T02:00:00+01:00")), 3_600);
         assert_eq!(parse_reset(Some("soon")), 0);
         assert_eq!(parse_reset(None), 0);
     }

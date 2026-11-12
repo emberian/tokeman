@@ -335,6 +335,15 @@ mod tests {
         let only = history("a", 0.54, 0.60, NOW + 5 * DAY);
         let forecast = run(&[only], &[], 0.05).unwrap();
         assert!((dry_in_hours(&forecast) - 35.0).abs() < 0.01);
+        // And from the window a reset gives back: 5% lasts past the reset
+        // in 4 hours, then 95% lasts 95 more.
+        let resetting = history("a", 0.84, 0.90, NOW + 4 * HOUR);
+        let forecast = run(&[resetting], &[], 0.05).unwrap();
+        assert!(
+            (dry_in_hours(&forecast) - 99.0).abs() < 0.01,
+            "{}",
+            dry_in_hours(&forecast)
+        );
     }
 
     #[test]
@@ -379,7 +388,16 @@ mod tests {
     #[test]
     fn room_that_outlasts_the_week_has_no_time_and_no_use_is_idle() {
         let slow = history("a", 0.100, 0.106, NOW + 6 * DAY);
-        assert_eq!(run(&[slow], &[], 0.0).unwrap().outlook, Outlook::Beyond);
+        assert_eq!(
+            run(std::slice::from_ref(&slow), &[], 0.0).unwrap().outlook,
+            Outlook::Beyond
+        );
+        // Resets on offer add nothing to say when nothing runs dry.
+        let offered = run(&[slow], &[2], 0.0).unwrap();
+        assert_eq!(
+            (offered.outlook, offered.refills, offered.with_resets),
+            (Outlook::Beyond, 2, None)
+        );
         let idle = history("a", 0.3, 0.3, NOW + 6 * DAY);
         let forecast = run(&[idle], &[], 0.0).unwrap();
         assert_eq!(forecast.outlook, Outlook::Idle);
@@ -428,6 +446,26 @@ mod tests {
         assert!((on_fable.room - 0.30).abs() < 1e-9, "{}", on_fable.room);
         let on_any = forecast(Service::Claude, &[input], None, 0.0, NOW).unwrap();
         assert!((on_any.room - 0.80).abs() < 1e-9);
+        // A reset gives Fable back its share of the weekly, not a whole
+        // weekly: 30% at 1%/h lasts past the reset in 10 hours, then 50%
+        // lasts 50 more.
+        let mut resetting = history("a", 0.14, 0.20, NOW + 10 * HOUR);
+        for reading in &mut resetting {
+            let mut limit = model_limit("fable", "Fable", 0.4, Source::Profile);
+            limit.share = Some(0.5);
+            reading.limits.push(limit);
+        }
+        let input = Input {
+            latest: resetting.last().unwrap(),
+            recent: &resetting,
+            refills: 0,
+        };
+        let on_fable = forecast(Service::Claude, &[input], Some(&fable), 0.0, NOW).unwrap();
+        assert!(
+            (dry_in_hours(&on_fable) - 60.0).abs() < 0.01,
+            "{}",
+            dry_in_hours(&on_fable)
+        );
     }
 
     #[test]
@@ -464,6 +502,69 @@ mod tests {
         };
         assert_eq!(forecast(Service::Claude, &[input], None, 0.0, NOW), None);
         assert_eq!(forecast(Service::Claude, &[], None, 0.0, NOW), None);
+    }
+
+    #[test]
+    fn the_rate_is_the_use_gained_inside_one_reset_window_over_the_time_it_covers() {
+        let rate = |reads: &[(i64, f64, i64)]| {
+            let recent: Vec<Reading> = reads
+                .iter()
+                .map(|(hours_ago, used, reset)| weekly("a", NOW - hours_ago * HOUR, *used, *reset))
+                .collect();
+            run(&[recent], &[], 0.0).map(|forecast| forecast.rate)
+        };
+        let close = |rate: Option<f64>, want: f64| {
+            let rate = rate.unwrap();
+            assert!((rate - want).abs() < 1e-9, "{rate} is not {want}");
+        };
+        let (old, new) = (NOW - HOUR - 1, NOW + 7 * DAY);
+        // Two hours of reads, not the six the rate is named for: 10%/h.
+        close(
+            rate(&[(2, 0.10, new), (1, 0.20, new), (0, 0.30, new)]),
+            0.10,
+        );
+        // The window reset between the second and third read, and the new
+        // one reads higher: that jump is not use.
+        close(
+            rate(&[
+                (3, 0.10, old),
+                (2, 0.20, old),
+                (1, 0.50, new),
+                (0, 0.60, new),
+            ]),
+            0.10,
+        );
+        // A value the server took back is not negative use.
+        close(
+            rate(&[
+                (3, 0.30, new),
+                (2, 0.20, new),
+                (1, 0.25, new),
+                (0, 0.35, new),
+            ]),
+            0.075,
+        );
+        // One hour of one window is enough to call a rate; less is not.
+        close(rate(&[(1, 0.10, new), (0, 0.12, new)]), 0.02);
+        assert_eq!(
+            rate(&[(2, 0.10, old), (1, 0.50, new), (0, 0.52, new)]).map(|rate| rate > 0.0),
+            Some(true),
+            "the hour after the reset counts"
+        );
+    }
+
+    #[test]
+    fn an_account_counts_through_its_longest_window() {
+        // A 5h window at its wall beside a weekly with room: the weekly is
+        // what the fleet runs dry on.
+        let mut recent = history("a", 0.54, 0.60, NOW + 5 * DAY);
+        for reading in &mut recent {
+            reading.set_session(Some(Window::new(0.99, NOW + HOUR)));
+        }
+        let forecast = run(&[recent], &[], 0.0).unwrap();
+        assert_eq!(forecast.span, Span::Weekly);
+        assert!((forecast.room - 0.40).abs() < 1e-9, "{}", forecast.room);
+        assert!((dry_in_hours(&forecast) - 40.0).abs() < 0.01);
     }
 
     #[test]
