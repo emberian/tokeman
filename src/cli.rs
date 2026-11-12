@@ -79,7 +79,10 @@ pub enum Command {
         action: RotateAction,
     },
     /// Show recent stored reads of one service
+    #[command(args_conflicts_with_subcommands = true)]
     History {
+        #[command(subcommand)]
+        action: Option<HistoryAction>,
         /// Which service's reads
         #[arg(long, value_enum, default_value = "claude")]
         service: ServiceArg,
@@ -129,6 +132,22 @@ pub enum Command {
     Settings {
         #[command(subcommand)]
         action: Option<SettingsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HistoryAction {
+    /// Bring the reads builds before 0.4 stored into this build's table, once
+    ///
+    /// Keeps the database as it was beside it (`snapshots.db.pre-0.4`),
+    /// rewrites the old tables under the rule a live read is stored by,
+    /// compares every account's history before and after, then drops the old
+    /// tables and reclaims their space. Safe to interrupt and run again. No
+    /// other tokeman reads or writes the history while it runs.
+    Compact {
+        /// Count what a run would keep; write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -654,6 +673,8 @@ mod tests {
             "tokeman rotate quarantine work --model fable --window weekly --until 1900000000",
             "tokeman rotate clear-quarantine work --model fable",
             "tokeman history --last 5 --json",
+            "tokeman history compact",
+            "tokeman history compact --dry-run",
             "tokeman stats",
             "tokeman chart --metric fable --hours 12",
             "tokeman settings",

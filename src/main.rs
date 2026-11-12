@@ -3,8 +3,8 @@ use clap::Parser;
 
 use tokeman::account::Fleet;
 use tokeman::cli::{
-    self, AgyAction, ClaudeAction, Cli, CodexAction, Command, KeyAction, RotateAction,
-    SettingsAction,
+    self, AgyAction, ClaudeAction, Cli, CodexAction, Command, HistoryAction, KeyAction,
+    RotateAction, SettingsAction,
 };
 use tokeman::commands::{claude, codex, rotate, services, view};
 use tokeman::daemon::cycle;
@@ -28,11 +28,12 @@ async fn main() -> Result<()> {
             }
             let overview = view::overview(&fleet, cli.fresh).await;
             if cli.json {
-                text::print_json(&overview)
+                text::print_json(&overview)?;
             } else {
                 text::print_overview(&overview);
-                Ok(())
             }
+            text::print_uncompacted(view::uncompacted());
+            Ok(())
         }
         Some(command) => dispatch(command).await,
     }
@@ -47,6 +48,7 @@ async fn dispatch(command: Command) -> Result<()> {
             } else {
                 text::print_list(&overview);
             }
+            text::print_uncompacted(view::uncompacted());
         }
         Command::Claude { action } => claude_command(action).await?,
         Command::Codex { action } => codex_command(action).await?,
@@ -56,6 +58,11 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate_command(action).await?,
         Command::History {
+            action: Some(HistoryAction::Compact { dry_run }),
+            ..
+        } => text::print_compaction(&view::compact(dry_run)?),
+        Command::History {
+            action: None,
             service,
             last,
             account,
@@ -68,9 +75,11 @@ async fn dispatch(command: Command) -> Result<()> {
             } else {
                 text::print_history(&readings);
             }
+            text::print_uncompacted(view::uncompacted());
         }
         Command::Stats { service } => {
-            text::print_stats(&view::stats(&Fleet::load()?, service.into()))
+            text::print_stats(&view::stats(&Fleet::load()?, service.into()));
+            text::print_uncompacted(view::uncompacted());
         }
         Command::Chart {
             service,
@@ -80,15 +89,20 @@ async fn dispatch(command: Command) -> Result<()> {
             iterm,
             width,
             height,
-        } => text::print_chart(&tokeman::ui::chart::run(&tokeman::ui::chart::Request {
-            service: service.into(),
-            hours,
-            metric,
-            output,
-            iterm,
-            width,
-            height,
-        })?),
+        } => {
+            let chart = tokeman::ui::chart::run(&tokeman::ui::chart::Request {
+                service: service.into(),
+                hours,
+                metric,
+                output,
+                iterm,
+                width,
+                height,
+            });
+            // Said first: a range with no reads in it is an error below.
+            text::print_uncompacted(view::uncompacted());
+            text::print_chart(&chart?);
+        }
         Command::Settings { action } => match action.unwrap_or(SettingsAction::Show) {
             SettingsAction::Show => text::print_settings(&view::settings()?),
             SettingsAction::Set { key, value } => {

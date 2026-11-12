@@ -13,7 +13,7 @@ use crate::quota::{
     Balance, Detail, Level, Limit, ModelKey, Reading, ResetCreditCount, Scope, Service,
     SessionLimit, Span, Verdict, Window,
 };
-use crate::store::Stats;
+use crate::store::{Stats, compact};
 use crate::ui::overview::{AccountView, Monitor, Origin, Overview};
 use crate::util::one_line;
 
@@ -784,6 +784,64 @@ pub fn print_history(readings: &[Reading]) {
         );
     }
     println!();
+}
+
+/// Said after a view of the history while reads from before 0.4 are still
+/// in their old tables.
+pub fn print_uncompacted(uncompacted: bool) {
+    if uncompacted {
+        eprintln!(
+            "{YELLOW}This history has reads from before 0.4 that are not shown.{RESET} Run \
+             `tokeman history compact` once to bring them in."
+        );
+    }
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1e6)
+}
+
+pub fn print_compaction(report: &compact::Report) {
+    use compact::Outcome;
+    let path = tilde(&report.path);
+    if report.outcome == Outcome::Nothing {
+        println!("{path} has no reads from before 0.4: nothing to compact.");
+        return;
+    }
+    let dry = report.outcome == Outcome::Rehearsed;
+    println!("\n {BOLD}tokeman history compact{RESET} — {path}\n");
+    for table in &report.tables {
+        let unreadable = match table.unreadable {
+            0 => String::new(),
+            count => format!("  {DIM}({count} unreadable, left out){RESET}"),
+        };
+        println!(
+            "   {:<18} {:>9} rows -> {:>8} {}{unreadable}",
+            table.table,
+            table.rows,
+            table.kept,
+            if dry { "would be kept" } else { "kept" },
+        );
+    }
+    if dry {
+        println!("\n   Dry run: nothing was written.\n");
+        return;
+    }
+    let accounts: u64 = report.tables.iter().map(|table| table.accounts).sum();
+    println!(
+        "\n   {accounts} accounts read the same before and after; the old tables are dropped."
+    );
+    println!(
+        "   {} -> {}",
+        megabytes(report.bytes_before),
+        megabytes(report.bytes_after)
+    );
+    if let Some(original) = &report.original {
+        println!(
+            "   The database as it was is kept at {}; delete it when you no longer want it.\n",
+            tilde(original)
+        );
+    }
 }
 
 /// `tokeman stats`: how fast each limit of each account is being used.
