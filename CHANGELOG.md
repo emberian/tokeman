@@ -226,6 +226,7 @@ rewrites the plist, launcher and hook for the new binary.
 | `tokeman add` | `tokeman claude add <name> <key>` |
 | `tokeman remove` | `tokeman claude remove <name>` |
 | `tokeman refresh` | `tokeman claude refresh [<account>]` |
+| `tokeman tray` | `the macOS menu-bar app: in the tokeman checkout, cd macos/tray && bash build.sh && open Tokeman.app` |
 
 ### Behaviour changes to know about
 

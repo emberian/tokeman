@@ -643,6 +643,10 @@ pub const REMOVED: &[(&[&str], &str)] = &[
     (&["add"], "tokeman claude add <name> <key>"),
     (&["remove"], "tokeman claude remove <name>"),
     (&["refresh"], "tokeman claude refresh [<account>]"),
+    (
+        &["tray"],
+        "the macOS menu-bar app: in the tokeman checkout, cd macos/tray && bash build.sh && open Tokeman.app",
+    ),
 ];
 
 /// The replacement for a removed spelling, when `args` (the words after the
@@ -886,6 +890,7 @@ mod tests {
             ("services import antigravity", "tokeman agy import"),
             ("services use a@example.com", "tokeman agy use"),
             ("services best antigravity", "tokeman agy best"),
+            ("tray", "the macOS menu-bar app"),
         ];
         for (line, replacement) in old {
             let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
