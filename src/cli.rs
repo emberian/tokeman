@@ -9,6 +9,7 @@ use crate::quota::Service;
 
 #[derive(Parser)]
 #[command(
+    version,
     name = "tokeman",
     about = "Keeps Claude Code, Codex and agy on a subscription account with room left, and shows the rest"
 )]

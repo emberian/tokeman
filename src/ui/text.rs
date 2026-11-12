@@ -166,7 +166,11 @@ pub fn error_text(reading: &Reading) -> Option<String> {
 fn brief_error(error: &str) -> String {
     let message = error.find('{').and_then(|start| {
         let body: serde_json::Value = serde_json::from_str(&error[start..]).ok()?;
-        let message = body["error"]["message"].as_str()?;
+        // The API's `{"error": {"message": …}}` or the token endpoint's
+        // `{"error": …, "error_description": …}`.
+        let message = body["error"]["message"]
+            .as_str()
+            .or_else(|| body["error_description"].as_str())?;
         Some(format!("{}{message}", &error[..start]))
     });
     message.unwrap_or_else(|| one_line(error, 200))
@@ -179,7 +183,8 @@ pub fn describe_login(account: &Account, now_ms: i64) -> String {
     };
     if let Some(error) = &login.error {
         return format!(
-            "login refused ({error}); run `tokeman claude login {}`",
+            "login refused ({}); run `tokeman claude login {}`",
+            brief_error(error),
             account.name
         );
     }
@@ -1564,6 +1569,23 @@ mod tests {
     use super::*;
     use crate::codex::probe::tests::{usage_body, weekly_only_body};
     use serde_json::json;
+
+    #[test]
+    fn an_error_with_a_json_body_is_shown_by_its_message() {
+        assert_eq!(
+            brief_error(
+                r#"token endpoint returned HTTP 400: {"error": "invalid_grant", "error_description": "Refresh token expired"}"#
+            ),
+            "token endpoint returned HTTP 400: Refresh token expired"
+        );
+        assert_eq!(
+            brief_error(
+                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"Not allowed."}}"#
+            ),
+            "HTTP 403: Not allowed."
+        );
+        assert_eq!(brief_error("network: timed out"), "network: timed out");
+    }
 
     #[test]
     fn text_helpers_count_characters_not_bytes() {

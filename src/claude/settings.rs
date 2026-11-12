@@ -163,17 +163,7 @@ pub fn describe_credential(account: &Account, now_ms: i64) -> String {
             ),
             None => "a full-scope login token".into(),
         },
-        Some(Credential::Setup(_)) => {
-            if account
-                .login
-                .as_ref()
-                .is_some_and(|login| login.error.is_some())
-            {
-                "its inference-only setup token (login refused; run `tokeman claude login`)".into()
-            } else {
-                "its inference-only setup token".into()
-            }
-        }
+        Some(Credential::Setup(_)) => "its inference-only setup token".into(),
         None => "no usable credential".into(),
     }
 }
@@ -329,7 +319,7 @@ mod tests {
         assert_eq!(event.expires_at, None);
         assert_eq!(
             describe_credential(&account, 0),
-            "its inference-only setup token (login refused; run `tokeman claude login`)"
+            "its inference-only setup token"
         );
         assert_eq!(
             describe_credential(&login_account("a", 8 * HOUR_MS), 0),
