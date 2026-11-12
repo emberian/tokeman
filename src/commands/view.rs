@@ -147,7 +147,12 @@ pub async fn fresh(fleet: &Fleet, only: Option<Service>) -> Overview {
 /// the only reader, and this is the stored view: no request is sent.
 /// Without it, or with `force`, every account is read now.
 pub async fn overview(fleet: &Fleet, force: bool) -> Overview {
-    if !force && Monitor::now().keeps_fresh() {
+    overview_under(fleet, force, Monitor::now()).await
+}
+
+/// [`overview`] under a given state of the background service.
+async fn overview_under(fleet: &Fleet, force: bool, monitor: Monitor) -> Overview {
+    if !force && monitor.keeps_fresh() {
         stored(fleet).await
     } else {
         fresh(fleet, None).await
@@ -541,6 +546,34 @@ mod tests {
         assert_eq!(winner(&[fuller, both], &fleet, None).unwrap(), "both");
         let limited = probe_from(&limited_body(), "limited", at);
         assert_eq!(winner(&[limited], &fleet, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_surface_reads_no_account_while_the_service_reads() {
+        use crate::ui::overview::Origin;
+        // An account whose read fails before a request is sent: a view read
+        // now carries that failure, a stored view has nothing of it.
+        let fleet = Fleet {
+            services: vec![ServiceAccount::with_key_file(
+                Service::Zai,
+                "glm",
+                "/nonexistent/zai-key",
+            )],
+            ..Fleet::default()
+        };
+        let viewed = overview_under(&fleet, false, Monitor::Running).await;
+        assert_eq!(viewed.origin, Origin::Stored);
+        assert_eq!(viewed.accounts[0].reading, None, "nothing was read");
+        for monitor in [Monitor::Paused, Monitor::Stopped, Monitor::NotInstalled] {
+            let read = overview_under(&fleet, false, monitor).await;
+            assert_eq!(read.origin, Origin::Fresh, "{monitor:?}");
+            let reading = read.accounts[0].reading.as_ref().expect("read now");
+            assert!(reading.error.is_some(), "{monitor:?}");
+        }
+        // `--fresh` reads even while the service runs.
+        let forced = overview_under(&fleet, true, Monitor::Running).await;
+        assert_eq!(forced.origin, Origin::Fresh);
+        assert!(forced.accounts[0].reading.is_some());
     }
 
     fn service_reading(service: Service, account: &str, groups: &[(&str, f64)]) -> Reading {

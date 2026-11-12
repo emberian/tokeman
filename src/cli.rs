@@ -799,6 +799,61 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_is_confirmed_only_by_yes_and_clear_goes_with_no_claim() {
+        let Some(Command::Claude {
+            action:
+                ClaudeAction::Reset {
+                    name,
+                    grant,
+                    session,
+                    yes,
+                    clear,
+                },
+        }) = parse("tokeman claude reset work").unwrap().command
+        else {
+            panic!("not a claude reset");
+        };
+        assert_eq!(
+            (name.as_deref(), grant, session, yes, clear),
+            (Some("work"), None, false, false, false)
+        );
+        let Some(Command::Codex {
+            action:
+                CodexAction::Reset {
+                    account,
+                    credit,
+                    yes,
+                    clear,
+                },
+        }) = parse("tokeman codex reset work").unwrap().command
+        else {
+            panic!("not a codex reset");
+        };
+        assert_eq!(
+            (account.as_str(), credit, yes, clear),
+            ("work", None, false, false)
+        );
+        for line in [
+            // Nothing is claimed without naming the account.
+            "tokeman claude reset --yes",
+            "tokeman claude reset --grant g1",
+            "tokeman claude reset --session",
+            "tokeman codex reset",
+            "tokeman codex reset --yes",
+            // One reset at a time.
+            "tokeman claude reset work --session --grant g1",
+            // Forgetting a claim never sends one.
+            "tokeman claude reset work --clear --yes",
+            "tokeman claude reset work --clear --grant g1",
+            "tokeman claude reset work --clear --session",
+            "tokeman codex reset work --clear --yes",
+            "tokeman codex reset work --clear --credit c1",
+        ] {
+            assert!(parse(line).is_err(), "{line} parses");
+        }
+    }
+
+    #[test]
     fn a_removed_spelling_does_not_parse_and_names_its_replacement() {
         let old = [
             ("launch", "tokeman claude launch"),

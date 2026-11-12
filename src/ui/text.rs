@@ -2244,6 +2244,28 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_badge_is_the_verdict_and_an_unread_account_is_an_error_or_no_quota() {
+        use crate::quota::ReadError;
+        let mut reading = crate::testing::reading("a", 0.1, 0.2);
+        let word = |reading: &Reading| badge(reading).unwrap();
+        assert_eq!(word(&reading), ("allowed".to_owned(), Some(Level::Ok)));
+        reading.claude_mut().verdict = Verdict::Rejected;
+        assert_eq!(
+            word(&reading),
+            ("REJECTED".to_owned(), Some(Level::Critical))
+        );
+        reading.claude_mut().verdict = Verdict::AllowedWarning;
+        assert_eq!(word(&reading), ("warning".to_owned(), Some(Level::Low)));
+        // No account-wide window: the read failed, or carried no quota.
+        reading.limits.clear();
+        assert_eq!(word(&reading), ("no quota".to_owned(), None));
+        reading.error = Some(ReadError::NoCredential);
+        assert_eq!(word(&reading), ("error".to_owned(), Some(Level::Critical)));
+        // A service without a detail has a badge only when its read failed.
+        assert_eq!(badge(&Reading::empty(Service::Kimi, "kimi", 0)), None);
+    }
+
+    #[test]
     fn truncation_counts_characters_not_bytes() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
     }

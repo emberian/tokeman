@@ -514,7 +514,67 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::Service;
+    use crate::quota::{ReadError, Service, SessionLimit, Source};
+    use crate::testing::{model_limit, reading, refused};
+
+    #[test]
+    fn a_reading_is_described_by_what_is_left_on_each_limit_that_counts() {
+        let mut probed = reading("a", 0.68, 0.75);
+        assert_eq!(describe(Some(&probed), None), "5h 32% left, 7d 25% left");
+        // Fable at 82% of a limit half the weekly's size: 9% of the weekly
+        // is left for it.
+        let mut fable = model_limit("fable", "Fable", 0.82, Source::Profile);
+        fable.share = Some(0.5);
+        probed.limits.push(fable);
+        let on_fable = ModelKey::new("claude-fable-5-1");
+        assert_eq!(
+            describe(Some(&probed), Some(&on_fable)),
+            "5h 32% left, 7d 25% left, Fable 7d 9% left"
+        );
+        // A limit on another model is not this session's.
+        let on_opus = ModelKey::new("claude-opus-4-8");
+        assert_eq!(
+            describe(Some(&probed), Some(&on_opus)),
+            "5h 32% left, 7d 25% left"
+        );
+        // An account without a 5-hour limit, and one that did not report it.
+        probed.set_session(None);
+        probed.claude_mut().session_limit = SessionLimit::Absent;
+        assert_eq!(
+            describe(Some(&probed), None),
+            "5h none (no 5h limit), 7d 25% left"
+        );
+        probed.claude_mut().session_limit = SessionLimit::Present;
+        assert_eq!(describe(Some(&probed), None), "5h unreported, 7d 25% left");
+        assert_eq!(describe(Some(&refused("a")), None), "quota unavailable");
+        assert_eq!(describe(None, None), "quota unavailable");
+    }
+
+    #[test]
+    fn coverage_counts_the_readings_with_quota_and_groups_the_rest_by_cause() {
+        let timeout = |name: &str| {
+            Reading::failed(
+                Service::Claude,
+                name,
+                0,
+                ReadError::Network {
+                    message: "timed out".into(),
+                },
+            )
+        };
+        let readings = [
+            reading("a", 0.1, 0.1),
+            refused("b"),
+            timeout("c"),
+            timeout("d"),
+            Reading::empty(Service::Claude, "e", 0),
+        ];
+        assert_eq!(
+            coverage_summary(&readings, 5),
+            "1/5 quota readings; unavailable [HTTP 401: b; network: c, d; no quota headers: e]"
+        );
+        assert_eq!(coverage_summary(&readings[..1], 1), "1/1 quota readings");
+    }
 
     #[test]
     fn what_a_sample_did_not_recognise_joins_its_accounts_read() {
