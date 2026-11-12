@@ -717,6 +717,11 @@ pub async fn reset_plan(
     .await
 }
 
+/// Forget `name`'s pending credit claim; the claim that was forgotten.
+pub fn reset_clear(name: &str) -> Result<Option<crate::claims::Pending>> {
+    crate::claims::Journal::default().clear(crate::quota::Service::Codex, name)
+}
+
 /// Send the claim `plan` describes.
 pub async fn reset_claim(plan: &resets::ResetPlan) -> Result<resets::Claim> {
     resets::claim(

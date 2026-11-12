@@ -8,14 +8,13 @@ use crate::claude::sessions;
 use crate::codex::probe::State;
 use crate::codex::resets as codex_resets;
 use crate::commands::codex::{self, Listed};
-use crate::daemon::status::Report;
 use crate::paths::tilde;
-use crate::quota::Scope;
 use crate::quota::{
-    Balance, CodexDetail, Level, Limit, Reading, ResetCreditCount, Service, SessionLimit, Span,
-    Verdict, Window,
+    Balance, Detail, Level, Limit, ModelKey, Reading, ResetCreditCount, Scope, Service,
+    SessionLimit, Span, Verdict, Window,
 };
 use crate::store::Stats;
+use crate::ui::overview::{AccountView, Monitor, Origin, Overview};
 use crate::util::one_line;
 
 const BAR_WIDTH: usize = 40;
@@ -49,22 +48,6 @@ pub fn mask_key(key: &str) -> String {
     } else {
         "****".into()
     }
-}
-
-/// `Opus 4.8` -> `O48`, `Fable` -> `Fab`: three characters for a column.
-pub fn short_bucket_label(label: &str) -> String {
-    let mut words = label.split_whitespace();
-    let name = words.next().unwrap_or("?");
-    let version: String = words
-        .flat_map(str::chars)
-        .filter(char::is_ascii_digit)
-        .collect();
-    let short = if version.is_empty() {
-        name.chars().take(3).collect::<String>()
-    } else {
-        format!("{}{version}", name.chars().next().unwrap_or('?'))
-    };
-    short.chars().take(3).collect()
 }
 
 /// Long and short names for the limit the server named as binding.
@@ -132,7 +115,7 @@ const LEVELS: [&str; 3] = [GREEN, YELLOW, RED];
 
 /// A forty-cell bar of the fraction left, coloured by level.
 pub fn bar(used: f64) -> String {
-    let remaining = 1.0 - used;
+    let remaining = (1.0 - used).clamp(0.0, 1.0);
     let filled = ((remaining * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
     let empty = BAR_WIDTH - filled;
     format!(
@@ -144,21 +127,63 @@ pub fn bar(used: f64) -> String {
     )
 }
 
-/// A word for the reading's state and the level to colour it with.
-pub fn status_badge(reading: &Reading) -> (&'static str, Option<Level>) {
-    if reading.session().is_none() && reading.weekly().is_none() {
-        return if reading.error.is_some() {
+/// A word for the reading's state and the level to colour it with: Claude's
+/// verdict, Codex's `ok` or `limited (...)`, `error` for a failed read of any
+/// service. `None` when a service that judges nothing answered.
+pub fn badge(reading: &Reading) -> Option<(String, Option<Level>)> {
+    let (word, level) = match &reading.detail {
+        Detail::Claude(claude) => {
+            if reading.shared().next().is_none() {
+                if reading.error.is_some() {
+                    ("error", Some(Level::Critical))
+                } else {
+                    ("no quota", None)
+                }
+            } else {
+                match claude.verdict {
+                    Verdict::Allowed => ("allowed", Some(Level::Ok)),
+                    Verdict::AllowedWarning => ("warning", Some(Level::Low)),
+                    Verdict::Rejected => ("REJECTED", Some(Level::Critical)),
+                    Verdict::Unknown => ("unknown", Some(Level::Low)),
+                }
+            }
+        }
+        Detail::Codex(_) => match State::of(reading) {
+            State::Ok => ("ok", Some(Level::Ok)),
+            State::Error { .. } => ("error", Some(Level::Critical)),
+            limited => return Some((limited.to_string(), Some(Level::Critical))),
+        },
+        Detail::None => {
+            reading.error.as_ref()?;
             ("error", Some(Level::Critical))
+        }
+    };
+    Some((word.to_owned(), level))
+}
+
+/// Why the read produced no quota, on one line: an API error body as its
+/// message, and for Codex what to run when the token was rejected.
+pub fn error_text(reading: &Reading) -> Option<String> {
+    let error = reading.error.as_ref()?;
+    let text = brief_error(&error.to_string());
+    Some(
+        if reading.service == Service::Codex && error.is_unauthorized() {
+            format!("{text}; needs `tokeman codex refresh`")
         } else {
-            ("no quota", None)
-        };
-    }
-    match reading.verdict() {
-        Verdict::Allowed => ("allowed", Some(Level::Ok)),
-        Verdict::AllowedWarning => ("warning", Some(Level::Low)),
-        Verdict::Rejected => ("REJECTED", Some(Level::Critical)),
-        Verdict::Unknown => ("unknown", Some(Level::Low)),
-    }
+            text
+        },
+    )
+}
+
+/// `HTTP 403: OAuth authentication is currently not allowed ...` for an
+/// error that carries the API's JSON body; any other error as it is.
+fn brief_error(error: &str) -> String {
+    let message = error.find('{').and_then(|start| {
+        let body: serde_json::Value = serde_json::from_str(&error[start..]).ok()?;
+        let message = body["error"]["message"].as_str()?;
+        Some(format!("{}{message}", &error[..start]))
+    });
+    message.unwrap_or_else(|| one_line(error, 200))
 }
 
 /// What an account's login is good for, for `tokeman list`.
@@ -239,81 +264,6 @@ fn login_lifetime(account: &Account, now_ms: i64) -> String {
     }
 }
 
-/// The gauges `tokeman` prints with no subcommand.
-pub fn print_readings(readings: &[Reading], probe_model: &str) {
-    let total = readings.len();
-    let ok = readings.iter().filter(|r| r.error.is_none()).count();
-    println!("\n {BOLD}tokeman{RESET} — {ok}/{total} accounts probed with {probe_model}\n");
-    for reading in readings {
-        println!(" {BOLD}{}{RESET}", reading.account);
-        let reported = reading.session().is_some() || reading.weekly().is_some();
-        match (&reading.error, reported) {
-            (Some(error), false) => println!("   {RED}error: {error}{RESET}"),
-            (_, true) => print_windows(reading),
-            (None, false) => println!(
-                "   {YELLOW}no unified quota headers (an API key rather than OAuth?){RESET}"
-            ),
-        }
-        print_buckets(reading);
-        println!();
-    }
-}
-
-fn print_windows(reading: &Reading) {
-    match reading.session() {
-        Some(w) => println!(
-            "   Session (5h) {}  resets {}",
-            bar(w.used),
-            format_reset(w.resets_at)
-        ),
-        None if reading.session_limit() == SessionLimit::Absent => {
-            println!("   Session (5h) {DIM}no 5h limit on this account{RESET}");
-        }
-        None => {}
-    }
-    if let Some(w) = reading.weekly() {
-        let warning = match w.remaining() {
-            r if r < 0.10 => format!("  {RED}!! critical{RESET}"),
-            r if r < 0.20 => format!("  {YELLOW}! low{RESET}"),
-            _ => String::new(),
-        };
-        println!(
-            "   Weekly  (7d) {}  resets {}{warning}",
-            bar(w.used),
-            format_reset(w.resets_at)
-        );
-    }
-    let claude = reading.claude();
-    if let Some(w) = reading.window(Span::Unknown, &Scope::extra_usage()) {
-        let disabled = claude
-            .and_then(|claude| claude.overage.as_ref())
-            .and_then(|overage| overage.disabled_reason.as_deref());
-        let label = match disabled {
-            Some("out_of_credits") => format!("Extra usage  {RED}(no credits){RESET}"),
-            Some(reason) => format!("Extra usage  {YELLOW}({reason}){RESET}"),
-            None => "Extra usage ".into(),
-        };
-        println!(
-            "   {label} {}  resets {}",
-            bar(w.used),
-            format_reset(w.resets_at)
-        );
-    }
-    let (word, level) = status_badge(reading);
-    let color = level.map_or(DIM, |level| super::level_color(level, LEVELS));
-    let claim = claude
-        .and_then(|claude| claude.claim.as_deref())
-        .map(|claim| claim_label(claim).map_or(claim, |(long, _)| long))
-        .unwrap_or("--");
-    println!("   Status: {color}{word}{RESET}  (limit: {claim})");
-    for line in claude
-        .map(|claude| signal_lines(&claude.signals))
-        .unwrap_or_default()
-    {
-        println!("   {DIM}{line}{RESET}");
-    }
-}
-
 /// What the headers said beyond the windows: none of it is room.
 pub fn signal_lines(signals: &crate::quota::Signals) -> Vec<String> {
     let mut lines = Vec::new();
@@ -343,31 +293,6 @@ pub fn signal_lines(signals: &crate::quota::Signals) -> Vec<String> {
         lines.push(format!("Could buy: {}", signals.upgrade_paths.join(", ")));
     }
     lines
-}
-
-fn print_buckets(reading: &Reading) {
-    if reading.models().next().is_none() {
-        let reason = match reading
-            .claude()
-            .and_then(|claude| claude.profile_error.as_ref())
-        {
-            Some(_) => "profile usage credential expired or unavailable",
-            None => "no per-model limits reported",
-        };
-        println!("   Model   (7d) --  {DIM}{reason}{RESET}");
-    }
-    for limit in reading.models() {
-        println!(
-            "   {:<12} {}  resets {}  {DIM}{}{}{RESET}",
-            format!("{} (7d)", limit.label),
-            bar(limit.window.used),
-            format_reset(limit.window.resets_at),
-            limit.source.label(),
-            share_note(limit, reading.weekly().as_ref())
-                .map(|note| format!("; {note}"))
-                .unwrap_or_default(),
-        );
-    }
 }
 
 /// `$21.96` for dollars, `21.96 EUR` for anything else.
@@ -415,24 +340,196 @@ pub fn limit_name(limit: &Limit) -> String {
     }
 }
 
-/// `5h 99% · weekly 79% · extra usage $21.96 of $50.00 left`, or the error:
-/// one service account on one line, without colour.
-pub fn usage_summary(usage: &Reading) -> String {
-    if let Some(error) = &usage.error {
-        return format!("error: {}", one_line(&error.to_string(), 100));
+/// The limits of a reading in the order every surface shows them: the
+/// account-wide windows, then each model's, then each group's, as reported.
+pub fn limits_in_order(reading: &Reading) -> Vec<&Limit> {
+    let rank = |limit: &Limit| match limit.scope {
+        Scope::All => 0,
+        Scope::Model(_) => 1,
+        Scope::Group(_) => 2,
+    };
+    let mut limits: Vec<&Limit> = reading.limits.iter().collect();
+    limits.sort_by_key(|limit| rank(limit));
+    limits
+}
+
+/// For a limit that is a share of the weekly: how much of the weekly it
+/// still allows.
+pub fn share_note(limit: &Limit, weekly: Option<&Window>) -> Option<String> {
+    limit.share.map(|share| {
+        format!(
+            "{:.0}% of the weekly, {:.0}% of the weekly left for it",
+            share * 100.0,
+            limit.room(weekly).max(0.0) * 100.0
+        )
+    })
+}
+
+/// What a surface says after a limit's gauge: that the server refuses on
+/// it, the absolute amount, where a model's reading came from, its share of
+/// the weekly, why extra usage is off.
+pub fn limit_note(limit: &Limit, reading: &Reading) -> Option<String> {
+    let mut parts = Vec::new();
+    if limit.is_rejected() {
+        parts.push("limited".to_owned());
     }
-    let mut parts: Vec<String> = usage
-        .limits
-        .iter()
-        .map(|meter| {
+    if let Some(amount) = &limit.amount {
+        parts.push(format!(
+            "{:.0}/{:.0} {}",
+            amount.used, amount.limit, amount.unit
+        ));
+    }
+    if limit.key().is_some() && limit.source != crate::quota::Source::Poll {
+        parts.push(limit.source.label().to_owned());
+    }
+    parts.extend(share_note(limit, reading.weekly().as_ref()));
+    if limit.scope == Scope::extra_usage()
+        && let Some(reason) = reading
+            .claude()
+            .and_then(|claude| claude.overage.as_ref())
+            .and_then(|overage| overage.disabled_reason.as_deref())
+    {
+        parts.push(match reason {
+            "out_of_credits" => "no credits".to_owned(),
+            other => other.to_owned(),
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// `2 reset credits (0 usable now)`.
+fn credits_text(credits: ResetCreditCount) -> String {
+    let plural = if credits.available == 1 { "" } else { "s" };
+    match credits.applicable {
+        Some(now) => format!(
+            "{} reset credit{plural} ({now} usable now)",
+            credits.available
+        ),
+        None => format!("{} reset credit{plural}", credits.available),
+    }
+}
+
+/// What a reading says beyond its limits, one line each: Claude's missing
+/// 5h limit, binding limit and header signals; Codex's email, reset
+/// credits, unavailable models and spending cap; any service's balances.
+pub fn notes(reading: &Reading) -> Vec<String> {
+    let mut notes = Vec::new();
+    match &reading.detail {
+        Detail::Claude(claude) => {
+            if reading.error.is_none() && reading.shared().next().is_none() {
+                notes.push("no unified quota headers (an API key rather than OAuth?)".to_owned());
+            }
+            if reading.session().is_none() && claude.session_limit == SessionLimit::Absent {
+                notes.push("no 5h limit on this account".to_owned());
+            }
+            if let Some(claim) = claude.claim.as_deref() {
+                notes.push(format!(
+                    "binding limit: {}",
+                    claim_label(claim).map_or(claim, |(long, _)| long)
+                ));
+            }
+            notes.extend(signal_lines(&claude.signals));
+            if claude
+                .overage
+                .as_ref()
+                .is_some_and(|overage| overage.in_use)
+            {
+                notes.push("extra usage is in use".to_owned());
+            }
+            if reading.has_quota() && reading.models().next().is_none() {
+                notes.push(
+                    match claude.profile_error {
+                        Some(_) => {
+                            "per-model limits unavailable (profile usage credential expired or unavailable)"
+                        }
+                        None => "no per-model limits reported",
+                    }
+                    .to_owned(),
+                );
+            }
+        }
+        Detail::Codex(codex) => {
+            notes.extend(codex.email.clone());
+            notes.extend(
+                codex
+                    .reset_credits
+                    .filter(|credits| credits.available > 0)
+                    .map(credits_text),
+            );
+            for model in codex.models.iter().filter(|model| model.is_unavailable()) {
+                let mut line = format!("model {} unavailable", model.slug);
+                if let Some(at) = model.available_at {
+                    line.push_str(&format!(" until {}", codex::fmt_epoch(at)));
+                }
+                if model.credits_would_enable == Some(true) {
+                    line.push_str(", credits would enable it");
+                }
+                notes.push(line);
+            }
+            if let Some(spend) = &codex.spend_control
+                && (spend.reached == Some(true) || spend.limit.is_some())
+            {
+                let mut line = format!(
+                    "spend control {}",
+                    if spend.reached == Some(true) {
+                        "reached"
+                    } else {
+                        "ok"
+                    }
+                );
+                if let Some(cap) = &spend.limit {
+                    line.push_str(&format!(
+                        ", used {} of {}",
+                        cap.used.as_deref().unwrap_or("?"),
+                        cap.limit.as_deref().unwrap_or("?")
+                    ));
+                    if let Some(percent) = cap.used_percent {
+                        line.push_str(&format!(" ({percent:.0}%)"));
+                    }
+                    if let Some(at) = cap.reset_at.filter(|at| *at > 0) {
+                        line.push_str(&format!(", resets {}", format_reset(at)));
+                    }
+                }
+                notes.push(line);
+            }
+        }
+        Detail::None => {}
+    }
+    notes.extend(reading.balances.iter().map(balance_text));
+    notes
+}
+
+/// `5h 99% · weekly 79% · extra usage $21.96 of $50.00 left`, or the error:
+/// one reading on one line, without colour. Each limit is named and says
+/// what is left of it.
+pub fn summary(reading: &Reading) -> String {
+    if let Some(error) = error_text(reading) {
+        return format!("error: {}", one_line(&error, 100));
+    }
+    let mut parts: Vec<String> = limits_in_order(reading)
+        .into_iter()
+        .map(|limit| {
             format!(
                 "{} {:.0}%",
-                limit_name(meter),
-                (meter.window.remaining().max(0.0) * 100.0).round()
+                limit_name(limit),
+                (limit.window.remaining().clamp(0.0, 1.0) * 100.0).round()
             )
         })
         .collect();
-    parts.extend(usage.balances.iter().map(balance_text));
+    parts.extend(reading.balances.iter().map(balance_text));
+    parts.extend(
+        reading
+            .codex()
+            .and_then(|codex| codex.reset_credits)
+            .filter(|credits| credits.available > 0)
+            .map(credits_text),
+    );
+    if let Some((word, Some(Level::Critical))) = badge(reading) {
+        parts.push(one_line(&word, 80));
+    }
+    if parts.is_empty() {
+        return "no limits reported".to_owned();
+    }
     parts.join(" · ")
 }
 
@@ -451,94 +548,180 @@ pub fn format_age(at: i64, now: i64) -> String {
     }
 }
 
-/// The services section of `tokeman list`: the last stored read of each
-/// configured service account, without network.
-///
-/// `seated` names the Antigravity account the agy CLI is signed in as; it is
-/// marked `*` like the Claude default.
-pub fn print_service_list(
-    accounts: &[crate::providers::ServiceAccount],
-    latest: &[Reading],
-    seated: Option<&str>,
-    now: i64,
-) {
-    if accounts.is_empty() {
-        return;
+/// A stored view older than this, with the background service running, is
+/// said to be stale.
+pub const STALE_SECS: i64 = 600;
+
+/// Where the view's readings come from and how old they are, on one line:
+/// `read now, 14/15 accounts answered`, or `stored view, last read 2m ago by
+/// the background service`.
+pub fn view_caption(overview: &Overview) -> String {
+    if overview.origin == Origin::Fresh {
+        return format!(
+            "read now, {}/{} accounts answered",
+            overview.answered(),
+            overview.accounts.len()
+        );
     }
-    println!("\n {BOLD}services{RESET}");
-    for account in accounts {
-        let read = latest
-            .iter()
-            .find(|usage| usage.service == account.service && usage.account == account.name);
-        let detail = match read {
-            Some(usage) => format!(
-                "{}{}  {DIM}({}){RESET}",
-                usage
-                    .plan
-                    .as_deref()
-                    .map(|plan| format!("[{plan}] "))
-                    .unwrap_or_default(),
-                usage_summary(usage),
-                format_age(usage.at, now)
-            ),
-            None => format!(
-                "{DIM}not read yet (`tokeman {} list`){RESET}",
-                crate::commands::services::command_word(account.service)
-            ),
-        };
-        let (marker, note) = if seated == Some(account.name.as_str()) {
-            ("*", format!("  {GREEN}agy's login{RESET}"))
+    let Some(read_at) = overview.read_at else {
+        return "stored view, nothing read yet".to_owned();
+    };
+    let age = format_age(read_at, overview.at);
+    match overview.monitor {
+        Monitor::Running if overview.at - read_at > STALE_SECS => {
+            format!("stored view, STALE: the background service last read {age}")
+        }
+        Monitor::Running => format!("stored view, last read {age} by the background service"),
+        Monitor::Paused => format!("stored view, last read {age}; rotation is paused"),
+        Monitor::NotInstalled => format!("stored view, last read {age}; no background service"),
+    }
+}
+
+/// What holding an account means for its service.
+fn held_note(service: Service) -> &'static str {
+    match service {
+        Service::Claude => "the default",
+        Service::Antigravity => "agy's login",
+        _ => "in use",
+    }
+}
+
+/// One account as a card: a heading, a gauge per limit, then what else the
+/// reading says. `target` is the model Claude starts on; a limit on it is
+/// marked `*`. `aged_at` is the view's time when its readings are stored
+/// ones, so each card says how old its reading is.
+pub fn account_lines(
+    account: &AccountView,
+    target: Option<&ModelKey>,
+    aged_at: Option<i64>,
+) -> Vec<String> {
+    let reading = account.reading.as_ref();
+    let mut head = format!(" {BOLD}{}{RESET} — {}", account.name, account.service_label);
+    if let Some(plan) = reading.and_then(|reading| reading.plan.as_deref()) {
+        head.push_str(&format!("  {DIM}[{plan}]{RESET}"));
+    }
+    if let Some(label) = &account.label {
+        head.push_str(&format!("  {DIM}{label}{RESET}"));
+    }
+    if account.parked {
+        head.push_str(&format!("  {DIM}parked{RESET}"));
+    }
+    if account.held {
+        head.push_str(&format!("  {GREEN}* {}{RESET}", held_note(account.service)));
+    }
+    if let Some(state) = &account.state {
+        let color = state
+            .level
+            .map_or(DIM, |level| super::level_color(level, LEVELS));
+        head.push_str(&format!("  {color}{}{RESET}", state.word));
+    }
+    if account.service == Service::Claude
+        && reading.is_some_and(Reading::has_quota)
+        && let Some(viable) = account.viable
+    {
+        head.push_str(if viable { "  ready" } else { "  below floor" });
+    }
+    let mut lines = vec![head];
+    let Some(reading) = reading else {
+        lines.push(format!("   {DIM}not read yet{RESET}"));
+        return lines;
+    };
+    if let Some(error) = &account.error {
+        lines.push(format!("   {RED}error: {error}{RESET}"));
+    }
+    let limits = limits_in_order(reading);
+    let width = limits
+        .iter()
+        .map(|limit| limit_name(limit).chars().count())
+        .max()
+        .unwrap_or(0);
+    for limit in limits {
+        let mark = if target
+            .zip(limit.key())
+            .is_some_and(|(target, key)| target.is_limited_by(key))
+        {
+            "*"
         } else {
-            (" ", String::new())
+            " "
         };
+        let note = limit_note(limit, reading)
+            .map(|note| format!("  {DIM}{note}{RESET}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  {mark}{:<width$} {}  resets {}{note}",
+            limit_name(limit),
+            bar(limit.window.used),
+            format_reset(limit.window.resets_at),
+        ));
+    }
+    for note in &account.notes {
+        let color = if note.starts_with('!') { YELLOW } else { DIM };
+        lines.push(format!("   {color}{note}{RESET}"));
+    }
+    if let Some(login) = account.login.as_ref().filter(|login| login.warning)
+        && let Some(note) = &login.note
+    {
+        lines.push(format!("   {YELLOW}{note}{RESET}"));
+    }
+    if let Some(now) = aged_at {
+        lines.push(format!(
+            "   {DIM}read {}{RESET}",
+            format_age(reading.at, now)
+        ));
+    }
+    lines
+}
+
+/// The view's time, when its readings are stored ones.
+fn aged_at(overview: &Overview) -> Option<i64> {
+    (overview.origin == Origin::Stored).then_some(overview.at)
+}
+
+fn target_of(overview: &Overview) -> Option<ModelKey> {
+    overview.target_model.as_deref().map(ModelKey::new)
+}
+
+fn print_offers(overview: &Overview) {
+    for offer in &overview.resets_on_offer {
         println!(
-            "{marker} {:<24} {:<12} {detail}{note}",
-            account.name,
-            account.service.label()
+            " reset on offer: {}: {} (`tokeman claude reset {}`; read {})",
+            offer.account,
+            offer.offer,
+            offer.account,
+            format_age(offer.read_at, overview.at)
         );
     }
 }
 
-/// `5H 90% · WEEKLY 58% · 2 reset credits (0 usable now)`, with the state
-/// when it is not `ok`: one stored Codex probe on one line.
-pub fn codex_summary(reading: &crate::ui::overview::CodexReading) -> String {
-    let mut parts: Vec<String> = reading
-        .windows
-        .iter()
-        .map(|named| {
-            format!(
-                "{} {:.0}%",
-                named.label,
-                (named.window.remaining().clamp(0.0, 1.0) * 100.0).round()
-            )
-        })
-        .collect();
-    if let Some(credits) = reading
-        .reset_credits
-        .filter(|credits| credits.available > 0)
-    {
-        let plural = if credits.available == 1 { "" } else { "s" };
-        parts.push(match credits.applicable {
-            Some(now) => format!(
-                "{} reset credit{plural} ({now} usable now)",
-                credits.available
-            ),
-            None => format!("{} reset credit{plural}", credits.available),
-        });
+/// The fleet view as cards: `tokeman`, and every `<service> list`.
+pub fn print_overview(overview: &Overview) {
+    let hint = match (overview.origin, overview.monitor) {
+        (Origin::Stored, _) => format!("  {DIM}(`tokeman --fresh` reads now){RESET}"),
+        (Origin::Fresh, _) => String::new(),
+    };
+    println!(
+        "\n {BOLD}tokeman{RESET} — {}{hint}\n",
+        view_caption(overview)
+    );
+    let target = target_of(overview);
+    for account in &overview.accounts {
+        for line in account_lines(account, target.as_ref(), aged_at(overview)) {
+            println!("{line}");
+        }
+        println!();
     }
-    if reading.state != "ok" {
-        parts.push(one_line(&reading.state, 80));
-    }
-    parts.join(" · ")
+    print_offers(overview);
 }
 
-/// The Codex section of `tokeman list`: the last stored probe of each profile.
-pub fn print_codex_list(accounts: &[crate::ui::overview::CodexView], now: i64) {
-    if accounts.is_empty() {
+/// `tokeman list`: every account of every service on a line of its own,
+/// from stored reads; a Claude account's credential and login follow it.
+pub fn print_list(overview: &Overview) {
+    if overview.accounts.is_empty() {
+        println!("{NO_ACCOUNTS}");
         return;
     }
-    println!("\n {BOLD}codex{RESET}");
-    for account in accounts {
+    println!("\n {BOLD}tokeman{RESET} — {}\n", view_caption(overview));
+    for account in &overview.accounts {
         let detail = match &account.reading {
             Some(reading) => format!(
                 "{}{}  {DIM}({}){RESET}",
@@ -547,83 +730,35 @@ pub fn print_codex_list(accounts: &[crate::ui::overview::CodexView], now: i64) {
                     .as_deref()
                     .map(|plan| format!("[{plan}] "))
                     .unwrap_or_default(),
-                codex_summary(reading),
-                format_age(reading.at, now)
+                summary(reading),
+                format_age(reading.at, overview.at)
             ),
-            None => format!("{DIM}not read yet (`tokeman codex list`){RESET}"),
+            None => format!("{DIM}not read yet (`tokeman --fresh`){RESET}"),
         };
-        println!(
-            "  {:<24} {:<12} {detail}",
-            account.name,
-            if account.parked { "parked" } else { "" }
-        );
-    }
-}
-
-/// Service accounts with their gauges. `seated` names the Antigravity
-/// account the agy CLI is signed in as.
-fn print_gauges(usages: &[Reading], seated: Option<&str>) {
-    println!();
-    for usage in usages {
-        let plan = usage
-            .plan
-            .as_deref()
-            .map(|plan| format!("  {DIM}[{plan}]{RESET}"))
-            .unwrap_or_default();
-        let note = if seated == Some(usage.account.as_str()) {
-            format!("  {GREEN}* agy's login{RESET}")
+        let (marker, held) = if account.held {
+            (
+                "*",
+                format!("  {GREEN}{}{RESET}", held_note(account.service)),
+            )
         } else {
-            String::new()
+            (" ", String::new())
         };
+        let parked = if account.parked { "parked  " } else { "" };
         println!(
-            " {BOLD}{}{RESET} — {}{plan}{note}",
-            usage.account,
-            usage.service.label()
+            "{marker} {:<24} {:<12} {parked}{detail}{held}",
+            account.name, account.service_label
         );
-        if let Some(error) = &usage.error {
-            println!("   {RED}error: {error}{RESET}");
-        }
-        let width = usage
-            .limits
-            .iter()
-            .map(|meter| limit_name(meter).chars().count())
-            .max()
-            .unwrap_or(0);
-        for meter in &usage.limits {
-            let amount = meter
-                .amount
-                .as_ref()
-                .map(|amount| {
-                    format!(
-                        "  {DIM}{:.0}/{:.0} {}{RESET}",
-                        amount.used, amount.limit, amount.unit
-                    )
-                })
-                .unwrap_or_default();
+        if let Some(login) = &account.login {
             println!(
-                "   {:<width$} {}  resets {}{amount}",
-                limit_name(meter),
-                bar(meter.window.used.clamp(0.0, 1.0)),
-                format_reset(meter.window.resets_at),
+                "  {:<24} {:<12} {DIM}offers {}; {}{RESET}",
+                "", "", login.credential, login.text
             );
         }
-        for balance in &usage.balances {
-            println!("   {}", balance_text(balance));
-        }
+    }
+    if !overview.resets_on_offer.is_empty() {
         println!();
     }
-}
-
-/// For a limit that is a share of the weekly: how much of the weekly it
-/// still allows.
-pub fn share_note(limit: &Limit, weekly: Option<&Window>) -> Option<String> {
-    limit.share.map(|share| {
-        format!(
-            "{:.0}% of the weekly, {:.0}% of the weekly left for it",
-            share * 100.0,
-            limit.room(weekly).max(0.0) * 100.0
-        )
-    })
+    print_offers(overview);
 }
 
 /// `tokeman history`: one stored read per line, newest first.
@@ -651,7 +786,7 @@ pub fn print_history(readings: &[Reading]) {
             "  {} {BOLD}{:<16}{RESET}  {}{state}",
             at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
             reading.account,
-            usage_summary(reading),
+            summary(reading),
         );
     }
     println!();
@@ -692,39 +827,52 @@ pub fn print_stats(stats: &[Stats]) {
     }
 }
 
-pub fn print_status(report: &Report) {
+/// `tokeman rotate status`: the rotation's state, then every Claude account
+/// as it was just read.
+pub fn print_status(overview: &Overview) {
+    let rotation = &overview.rotation;
     println!(
-        "monitor: {}{}",
-        report.monitor,
-        if report.service_installed {
-            " (service installed)"
-        } else {
-            ""
+        "monitor: {}",
+        match overview.monitor {
+            Monitor::Running => "running (service installed)",
+            Monitor::Paused => "paused (service installed)",
+            Monitor::NotInstalled => "no background service",
         }
     );
     println!(
         "mode: {} ({}s sampling)",
-        report.mode.label(),
-        report.probe_interval_secs
+        rotation.mode.label(),
+        rotation.probe_interval_secs
     );
     println!(
         "quota probe: {} (capacity signal; large-model admission can be stricter)",
         crate::anthropic::probe::PROBE_MODEL_LABEL
     );
-    println!("premium admission: {}", report.coverage);
-    println!("header-only limits: {}", report.sampling);
-    for offer in &report.resets_on_offer {
-        println!("reset on offer: {offer} (`tokeman claude reset`)");
+    if let Some(coverage) = &rotation.coverage {
+        println!("premium admission: {coverage}");
+    }
+    if let Some(sampling) = &rotation.sampling {
+        println!("header-only limits: {sampling}");
+    }
+    for offer in &overview.resets_on_offer {
+        println!(
+            "reset on offer: {}: {} (`tokeman claude reset`)",
+            offer.account, offer.offer
+        );
     }
     println!(
         "default for newly started Claude processes: {}",
-        report.default_account.as_deref().unwrap_or("/login")
+        match (&overview.default_account, rotation.default_is_unmanaged) {
+            (Some(name), _) => name,
+            (None, true) => "unmanaged OAuth token",
+            (None, false) => "/login",
+        }
     );
     println!(
-        "selection model: {} (only matching model-scoped buckets affect rotation)",
-        report.target_model.as_deref().unwrap_or("unknown")
+        "selection model: {} (only the limits marked * affect rotation)",
+        overview.target_model.as_deref().unwrap_or("unknown")
     );
-    let live = report.live_sessions.as_deref();
+    let live = rotation.live_sessions.as_deref();
     println!(
         "live Claude processes: {} ({})",
         live.map_or("?".to_string(), |sessions| sessions.len().to_string()),
@@ -743,52 +891,20 @@ pub fn print_status(report: &Report) {
         }
     );
     println!(
-        "default thresholds: change at 5h <= {:.0}% left or 7d <= {:.0}% left",
-        report.min_session_remaining * 100.0,
-        report.min_weekly_remaining * 100.0
+        "default thresholds: change at 5h <= {:.0}% left or 7d <= {:.0}% left\n",
+        rotation.min_session_remaining * 100.0,
+        rotation.min_weekly_remaining * 100.0
     );
-    for account in &report.accounts {
-        let marker = if account.is_default { "D" } else { " " };
-        if account.remaining_session.is_some() || account.remaining_weekly.is_some() {
-            let cell = |left: Option<f64>| {
-                left.map_or("  --".to_string(), |left| format!("{:>3.0}%", left * 100.0))
-            };
-            println!(
-                " {marker} {:<24} 5h {}  7d {}  {}",
-                account.name,
-                cell(account.remaining_session),
-                cell(account.remaining_weekly),
-                if account.viable {
-                    "ready"
-                } else {
-                    "below floor"
-                }
-            );
-        } else {
-            println!(
-                " {marker} {:<24} {}",
-                account.name,
-                account.error.as_deref().unwrap_or("no quota headers")
-            );
+    let target = target_of(overview);
+    for account in &overview.accounts {
+        let mut lines = account_lines(account, target.as_ref(), aged_at(overview));
+        if let Some(login) = &account.login {
+            lines.insert(1, format!("   offers {}", login.credential));
         }
-        println!("   {:<24} offers {}", "", account.credential);
-        if account.buckets.is_empty() {
-            println!("   {:<24} model-scoped 7d: unavailable", "");
+        for line in lines {
+            println!("{line}");
         }
-        for bucket in &account.buckets {
-            println!(
-                "   {:<24} {}{} {:>3.0}%  resets {}  {}",
-                "",
-                if bucket.relevant { "*" } else { " " },
-                bucket.label,
-                bucket.remaining * 100.0,
-                format_reset_compact(bucket.resets_at),
-                bucket.source.short_label(),
-            );
-        }
-        for limit in &account.limits {
-            println!("   {:<24} ! {}", "", limit.summary());
-        }
+        println!();
     }
 }
 
@@ -807,83 +923,6 @@ pub fn print_question(question: &str) {
     use std::io::Write;
     print!("{question}");
     std::io::stdout().flush().ok();
-}
-
-/// Fresh reads of any mix of services: Claude's gauges, the Codex table,
-/// then each other service's gauges.
-pub fn print_everything(readings: &[Reading]) {
-    let of = |wanted: fn(Service) -> bool| -> Vec<Reading> {
-        readings
-            .iter()
-            .filter(|reading| wanted(reading.service))
-            .cloned()
-            .collect()
-    };
-    let claude = of(|service| service == Service::Claude);
-    if !claude.is_empty() {
-        print_readings(&claude, crate::anthropic::probe::PROBE_MODEL_LABEL);
-    }
-    let codex = of(|service| service == Service::Codex);
-    if !codex.is_empty() {
-        println!(" {BOLD}codex{RESET}\n");
-        println!("{ROW_HEADER}");
-        let now = chrono::Utc::now().timestamp();
-        for reading in &codex {
-            for row in rows(reading, now) {
-                println!("{row}");
-            }
-        }
-        println!();
-    }
-    let others = of(|service| !matches!(service, Service::Claude | Service::Codex));
-    if !others.is_empty() {
-        print_gauges(&others, None);
-    }
-}
-
-/// `tokeman list`: every account of every service, from stored reads.
-pub fn print_stored(
-    fleet: &crate::account::Fleet,
-    overview: &crate::ui::overview::Overview,
-    seated: Option<&str>,
-) {
-    if fleet.accounts.is_empty() && fleet.services.is_empty() && fleet.codex.is_empty() {
-        println!("{NO_ACCOUNTS}");
-    }
-    let now_ms = overview.at * 1000;
-    for account in &fleet.accounts {
-        let marker = if overview.default_account.as_deref() == Some(account.name.as_str()) {
-            "*"
-        } else {
-            " "
-        };
-        let setup = account
-            .setup_key
-            .as_deref()
-            .map(mask_key)
-            .unwrap_or_else(|| "no setup key".into());
-        println!(
-            "{marker} {:<24} {setup}  {}",
-            account.name,
-            describe_login(account, now_ms)
-        );
-    }
-    print_codex_list(&overview.codex, overview.at);
-    let latest: Vec<_> = overview
-        .services
-        .iter()
-        .filter_map(|service| service.usage.clone())
-        .collect();
-    print_service_list(&fleet.services, &latest, seated, overview.at);
-    for offer in &overview.resets_on_offer {
-        println!(
-            "\n reset on offer: {}: {} (`tokeman claude reset {}`; read {})",
-            offer.account,
-            offer.offer,
-            offer.account,
-            format_age(offer.read_at, overview.at)
-        );
-    }
 }
 
 pub fn print_account_change(verb: &str, name: &str) {
@@ -1111,11 +1150,16 @@ pub fn print_reset_claimed(outcome: &resets::ClaimResponse) {
     }
 }
 
+/// `--clear` on either reset command: the claim that was forgotten.
 pub fn print_reset_cleared(name: &str, pending: Option<&crate::claims::Pending>) {
     match pending {
         Some(pending) => println!(
-            "{name}: forgot the claim of grant {} (request {})",
-            pending.item.as_deref().unwrap_or("?"),
+            "{name}: forgot the claim of {} (request {})",
+            match (pending.service, pending.item.as_deref()) {
+                (Service::Codex, Some(credit)) => format!("credit {credit}"),
+                (Service::Codex, None) => "one reset credit".to_owned(),
+                (_, item) => format!("grant {}", item.unwrap_or("?")),
+            },
             pending.request_id
         ),
         None => println!("{name}: no claim pending"),
@@ -1124,147 +1168,19 @@ pub fn print_reset_cleared(name: &str, pending: Option<&crate::claims::Pending>)
 
 // ---- Codex ----
 
-/// The header of the Codex table.
-pub const ROW_HEADER: &str = "ACCOUNT      EMAIL                      PLAN    5H               WEEKLY           RESETS     STATE";
-
-/// `45% (2h10m)`, or `-` for no window.
-pub fn window_cell(window: Option<Window>, now: i64) -> String {
-    let Some(window) = window else {
-        return "-".to_owned();
-    };
-    let used = format!("{:.0}%", window.used * 100.0);
-    let left = window.resets_at - now;
-    if window.resets_at > 0 && left > 0 {
-        format!("{used} ({})", duration_cell(left))
-    } else {
-        used
-    }
-}
-
-pub fn duration_cell(seconds: i64) -> String {
-    let days = seconds / 86_400;
-    let hours = (seconds % 86_400) / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    if days > 0 {
-        format!("{days}d{hours}h")
-    } else if hours > 0 {
-        format!("{hours}h{minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
-}
-
-/// Reset credits held, and how many would clear a limit now: `2 (0 now)`.
-pub fn resets_cell(count: Option<ResetCreditCount>) -> String {
-    match count {
-        None => "-".to_owned(),
-        Some(ResetCreditCount {
-            available,
-            applicable: Some(applicable),
-        }) => format!("{available} ({applicable} now)"),
-        Some(ResetCreditCount { available, .. }) => available.to_string(),
-    }
-}
-
-/// Every window of a scoped limit, each named: `weekly 40% (3d2h)  5h 10%`.
-fn windows_cell(limits: &[&Limit], now: i64) -> String {
-    limits
-        .iter()
-        .map(|limit| format!("{} {}", limit.span, window_cell(Some(limit.window), now)))
-        .collect::<Vec<_>>()
-        .join("  ")
-}
-
-/// A probe as one table row under [`ROW_HEADER`], then one indented line
-/// for each window of another length, per-model bucket, unavailable model
-/// and spending cap.
-pub fn rows(probe: &Reading, now: i64) -> Vec<String> {
-    let detail = CodexDetail::default();
-    let codex = probe.codex().unwrap_or(&detail);
-    let mut lines = vec![format!(
-        "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} {}",
-        probe.account,
-        codex.email.as_deref().unwrap_or("-"),
-        probe.plan.as_deref().unwrap_or("-"),
-        window_cell(probe.session(), now),
-        window_cell(probe.weekly(), now),
-        resets_cell(codex.reset_credits),
-        State::of(probe),
-    )];
-    for limit in probe
-        .shared()
-        .filter(|limit| !matches!(limit.span, Span::FiveHour | Span::Weekly))
-    {
-        lines.push(format!(
-            "  └ {:<24} {}",
-            format!("{} window", limit.span),
-            window_cell(Some(limit.window), now),
-        ));
-    }
-    for (_, limits) in probe.scoped() {
-        lines.push(format!(
-            "  └ {:<24} {}  {}",
-            limits[0].label,
-            windows_cell(&limits, now),
-            if limits.iter().any(|limit| limit.is_rejected()) {
-                "limited"
-            } else {
-                "ok"
-            },
-        ));
-    }
-    for model in codex.models.iter().filter(|model| model.is_unavailable()) {
-        let mut line = format!("  └ model {} unavailable", model.slug);
-        if let Some(at) = model.available_at {
-            line.push_str(&format!(" until {}", crate::commands::codex::fmt_epoch(at)));
-        }
-        if model.credits_would_enable == Some(true) {
-            line.push_str(", credits would enable it");
-        }
-        lines.push(line);
-    }
-    if let Some(spend) = &codex.spend_control
-        && (spend.reached == Some(true) || spend.limit.is_some())
-    {
-        let mut line = format!(
-            "  └ spend control {}",
-            if spend.reached == Some(true) {
-                "reached"
-            } else {
-                "ok"
-            }
-        );
-        if let Some(cap) = &spend.limit {
-            line.push_str(&format!(
-                ", used {} of {}",
-                cap.used.as_deref().unwrap_or("?"),
-                cap.limit.as_deref().unwrap_or("?")
-            ));
-            if let Some(percent) = cap.used_percent {
-                line.push_str(&format!(" ({percent:.0}%)"));
-            }
-            if let Some(at) = cap.reset_at.filter(|at| *at > now) {
-                line.push_str(&format!(", resets in {}", duration_cell(at - now)));
-            }
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-/// [`rows`], then one line per reset credit, or why the list is missing.
-pub fn listed_rows(listed: &Listed, now: i64) -> Vec<String> {
-    let mut lines = rows(&listed.probe, now);
+/// One line per reset credit an account holds, or why the list is missing.
+pub fn credit_lines(listed: &Listed) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(list) = &listed.reset_credit_list {
         lines.extend(
             list.credits
                 .iter()
-                .map(|credit| format!("  └ reset credit {}", codex_resets::describe(credit))),
+                .map(|credit| format!("   reset credit {}", codex_resets::describe(credit))),
         );
     }
     if let Some(error) = &listed.reset_credit_error {
         lines.push(format!(
-            "  └ reset credit details unavailable ({error}); counts above are from the usage body"
+            "   reset credit details unavailable ({error}); the count above is from the usage body"
         ));
     }
     lines
@@ -1272,10 +1188,6 @@ pub fn listed_rows(listed: &Listed, now: i64) -> Vec<String> {
 
 pub fn print_codex_added(account: &crate::account::CodexAccount) {
     println!("registered {} at {}", account.name, account.codex_home);
-}
-
-pub fn print_no_codex() {
-    println!("no codex accounts configured — try `tokeman codex discover --adopt`");
 }
 
 pub fn print_codex_discovery(discovery: &codex::Discovery, adopt: bool) {
@@ -1321,15 +1233,33 @@ pub fn print_codex_imported(imported: &[codex::Imported]) {
     );
 }
 
-/// `tokeman codex list`: the table, with each account's reset credits.
-pub fn print_codex_listed(listed: &[codex::Listed]) {
-    let now = chrono::Utc::now().timestamp();
-    println!("{ROW_HEADER}");
-    for entry in listed {
-        for row in listed_rows(entry, now) {
-            println!("{row}");
+/// `tokeman codex list`: every profile as a card, with the reset credits it
+/// holds.
+pub fn print_codex_listed(overview: &Overview, listed: &[codex::Listed]) {
+    println!("\n {BOLD}tokeman{RESET} — {}\n", view_caption(overview));
+    for account in &overview.accounts {
+        for line in account_lines(account, None, aged_at(overview)) {
+            println!("{line}");
         }
+        for line in listed
+            .iter()
+            .filter(|entry| entry.probe.account == account.name)
+            .flat_map(credit_lines)
+        {
+            println!("{line}");
+        }
+        println!();
     }
+}
+
+/// One reading as a card, for a command that just read one account.
+fn print_reading(reading: &Reading, held: bool) {
+    let mut account = AccountView::of(reading.service, &reading.account, Some(reading));
+    account.held = held;
+    for line in account_lines(&account, None, None) {
+        println!("{line}");
+    }
+    println!();
 }
 
 pub fn print_codex_refresh(reports: &[codex::RefreshReport]) {
@@ -1395,18 +1325,14 @@ pub fn print_codex_watch(event: &codex::WatchEvent) {
 /// What a credit claim would do, shown before asking; returns the words for
 /// the credit, for the question.
 pub fn print_codex_reset_plan(plan: &codex_resets::ResetPlan) -> String {
-    let now = chrono::Utc::now().timestamp();
-    println!("{ROW_HEADER}");
-    for row in rows(&plan.probe, now) {
-        println!("{row}");
-    }
+    print_reading(&plan.probe, false);
     match &plan.credits {
         Ok(list) => {
             for credit in &list.credits {
-                println!("  └ reset credit {}", codex_resets::describe(credit));
+                println!("   reset credit {}", codex_resets::describe(credit));
             }
         }
-        Err(error) => println!("  └ reset credit details unavailable ({error})"),
+        Err(error) => println!("   reset credit details unavailable ({error})"),
     }
     if let Some(pending) = &plan.pending {
         println!(
@@ -1456,7 +1382,8 @@ pub fn codex_reset_uncertain(name: &str, claim: &codex_resets::Claim) -> Option<
         } => Some(format!(
             "no definite answer ({error}); the claim may or may not have gone through. \
              Run `tokeman codex reset {name}` again: it resends request {redeem_request_id}, \
-             which the backend redeems at most once"
+             which the backend redeems at most once. `tokeman codex reset {name} --clear` \
+             forgets the claim once the usage page shows what happened"
         )),
     }
 }
@@ -1482,7 +1409,8 @@ pub fn print_service_added(registered: &crate::commands::services::Registered, r
         registration_line(registered),
         registered.account.key_file.as_deref().unwrap_or_default()
     );
-    print_gauges(std::slice::from_ref(reading), None);
+    println!();
+    print_reading(reading, false);
 }
 
 pub fn print_agy_imported(imported: &crate::commands::services::Imported) {
@@ -1493,7 +1421,13 @@ pub fn print_agy_imported(imported: &crate::commands::services::Imported) {
     for registered in &imported.registered {
         println!("{}", registration_line(registered));
     }
-    print_gauges(&imported.readings, imported.seated.as_deref());
+    println!();
+    for reading in &imported.readings {
+        print_reading(
+            reading,
+            imported.seated.as_deref() == Some(reading.account.as_str()),
+        );
+    }
 }
 
 pub fn print_agy_use(report: &crate::providers::antigravity::seat::UseReport) {
@@ -1502,23 +1436,21 @@ pub fn print_agy_use(report: &crate::providers::antigravity::seat::UseReport) {
     }
 }
 
-/// `tokeman <service> list`: the service's accounts with their gauges.
-pub fn print_usages(service: Service, usages: &[Reading], seated: Option<&str>) {
-    if usages.is_empty() {
-        println!(
-            "No {} accounts configured. Use `{}`.",
-            service.label(),
-            match service {
-                Service::Antigravity => "tokeman agy import".to_owned(),
-                other => format!(
-                    "tokeman {} add <name> --key-file <path>",
-                    crate::commands::services::command_word(other)
-                ),
-            }
-        );
-        return;
-    }
-    print_gauges(usages, seated);
+/// What `tokeman <service> list` says when the service has no account.
+pub fn print_no_accounts(service: Service) {
+    println!(
+        "No {} accounts configured. Use `{}`.",
+        service.label(),
+        match service {
+            Service::Claude => "tokeman claude login <name>".to_owned(),
+            Service::Codex => "tokeman codex discover --adopt".to_owned(),
+            Service::Antigravity => "tokeman agy import".to_owned(),
+            other => format!(
+                "tokeman {} add <name> --key-file <path>",
+                crate::commands::services::command_word(other)
+            ),
+        }
+    );
 }
 
 /// `tokeman <service> best`. Codex prints the winner's CODEX_HOME alone, for
@@ -1531,10 +1463,7 @@ pub fn print_best(best: &crate::commands::view::Best) {
         }
         return;
     }
-    let note = match best.service {
-        Service::Claude => "the default",
-        _ => "agy's login",
-    };
+    let note = held_note(best.service);
     for (place, (name, room)) in best.ranked.iter().enumerate() {
         let Some(reading) = best.reading(name) else {
             continue;
@@ -1549,7 +1478,7 @@ pub fn print_best(best: &crate::commands::view::Best) {
             place + 1,
             name,
             (room.max(0.0) * 100.0).round(),
-            usage_summary(reading)
+            summary(reading)
         );
     }
     for reading in &best.readings {
@@ -1647,14 +1576,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn short_labels_keep_family_and_version() {
-        assert_eq!(short_bucket_label("Opus 4.8"), "O48");
-        assert_eq!(short_bucket_label("Opus 5"), "O5");
-        assert_eq!(short_bucket_label("Fable"), "Fab");
-        assert_eq!(short_bucket_label("Sonnet"), "Son");
-    }
-
-    #[test]
     fn text_helpers_count_characters_not_bytes() {
         assert_eq!(one_line("a\n  b\tc", 10), "a b c");
         assert_eq!(one_line("💥💥💥", 2), "💥💥…");
@@ -1688,16 +1609,20 @@ mod tests {
             ..Reading::empty(Service::Kimi, "kimi", 0)
         };
         assert_eq!(
-            usage_summary(&usage),
+            summary(&usage),
             "5h 99% · weekly 0% · extra usage $21.96 of $50.00 left"
         );
         let failed = failed(Service::Zai, "glm", 0, "z.ai refused:\n bad key");
-        assert_eq!(usage_summary(&failed), "error: z.ai refused: bad key");
+        assert_eq!(summary(&failed), "error: z.ai refused: bad key");
         let grouped = Reading {
             limits: vec![meter(Some("Gemini Models"), "5h", 0.5)],
             ..Reading::empty(Service::Antigravity, "a", 0)
         };
-        assert_eq!(usage_summary(&grouped), "Gemini Models 5h 50%");
+        assert_eq!(summary(&grouped), "Gemini Models 5h 50%");
+        assert_eq!(
+            summary(&Reading::empty(Service::Zai, "glm", 0)),
+            "no limits reported"
+        );
         assert_eq!(format_money(-5, "EUR"), "-0.05 EUR");
         assert_eq!(format_age(100, 100 + 7200), "2h ago");
     }
@@ -1717,47 +1642,6 @@ mod tests {
         assert_eq!(
             login_note(&account, DAY_MS).as_deref(),
             Some("login refused: run `tokeman claude login acct`")
-        );
-    }
-
-    #[test]
-    fn a_codex_probe_reads_as_named_windows_credits_and_trouble() {
-        use crate::quota::{ResetCreditCount, Window};
-        use crate::ui::overview::{CodexReading, NamedWindow};
-        let mut reading = CodexReading {
-            at: 0,
-            email: None,
-            plan: Some("pro".into()),
-            state: "ok".into(),
-            viable: true,
-            windows: vec![
-                NamedWindow {
-                    label: "5H".into(),
-                    window: Window::new(0.1, 0),
-                },
-                NamedWindow {
-                    label: "WEEKLY".into(),
-                    window: Window::new(0.42, 0),
-                },
-            ],
-            extra: Vec::new(),
-            reset_credits: Some(ResetCreditCount {
-                available: 2,
-                applicable: Some(0),
-            }),
-        };
-        assert_eq!(
-            codex_summary(&reading),
-            "5H 90% · WEEKLY 58% · 2 reset credits (0 usable now)"
-        );
-        reading.reset_credits = Some(ResetCreditCount {
-            available: 0,
-            applicable: None,
-        });
-        reading.state = "limited (weekly)".into();
-        assert_eq!(
-            codex_summary(&reading),
-            "5H 90% · WEEKLY 58% · limited (weekly)"
         );
     }
 
@@ -1797,6 +1681,7 @@ mod tests {
         let mut fable =
             crate::testing::model_limit("fable", "Fable", 0.5, crate::quota::Source::Profile);
         assert_eq!(share_note(&fable, reading.weekly().as_ref()), None);
+        assert_eq!(limit_note(&fable, &reading).as_deref(), Some("profile"));
         fable.share = Some(0.5);
         reading.limits.push(fable.clone());
         assert_eq!(
@@ -1829,49 +1714,193 @@ mod tests {
         assert!(line.contains("soon"), "{line}");
     }
 
-    #[test]
-    fn cells_format_usage_and_time_left() {
-        assert_eq!(window_cell(None, 0), "-");
-        assert_eq!(window_cell(Some(Window::new(0.456, 0)), 0), "46%");
-        assert_eq!(
-            window_cell(Some(Window::new(0.1, 1_000 + 7_800)), 1_000),
-            "10% (2h10m)"
-        );
-        assert_eq!(window_cell(Some(Window::new(0.1, 500)), 1_000), "10%");
-        assert_eq!(duration_cell(90_000), "1d1h");
-        assert_eq!(duration_cell(120), "2m");
+    /// The lines without their colour codes.
+    fn plain(lines: Vec<String>) -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|line| {
+                let mut out = String::new();
+                let mut rest = line.as_str();
+                while let Some(start) = rest.find('\x1b') {
+                    out.push_str(&rest[..start]);
+                    let end = rest[start..]
+                        .find('m')
+                        .map_or(rest.len(), |m| start + m + 1);
+                    rest = &rest[end..];
+                }
+                out.push_str(rest);
+                out
+            })
+            .collect()
+    }
+
+    fn card(reading: &Reading) -> Vec<String> {
+        let account = AccountView::of(reading.service, &reading.account, Some(reading));
+        plain(account_lines(&account, None, None))
     }
 
     #[test]
-    fn rows_follow_the_header_and_list_extra_buckets() {
+    fn a_limit_is_named_by_what_it_covers_and_how_long_it_is() {
+        use crate::providers::limit;
+        use crate::quota::Source;
+        let window = Window::new(0.5, 0);
+        let shared = |span| Limit::new(span, Scope::All, window, Source::Headers);
+        assert_eq!(limit_name(&shared(Span::FiveHour)), "5h");
+        assert_eq!(limit_name(&shared(Span::Weekly)), "weekly");
+        assert_eq!(limit_name(&shared(Span::Other(86_400))), "daily");
+        let fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
+        assert_eq!(limit_name(&fable), "Fable weekly");
+        let group =
+            |label: &str, secs| limit(Some("Gemini Models".into()), label, secs, window, None);
+        assert_eq!(
+            limit_name(&group("weekly", Some(Span::WEEK_SECS))),
+            "Gemini Models weekly"
+        );
+        assert_eq!(limit_name(&group("5h", None)), "Gemini Models 5h");
+        assert_eq!(limit_name(&group("", Some(18_000))), "Gemini Models 5h");
+        // A limit the server names itself keeps that name.
+        let spark = Limit {
+            label: "codex_spark".into(),
+            ..Limit::new(
+                Span::Weekly,
+                Scope::Group("gpt-5.3-codex-spark".into()),
+                window,
+                Source::Poll,
+            )
+        };
+        assert_eq!(limit_name(&spark), "codex_spark weekly");
+        assert_eq!(
+            limit_name(&Limit::extra_usage(window, Source::Headers)),
+            "extra usage"
+        );
+        assert_eq!(
+            limit_name(&limit(
+                None,
+                "monthly (Kimi Code share)",
+                None,
+                window,
+                None
+            )),
+            "monthly (Kimi Code share)"
+        );
+    }
+
+    #[test]
+    fn every_service_is_drawn_by_the_one_card() {
+        use crate::quota::Source;
+        // Claude: account-wide windows, then the models, then extra usage.
+        let mut claude = crate::testing::reading("a", 0.25, 0.4);
+        claude
+            .limits
+            .insert(0, Limit::extra_usage(Window::new(0.1, 0), Source::Headers));
+        let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
+        fable.share = Some(0.5);
+        claude.limits.push(fable);
+        claude.claude_mut().claim = Some("seven_day".into());
+        let mut account = AccountView::of(Service::Claude, "a", Some(&claude));
+        account.held = true;
+        account.viable = Some(false);
+        let target = ModelKey::new("claude-fable-5-1");
+        let lines = plain(account_lines(
+            &account,
+            Some(&target),
+            Some(claude.at + 120),
+        ));
+        assert_eq!(lines[0], " a — Claude  * the default  allowed  below floor");
+        let names: Vec<&str> = lines[1..5]
+            .iter()
+            .map(|line| line[2..15].trim_end())
+            .collect();
+        assert_eq!(names, [" 5h", " weekly", "*Fable weekly", " extra usage"]);
+        assert!(lines[1].contains(" 75% left  resets --"), "{}", lines[1]);
+        assert!(
+            lines[3].ends_with("profile; 50% of the weekly, 25% of the weekly left for it"),
+            "{}",
+            lines[3]
+        );
+        assert_eq!(lines[5], "   binding limit: weekly");
+        assert_eq!(lines.last().unwrap(), "   read 2m ago");
+
+        // Codex: the same card, with what only Codex says as notes.
         let at = DateTime::from_timestamp(1_000, 0).unwrap();
         let mut body = usage_body(30.0, 60.0);
-        body["rate_limit"]["primary_window"]["reset_at"] = json!(1_000 + 3_600);
-        let probe = probe_from(&body, "one", at);
-        let lines = rows(&probe, 1_000);
-        assert_eq!(lines.len(), 2);
-        assert!(
-            lines[0].starts_with(
-                "one          a@b.c                      plus    30% (1h0m)       60%"
-            ),
-            "{}",
-            lines[0]
-        );
-        assert!(lines[0].ends_with(" -          ok"), "{}", lines[0]);
-        assert!(lines[1].starts_with("  └ codex_spark "), "{}", lines[1]);
-        assert!(lines[1].contains("window 100%"), "{}", lines[1]);
-        assert!(lines[1].ends_with("limited"));
+        body["rate_limit"]["primary_window"]["reset_at"] = json!(0);
+        let codex = probe_from(&body, "one", at);
+        let lines = card(&codex);
+        assert_eq!(lines[0], " one — Codex  [plus]  ok");
+        assert!(lines[1].starts_with("   5h "), "{}", lines[1]);
+        assert!(lines[1].contains(" 70% left"), "{}", lines[1]);
+        assert!(lines[2].starts_with("   weekly "), "{}", lines[2]);
+        assert!(lines[3].starts_with("   codex_spark "), "{}", lines[3]);
+        assert!(lines[3].ends_with("limited"), "{}", lines[3]);
+        assert_eq!(lines[4], "   a@b.c");
+
+        // A weekly-only account has one gauge, named by its length.
+        let weekly = card(&probe_from(&weekly_only_body(42.0), "one", at));
+        assert_eq!(weekly[0], " one — Codex  [promax]  ok");
+        assert!(weekly[1].starts_with("   weekly "), "{}", weekly[1]);
+        assert!(weekly[1].contains(" 58% left"), "{}", weekly[1]);
         assert_eq!(
-            ROW_HEADER,
-            format!(
-                "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} STATE",
-                "ACCOUNT", "EMAIL", "PLAN", "5H", "WEEKLY", "RESETS"
-            )
+            weekly[2..],
+            ["   a@b.c", "   2 reset credits (0 usable now)"]
+        );
+
+        // An account never read, and one whose read failed.
+        let unread = AccountView::of(Service::Kimi, "kimi", None);
+        assert_eq!(
+            plain(account_lines(&unread, None, None)),
+            [" kimi — Kimi Code", "   not read yet"]
+        );
+        let failed = crate::providers::failed(Service::Zai, "glm", 0, "bad key");
+        assert_eq!(
+            card(&failed),
+            [" glm — GLM (z.ai)  error", "   error: bad key"]
         );
     }
 
     #[test]
-    fn a_failed_credit_list_is_said_under_the_account_row() {
+    fn a_codex_reading_on_one_line_names_its_windows_credits_and_trouble() {
+        let at = DateTime::from_timestamp(0, 0).unwrap();
+        let mut body = weekly_only_body(42.0);
+        assert_eq!(
+            summary(&probe_from(&body, "one", at)),
+            "weekly 58% · 2 reset credits (0 usable now)"
+        );
+        body["rate_limit_reset_credits"] = json!({"available_count": 0});
+        body["rate_limit"]["allowed"] = json!(false);
+        body["rate_limit"]["limit_reached"] = json!(true);
+        let limited = summary(&probe_from(&body, "one", at));
+        assert!(limited.starts_with("weekly 58% · limited"), "{limited}");
+        let refused = Reading::failed(
+            Service::Codex,
+            "one",
+            0,
+            crate::quota::ReadError::Http {
+                status: 401,
+                body: "expired".into(),
+            },
+        );
+        assert_eq!(
+            summary(&refused),
+            "error: HTTP 401: expired; needs `tokeman codex refresh`"
+        );
+        assert_eq!(badge(&refused).unwrap().0, "error");
+    }
+
+    #[test]
+    fn an_api_error_body_is_shown_as_its_message() {
+        assert_eq!(
+            brief_error(
+                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
+            ),
+            "HTTP 403: OAuth authentication is currently not allowed for this organization."
+        );
+        assert_eq!(brief_error("network: timed out"), "network: timed out");
+        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
+    }
+
+    #[test]
+    fn a_failed_credit_list_is_said_under_the_account() {
         let at = DateTime::from_timestamp(0, 0).unwrap();
         let listed = Listed {
             probe: probe_from(&weekly_only_body(5.0), "holder", at),
@@ -1881,32 +1910,16 @@ mod tests {
                 body: "oops".into(),
             }),
         };
-        let lines = listed_rows(&listed, 0);
-        assert!(lines[0].contains("2 (0 now)"), "{}", lines[0]);
         assert_eq!(
-            lines.last().unwrap(),
-            "  └ reset credit details unavailable (HTTP 500: oops); counts above are from the usage body"
+            credit_lines(&listed),
+            [
+                "   reset credit details unavailable (HTTP 500: oops); the count above is from the usage body"
+            ]
         );
     }
 
     #[test]
-    fn a_weekly_only_account_fills_the_weekly_column_not_the_first() {
-        let at = DateTime::from_timestamp(1_000, 0).unwrap();
-        let mut body = weekly_only_body(42.0);
-        body["rate_limit"]["primary_window"]["reset_at"] = json!(1_000 + 2 * 86_400 + 3_600);
-        let probe = probe_from(&body, "one", at);
-        let lines = rows(&probe, 1_000);
-        assert_eq!(
-            lines,
-            vec![format!(
-                "{:<12} {:<26} {:<7} {:<16} {:<16} {:<10} ok",
-                "one", "a@b.c", "promax", "-", "42% (2d1h)", "2 (0 now)"
-            )]
-        );
-    }
-
-    #[test]
-    fn other_windows_unavailable_models_and_spend_caps_get_their_own_lines() {
+    fn other_windows_unavailable_models_and_spend_caps_are_said() {
         let at = DateTime::from_timestamp(0, 0).unwrap();
         let mut body = weekly_only_body(10.0);
         body["rate_limit"]["secondary_window"] =
@@ -1914,21 +1927,62 @@ mod tests {
         body["model_usage"]["gpt-7"] =
             json!({"available": false, "available_at": 7_200, "credits_would_enable": true});
         body["spend_control"] = json!({"reached": true, "individual_limit": {
-            "limit": "50.00", "used": "50.00", "remaining": "0", "used_percent": 100, "reset_at": 3_600}});
+            "limit": "50.00", "used": "50.00", "remaining": "0", "used_percent": 100, "reset_at": 0}});
         body["rate_limit_reset_credits"] = json!({"available_count": 1});
         let probe = probe_from(&body, "one", at);
-        let lines = rows(&probe, 0);
-        assert!(lines[0].contains(" 1          ok"), "{}", lines[0]);
+        let lines = card(&probe);
+        assert!(lines[2].starts_with("   daily "), "{}", lines[2]);
+        assert!(lines[2].contains(" 30% left"), "{}", lines[2]);
         assert_eq!(
-            &lines[1..],
-            &[
-                format!("  └ {:<24} 70%", "daily window"),
-                "  └ model gpt-7 unavailable until 1970-01-01 02:00Z, credits would enable it"
-                    .to_owned(),
-                "  └ spend control reached, used 50.00 of 50.00 (100%), resets in 1h0m".to_owned(),
+            notes(&probe),
+            [
+                "a@b.c",
+                "1 reset credit",
+                "model gpt-7 unavailable until 1970-01-01 02:00Z, credits would enable it",
+                "spend control reached, used 50.00 of 50.00 (100%)",
             ]
         );
-        assert_eq!(resets_cell(None), "-");
+    }
+
+    #[test]
+    fn the_caption_says_where_the_view_comes_from_and_how_old_it_is() {
+        use crate::account::Fleet;
+        use crate::ui::overview::Facts;
+        let fleet = Fleet {
+            accounts: vec![crate::testing::setup_account("a")],
+            ..Fleet::default()
+        };
+        let mut reading = crate::testing::reading("a", 0.1, 0.2);
+        reading.at = 1_000;
+        let view = |monitor, now| {
+            let facts = Facts {
+                monitor,
+                readings: vec![reading.clone()],
+                ..Facts::default()
+            };
+            Overview::build(&fleet, facts, None, now)
+        };
+        assert_eq!(
+            view_caption(&view(Monitor::Running, 1_125)),
+            "stored view, last read 2m ago by the background service"
+        );
+        assert_eq!(
+            view_caption(&view(Monitor::Running, 1_000 + 7_200)),
+            "stored view, STALE: the background service last read 2h ago"
+        );
+        assert_eq!(
+            view_caption(&view(Monitor::Paused, 1_030)),
+            "stored view, last read just now; rotation is paused"
+        );
+        let fresh = Overview::build(
+            &fleet,
+            Facts::default().with_fresh(vec![reading.clone()]),
+            None,
+            1_000,
+        );
+        assert_eq!(view_caption(&fresh), "read now, 1/1 accounts answered");
+        let empty = Overview::build(&fleet, Facts::default(), None, 1_000);
+        assert_eq!(view_caption(&empty), "stored view, nothing read yet");
     }
 
     fn probe_from(body: &serde_json::Value, name: &str, at: DateTime<Utc>) -> Reading {

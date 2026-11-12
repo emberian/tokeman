@@ -20,17 +20,17 @@ async fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
-        None if cli.watch => tokeman::ui::tui::run(Fleet::load()?).await,
+        None if cli.watch => tokeman::ui::tui::run(Fleet::load()?, cli.fresh).await,
         None => {
             let fleet = Fleet::load()?;
-            if fleet.accounts.is_empty() && fleet.codex.is_empty() && fleet.services.is_empty() {
+            if fleet.account_keys().is_empty() {
                 bail!("{}", text::NO_ACCOUNTS);
             }
-            let readings = view::probe(&fleet, None).await;
+            let overview = view::overview(&fleet, cli.fresh).await;
             if cli.json {
-                text::print_json(&readings)
+                text::print_json(&overview)
             } else {
-                text::print_everything(&readings);
+                text::print_overview(&overview);
                 Ok(())
             }
         }
@@ -41,12 +41,11 @@ async fn main() -> Result<()> {
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::List { json } => {
-            let fleet = Fleet::load()?;
-            let (overview, seated) = view::stored(&fleet).await;
+            let overview = view::stored(&Fleet::load()?).await;
             if json {
                 text::print_json(&overview)?;
             } else {
-                text::print_stored(&fleet, &overview, seated.as_deref());
+                text::print_list(&overview);
             }
         }
         Command::Claude { action } => claude_command(action).await?,
@@ -117,18 +116,7 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
         ClaudeAction::Refresh { name } => {
             text::print_claude_refresh(&claude::refresh(name.as_deref()).await?)
         }
-        ClaudeAction::List { json } => {
-            let fleet = Fleet::load()?;
-            if fleet.accounts.is_empty() {
-                bail!("{}", text::NO_ACCOUNTS);
-            }
-            let readings = view::probe(&fleet, Some(Service::Claude)).await;
-            if json {
-                text::print_json(&readings)?;
-            } else {
-                text::print_everything(&readings);
-            }
-        }
+        ClaudeAction::List { json } => service_list(Service::Claude, json).await?,
         ClaudeAction::Use { name } => {
             claude::use_account(&Fleet::load()?, &name)?;
             text::print_claude_use(&name);
@@ -186,14 +174,16 @@ async fn codex_command(action: CodexAction) -> Result<()> {
         CodexAction::List { json } => {
             let fleet = Fleet::load()?;
             if fleet.codex.is_empty() {
-                text::print_no_codex();
+                text::print_no_accounts(Service::Codex);
                 return Ok(());
             }
             let listed = codex::list(&fleet).await?;
             if json {
                 text::print_json(&listed)?;
             } else {
-                text::print_codex_listed(&listed);
+                let probes = listed.iter().map(|entry| entry.probe.clone()).collect();
+                let overview = view::shown(&fleet, probes, Some(Service::Codex)).await;
+                text::print_codex_listed(&overview, &listed);
             }
         }
         CodexAction::Refresh {
@@ -244,8 +234,14 @@ async fn codex_command(action: CodexAction) -> Result<()> {
         }
         CodexAction::Reset {
             account,
+            clear: true,
+            ..
+        } => text::print_reset_cleared(&account, codex::reset_clear(&account)?.as_ref()),
+        CodexAction::Reset {
+            account,
             credit,
             yes,
+            ..
         } => {
             let plan = codex::reset_plan(&Fleet::load()?, &account, credit.as_deref()).await?;
             let which = text::print_codex_reset_plan(&plan);
@@ -311,12 +307,16 @@ async fn key_command(service: Service, action: KeyAction) -> Result<()> {
     Ok(())
 }
 
+/// `tokeman <service> list`: read the service's accounts now and show them.
 async fn service_list(service: Service, json: bool) -> Result<()> {
-    let (readings, seated) = services::list(&Fleet::load()?, service).await;
+    let overview = view::fresh(&Fleet::load()?, Some(service)).await;
     if json {
-        text::print_json(&readings)
+        text::print_json(&overview.readings())
+    } else if overview.accounts.is_empty() {
+        text::print_no_accounts(service);
+        Ok(())
     } else {
-        text::print_usages(service, &readings, seated.as_deref());
+        text::print_overview(&overview);
         Ok(())
     }
 }

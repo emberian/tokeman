@@ -98,16 +98,6 @@ pub async fn import_antigravity() -> Result<Imported> {
     })
 }
 
-/// The accounts of one service, read now, and the one agy holds.
-pub async fn list(fleet: &Fleet, service: Service) -> (Vec<Reading>, Option<String>) {
-    let readings = view::probe(fleet, Some(service)).await;
-    let seated = match service {
-        Service::Antigravity => seated(&fleet.services).await,
-        _ => None,
-    };
-    (readings, seated)
-}
-
 /// The name of the account in `accounts` the agy CLI is signed in as. Asks
 /// the Keychain only when an Antigravity account is registered.
 pub async fn seated(accounts: &[ServiceAccount]) -> Option<String> {

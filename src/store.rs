@@ -161,7 +161,12 @@ impl Store {
     /// shows how long each value stood and when it moved.
     pub fn insert(&self, reading: &Reading) -> Result<()> {
         let service = reading.service.name();
-        let tx = self.conn.unchecked_transaction()?;
+        // Taken for writing at once: the row to compare with must not change
+        // between reading it and writing after it.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let newest: Option<(i64, String)> = tx
             .query_row(
                 "SELECT at, reading FROM readings WHERE service = ?1 AND account = ?2

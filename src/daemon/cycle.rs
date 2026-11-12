@@ -82,7 +82,7 @@ impl Outcome {
 /// Probe every account that is not parked, sample the startup model where
 /// due, fold in carried samples and observed rejections, and store the
 /// readings. Parked accounts get their refusal restated.
-pub(super) async fn probe_fleet(
+pub(crate) async fn probe_fleet(
     fleet: &Fleet,
     cadence: &mut Cadence,
     model: Option<&str>,

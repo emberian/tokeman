@@ -1,13 +1,17 @@
-//! `tokeman --watch`: a ratatui dashboard that probes on an interval, shows
-//! a card per account, charts the history over six ranges, and keeps one
-//! line per service account (GLM, Kimi, Antigravity) on its own cadence.
+//! `tokeman --watch`: a ratatui dashboard of the fleet view. A card per
+//! account of every service, and a chart of any limit's history over six
+//! ranges.
+//!
+//! While the background service runs this is a viewer: it re-reads the
+//! stored view every few seconds and sends no request. Without the service
+//! (or started with `--fresh`) it reads every account on the configured
+//! interval through `commands::view`. `r` reads now either way.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use chrono::Utc;
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -19,207 +23,168 @@ use ratatui::widgets::*;
 use tokio::task::JoinHandle;
 
 use crate::account::Fleet;
-use crate::anthropic::Client;
-use crate::anthropic::probe::{PROBE_MODEL, PROBE_MODEL_LABEL, PROBE_TIMEOUT, probe_all};
 use crate::claude::sessions::{self, Session};
+use crate::commands::view;
 use crate::daemon;
-use crate::observe;
-use crate::policy::{self, Mode};
-use crate::providers;
-use crate::quota::{Level, ModelKey, Reading, Scope, Service, Source, Span as QSpan, Window};
+use crate::policy::Mode;
+use crate::quota::{Level, Limit, Reading, Service};
 use crate::store::{Series, Store};
-use crate::ui::chart::{Point, format_duration_hours, points, segments};
+use crate::ui::chart::{self, Point, format_duration_hours, points, segments};
+use crate::ui::overview::{AccountView, Origin, Overview};
 use crate::ui::text::{
-    claim_label, format_age, format_reset_compact, short_bucket_label, status_badge,
-    truncate_chars, usage_summary,
+    format_age, format_reset_compact, limit_name, limits_in_order, truncate_chars, view_caption,
 };
 
 /// Chart ranges in days, cycled with `[` / `]`.
 const RANGE_DAYS: [i64; 6] = [1, 3, 5, 7, 14, 30];
-/// Points further apart than this are not joined.
+/// Points further apart than this were not read back to back.
 const GAP_SECS: i64 = 600;
+/// How often the stored view is read again while the service keeps it fresh.
+const VIEW_INTERVAL: Duration = Duration::from_secs(5);
+/// How often live Claude processes are counted and the history re-read.
+const SLOW_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The series the chart pane shows, cycled with Tab.
-#[derive(Clone, PartialEq, Eq)]
-enum ChartWindow {
-    Weekly,
-    Session,
-    Model { key: ModelKey, label: String },
-    Overage,
-}
-
-impl ChartWindow {
-    fn label(&self) -> &str {
-        match self {
-            Self::Session => "5h",
-            Self::Weekly => "7d",
-            Self::Model { label, .. } => label,
-            Self::Overage => "$$",
-        }
-    }
-
-    fn series(&self) -> Series {
-        match self {
-            Self::Session => Series::session(),
-            Self::Weekly => Series::weekly(),
-            Self::Model { key, .. } => Series::new(QSpan::Weekly, Scope::Model(key.clone())),
-            Self::Overage => Series::new(QSpan::Unknown, Scope::extra_usage()),
-        }
-    }
-}
-
-/// What the header says about the last probe.
-#[derive(Clone, Copy)]
-enum Status {
-    Starting,
-    Probing,
-    Probed {
-        ok: usize,
-        total: usize,
-        at: DateTime<Local>,
-    },
-}
-
-impl fmt::Display for Status {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Starting => f.write_str("Starting..."),
-            Self::Probing => f.write_str("Probing..."),
-            Self::Probed { ok, total, at } => {
-                write!(f, "Probed {ok}/{total} at {}", at.format("%H:%M:%S"))
-            }
-        }
-    }
+/// What a finished load hands the screen.
+struct Loaded {
+    overview: Overview,
+    /// `Some` when a census was taken with this load; the inner `None` is a
+    /// census that failed.
+    sessions: Option<Option<Vec<Session>>>,
 }
 
 struct App {
     fleet: Fleet,
-    store: Store,
-    readings: Vec<Reading>,
+    /// Read every account on the interval even while the service runs.
+    always_fresh: bool,
+    overview: Option<Overview>,
     selected: usize,
-    last_probe: Instant,
-    status: Status,
-    show_chart: bool,
-    chart_fullscreen: bool,
-    chart_window: ChartWindow,
-    /// Index into `RANGE_DAYS`.
-    chart_range: usize,
-    history: BTreeMap<String, Vec<Reading>>,
-    refresh_interval: Duration,
-    default_account: Option<String>,
-    /// The model Claude starts on, as settings.json spells it.
-    target_model: Option<String>,
+    loaded_at: Option<Instant>,
+    loading: bool,
     /// `None` until the first census, or when the census failed.
     live_sessions: Option<Vec<Session>>,
-    mode: Mode,
-    /// The last read of each service account, seeded from the store.
-    services: Vec<Reading>,
-    last_services_read: Option<Instant>,
+    census_at: Option<Instant>,
+    show_chart: bool,
+    chart_fullscreen: bool,
+    /// The limit the chart follows; `None` is the first the history holds.
+    chart_series: Option<Series>,
+    /// Index into `RANGE_DAYS`.
+    chart_range: usize,
+    /// The selected account's service, read back `range_days`.
+    history: Vec<Reading>,
+    history_of: Option<(Service, usize)>,
+    history_at: Option<Instant>,
 }
 
 impl App {
-    fn new(fleet: Fleet, store: Store) -> Self {
-        let refresh_interval = Duration::from_secs(fleet.launch.probe_interval_secs.max(1));
-        let default_account = daemon::default_account(&fleet).ok().flatten();
+    fn new(fleet: Fleet, always_fresh: bool) -> Self {
         Self {
-            store,
-            readings: Vec::new(),
+            fleet,
+            always_fresh,
+            overview: None,
             selected: 0,
-            last_probe: Instant::now() - refresh_interval,
-            status: Status::Starting,
+            loaded_at: None,
+            loading: false,
+            live_sessions: None,
+            census_at: None,
             show_chart: false,
             chart_fullscreen: false,
-            chart_window: ChartWindow::Weekly,
+            chart_series: None,
             chart_range: 0,
-            history: BTreeMap::new(),
-            refresh_interval,
-            default_account,
-            target_model: current_model(),
-            live_sessions: None,
-            mode: Mode::Normal,
-            services: Vec::new(),
-            last_services_read: None,
-            fleet,
+            history: Vec::new(),
+            history_of: None,
+            history_at: None,
         }
     }
 
-    fn target_key(&self) -> Option<ModelKey> {
-        self.target_model.as_deref().map(ModelKey::new)
-    }
-
-    async fn apply_readings(&mut self, mut readings: Vec<Reading>) {
-        let _ = observe::scan_transcripts(&self.fleet.accounts);
-        observe::apply(&mut readings);
-        for reading in &readings {
-            let _ = self.store.insert(reading);
-        }
-        self.readings = readings;
-        if self.selected >= self.readings.len() {
-            self.selected = self.readings.len().saturating_sub(1);
-        }
-        self.last_probe = Instant::now();
-        self.status = Status::Probed {
-            ok: self.readings.iter().filter(|r| r.error.is_none()).count(),
-            total: self.readings.len(),
-            at: Local::now(),
-        };
-        self.default_account = daemon::default_account(&self.fleet).ok().flatten();
-        self.target_model = current_model();
-        self.live_sessions = sessions::live().await.ok();
-        self.mode = policy::safe_mode_for(
-            &self.readings,
-            self.fleet.accounts.len(),
-            &self.fleet.policy,
-            self.mode,
-            self.target_key().as_ref(),
-        );
-        self.load_history();
-    }
-
-    fn load_history(&mut self) {
-        let since = Utc::now() - chrono::Duration::days(self.range_days());
-        self.history.clear();
-        for account in &self.fleet.accounts {
-            if let Ok(snapshots) =
-                self.store
-                    .since(Service::Claude, Some(&account.name), since.timestamp())
-            {
-                self.history.insert(account.name.clone(), snapshots);
-            }
-        }
-    }
-
-    fn services_due(&self) -> bool {
-        !self.fleet.services.is_empty()
+    /// Whether the background service is the reader and this only shows.
+    fn is_viewer(&self) -> bool {
+        !self.always_fresh
             && self
-                .last_services_read
-                .is_none_or(|at| at.elapsed() >= self.fleet.launch.services_interval())
+                .overview
+                .as_ref()
+                .is_none_or(|overview| overview.monitor.keeps_fresh())
     }
 
-    fn spawn_services_read(&mut self) -> JoinHandle<Vec<Reading>> {
-        let accounts = self.fleet.services.clone();
+    fn interval(&self) -> Duration {
+        if self.is_viewer() {
+            VIEW_INTERVAL
+        } else {
+            Duration::from_secs(self.fleet.launch.probe_interval_secs.max(1))
+        }
+    }
+
+    fn next_load_in(&self) -> Duration {
+        match self.loaded_at {
+            Some(at) => self.interval().saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Build the view in the background: the stored one, or a read of every
+    /// account when nothing else reads them or `force` asks.
+    fn spawn_load(&mut self, force: bool) -> JoinHandle<Loaded> {
+        self.loading = true;
+        let fleet = self.fleet.clone();
+        let force = force || self.always_fresh;
+        let census = self
+            .census_at
+            .is_none_or(|at| at.elapsed() >= SLOW_INTERVAL);
         tokio::spawn(async move {
-            providers::read_all(providers::client(), &accounts, Utc::now().timestamp()).await
+            let overview = view::overview(&fleet, force).await;
+            let sessions = match census {
+                true => Some(sessions::live().await.ok()),
+                false => None,
+            };
+            Loaded { overview, sessions }
         })
     }
 
-    fn apply_services(&mut self, usages: Vec<Reading>) {
-        for usage in &usages {
-            let _ = self.store.insert(usage);
+    fn apply(&mut self, loaded: Loaded) {
+        if let Some(sessions) = loaded.sessions {
+            self.live_sessions = sessions;
+            self.census_at = Some(Instant::now());
         }
-        self.services = usages;
-        self.last_services_read = Some(Instant::now());
+        self.overview = Some(loaded.overview);
+        self.loading = false;
+        self.loaded_at = Some(Instant::now());
+        let count = self.accounts().len();
+        if self.selected >= count {
+            self.selected = count.saturating_sub(1);
+        }
     }
 
-    /// The stored reads of the configured service accounts, in fleet order.
-    fn seed_services(&mut self) {
-        let accounts: Vec<(Service, &str)> = self
-            .fleet
-            .services
-            .iter()
-            .map(|account| (account.service, account.name.as_str()))
-            .collect();
-        self.services = self.store.latest(&accounts).unwrap_or_default();
+    fn accounts(&self) -> &[AccountView] {
+        self.overview
+            .as_ref()
+            .map_or(&[], |overview| overview.accounts.as_slice())
+    }
+
+    fn selected_account(&self) -> Option<&AccountView> {
+        self.accounts().get(self.selected)
+    }
+
+    /// Read the selected account's service back over the chart range, when
+    /// the selection or the range changed, or the last read is old.
+    fn load_history(&mut self, now: bool) {
+        let Some(service) = self.selected_account().map(|account| account.service) else {
+            return;
+        };
+        let wanted = Some((service, self.chart_range));
+        let stale = self
+            .history_at
+            .is_none_or(|at| at.elapsed() >= SLOW_INTERVAL);
+        if !now && !stale && self.history_of == wanted {
+            return;
+        }
+        let since = Utc::now().timestamp() - self.range_days() * 86_400;
+        self.history = Store::open_read_only()
+            .and_then(|store| store.since(service, None, since))
+            .unwrap_or_default();
+        if self.history_of.map(|(of, _)| of) != Some(service) {
+            self.chart_series = None;
+        }
+        self.history_of = wanted;
+        self.history_at = Some(Instant::now());
     }
 
     fn range_days(&self) -> i64 {
@@ -230,53 +195,34 @@ impl App {
         format!("{}d", self.range_days())
     }
 
-    fn spawn_probe(&mut self) -> JoinHandle<Vec<Reading>> {
-        self.status = Status::Probing;
-        let accounts = self.fleet.accounts.clone();
-        tokio::spawn(async move {
-            let now = Utc::now().timestamp();
-            probe_all(Client::shared(), &accounts, PROBE_MODEL, PROBE_TIMEOUT, now).await
-        })
+    /// The limit the chart follows now.
+    fn series(&self) -> Option<Series> {
+        self.chart_series
+            .clone()
+            .or_else(|| chart::resolve(None, &self.history).ok())
     }
 
-    fn available_chart_windows(&self) -> Vec<ChartWindow> {
-        let mut buckets = BTreeMap::<ModelKey, String>::new();
-        for limit in self.readings.iter().flat_map(Reading::models) {
-            if let Some(key) = limit.key() {
-                buckets
-                    .entry(key.clone())
-                    .or_insert_with(|| limit.label.clone());
-            }
+    fn series_label(&self) -> String {
+        self.series().map_or_else(
+            || "no history".to_owned(),
+            |series| chart::series_name(&series, &self.history),
+        )
+    }
+
+    /// Step to the next limit the history holds.
+    fn cycle_series(&mut self) {
+        let known: Vec<Series> = Series::known(&self.history)
+            .into_iter()
+            .map(|(series, _)| series)
+            .collect();
+        if known.is_empty() {
+            return;
         }
-        for limit in self.history.values().flatten().flat_map(Reading::models) {
-            if let Some(key) = limit.key() {
-                buckets
-                    .entry(key.clone())
-                    .or_insert_with(|| limit.label.clone());
-            }
-        }
-        let mut windows = vec![ChartWindow::Weekly, ChartWindow::Session];
-        windows.extend(
-            buckets
-                .into_iter()
-                .map(|(key, label)| ChartWindow::Model { key, label }),
-        );
-        windows.push(ChartWindow::Overage);
-        windows
-    }
-
-    fn cycle_chart_window(&mut self) {
-        let windows = self.available_chart_windows();
-        let current = windows
-            .iter()
-            .position(|window| window == &self.chart_window)
-            .unwrap_or_else(|| windows.len().saturating_sub(1));
-        self.chart_window = windows[(current + 1) % windows.len()].clone();
-    }
-
-    fn next_probe_in(&self) -> Duration {
-        self.refresh_interval
-            .saturating_sub(self.last_probe.elapsed())
+        let current = self
+            .series()
+            .and_then(|series| known.iter().position(|other| *other == series))
+            .unwrap_or(known.len() - 1);
+        self.chart_series = Some(known[(current + 1) % known.len()].clone());
     }
 }
 
@@ -301,17 +247,13 @@ impl Drop for TerminalSession {
     }
 }
 
-pub async fn run(fleet: Fleet) -> Result<()> {
-    let store = Store::open()?;
-    let mut app = App::new(fleet, store);
-    app.seed_services();
-    app.live_sessions = sessions::live().await.ok();
+pub async fn run(fleet: Fleet, always_fresh: bool) -> Result<()> {
+    let mut app = App::new(fleet, always_fresh);
     let started_as = daemon::executable_identity();
 
     let terminal_session = TerminalSession::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    let mut active_probe: Option<JoinHandle<Vec<Reading>>> = None;
-    let mut active_services: Option<JoinHandle<Vec<Reading>>> = None;
+    let mut active: Option<JoinHandle<Loaded>> = None;
     let mut executable_replaced = false;
 
     loop {
@@ -321,23 +263,12 @@ pub async fn run(fleet: Fleet) -> Result<()> {
             executable_replaced = true;
             break;
         }
-        if active_probe.as_ref().is_some_and(JoinHandle::is_finished)
-            && let Some(probe) = active_probe.take()
-        {
-            app.apply_readings(probe.await?).await;
+        if let Some(load) = active.take_if(|load| load.is_finished()) {
+            app.apply(load.await?);
+            app.load_history(false);
         }
-        if app.last_probe.elapsed() >= app.refresh_interval && active_probe.is_none() {
-            active_probe = Some(app.spawn_probe());
-        }
-        if let Some(read) = active_services.take_if(|read| read.is_finished()) {
-            match read.await {
-                Ok(usages) => app.apply_services(usages),
-                // Retried at the next interval rather than at once.
-                Err(_) => app.last_services_read = Some(Instant::now()),
-            }
-        }
-        if active_services.is_none() && app.services_due() {
-            active_services = Some(app.spawn_services_read());
+        if active.is_none() && app.next_load_in().is_zero() {
+            active = Some(app.spawn_load(false));
         }
 
         terminal.draw(|f| draw(f, &app))?;
@@ -351,12 +282,10 @@ pub async fn run(fleet: Fleet) -> Result<()> {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('r') => {
-                    if active_probe.is_none() {
-                        active_probe = Some(app.spawn_probe());
+                    if let Some(load) = active.take() {
+                        load.abort();
                     }
-                    if active_services.is_none() && !app.fleet.services.is_empty() {
-                        active_services = Some(app.spawn_services_read());
-                    }
+                    active = Some(app.spawn_load(true));
                 }
                 KeyCode::Char('c') => {
                     app.show_chart = !app.show_chart;
@@ -371,31 +300,30 @@ pub async fn run(fleet: Fleet) -> Result<()> {
                         app.chart_fullscreen = true;
                     }
                 }
-                KeyCode::Tab => app.cycle_chart_window(),
+                KeyCode::Tab => app.cycle_series(),
                 KeyCode::Char('[') => {
                     app.chart_range = (app.chart_range + RANGE_DAYS.len() - 1) % RANGE_DAYS.len();
-                    app.load_history();
+                    app.load_history(true);
                 }
                 KeyCode::Char(']') => {
                     app.chart_range = (app.chart_range + 1) % RANGE_DAYS.len();
-                    app.load_history();
+                    app.load_history(true);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.selected = app.selected.saturating_sub(1);
+                    app.load_history(false);
                 }
-                KeyCode::Down | KeyCode::Char('j') if app.selected + 1 < app.readings.len() => {
+                KeyCode::Down | KeyCode::Char('j') if app.selected + 1 < app.accounts().len() => {
                     app.selected += 1;
+                    app.load_history(false);
                 }
                 _ => {}
             }
         }
     }
 
-    if let Some(probe) = active_probe {
-        probe.abort();
-    }
-    if let Some(read) = active_services {
-        read.abort();
+    if let Some(load) = active {
+        load.abort();
     }
     drop(terminal);
     drop(terminal_session);
@@ -403,6 +331,31 @@ pub async fn run(fleet: Fleet) -> Result<()> {
         super::text::notice("tokeman was upgraded while --watch was open; rerun tokeman --watch");
     }
     Ok(())
+}
+
+/// The two header lines: where the view comes from and how old it is, then
+/// what Claude Code holds and the rotation's floors.
+fn header_text(app: &App) -> String {
+    let Some(overview) = &app.overview else {
+        return " Tokeman  |  reading...".to_owned();
+    };
+    let next = if app.loading {
+        "reading...".to_owned()
+    } else if app.is_viewer() {
+        "r: read now".to_owned()
+    } else {
+        format!("next read {}s", app.next_load_in().as_secs())
+    };
+    format!(
+        " Tokeman  |  {}  |  {next}\n default(new): {} / {}  |  live pins (~=estimate): {}  |  {} floors: {:.0}% 5h / {:.0}% 7d",
+        view_caption(overview),
+        overview.default_account.as_deref().unwrap_or("/login"),
+        overview.target_model.as_deref().unwrap_or("model?"),
+        sessions::summary(app.live_sessions.as_deref()),
+        overview.rotation.mode.label(),
+        overview.rotation.min_session_remaining * 100.0,
+        overview.rotation.min_weekly_remaining * 100.0,
+    )
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -415,45 +368,28 @@ fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let floors = app.fleet.policy.floors(app.mode);
-    let header_text = format!(
-        " Tokeman  |  {}  |  default(new): {} / {}  |  next {}s\n live pins (~=estimate): {}  |  {} floors: {:.0}% 5h / {:.0}% 7d",
-        app.status,
-        app.default_account.as_deref().unwrap_or("/login"),
-        app.target_model.as_deref().unwrap_or("model?"),
-        app.next_probe_in().as_secs(),
-        sessions::summary(app.live_sessions.as_deref()),
-        app.mode.label(),
-        floors.session * 100.0,
-        floors.weekly * 100.0,
-    );
-    let header = Paragraph::new(header_text)
+    let stale = app.overview.as_ref().is_some_and(|overview| {
+        overview.origin == Origin::Stored
+            && overview
+                .read_at
+                .is_none_or(|at| overview.at - at > crate::ui::text::STALE_SECS)
+    });
+    let header = Paragraph::new(header_text(app))
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(if stale { Color::Yellow } else { Color::Cyan })
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, chunks[0]);
 
-    let main = if app.fleet.services.is_empty() {
-        chunks[1]
-    } else {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(4),
-                Constraint::Length(app.fleet.services.len() as u16 + 1),
-            ])
-            .split(chunks[1]);
-        draw_services(f, split[1], app);
-        split[0]
-    };
-    let chunks = [chunks[0], main, chunks[2]];
-
-    if app.readings.is_empty() {
-        let empty = Paragraph::new("  No results yet. Waiting for first probe...")
-            .style(Style::default().fg(Color::DarkGray));
+    if app.accounts().is_empty() {
+        let text = if app.overview.is_some() {
+            "  No accounts configured."
+        } else {
+            "  Reading the fleet view..."
+        };
+        let empty = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, chunks[1]);
     } else if app.show_chart && app.chart_fullscreen {
         draw_chart(f, chunks[1], app);
@@ -470,14 +406,13 @@ fn draw(f: &mut Frame, app: &App) {
 
     let footer_text = if app.show_chart {
         format!(
-            " q: quit  r: refresh  c: split  C: full-screen  Tab: window [{}]  [/]: range [{}]",
-            app.chart_window.label(),
+            " q: quit  r: read now  c: split  C: full-screen  Tab: limit [{}]  [/]: range [{}]",
+            app.series_label(),
             app.range_label()
         )
     } else {
-        format!(
-            " q: quit  r: refresh  j/k: navigate  c/C: charts  |  D=default(new), !=observed rejection  |  {PROBE_MODEL_LABEL} + model feedback"
-        )
+        " q: quit  r: read now  j/k: navigate  c/C: charts  |  * = the account its tool holds"
+            .to_owned()
     };
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -485,23 +420,14 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(footer, chunks[2]);
 }
 
-/// The shared windows a card shows, with their gauge labels.
-fn shared_windows(reading: &Reading) -> Vec<(&'static str, Window)> {
-    [
-        ("5h", reading.session()),
-        ("7d", reading.weekly()),
-        ("$$", reading.window(QSpan::Unknown, &Scope::extra_usage())),
-    ]
-    .into_iter()
-    .filter_map(|(label, window)| Some((label, window?)))
-    .collect()
-}
-
-/// Lines in a card: name, quota gauges (or the error), model gauges,
-/// optional sparkline, spacer.
-fn card_rows(reading: &Reading, show_spark: bool) -> u16 {
-    let quota_rows = shared_windows(reading).len().max(1) as u16;
-    2 + quota_rows + reading.models().count().max(1) as u16 + u16::from(show_spark)
+/// Lines in a card: the name, a gauge per limit (or one line saying why
+/// there is none), an optional sparkline, a spacer.
+fn card_rows(account: &AccountView, show_spark: bool) -> u16 {
+    let limits = account
+        .reading
+        .as_ref()
+        .map_or(0, |reading| reading.limits.len());
+    2 + limits.max(1) as u16 + u16::from(show_spark)
 }
 
 /// Which cards fit, keeping the selected one visible when the fleet is
@@ -525,17 +451,34 @@ fn visible_range(heights: &[u16], selected: usize, available: u16) -> (usize, us
     (start, end)
 }
 
+/// The selected account's points of the charted limit, when there are
+/// enough to draw.
+fn spark_points(app: &App, index: usize, account: &AccountView) -> Option<Vec<u64>> {
+    if index != app.selected {
+        return None;
+    }
+    let series = app.series()?;
+    let data: Vec<u64> = app
+        .history
+        .iter()
+        .filter(|reading| reading.account == account.name)
+        .filter_map(|reading| series.window(reading))
+        .map(|window| (window.remaining() * 100.0).round().clamp(0.0, 100.0) as u64)
+        .collect();
+    (data.len() >= 2).then_some(data)
+}
+
 fn draw_cards(f: &mut Frame, area: Rect, app: &App) {
-    let spark_history = |index: usize, reading: &Reading| {
-        app.history
-            .get(&reading.account)
-            .filter(|h| index == app.selected && h.len() >= 2)
-    };
-    let heights: Vec<u16> = app
-        .readings
+    let accounts = app.accounts();
+    let sparks: Vec<Option<Vec<u64>>> = accounts
         .iter()
         .enumerate()
-        .map(|(i, r)| card_rows(r, spark_history(i, r).is_some()))
+        .map(|(index, account)| spark_points(app, index, account))
+        .collect();
+    let heights: Vec<u16> = accounts
+        .iter()
+        .zip(&sparks)
+        .map(|(account, spark)| card_rows(account, spark.is_some()))
         .collect();
     let (start, end) = visible_range(&heights, app.selected, area.height);
     let constraints: Vec<_> = heights[start..end]
@@ -547,218 +490,163 @@ fn draw_cards(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    let aged_at = app
+        .overview
+        .as_ref()
+        .filter(|overview| overview.origin == Origin::Stored)
+        .map(|overview| overview.at);
 
-    for (visible, reading) in app.readings[start..end].iter().enumerate() {
+    for (visible, account) in accounts[start..end].iter().enumerate() {
         let index = start + visible;
-        draw_card(
-            f,
-            card_areas[visible],
-            reading,
-            heights[index],
-            index == app.selected,
-            app.default_account.as_deref() == Some(reading.account.as_str()),
-            spark_history(index, reading),
-        );
+        let lines = card_lines(account, index == app.selected, aged_at);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Length(1); heights[index] as usize])
+            .split(card_areas[visible]);
+        for (row, line) in lines.into_iter().enumerate() {
+            f.render_widget(Paragraph::new(line), rows[row]);
+        }
+        if let Some(data) = &sparks[index] {
+            let row = rows[heights[index] as usize - 2];
+            let label = format!("   {} ", truncate_chars(&app.series_label(), 20));
+            let label_width = label.chars().count() as u16;
+            f.render_widget(
+                Paragraph::new(Span::styled(label, Style::default().fg(Color::DarkGray))),
+                Rect {
+                    width: label_width.min(row.width),
+                    ..row
+                },
+            );
+            let sparkline = Sparkline::default()
+                .data(data)
+                .style(Style::default().fg(Color::Cyan));
+            f.render_widget(
+                sparkline,
+                Rect {
+                    x: row.x + label_width.min(row.width),
+                    width: row.width.saturating_sub(label_width + 2),
+                    ..row
+                },
+            );
+        }
     }
 }
 
-fn draw_card(
-    f: &mut Frame,
-    area: Rect,
-    reading: &Reading,
-    row_count: u16,
-    selected: bool,
-    is_default: bool,
-    spark_history: Option<&Vec<Reading>>,
-) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(1); row_count as usize])
-        .split(area);
-
-    let marker = match (selected, is_default) {
-        (true, true) => ">D",
+/// One account's card, without its sparkline: the name line, then a gauge
+/// per limit, or one line saying why there is none.
+fn card_lines(account: &AccountView, selected: bool, aged_at: Option<i64>) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let marker = match (selected, account.held) {
+        (true, true) => ">*",
         (true, false) => "> ",
-        (false, true) => " D",
+        (false, true) => " *",
         (false, false) => "  ",
     };
-    let (status, level) = status_badge(reading);
-    let status_color = level.map_or(Color::DarkGray, |level| super::level_color(level, LEVELS));
-    let claim = reading
-        .claude()
-        .and_then(|claude| claude.claim.as_deref())
-        .and_then(claim_label)
-        .map_or(String::new(), |(_, short)| format!(" {short}"));
-    let claim = if reading.session_limit() == crate::quota::SessionLimit::Absent {
-        format!("{claim} · no 5h limit")
-    } else {
-        claim
-    };
-
-    let name_line = Line::from(vec![
+    let mut name = vec![
         Span::styled(
             format!("{marker} "),
-            Style::default().fg(if is_default {
+            Style::default().fg(if account.held {
                 Color::LightGreen
             } else {
                 Color::Cyan
             }),
         ),
         Span::styled(
-            &reading.account,
+            account.name.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(status, Style::default().fg(status_color)),
-        Span::styled(claim, Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(name_line), rows[0]);
-
-    let mut row = 1;
-    let windows = shared_windows(reading);
-    if !windows.is_empty() {
-        for (label, window) in windows {
-            f.render_widget(Paragraph::new(gauge_line(label, window)), rows[row]);
-            row += 1;
-        }
-    } else {
-        let (text, color) = match &reading.error {
-            Some(error) => (
-                format!("   error: {}", truncate_chars(&error.to_string(), 80)),
-                Color::Red,
-            ),
-            None => ("   no unified quota headers".to_owned(), Color::DarkGray),
-        };
-        let line = Line::from(Span::styled(text, Style::default().fg(color)));
-        f.render_widget(Paragraph::new(line), rows[row]);
-        row += 1;
+        Span::styled(format!("  {}", account.service_label), dim),
+    ];
+    if let Some(state) = &account.state {
+        let color = state
+            .level
+            .map_or(Color::DarkGray, |level| super::level_color(level, LEVELS));
+        name.push(Span::styled(
+            format!("  {}", truncate_chars(&state.word, 40)),
+            Style::default().fg(color),
+        ));
     }
-    if reading.models().next().is_none() {
-        let reason = if reading
-            .claude()
-            .is_some_and(|claude| claude.profile_error.is_some())
-        {
-            "profile credential expired/unavailable"
-        } else {
-            "profile usage not captured"
-        };
-        let line = Line::from(vec![
-            Span::raw("   M7  "),
-            Span::styled(reason, Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line), rows[row]);
-        row += 1;
-    } else {
-        for limit in reading.models() {
-            let label = compact_bucket_label(&limit.label, limit.source == Source::Observed);
-            f.render_widget(Paragraph::new(gauge_line(&label, limit.window)), rows[row]);
-            row += 1;
-        }
+    if account.parked {
+        name.push(Span::styled("  parked", dim));
     }
-
-    if let Some(snapshots) = spark_history {
-        let spark_data: Vec<u64> = snapshots
-            .iter()
-            .filter_map(Reading::weekly)
-            .map(|w| (w.remaining() * 100.0).round().clamp(0.0, 100.0) as u64)
-            .collect();
-        if !spark_data.is_empty() {
-            let label = "   7d ";
-            let label_width = label.len() as u16;
-            f.render_widget(
-                Paragraph::new(Span::styled(label, Style::default().fg(Color::DarkGray))),
-                Rect {
-                    x: area.x,
-                    y: rows[row].y,
-                    width: label_width,
-                    height: 1,
-                },
-            );
-            let spark_area = Rect {
-                x: area.x + label_width,
-                y: rows[row].y,
-                width: rows[row].width.saturating_sub(label_width + 2),
-                height: 1,
-            };
-            let sparkline = Sparkline::default()
-                .data(&spark_data)
-                .style(Style::default().fg(Color::Cyan));
-            f.render_widget(sparkline, spark_area);
-        }
+    if account.service == Service::Claude && account.viable == Some(false) {
+        name.push(Span::styled(
+            "  below floor",
+            Style::default().fg(Color::Yellow),
+        ));
     }
-}
-
-/// One line per configured service account: its last read, or that none came yet.
-fn service_lines(app: &App, now: i64) -> Vec<Line<'static>> {
-    app.fleet
-        .services
+    let warning = account
+        .notes
         .iter()
-        .map(|account| {
-            let read = app
-                .services
-                .iter()
-                .find(|usage| usage.service == account.service && usage.account == account.name);
-            let head = Span::raw(format!(
-                " {:<22} {:<11} ",
-                truncate_chars(&account.name, 22),
-                account.service.label()
-            ));
-            let Some(usage) = read else {
-                return Line::from(vec![
-                    head,
-                    Span::styled("reading...", Style::default().fg(Color::DarkGray)),
-                ]);
-            };
-            let color = match (&usage.error, usage.tightest()) {
-                (Some(_), _) => Color::Red,
-                (None, Some(meter)) => {
-                    super::level_color(Level::of(meter.window.remaining()), LEVELS)
-                }
-                (None, None) => Color::DarkGray,
-            };
-            Line::from(vec![
-                head,
-                Span::styled(usage_summary(usage), Style::default().fg(color)),
-                Span::styled(
-                    format!("  {}", format_age(usage.at, now)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        })
-        .collect()
-}
-
-fn draw_services(f: &mut Frame, area: Rect, app: &App) {
-    let services = Paragraph::new(service_lines(app, Utc::now().timestamp()))
-        .block(Block::default().borders(Borders::TOP).title(" services "));
-    f.render_widget(services, area);
+        .find(|note| note.starts_with('!'))
+        .or(account
+            .login
+            .as_ref()
+            .filter(|login| login.warning)
+            .and_then(|login| login.note.as_ref()));
+    if let Some(warning) = warning {
+        name.push(Span::styled(
+            format!("  {}", truncate_chars(warning, 60)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let reading = account.reading.as_ref();
+    if let (Some(reading), Some(now)) = (reading, aged_at) {
+        name.push(Span::styled(
+            format!("  {}", format_age(reading.at, now)),
+            dim,
+        ));
+    }
+    let mut lines = vec![Line::from(name)];
+    let limits = reading.map(limits_in_order).unwrap_or_default();
+    let width = limits
+        .iter()
+        .map(|limit| limit_name(limit).chars().count())
+        .max()
+        .unwrap_or(0);
+    lines.extend(limits.iter().map(|limit| gauge_line(limit, width)));
+    if limits.is_empty() {
+        let (text, color) = match (&account.error, reading) {
+            (Some(error), _) => (format!("error: {}", truncate_chars(error, 100)), Color::Red),
+            (None, Some(_)) => (
+                account
+                    .notes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no limits reported".to_owned()),
+                Color::DarkGray,
+            ),
+            (None, None) => ("not read yet".to_owned(), Color::DarkGray),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("   {text}"),
+            Style::default().fg(color),
+        )));
+    }
+    lines
 }
 
 /// The terminal palette for [`super::level_color`].
 const LEVELS: [Color; 3] = [Color::Green, Color::Yellow, Color::Red];
 
-/// The model Claude Code starts with, as its settings name it.
-fn current_model() -> Option<String> {
-    crate::commands::view::target_model().map(|model| model.as_str().to_owned())
-}
-
-/// `O48`, with `!` when the bucket is an observed rejection.
-fn compact_bucket_label(label: &str, rejected: bool) -> String {
-    let short = short_bucket_label(label);
-    if rejected { format!("{short}!") } else { short }
-}
-
-fn gauge_line<'a>(label: &str, window: Window) -> Line<'a> {
-    let remaining = window.remaining().clamp(0.0, 1.0);
+/// One limit as a gauge: its name padded to `width`, a bar of what is left,
+/// the percentage and the reset.
+fn gauge_line(limit: &Limit, width: usize) -> Line<'static> {
+    let remaining = limit.window.remaining().clamp(0.0, 1.0);
     let bar_width = 30usize;
     let filled = ((remaining * bar_width as f64).round() as usize).min(bar_width);
     let empty = bar_width - filled;
     let pct = (remaining * 100.0).round() as u8;
     let color = super::level_color(Level::of(remaining), LEVELS);
-    let reset = format_reset_compact(window.resets_at);
+    let reset = format_reset_compact(limit.window.resets_at);
+    let mark = if limit.is_rejected() || limit.source == crate::quota::Source::Observed {
+        "!"
+    } else {
+        " "
+    };
 
     Line::from(vec![
-        Span::raw(format!("   {label} ")),
+        Span::raw(format!("  {mark}{:<width$} ", limit_name(limit))),
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
         Span::styled(
             "\u{2591}".repeat(empty),
@@ -804,22 +692,40 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         Color::LightRed,
         Color::White,
     ];
-
-    let series = app.chart_window.series();
-    let entries: Vec<ChartEntry> = app
-        .history
+    let (Some(service), Some(series)) = (app.history_of.map(|(service, _)| service), app.series())
+    else {
+        let empty = Paragraph::new("  No history in this range.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(empty, area);
+        return;
+    };
+    let mut by_account: BTreeMap<&str, Vec<Reading>> = BTreeMap::new();
+    for reading in &app.history {
+        by_account
+            .entry(reading.account.as_str())
+            .or_default()
+            .push(reading.clone());
+    }
+    let held: Vec<&str> = app
+        .accounts()
+        .iter()
+        .filter(|account| account.service == service && account.held)
+        .map(|account| account.name.as_str())
+        .collect();
+    let entries: Vec<ChartEntry> = by_account
         .iter()
         .enumerate()
-        .filter_map(|(index, (name, snapshots))| {
-            let points = points(snapshots, &series);
+        .filter_map(|(index, (name, readings))| {
+            let points = points(readings, &series);
             if points.is_empty() {
                 return None;
             }
             Some(ChartEntry {
-                name: if app.default_account.as_deref() == Some(name.as_str()) {
-                    format!("D {name}")
+                name: if held.contains(name) {
+                    format!("* {name}")
                 } else {
-                    name.clone()
+                    (*name).to_owned()
                 },
                 color: colors[index % colors.len()],
                 segments: chart_segments(&points, now),
@@ -828,13 +734,8 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let range_hours = (app.range_days() * 24) as f64;
-    let normal = app.fleet.policy.floors(Mode::Normal);
-    let sip = app.fleet.policy.floors(Mode::Sip);
-    let floors = match &app.chart_window {
-        ChartWindow::Session => Some((normal.session * 100.0, sip.session * 100.0)),
-        ChartWindow::Weekly => Some((normal.weekly * 100.0, sip.weekly * 100.0)),
-        ChartWindow::Model { .. } | ChartWindow::Overage => None,
-    };
+    let floors = chart::floors(service, &series, &app.fleet.policy)
+        .map(|(normal, sip)| (normal * 100.0, sip * 100.0));
     let normal_floor = floors.map(|(normal, _)| vec![(-range_hours, normal), (0.0, normal)]);
     let sip_floor = floors.map(|(_, sip)| vec![(-range_hours, sip), (0.0, sip)]);
 
@@ -873,6 +774,10 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
+    let mode = app
+        .overview
+        .as_ref()
+        .map_or(Mode::Normal, |overview| overview.rotation.mode);
     let x_labels = vec![
         Span::raw(format!("-{}", app.range_label())),
         Span::raw(format!("-{}", format_duration_hours(range_hours / 2.0))),
@@ -882,11 +787,12 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(format!(
-                    " {} remaining ({}) · {} mode · {} ",
-                    app.chart_window.label(),
+                    " {} {} remaining ({}) · {} mode · {} ",
+                    service.label(),
+                    chart::series_name(&series, &app.history),
                     app.range_label(),
-                    app.mode.label(),
-                    crate::ui::chart::signal_label(Service::Claude, &app.chart_window.series()),
+                    mode.label(),
+                    chart::signal_label(service, &series),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -913,51 +819,15 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::ReadError;
+    use crate::quota::{ReadError, Source, Window};
     use crate::testing::{model_limit, point};
+    use crate::ui::overview::{Facts, Monitor};
 
-    #[test]
-    fn each_service_account_gets_a_line_read_or_not() {
-        use crate::providers::ServiceAccount;
-        let dir = tempfile::tempdir().unwrap();
-        let fleet = Fleet {
-            services: vec![
-                ServiceAccount::with_key_file(Service::Zai, "glm", "~/.zai-key"),
-                ServiceAccount::with_key_file(Service::Kimi, "kimi", "~/.kimikey"),
-            ],
-            ..Fleet::default()
-        };
-        let mut app = App::new(fleet, Store::open_at(&dir.path().join("s.db")).unwrap());
-        app.services = vec![Reading {
-            limits: vec![crate::providers::limit(
-                None,
-                "weekly",
-                None,
-                Window::new(0.9, 0),
-                None,
-            )],
-            ..Reading::empty(Service::Kimi, "kimi", 1_000)
-        }];
-        let text: Vec<String> = service_lines(&app, 1_000 + 300)
+    fn text(line: &Line) -> String {
+        line.spans
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect()
-            })
-            .collect();
-        assert_eq!(text.len(), 2);
-        assert!(
-            text[0].contains("glm") && text[0].contains("reading..."),
-            "{text:?}"
-        );
-        assert!(
-            text[1].contains("weekly 10%") && text[1].contains("5m ago"),
-            "{text:?}"
-        );
-        let tight = service_lines(&app, 1_300)[1].spans[1].style.fg;
-        assert_eq!(tight, Some(Color::Red));
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn reading() -> Reading {
@@ -967,12 +837,156 @@ mod tests {
         r
     }
 
+    fn view(reading: Option<&Reading>) -> AccountView {
+        let service = reading.map_or(Service::Kimi, |reading| reading.service);
+        AccountView::of(service, "a", reading)
+    }
+
     #[test]
-    fn card_rows_count_every_line() {
-        assert_eq!(card_rows(&reading(), false), 2 + 2 + 1);
-        assert_eq!(card_rows(&reading(), true), 2 + 2 + 1 + 1);
+    fn a_card_has_a_gauge_per_limit_whatever_the_service() {
+        let claude = view(Some(&reading()));
+        assert_eq!(card_rows(&claude, false), 2 + 3);
+        assert_eq!(card_rows(&claude, true), 2 + 3 + 1);
+        let lines: Vec<String> = card_lines(&claude, true, Some(reading().at + 300))
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with(">  a  Claude  allowed"), "{lines:?}");
+        assert!(lines[0].ends_with("5m ago"), "{lines:?}");
+        assert!(lines[1].starts_with("   5h "), "{lines:?}");
+        assert!(lines[1].contains(" 80% left"), "{lines:?}");
+        assert!(lines[2].starts_with("   weekly "), "{lines:?}");
+        assert!(
+            lines[3].starts_with("  !Fable weekly "),
+            "an observed rejection is marked: {lines:?}"
+        );
+
+        let kimi = Reading {
+            limits: vec![crate::providers::limit(
+                Some("Tools".into()),
+                "monthly",
+                None,
+                Window::new(0.9, 0),
+                None,
+            )],
+            ..Reading::empty(Service::Kimi, "a", 0)
+        };
+        let mut held = view(Some(&kimi));
+        held.held = true;
+        let lines = card_lines(&held, false, None);
+        assert_eq!(text(&lines[0]), " * a  Kimi Code");
+        assert!(
+            text(&lines[1]).starts_with("   Tools monthly "),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn a_card_without_limits_says_why() {
         let failed = Reading::failed(Service::Claude, "a", 0, ReadError::NoCredential);
-        assert_eq!(card_rows(&failed, false), 2 + 1 + 1);
+        let account = view(Some(&failed));
+        assert_eq!(card_rows(&account, false), 2 + 1);
+        let lines = card_lines(&account, false, None);
+        assert_eq!(text(&lines[1]), "   error: no usable credential");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Red));
+        let unread = card_lines(&view(None), false, None);
+        assert_eq!(text(&unread[1]), "   not read yet");
+        let empty = card_lines(
+            &view(Some(&Reading::empty(Service::Zai, "a", 0))),
+            false,
+            None,
+        );
+        assert_eq!(text(&empty[1]), "   no limits reported");
+    }
+
+    #[test]
+    fn the_header_says_stored_or_read_and_only_a_reader_counts_down() {
+        let fleet = Fleet {
+            accounts: vec![crate::testing::setup_account("a")],
+            ..Fleet::default()
+        };
+        let mut app = App::new(fleet.clone(), false);
+        assert_eq!(header_text(&app), " Tokeman  |  reading...");
+        assert!(
+            app.next_load_in().is_zero(),
+            "the first load is due at once"
+        );
+        let facts = |monitor| Facts {
+            monitor,
+            readings: vec![reading()],
+            ..Facts::default()
+        };
+        let at = reading().at + 30;
+        app.apply(Loaded {
+            overview: Overview::build(&fleet, facts(Monitor::Running), None, at),
+            sessions: Some(Some(Vec::new())),
+        });
+        assert!(app.is_viewer());
+        assert_eq!(app.interval(), VIEW_INTERVAL);
+        let header = header_text(&app);
+        assert!(
+            header.contains("stored view, last read just now by the background service"),
+            "{header}"
+        );
+        assert!(header.contains("r: read now"), "{header}");
+        assert!(
+            header.contains("live pins (~=estimate): none detected"),
+            "{header}"
+        );
+
+        // Without the service it reads on the configured interval.
+        app.apply(Loaded {
+            overview: Overview::build(
+                &fleet,
+                facts(Monitor::NotInstalled).with_fresh(vec![reading()]),
+                None,
+                at,
+            ),
+            sessions: None,
+        });
+        assert!(!app.is_viewer());
+        assert_eq!(
+            app.interval(),
+            Duration::from_secs(fleet.launch.probe_interval_secs)
+        );
+        let header = header_text(&app);
+        assert!(
+            header.contains("read now, 1/1 accounts answered"),
+            "{header}"
+        );
+        assert!(header.contains("next read "), "{header}");
+        assert!(
+            header.contains("none detected"),
+            "a load without a census keeps the last one: {header}"
+        );
+        // `--fresh` reads even while the service runs.
+        let mut forced = App::new(fleet.clone(), true);
+        forced.apply(Loaded {
+            overview: Overview::build(&fleet, facts(Monitor::Running), None, at),
+            sessions: None,
+        });
+        assert!(!forced.is_viewer());
+    }
+
+    #[test]
+    fn tab_steps_through_the_limits_the_history_holds() {
+        let mut app = App::new(Fleet::default(), false);
+        app.history = vec![reading()];
+        assert_eq!(app.series(), Some(Series::session()));
+        assert_eq!(app.series_label(), "5h");
+        app.cycle_series();
+        assert_eq!(app.series(), Some(Series::weekly()));
+        app.cycle_series();
+        assert_eq!(app.series_label(), "Fable weekly");
+        app.cycle_series();
+        assert_eq!(app.series(), Some(Series::session()));
+        app.history.clear();
+        app.chart_series = None;
+        app.cycle_series();
+        assert_eq!(app.series(), None);
+        assert_eq!(app.series_label(), "no history");
     }
 
     #[test]
@@ -982,12 +996,6 @@ mod tests {
         assert_eq!(visible_range(&heights, 3, 12), (2, 4));
         assert_eq!(visible_range(&heights, 1, 3), (1, 2));
         assert_eq!(visible_range(&[], 0, 10), (0, 0));
-    }
-
-    #[test]
-    fn observed_buckets_are_marked() {
-        assert_eq!(compact_bucket_label("Opus 4.8", true), "O48!");
-        assert_eq!(compact_bucket_label("Fable", false), "Fab");
     }
 
     #[test]

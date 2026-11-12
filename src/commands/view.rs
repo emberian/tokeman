@@ -1,5 +1,6 @@
-//! Reading and ranking the whole fleet: the shared probe, the stored view,
-//! the one ranking behind every `best`, history and stats.
+//! Reading and ranking the whole fleet: the shared probe, the fleet view
+//! (stored or read now), the one ranking behind every `best`, history and
+//! stats.
 
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -14,7 +15,7 @@ use crate::policy::{self, Floors};
 use crate::providers::{self, ServiceAccount};
 use crate::quota::{ModelKey, Reading, Service};
 use crate::store::{Stats, Store};
-use crate::ui::overview::Overview;
+use crate::ui::overview::{Facts, Monitor, Overview};
 
 /// No floor: any counted window with something left can take work.
 pub const ANY_ROOM: Floors = Floors {
@@ -93,13 +94,59 @@ pub fn record(readings: &[Reading]) {
     }
 }
 
-/// Everything stored about the fleet, and the account agy is signed in as.
-/// No request and no write.
-pub async fn stored(fleet: &Fleet) -> (Overview, Option<String>) {
-    (
-        Overview::stored(fleet, now()),
-        super::services::seated(&fleet.services).await,
-    )
+/// The fleet view from what is stored: no request and no write. Each
+/// reading is as old as its `at`.
+pub async fn stored(fleet: &Fleet) -> Overview {
+    let at = now();
+    let mut facts = Facts::on_disk(fleet, at);
+    facts.agy_account = super::services::seated(&fleet.services).await;
+    Overview::build(fleet, facts, None, at)
+}
+
+/// The fleet view of readings made just now, over what is stored about the
+/// rest; of one service's accounts with `only`.
+pub async fn shown(fleet: &Fleet, readings: Vec<Reading>, only: Option<Service>) -> Overview {
+    let at = now();
+    let mut facts = Facts::on_disk(fleet, at).with_fresh(readings);
+    let claude: Vec<Reading> = facts
+        .readings
+        .iter()
+        .filter(|reading| reading.service == Service::Claude)
+        .cloned()
+        .collect();
+    if only.is_none_or(|only| only == Service::Claude) && !claude.is_empty() {
+        let model = facts.target_model.as_deref().map(ModelKey::new);
+        facts.mode = policy::safe_mode_for(
+            &claude,
+            fleet.accounts.len(),
+            &fleet.policy,
+            facts.mode,
+            model.as_ref(),
+        );
+        facts.probe_interval_secs = None;
+    }
+    if only.is_none_or(|only| only == Service::Antigravity) {
+        facts.agy_account = super::services::seated(&fleet.services).await;
+    }
+    Overview::build(fleet, facts, only, at)
+}
+
+/// The fleet view, read now: every account of `only` (every service when
+/// `None`) through [`probe`].
+pub async fn fresh(fleet: &Fleet, only: Option<Service>) -> Overview {
+    let readings = probe(fleet, only).await;
+    shown(fleet, readings, only).await
+}
+
+/// The fleet view a surface shows. While the background service runs it is
+/// the only reader, and this is the stored view: no request is sent.
+/// Without it, or with `force`, every account is read now.
+pub async fn overview(fleet: &Fleet, force: bool) -> Overview {
+    if !force && Monitor::now().keeps_fresh() {
+        stored(fleet).await
+    } else {
+        fresh(fleet, None).await
+    }
 }
 
 /// What part of a reading an account is ranked on.

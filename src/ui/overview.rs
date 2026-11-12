@@ -1,19 +1,24 @@
-//! The stored view: everything tokeman last read about every account, put
-//! together without a request and without a write. `tokeman list --json`
-//! prints it, and both trays draw from it; the daemon (or an explicit probe)
-//! is what keeps the stores it reads fresh.
+//! The fleet view: everything known about every account of every service,
+//! in one structure. `tokeman list --json` is its serialization, and every
+//! surface (the text reports, `--watch`, both trays) draws it.
+//!
+//! A view is built from [`Facts`]. [`Facts::on_disk`] gathers them without
+//! a request or a write, which is what a surface shows while the background
+//! service keeps the stores fresh; a caller that has just read the accounts
+//! itself puts its readings on top with [`Facts::with_fresh`].
 
 use serde::Serialize;
 
-use crate::account::{Account, CodexAccount, Fleet};
+use crate::account::{Account, Fleet};
 use crate::anthropic::profile::Cache;
 use crate::anthropic::resets;
+use crate::claude::sessions::Session;
 use crate::claude::settings as claude_settings;
-use crate::codex::probe::State;
+use crate::daemon::cadence::Cadence;
 use crate::daemon::{lock, service};
-use crate::providers::ServiceAccount;
-use crate::quota::{Limit, Reading, ResetCreditCount, Service, SessionLimit, Source, Window};
-use crate::quota::{Scope, Span};
+use crate::observe::{self, ObservedLimit};
+use crate::policy::{self, Mode};
+use crate::quota::{Level, ModelKey, Reading, Service, Verdict};
 use crate::store::Store;
 use crate::ui::text;
 
@@ -22,69 +27,129 @@ use crate::ui::text;
 #[serde(rename_all = "kebab-case")]
 pub enum Monitor {
     Running,
+    /// The service is installed and rotation is paused: Claude is not read.
     Paused,
-    /// No background service: only explicit probes add readings.
+    /// No background service: only explicit reads add readings.
     NotInstalled,
+}
+
+impl Monitor {
+    pub fn now() -> Self {
+        if !service::is_installed() {
+            Self::NotInstalled
+        } else if lock::is_paused() {
+            Self::Paused
+        } else {
+            Self::Running
+        }
+    }
+
+    /// Whether the background service reads every account by itself, so a
+    /// surface only has to show what is stored.
+    pub fn keeps_fresh(self) -> bool {
+        self == Self::Running
+    }
+}
+
+/// Where a view's readings come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// The history: what the last reads said, each as old as its `at`.
+    Stored,
+    /// Read for this view.
+    Fresh,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Overview {
     /// Epoch seconds when this view was put together.
     pub at: i64,
+    pub origin: Origin,
+    /// Epoch seconds of the newest reading in the view.
+    pub read_at: Option<i64>,
     pub monitor: Monitor,
+    /// The account Claude Code's settings offer now, when tokeman manages it.
     pub default_account: Option<String>,
+    /// The model Claude Code starts on, as its settings spell it.
     pub target_model: Option<String>,
-    pub claude: Vec<ClaudeView>,
+    /// The most weekly room among the Claude accounts whose last reading
+    /// allows work: what a status dot shows.
+    pub best_weekly_remaining: Option<f64>,
+    pub rotation: Rotation,
+    /// Every configured account: Claude, then Codex, then the other
+    /// services, each in configured order.
+    pub accounts: Vec<AccountView>,
     pub resets_on_offer: Vec<ResetOffer>,
-    pub codex: Vec<CodexView>,
-    pub services: Vec<ServiceView>,
+}
+
+/// The state of Claude's rotation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Rotation {
+    pub mode: Mode,
+    pub probe_interval_secs: u64,
+    /// The floors of `mode`: the default changes at or below them.
+    pub min_session_remaining: f64,
+    pub min_weekly_remaining: f64,
+    /// Claude's settings offer a credential that is no configured account's.
+    pub default_is_unmanaged: bool,
+    /// How many accounts have profile limits and how many rejections stand
+    /// (`tokeman rotate status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<String>,
+    /// Whether and how the startup model's own limit is sampled
+    /// (`tokeman rotate status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<String>,
+    /// Live Claude processes and the account each spends. `None` when no
+    /// census was taken for this view, or it failed.
+    pub live_sessions: Option<Vec<Session>>,
+}
+
+/// One account of one service.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountView {
+    pub service: Service,
+    pub service_label: &'static str,
+    pub name: String,
+    pub label: Option<String>,
+    /// The tool holds this account now: Claude Code's default, agy's login.
+    pub held: bool,
+    /// A Codex profile kept out of `codex best` and `codex use`.
+    pub parked: bool,
+    /// Claude: the credential and the login's state.
+    pub login: Option<LoginView>,
+    /// The reading's state in a word, and the level to colour it with.
+    pub state: Option<State>,
+    /// Claude: whether the account is above the rotation's floors for the
+    /// startup model. Codex: whether the backend accepts work on it.
+    pub viable: Option<bool>,
+    /// Why the last read produced no quota, on one line.
+    pub error: Option<String>,
+    /// What the reading says beyond its limits, one line each.
+    pub notes: Vec<String>,
+    /// The last reading, stored or fresh; `None` for an account never read.
+    pub reading: Option<Reading>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ClaudeView {
-    pub name: String,
-    pub is_default: bool,
+pub struct State {
+    pub word: String,
+    pub level: Option<Level>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoginView {
     /// Which credential the account offers Claude, without secrets.
     pub credential: String,
     /// The login's state and when it ends, as `tokeman list` words it.
-    pub login: String,
+    pub text: String,
     /// The refusal or the end date alone, for a small surface.
-    pub login_note: Option<String>,
+    pub note: Option<String>,
     /// The login is refused, ended, or close to ending.
-    pub login_warning: bool,
+    pub warning: bool,
     /// Epoch seconds when the refresh token dies, when reported.
-    pub login_ends_at: Option<i64>,
-    pub reading: Option<ClaudeReading>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ClaudeReading {
-    /// Epoch seconds.
-    pub at: i64,
-    pub status: Option<String>,
-    pub error: Option<String>,
-    pub session: Option<Window>,
-    /// `absent` is an account with no 5h limit; `unknown` is one whose
-    /// reading does not say.
-    pub session_limit: SessionLimit,
-    pub weekly: Option<Window>,
-    pub overage: Option<Window>,
-    pub buckets: Vec<BucketView>,
-    /// What the headers said beyond the windows, one line each.
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct BucketView {
-    pub label: String,
-    /// Three characters for a gauge label.
-    pub short: String,
-    pub window: Window,
-    pub source: Source,
-    /// The limit's size as a fraction of the weekly limit, when it is one.
-    pub share: Option<f64>,
-    /// Room for the model as a fraction of the weekly limit.
-    pub room: f64,
+    pub ends_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -95,296 +160,289 @@ pub struct ResetOffer {
     pub read_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CodexView {
-    pub name: String,
-    pub label: Option<String>,
-    pub parked: bool,
-    pub reading: Option<CodexReading>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct NamedWindow {
-    /// `5H`, `WEEKLY`, or another span.
-    pub label: String,
-    pub window: Window,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CodexExtra {
-    pub name: String,
-    pub limited: bool,
-    pub windows: Vec<NamedWindow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CodexReading {
-    /// Epoch seconds.
-    pub at: i64,
-    pub email: Option<String>,
-    pub plan: Option<String>,
-    /// `ok`, `limited (...)` or the error, as `tokeman codex list` words it.
-    pub state: String,
-    pub viable: bool,
-    pub windows: Vec<NamedWindow>,
-    pub extra: Vec<CodexExtra>,
-    pub reset_credits: Option<ResetCreditCount>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ServiceView {
-    pub name: String,
-    pub service: Service,
-    pub service_label: &'static str,
-    /// The read on one line, as `tokeman list` words it.
-    pub summary: Option<String>,
-    pub usage: Option<Reading>,
-}
-
-/// What the stores hold, gathered before the view is built.
-#[derive(Debug, Clone, Default)]
-pub struct Stored {
-    /// The newest reading of each account of each service.
+/// What a view is built from.
+#[derive(Debug, Clone)]
+pub struct Facts {
+    pub origin: Origin,
+    pub monitor: Monitor,
+    /// The newest reading of each account.
     pub readings: Vec<Reading>,
-    /// Per account: when its reset offers were read, and the usable ones.
-    pub offers: Vec<(String, i64, Vec<String>)>,
+    pub offers: Vec<ResetOffer>,
     pub default_account: Option<String>,
+    pub default_is_unmanaged: bool,
     pub target_model: Option<String>,
+    /// The Antigravity account agy is signed in as.
+    pub agy_account: Option<String>,
+    pub mode: Mode,
+    pub probe_interval_secs: Option<u64>,
+    /// Rejections on record whose reset is still ahead.
+    pub observed: Vec<ObservedLimit>,
+    pub coverage: Option<String>,
+    pub sampling: Option<String>,
+    pub live_sessions: Option<Vec<Session>>,
 }
 
-impl Stored {
-    fn reading(&self, service: Service, account: &str) -> Option<&Reading> {
-        self.readings
-            .iter()
-            .find(|reading| reading.service == service && reading.account == account)
+impl Default for Facts {
+    fn default() -> Self {
+        Self {
+            origin: Origin::Stored,
+            monitor: Monitor::NotInstalled,
+            readings: Vec::new(),
+            offers: Vec::new(),
+            default_account: None,
+            default_is_unmanaged: false,
+            target_model: None,
+            agy_account: None,
+            mode: Mode::Normal,
+            probe_interval_secs: None,
+            observed: Vec::new(),
+            coverage: None,
+            sampling: None,
+            live_sessions: None,
+        }
     }
+}
 
-    /// Read the history, the reset cache and Claude's settings. Nothing is
-    /// created or written; a store that does not exist yet reads as empty.
-    pub fn load(fleet: &Fleet, now: i64) -> Self {
-        let store = Store::open_read_only().ok();
-        let accounts = fleet.account_keys();
+impl Facts {
+    /// What is on disk now: the history, the reset cache, Claude's settings,
+    /// the daemon's cycle state and the rejections on record. Nothing is
+    /// requested, created or written; a store that does not exist yet reads
+    /// as empty.
+    pub fn on_disk(fleet: &Fleet, now: i64) -> Self {
         let cache = Cache::default();
         let settings = claude_settings::load().ok();
+        let token = settings
+            .as_ref()
+            .and_then(claude_settings::configured_token);
+        let default_account = token
+            .and_then(|value| fleet.account_holding(value))
+            .map(|account| account.name.clone());
+        let cadence = Cadence::load();
         Self {
-            readings: store
-                .as_ref()
-                .and_then(|store| store.latest(&accounts).ok())
+            origin: Origin::Stored,
+            monitor: Monitor::now(),
+            readings: Store::open_read_only()
+                .and_then(|store| store.latest(&fleet.account_keys()))
                 .unwrap_or_default(),
             offers: fleet
                 .accounts
                 .iter()
                 .filter_map(|account| {
                     let (read_at, offers) = resets::stored_offers(&cache, &account.name, now)?;
-                    Some((account.name.clone(), read_at, offers))
+                    Some(offers.into_iter().map(move |offer| ResetOffer {
+                        account: account.name.clone(),
+                        offer,
+                        read_at,
+                    }))
                 })
+                .flatten()
                 .collect(),
-            default_account: settings
-                .as_ref()
-                .and_then(claude_settings::configured_token)
-                .and_then(|value| fleet.account_holding(value))
-                .map(|account| account.name.clone()),
+            default_is_unmanaged: token.is_some() && default_account.is_none(),
+            default_account,
             target_model: settings
                 .as_ref()
                 .and_then(claude_settings::target_model)
                 .map(str::to_owned),
+            agy_account: None,
+            mode: cadence.mode.unwrap_or(Mode::Normal),
+            probe_interval_secs: cadence.probe_interval_secs,
+            observed: observe::active_limits(),
+            coverage: None,
+            sampling: None,
+            live_sessions: None,
         }
+    }
+
+    /// Put readings made just now over the stored ones of the same accounts.
+    pub fn with_fresh(mut self, fresh: Vec<Reading>) -> Self {
+        for reading in fresh {
+            match self.readings.iter_mut().find(|stored| {
+                stored.service == reading.service && stored.account == reading.account
+            }) {
+                Some(stored) => *stored = reading,
+                None => self.readings.push(reading),
+            }
+        }
+        self.origin = Origin::Fresh;
+        self
+    }
+
+    fn reading(&self, service: Service, account: &str) -> Option<&Reading> {
+        self.readings
+            .iter()
+            .find(|reading| reading.service == service && reading.account == account)
     }
 }
 
 impl Overview {
-    /// The view of `fleet` from what is on disk now.
-    pub fn stored(fleet: &Fleet, now: i64) -> Self {
-        let monitor = if !service::is_installed() {
-            Monitor::NotInstalled
-        } else if lock::is_paused() {
-            Monitor::Paused
-        } else {
-            Monitor::Running
-        };
-        Self::build(fleet, Stored::load(fleet, now), monitor, now)
-    }
-
-    pub fn build(fleet: &Fleet, stored: Stored, monitor: Monitor, now: i64) -> Self {
+    /// The view of `fleet` that `facts` describe; of one service's accounts
+    /// with `only`.
+    pub fn build(fleet: &Fleet, facts: Facts, only: Option<Service>, now: i64) -> Self {
         let now_ms = now * 1000;
+        let model = facts.target_model.as_deref().map(ModelKey::new);
+        let wants = |service: Service| only.is_none_or(|only| only == service);
+        let mut accounts = Vec::new();
+        for account in fleet.accounts.iter().filter(|_| wants(Service::Claude)) {
+            let reading = facts.reading(Service::Claude, &account.name);
+            let mut view = AccountView::of(Service::Claude, &account.name, reading);
+            view.held = facts.default_account.as_deref() == Some(account.name.as_str());
+            view.login = Some(login_view(account, now_ms));
+            view.viable = reading
+                .map(|reading| policy::viable(reading, facts.mode, &fleet.policy, model.as_ref()));
+            view.notes.extend(
+                facts
+                    .observed
+                    .iter()
+                    .filter(|limit| limit.account == account.name)
+                    .map(|limit| format!("! {}", limit.summary())),
+            );
+            accounts.push(view);
+        }
+        for account in fleet.codex.iter().filter(|_| wants(Service::Codex)) {
+            let reading = facts.reading(Service::Codex, &account.name);
+            let mut view = AccountView::of(Service::Codex, &account.name, reading);
+            view.label = account.label.clone();
+            view.parked = account.parked;
+            view.viable = reading.map(Reading::accepts_work);
+            accounts.push(view);
+        }
+        for account in fleet
+            .services
+            .iter()
+            .filter(|account| wants(account.service))
+        {
+            let reading = facts.reading(account.service, &account.name);
+            let mut view = AccountView::of(account.service, &account.name, reading);
+            view.label = account.label.clone();
+            view.held = account.service == Service::Antigravity
+                && facts.agy_account.as_deref() == Some(account.name.as_str());
+            accounts.push(view);
+        }
+        let floors = fleet.policy.floors(facts.mode);
         Self {
             at: now,
-            monitor,
-            claude: fleet
-                .accounts
+            origin: facts.origin,
+            read_at: accounts
                 .iter()
-                .map(|account| {
-                    claude_view(
-                        account,
-                        stored.reading(Service::Claude, &account.name),
-                        stored.default_account.as_deref() == Some(account.name.as_str()),
-                        now_ms,
-                    )
-                })
-                .collect(),
-            resets_on_offer: stored
+                .filter_map(|account| account.reading.as_ref())
+                .map(|reading| reading.at)
+                .max(),
+            monitor: facts.monitor,
+            best_weekly_remaining: accounts
+                .iter()
+                .filter(|account| account.service == Service::Claude)
+                .filter_map(|account| account.reading.as_ref())
+                .filter(|reading| reading.error.is_none() && reading.verdict() != Verdict::Rejected)
+                .filter_map(Reading::weekly_remaining)
+                .reduce(f64::max),
+            rotation: Rotation {
+                mode: facts.mode,
+                probe_interval_secs: facts
+                    .probe_interval_secs
+                    .unwrap_or_else(|| fleet.policy.interval_secs(facts.mode)),
+                min_session_remaining: floors.session,
+                min_weekly_remaining: floors.weekly,
+                default_is_unmanaged: facts.default_is_unmanaged,
+                coverage: facts.coverage,
+                sampling: facts.sampling,
+                live_sessions: facts.live_sessions,
+            },
+            accounts,
+            resets_on_offer: facts
                 .offers
-                .iter()
-                .flat_map(|(account, read_at, offers)| {
-                    offers.iter().map(|offer| ResetOffer {
-                        account: account.clone(),
-                        offer: offer.clone(),
-                        read_at: *read_at,
-                    })
-                })
+                .into_iter()
+                .filter(|_| wants(Service::Claude))
                 .collect(),
-            codex: fleet
-                .codex
-                .iter()
-                .map(|account| codex_view(account, stored.reading(Service::Codex, &account.name)))
-                .collect(),
-            services: fleet
-                .services
-                .iter()
-                .map(|account| {
-                    service_view(account, stored.reading(account.service, &account.name))
-                })
-                .collect(),
-            default_account: stored.default_account,
-            target_model: stored.target_model,
+            default_account: facts.default_account,
+            target_model: facts.target_model,
         }
     }
 
-    /// The Claude account with the most weekly room among those whose last
-    /// reading allows work, for a status dot.
-    pub fn best_weekly_remaining(&self) -> Option<f64> {
-        self.claude
+    /// The accounts of one service, in configured order.
+    pub fn of(&self, service: Service) -> impl Iterator<Item = &AccountView> {
+        self.accounts
+            .iter()
+            .filter(move |account| account.service == service)
+    }
+
+    /// The services that have an account, in the view's order.
+    pub fn services(&self) -> Vec<Service> {
+        let mut services = Vec::new();
+        for account in &self.accounts {
+            if !services.contains(&account.service) {
+                services.push(account.service);
+            }
+        }
+        services
+    }
+
+    /// The last reading of every account that has one.
+    pub fn readings(&self) -> Vec<Reading> {
+        self.accounts
+            .iter()
+            .filter_map(|account| account.reading.clone())
+            .collect()
+    }
+
+    /// How many accounts' last read produced no error.
+    pub fn answered(&self) -> usize {
+        self.accounts
             .iter()
             .filter_map(|account| account.reading.as_ref())
-            .filter(|reading| {
-                reading.error.is_none() && reading.status.as_deref() != Some("rejected")
-            })
-            .filter_map(|reading| reading.weekly)
-            .map(|weekly| weekly.remaining())
-            .reduce(f64::max)
+            .filter(|reading| reading.error.is_none())
+            .count()
     }
 }
 
-fn claude_view(
-    account: &Account,
-    snapshot: Option<&Reading>,
-    is_default: bool,
-    now_ms: i64,
-) -> ClaudeView {
+impl AccountView {
+    /// An account as its last reading alone describes it.
+    pub fn of(service: Service, name: &str, reading: Option<&Reading>) -> Self {
+        Self {
+            service,
+            service_label: service.label(),
+            name: name.to_owned(),
+            label: None,
+            held: false,
+            parked: false,
+            login: None,
+            state: reading.and_then(|reading| {
+                let (word, level) = text::badge(reading)?;
+                Some(State { word, level })
+            }),
+            viable: None,
+            error: reading.and_then(text::error_text),
+            notes: reading.map(text::notes).unwrap_or_default(),
+            reading: reading.cloned(),
+        }
+    }
+}
+
+fn login_view(account: &Account, now_ms: i64) -> LoginView {
     let login = account.login.as_ref();
-    ClaudeView {
-        name: account.name.clone(),
-        is_default,
+    LoginView {
         credential: claude_settings::describe_credential(account, now_ms),
-        login: text::describe_login(account, now_ms),
-        login_note: text::login_note(account, now_ms),
-        login_warning: login.is_some_and(|login| login.error.is_some() || login.is_ageing(now_ms)),
-        login_ends_at: login
+        text: text::describe_login(account, now_ms),
+        note: text::login_note(account, now_ms),
+        warning: login.is_some_and(|login| login.error.is_some() || login.is_ageing(now_ms)),
+        ends_at: login
             .and_then(|login| login.refresh_expires_at)
             .map(|at| at / 1000),
-        reading: snapshot.map(|snapshot| {
-            let claude = snapshot.claude();
-            let weekly = snapshot.weekly();
-            ClaudeReading {
-                at: snapshot.at,
-                status: claude.map(|claude| claude.verdict.as_str().to_owned()),
-                error: snapshot
-                    .error
-                    .as_ref()
-                    .map(|error| brief_error(&error.to_string())),
-                session: snapshot.session(),
-                session_limit: snapshot.session_limit(),
-                weekly,
-                overage: snapshot.window(Span::Unknown, &Scope::extra_usage()),
-                buckets: snapshot
-                    .models()
-                    .map(|limit| bucket_view(limit, weekly.as_ref()))
-                    .collect(),
-                notes: claude
-                    .map(|claude| text::signal_lines(&claude.signals))
-                    .unwrap_or_default(),
-            }
-        }),
-    }
-}
-
-/// `HTTP 403: OAuth authentication is currently not allowed ...` for an
-/// error that carries the API's JSON body; any other error as it is.
-fn brief_error(error: &str) -> String {
-    let message = error.find('{').and_then(|start| {
-        let body: serde_json::Value = serde_json::from_str(&error[start..]).ok()?;
-        let message = body["error"]["message"].as_str()?;
-        Some(format!("{}{message}", &error[..start]))
-    });
-    message.unwrap_or_else(|| crate::util::one_line(error, 200))
-}
-
-pub fn bucket_view(bucket: &Limit, weekly: Option<&Window>) -> BucketView {
-    BucketView {
-        label: bucket.label.clone(),
-        short: text::short_bucket_label(&bucket.label),
-        window: bucket.window,
-        source: bucket.source,
-        share: bucket.share,
-        room: bucket.room(weekly),
-    }
-}
-
-fn named(limit: &Limit) -> NamedWindow {
-    NamedWindow {
-        label: limit.span.label().to_uppercase(),
-        window: limit.window,
-    }
-}
-
-fn codex_view(account: &CodexAccount, probe: Option<&Reading>) -> CodexView {
-    CodexView {
-        name: account.name.clone(),
-        label: account.label.clone(),
-        parked: account.parked,
-        reading: probe.map(|probe| {
-            let codex = probe.codex();
-            CodexReading {
-                at: probe.at,
-                email: codex.and_then(|codex| codex.email.clone()),
-                plan: probe.plan.clone(),
-                state: State::of(probe).to_string(),
-                viable: probe.accepts_work(),
-                windows: probe.shared().map(named).collect(),
-                extra: probe
-                    .scoped()
-                    .into_iter()
-                    .map(|(_, limits)| CodexExtra {
-                        name: limits[0].label.clone(),
-                        limited: limits.iter().any(|limit| limit.is_rejected()),
-                        windows: limits.into_iter().map(named).collect(),
-                    })
-                    .collect(),
-                reset_credits: codex.and_then(|codex| codex.reset_credits),
-            }
-        }),
-    }
-}
-
-fn service_view(account: &ServiceAccount, usage: Option<&Reading>) -> ServiceView {
-    ServiceView {
-        name: account.name.clone(),
-        service: account.service,
-        service_label: account.service.label(),
-        summary: usage.map(text::usage_summary),
-        usage: usage.cloned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ServiceAccount;
+    use crate::quota::{
+        CodexDetail, Detail, Limit, ResetCreditCount, Scope, SessionLimit, Source, Span, Window,
+    };
     use crate::testing::{codex_account, login_account, setup_account};
 
     const NOW: i64 = 1_794_000_000;
     const DAY_MS: i64 = 86_400_000;
 
-    fn snapshot(account: &str, weekly: f64) -> Reading {
+    fn claude(account: &str, weekly: f64) -> Reading {
         let mut reading = crate::testing::reading(account, 0.0, 0.0);
         reading.at = NOW - 60;
         reading.set_session(None);
@@ -400,103 +458,41 @@ mod tests {
         Fleet {
             accounts: vec![ageing, setup_account("plain")],
             codex: vec![codex_account("work", "~/.codex-homes/work")],
-            services: vec![ServiceAccount::with_key_file(
-                Service::Kimi,
-                "kimi",
-                "~/.kimikey",
-            )],
+            services: vec![
+                ServiceAccount::with_key_file(Service::Kimi, "kimi", "~/.kimikey"),
+                ServiceAccount::with_key_file(Service::Antigravity, "g@x.y", "~/unused"),
+            ],
             ..Fleet::default()
         }
     }
 
+    fn build(facts: Facts) -> Overview {
+        Overview::build(&fleet(), facts, None, NOW)
+    }
+
     #[test]
-    fn an_account_without_a_5h_limit_differs_from_one_that_did_not_say() {
-        let mut absent = snapshot("ultra", 0.4);
+    fn every_account_of_every_service_is_one_kind_of_entry() {
+        let mut absent = claude("ultra", 0.4);
         absent.claude_mut().session_limit = SessionLimit::Absent;
         let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
         fable.share = Some(0.5);
         absent.limits.push(fable);
-        let stored = Stored {
-            readings: vec![absent, snapshot("plain", 0.9)],
-            default_account: Some("ultra".into()),
-            ..Stored::default()
-        };
-        let view = Overview::build(&fleet(), stored, Monitor::Running, NOW);
-        let ultra = &view.claude[0];
-        assert!(ultra.is_default);
-        let reading = ultra.reading.as_ref().unwrap();
-        assert_eq!(reading.session, None);
-        assert_eq!(reading.session_limit, SessionLimit::Absent);
-        // Half the bucket left, the bucket is half the weekly: a quarter of it.
-        assert_eq!(reading.buckets[0].short, "Fab");
-        assert!((reading.buckets[0].room - 0.25).abs() < 1e-12);
-        assert_eq!(reading.at, NOW - 60);
-        let plain = view.claude[1].reading.as_ref().unwrap();
-        assert_eq!(plain.session_limit, SessionLimit::Unknown);
-        assert!((view.best_weekly_remaining().unwrap() - 0.6).abs() < 1e-12);
-
-        let json = serde_json::to_value(&view).unwrap();
-        assert_eq!(json["monitor"], "running");
-        assert_eq!(json["claude"][0]["reading"]["session_limit"], "absent");
-        assert_eq!(json["claude"][1]["reading"]["session_limit"], "unknown");
-        assert_eq!(json["claude"][0]["reading"]["weekly"]["utilization"], 0.4);
-    }
-
-    #[test]
-    fn a_login_near_its_end_warns_and_an_unread_account_has_no_reading() {
-        let view = Overview::build(&fleet(), Stored::default(), Monitor::NotInstalled, NOW);
-        let ultra = &view.claude[0];
-        assert!(ultra.login_warning);
-        assert_eq!(ultra.login_ends_at, Some(NOW + 2 * 86_400));
-        assert!(ultra.login.contains("login ends"), "{}", ultra.login);
-        let note = ultra.login_note.as_deref().unwrap();
-        assert!(
-            note.starts_with("login ends") && note.ends_with("soon"),
-            "{note}"
-        );
-        assert_eq!(ultra.reading, None);
-        let plain = &view.claude[1];
-        assert!(!plain.login_warning);
-        assert_eq!(plain.login_ends_at, None);
-        assert_eq!(plain.login_note, None);
-        assert_eq!(view.best_weekly_remaining(), None);
-        assert_eq!(view.codex[0].reading, None);
-        assert_eq!(view.services[0].usage, None);
-        assert_eq!(
-            serde_json::to_value(&view).unwrap()["monitor"],
-            "not-installed"
-        );
-    }
-
-    #[test]
-    fn an_api_error_body_is_shown_as_its_message() {
-        assert_eq!(
-            brief_error(
-                r#"HTTP 403: {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_1"}"#
-            ),
-            "HTTP 403: OAuth authentication is currently not allowed for this organization."
-        );
-        assert_eq!(brief_error("network: timed out"), "network: timed out");
-        assert_eq!(brief_error("HTTP 502: {not json"), "HTTP 502: {not json");
-    }
-
-    #[test]
-    fn codex_windows_are_named_by_length_and_carry_the_credit_count() {
-        let shared = |span, used, reset| {
+        let mut codex = Reading::empty(Service::Codex, "work", NOW - 600);
+        codex.limits = vec![
             Limit::new(
-                span,
-                crate::quota::Scope::All,
-                Window::new(used, reset),
+                Span::Weekly,
+                Scope::All,
+                Window::new(0.42, NOW + 86_400),
                 Source::Poll,
-            )
-        };
-        let mut probe = Reading::empty(Service::Codex, "work", NOW - 600);
-        probe.limits = vec![
-            shared(Span::Weekly, 0.42, NOW + 86_400),
-            shared(Span::FiveHour, 0.1, NOW + 3_600),
+            ),
+            Limit::new(
+                Span::FiveHour,
+                Scope::All,
+                Window::new(0.1, NOW + 3_600),
+                Source::Poll,
+            ),
         ];
-        probe.detail = crate::quota::Detail::Codex(crate::quota::CodexDetail {
-            email: Some("a@b.c".into()),
+        codex.detail = Detail::Codex(CodexDetail {
             allowed: Some(true),
             reset_credits: Some(ResetCreditCount {
                 available: 2,
@@ -504,25 +500,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        // A Claude account of the same name is another account.
-        let namesake = snapshot("work", 0.5);
-        let stored = Stored {
-            readings: vec![namesake, probe],
-            ..Stored::default()
-        };
-        let view = Overview::build(&fleet(), stored, Monitor::Paused, NOW);
-        let reading = view.codex[0].reading.as_ref().unwrap();
-        let labels: Vec<_> = reading.windows.iter().map(|w| w.label.as_str()).collect();
-        assert_eq!(labels, ["WEEKLY", "5H"]);
-        assert_eq!(reading.state, "ok");
-        assert!(reading.viable);
-        assert_eq!(reading.reset_credits.unwrap().available, 2);
-        assert_eq!(reading.email.as_deref(), Some("a@b.c"));
-    }
-
-    #[test]
-    fn services_and_reset_offers_come_from_what_was_stored() {
-        let usage = Reading {
+        let kimi = Reading {
             plan: Some("Vivace".into()),
             limits: vec![crate::providers::limit(
                 None,
@@ -533,33 +511,207 @@ mod tests {
             )],
             ..Reading::empty(Service::Kimi, "kimi", NOW - 120)
         };
-        let stored = Stored {
-            // A read of another service under the same name is not this account's.
+        let view = build(Facts {
             readings: vec![
+                // A Claude account of a Codex profile's name is another account.
+                claude("work", 0.5),
+                absent.clone(),
+                claude("plain", 0.97),
+                codex.clone(),
+                // A read of another service under the same name is not this account's.
                 crate::providers::failed(Service::Zai, "kimi", NOW, "wrong service"),
-                usage.clone(),
+                kimi.clone(),
             ],
-            offers: vec![
-                (
-                    "ultra".into(),
-                    NOW - 900,
-                    vec!["weekly reset, usable now".into()],
-                ),
-                ("plain".into(), NOW - 900, Vec::new()),
-            ],
-            ..Stored::default()
-        };
-        let view = Overview::build(&fleet(), stored, Monitor::Running, NOW);
-        assert_eq!(view.services[0].usage.as_ref(), Some(&usage));
-        assert_eq!(view.services[0].summary.as_deref(), Some("weekly 79%"));
-        assert_eq!(view.services[0].service_label, "Kimi Code");
+            default_account: Some("ultra".into()),
+            agy_account: Some("g@x.y".into()),
+            target_model: Some("claude-fable-5-1".into()),
+            monitor: Monitor::Running,
+            ..Facts::default()
+        });
+        let names: Vec<_> = view
+            .accounts
+            .iter()
+            .map(|account| (account.service, account.name.as_str()))
+            .collect();
         assert_eq!(
-            view.resets_on_offer,
-            [ResetOffer {
-                account: "ultra".into(),
-                offer: "weekly reset, usable now".into(),
-                read_at: NOW - 900,
-            }]
+            names,
+            [
+                (Service::Claude, "ultra"),
+                (Service::Claude, "plain"),
+                (Service::Codex, "work"),
+                (Service::Kimi, "kimi"),
+                (Service::Antigravity, "g@x.y"),
+            ]
         );
+        assert_eq!(
+            view.services(),
+            [
+                Service::Claude,
+                Service::Codex,
+                Service::Kimi,
+                Service::Antigravity
+            ]
+        );
+        let ultra = &view.accounts[0];
+        assert!(ultra.held);
+        assert_eq!(ultra.reading.as_ref(), Some(&absent));
+        assert_eq!(ultra.viable, Some(true));
+        assert_eq!(ultra.state.as_ref().unwrap().word, "allowed");
+        assert!(
+            ultra.notes.iter().any(|note| note.contains("no 5h limit")),
+            "{:?}",
+            ultra.notes
+        );
+        // 3% of the weekly left is under the normal floor.
+        assert_eq!(view.accounts[1].viable, Some(false));
+        assert!(!view.accounts[1].held);
+        let work = &view.accounts[2];
+        assert_eq!(work.reading.as_ref(), Some(&codex));
+        assert_eq!(work.viable, Some(true));
+        assert_eq!(work.state.as_ref().unwrap().word, "ok");
+        assert!(
+            work.notes
+                .iter()
+                .any(|note| note.contains("2 reset credits")),
+            "{:?}",
+            work.notes
+        );
+        assert_eq!(view.accounts[3].reading.as_ref(), Some(&kimi));
+        assert_eq!(view.accounts[3].service_label, "Kimi Code");
+        let agy = &view.accounts[4];
+        assert!(agy.held, "agy's login");
+        assert_eq!((agy.reading.as_ref(), agy.state.as_ref()), (None, None));
+        assert!((view.best_weekly_remaining.unwrap() - 0.6).abs() < 1e-12);
+        assert_eq!(view.read_at, Some(NOW - 60));
+        assert_eq!(view.answered(), 4);
+
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["monitor"], "running");
+        assert_eq!(json["origin"], "stored");
+        assert_eq!(json["accounts"][0]["service"], "claude");
+        assert_eq!(json["accounts"][0]["state"]["level"], "ok");
+        assert_eq!(
+            json["accounts"][0]["reading"]["limits"][0]["window"]["utilization"],
+            0.4
+        );
+        assert_eq!(
+            json["accounts"][0]["reading"]["detail"]["claude"]["session_limit"],
+            "absent"
+        );
+        assert_eq!(
+            json["accounts"][2]["reading"]["limits"][1]["span"],
+            "five_hour"
+        );
+        assert_eq!(json["rotation"]["mode"], "normal");
+
+        // One service's view holds that service's accounts alone.
+        let only = Overview::build(
+            &fleet(),
+            Facts {
+                readings: vec![kimi],
+                ..Facts::default()
+            },
+            Some(Service::Kimi),
+            NOW,
+        );
+        assert_eq!(only.accounts.len(), 1);
+        assert_eq!(only.accounts[0].name, "kimi");
+    }
+
+    #[test]
+    fn a_login_near_its_end_warns_and_an_unread_account_has_no_reading() {
+        let view = build(Facts::default());
+        let ultra = &view.accounts[0];
+        let login = ultra.login.as_ref().unwrap();
+        assert!(login.warning);
+        assert_eq!(login.ends_at, Some(NOW + 2 * 86_400));
+        assert!(login.text.contains("login ends"), "{}", login.text);
+        let note = login.note.as_deref().unwrap();
+        assert!(
+            note.starts_with("login ends") && note.ends_with("soon"),
+            "{note}"
+        );
+        assert_eq!(ultra.reading, None);
+        assert_eq!(ultra.viable, None);
+        let plain = view.accounts[1].login.as_ref().unwrap();
+        assert!(!plain.warning);
+        assert_eq!((plain.ends_at, plain.note.as_deref()), (None, None));
+        assert_eq!(view.best_weekly_remaining, None);
+        assert_eq!(view.read_at, None);
+        assert!(
+            view.accounts
+                .iter()
+                .all(|account| account.reading.is_none())
+        );
+        assert_eq!(view.accounts[2].login, None);
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["monitor"],
+            "not-installed"
+        );
+    }
+
+    #[test]
+    fn fresh_readings_replace_the_stored_ones_and_the_rest_stay() {
+        let stored = Facts {
+            readings: vec![claude("ultra", 0.4), claude("plain", 0.5)],
+            ..Facts::default()
+        };
+        let mut read_now = claude("ultra", 0.45);
+        read_now.at = NOW;
+        let failed = crate::providers::failed(Service::Kimi, "kimi", NOW, "HTTP 401: {\"x\":1}");
+        let view = build(stored.with_fresh(vec![read_now.clone(), failed]));
+        assert_eq!(view.origin, Origin::Fresh);
+        assert_eq!(view.accounts[0].reading.as_ref(), Some(&read_now));
+        assert_eq!(view.accounts[1].reading.as_ref().unwrap().at, NOW - 60);
+        let kimi = &view.accounts[3];
+        assert_eq!(kimi.state.as_ref().unwrap().word, "error");
+        assert_eq!(kimi.state.as_ref().unwrap().level, Some(Level::Critical));
+        assert_eq!(kimi.error.as_deref(), Some("HTTP 401: {\"x\":1}"));
+        assert_eq!(view.read_at, Some(NOW));
+        assert_eq!(view.answered(), 2);
+    }
+
+    #[test]
+    fn reset_offers_and_rejections_on_record_ride_along() {
+        let offer = ResetOffer {
+            account: "ultra".into(),
+            offer: "weekly reset, usable now".into(),
+            read_at: NOW - 900,
+        };
+        let rejection = ObservedLimit {
+            account: "plain".into(),
+            family: crate::observe::Family::Opus,
+            model: Some(ModelKey::new("opus48")),
+            window: crate::observe::LimitWindow::Weekly,
+            observed_at: NOW - 10,
+            resets_at: NOW + 3600,
+            session_id: None,
+            source: crate::observe::LimitSource::Manual,
+        };
+        let facts = Facts {
+            readings: vec![claude("plain", 0.2)],
+            offers: vec![offer.clone()],
+            observed: vec![rejection],
+            mode: Mode::Sip,
+            ..Facts::default()
+        };
+        let view = build(facts.clone());
+        assert_eq!(view.resets_on_offer, [offer]);
+        let plain = &view.accounts[1];
+        assert!(
+            plain
+                .notes
+                .iter()
+                .any(|note| note.starts_with("! Opus 4.8 weekly rejected")),
+            "{:?}",
+            plain.notes
+        );
+        assert!(view.accounts[0].notes.is_empty());
+        assert_eq!(view.rotation.mode, Mode::Sip);
+        let floors = fleet().policy.floors(Mode::Sip);
+        assert_eq!(view.rotation.min_weekly_remaining, floors.weekly);
+        // Offers are Claude's: another service's view has none.
+        let codex = Overview::build(&fleet(), facts, Some(Service::Codex), NOW);
+        assert!(codex.resets_on_offer.is_empty());
     }
 }

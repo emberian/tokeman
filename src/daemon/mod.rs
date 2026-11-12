@@ -9,7 +9,6 @@ pub mod log;
 pub mod refresh;
 pub mod service;
 pub mod services;
-pub mod status;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

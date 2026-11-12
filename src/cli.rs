@@ -18,7 +18,11 @@ pub struct Cli {
     /// Launch the live TUI dashboard
     #[arg(long)]
     pub watch: bool,
-    /// Output the reads as JSON
+    /// Read every account now. Without it, while the background service
+    /// runs, the stored view is shown and no request is sent
+    #[arg(long)]
+    pub fresh: bool,
+    /// Output the fleet view as JSON (the shape of `tokeman list --json`)
     #[arg(long)]
     pub json: bool,
 }
@@ -29,7 +33,7 @@ pub enum Command {
     ///
     /// Makes no request and writes nothing.
     List {
-        /// The stored view as JSON (what the trays read)
+        /// The fleet view as JSON (what the trays read)
         #[arg(long)]
         json: bool,
     },
@@ -277,6 +281,10 @@ pub enum CodexAction {
         /// Do not ask
         #[arg(long)]
         yes: bool,
+        /// Forget a credit claim whose outcome is unknown, once the account's
+        /// usage page shows what happened
+        #[arg(long, conflicts_with_all = ["credit", "yes"])]
+        clear: bool,
     },
 }
 

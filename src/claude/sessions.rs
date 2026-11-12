@@ -48,7 +48,7 @@ impl Serialize for Attribution {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Session {
     pub pid: u32,
     pub tty: Option<String>,
