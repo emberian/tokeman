@@ -180,7 +180,7 @@ fn keychain_account() -> Result<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            dirs::home_dir()?
+            paths::home()
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
         })
