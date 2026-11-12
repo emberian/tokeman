@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// How `tokeman launch` and the trays start Claude.
+/// How `tokeman claude launch` and the trays start Claude.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchSettings {
     /// Extra arguments for claude, e.g. `["--model", "opus"]`.
@@ -164,6 +164,21 @@ pub struct PolicySettings {
     /// the startup model to read the limits only its responses carry. 0 disables.
     #[serde(default = "d_sample_secs")]
     pub target_model_sample_secs: u64,
+    /// Whether the daemon moves a running Codex off an account below the
+    /// `codex_min_*` floors. It needs two unparked profiles and a control
+    /// socket to do anything.
+    #[serde(default = "d_codex_auto_move")]
+    pub codex_auto_move: bool,
+    /// A running Codex leaves its account at these floors when another
+    /// offers the `codex_land_min_*` room.
+    #[serde(default = "d_codex_min")]
+    pub codex_min_5h_remaining: f64,
+    #[serde(default = "d_codex_min")]
+    pub codex_min_7d_remaining: f64,
+    #[serde(default = "d_codex_land")]
+    pub codex_land_min_5h_remaining: f64,
+    #[serde(default = "d_codex_land")]
+    pub codex_land_min_7d_remaining: f64,
 }
 
 fn d_normal_5h() -> f64 {
@@ -193,6 +208,15 @@ fn d_sip_interval() -> u64 {
 fn d_sample_secs() -> u64 {
     1800
 }
+fn d_codex_auto_move() -> bool {
+    true
+}
+fn d_codex_min() -> f64 {
+    0.20
+}
+fn d_codex_land() -> f64 {
+    0.30
+}
 
 impl Default for PolicySettings {
     fn default() -> Self {
@@ -206,11 +230,87 @@ impl Default for PolicySettings {
             normal_probe_interval_secs: d_normal_interval(),
             sip_probe_interval_secs: d_sip_interval(),
             target_model_sample_secs: d_sample_secs(),
+            codex_auto_move: d_codex_auto_move(),
+            codex_min_5h_remaining: d_codex_min(),
+            codex_min_7d_remaining: d_codex_min(),
+            codex_land_min_5h_remaining: d_codex_land(),
+            codex_land_min_7d_remaining: d_codex_land(),
         }
     }
 }
 
 impl PolicySettings {
+    /// The `[rotation]` keys `tokeman settings set` accepts.
+    pub const KEYS: [&'static str; 5] = [
+        "codex_auto_move",
+        "codex_min_5h_remaining",
+        "codex_min_7d_remaining",
+        "codex_land_min_5h_remaining",
+        "codex_land_min_7d_remaining",
+    ];
+
+    /// Set one of [`Self::KEYS`] from its command-line spelling. A floor is
+    /// a fraction of capacity remaining (`0.2`) or a percentage (`20%`).
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let value = value.trim();
+        let floor = || -> Result<f64> {
+            let parsed = match value.strip_suffix('%') {
+                Some(percent) => percent.trim().parse::<f64>().map(|percent| percent / 100.0),
+                None => value.parse::<f64>(),
+            };
+            match parsed {
+                Ok(fraction) if (0.0..1.0).contains(&fraction) => Ok(fraction),
+                _ => bail!(
+                    "{key} takes a fraction remaining from 0 up to 1 (0.2 or 20%), not {value:?}"
+                ),
+            }
+        };
+        let mut next = self.clone();
+        match key {
+            "codex_auto_move" => {
+                next.codex_auto_move = match value {
+                    "true" | "on" | "1" => true,
+                    "false" | "off" | "0" => false,
+                    _ => bail!("codex_auto_move takes true or false, not {value:?}"),
+                }
+            }
+            "codex_min_5h_remaining" => next.codex_min_5h_remaining = floor()?,
+            "codex_min_7d_remaining" => next.codex_min_7d_remaining = floor()?,
+            "codex_land_min_5h_remaining" => next.codex_land_min_5h_remaining = floor()?,
+            "codex_land_min_7d_remaining" => next.codex_land_min_7d_remaining = floor()?,
+            _ => bail!(
+                "unknown rotation setting {key:?}; one of {}",
+                Self::KEYS.join(", ")
+            ),
+        }
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// `(key, value)` pairs in the order of [`Self::KEYS`], for display.
+    pub fn entries(&self) -> [(&'static str, String); 5] {
+        [
+            ("codex_auto_move", self.codex_auto_move.to_string()),
+            (
+                "codex_min_5h_remaining",
+                self.codex_min_5h_remaining.to_string(),
+            ),
+            (
+                "codex_min_7d_remaining",
+                self.codex_min_7d_remaining.to_string(),
+            ),
+            (
+                "codex_land_min_5h_remaining",
+                self.codex_land_min_5h_remaining.to_string(),
+            ),
+            (
+                "codex_land_min_7d_remaining",
+                self.codex_land_min_7d_remaining.to_string(),
+            ),
+        ]
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("normal_min_5h_remaining", self.normal_min_5h_remaining),
@@ -219,6 +319,16 @@ impl PolicySettings {
             ("sip_min_7d_remaining", self.sip_min_7d_remaining),
             ("land_min_5h_remaining", self.land_min_5h_remaining),
             ("land_min_7d_remaining", self.land_min_7d_remaining),
+            ("codex_min_5h_remaining", self.codex_min_5h_remaining),
+            ("codex_min_7d_remaining", self.codex_min_7d_remaining),
+            (
+                "codex_land_min_5h_remaining",
+                self.codex_land_min_5h_remaining,
+            ),
+            (
+                "codex_land_min_7d_remaining",
+                self.codex_land_min_7d_remaining,
+            ),
         ] {
             if !(0.0..1.0).contains(&value) {
                 bail!("rotation.{name} must be at least 0 and less than 1");
@@ -233,6 +343,11 @@ impl PolicySettings {
             || self.land_min_7d_remaining < self.normal_min_7d_remaining
         {
             bail!("rotation.land_min_* must not be below the normal floors");
+        }
+        if self.codex_land_min_5h_remaining < self.codex_min_5h_remaining
+            || self.codex_land_min_7d_remaining < self.codex_min_7d_remaining
+        {
+            bail!("rotation.codex_land_min_* must not be below the codex_min_* floors");
         }
         if self.normal_probe_interval_secs == 0 || self.sip_probe_interval_secs == 0 {
             bail!("rotation probe intervals must be at least one second");
@@ -295,5 +410,33 @@ mod tests {
             ..PolicySettings::default()
         };
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn the_codex_floors_are_set_by_name_and_must_nest() {
+        let mut policy = PolicySettings::default();
+        assert!(policy.codex_auto_move);
+        assert_eq!(policy.codex_min_5h_remaining, 0.20);
+        assert_eq!(policy.codex_min_7d_remaining, 0.20);
+        policy.set("codex_auto_move", "off").unwrap();
+        assert!(!policy.codex_auto_move);
+        assert!(policy.set("codex_auto_move", "sometimes").is_err());
+        policy.set("codex_min_5h_remaining", "0.1").unwrap();
+        policy.set("codex_land_min_7d_remaining", " 45% ").unwrap();
+        assert_eq!(policy.codex_min_5h_remaining, 0.1);
+        assert_eq!(policy.codex_land_min_7d_remaining, 0.45);
+        // A landing floor under the leaving floor would land on an account
+        // the next look leaves again.
+        let before = policy.clone();
+        assert!(policy.set("codex_min_7d_remaining", "0.5").is_err());
+        assert!(policy.set("codex_min_5h_remaining", "1").is_err());
+        assert!(policy.set("codex_min_5h_remaining", "lots").is_err());
+        assert!(policy.set("normal_min_5h_remaining", "0.1").is_err());
+        assert_eq!(policy, before, "a refused value changes nothing");
+        let shown: Vec<&str> = policy.entries().iter().map(|(key, _)| *key).collect();
+        assert_eq!(shown, PolicySettings::KEYS);
+        // A file written before these keys existed reads as the defaults.
+        let old: PolicySettings = toml::from_str("normal_min_5h_remaining = 0.07\n").unwrap();
+        assert_eq!(old, PolicySettings::default());
     }
 }
