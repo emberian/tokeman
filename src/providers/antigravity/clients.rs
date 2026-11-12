@@ -353,12 +353,21 @@ async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
     Ok((clients, sessions))
 }
 
-/// A client for loopback RPCs only: no proxy, short waits.
-fn rpc_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(RPC_TIMEOUT)
-        .build()
+/// The client for loopback RPCs only: no proxy, short waits. Built once;
+/// building one loads the system's trust store.
+fn rpc_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                // Each call is its own connection: nothing idle outlives it.
+                .pool_max_idle_per_host(0)
+                .timeout(RPC_TIMEOUT)
+                .build()
+                .ok()
+        })
+        .as_ref()
         .context("could not build the local RPC client")
 }
 

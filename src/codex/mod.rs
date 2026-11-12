@@ -34,6 +34,9 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLIENT_ID_ENV: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The wait before the first retry of a challenged request; each later
+/// retry waits one more of it.
+const CHALLENGE_BACKOFF: Duration = Duration::from_millis(400);
 
 /// The HTTP client every Codex request goes through.
 ///
@@ -47,6 +50,7 @@ pub struct Client {
     credits_url: String,
     token_url: String,
     client_id: String,
+    challenge_backoff: Duration,
 }
 
 impl Client {
@@ -82,7 +86,19 @@ impl Client {
             credits_url: CREDITS_URL.to_owned(),
             token_url: token_url.into(),
             client_id: client_id.into(),
+            challenge_backoff: CHALLENGE_BACKOFF,
         })
+    }
+
+    /// Wait `backoff` (and one more of it per retry) between retries of a
+    /// challenged request.
+    pub fn with_challenge_backoff(mut self, backoff: Duration) -> Self {
+        self.challenge_backoff = backoff;
+        self
+    }
+
+    pub(crate) fn challenge_backoff(&self) -> Duration {
+        self.challenge_backoff
     }
 
     pub fn with_credits_url(mut self, credits_url: impl Into<String>) -> Self {

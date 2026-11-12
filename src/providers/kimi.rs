@@ -507,7 +507,10 @@ mod tests {
         let usage = read_from(&client, &base, &wrong, NOW).await;
         let error = usage.error.unwrap().to_string();
         assert!(error.contains("HTTP 401"), "{error}");
-        assert!(error.contains("Invalid Authentication"), "{error}");
+        assert!(
+            error.contains("Kimi refused the key: Invalid Authentication"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

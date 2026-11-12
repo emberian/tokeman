@@ -505,7 +505,12 @@ pub fn landings(fleet: &Fleet) -> Vec<&CodexAccount> {
 /// The CODEX_HOMEs a Codex may be running on: `~/.codex`, then each
 /// registered profile's, once each.
 pub fn homes(fleet: &Fleet) -> Vec<CodexHome> {
-    let mut homes: Vec<CodexHome> = CodexHome::default_home().into_iter().collect();
+    homes_after(CodexHome::default_home().ok(), fleet)
+}
+
+/// [`homes`], with `default` as Codex's own fallback home.
+pub(crate) fn homes_after(default: Option<CodexHome>, fleet: &Fleet) -> Vec<CodexHome> {
+    let mut homes: Vec<CodexHome> = default.into_iter().collect();
     for account in &fleet.codex {
         let home = CodexHome::new(account.home());
         if !homes.contains(&home) {
@@ -918,13 +923,75 @@ mod tests {
 
     #[test]
     fn the_default_home_comes_first_and_each_home_once() {
-        let default = CodexHome::default_home().unwrap();
+        let default = CodexHome::new("/homes/me/.codex");
         let fleet = fleet_of(vec![
             crate::testing::codex_account("work", "/homes/work"),
-            crate::testing::codex_account("default", &default.path().display().to_string()),
+            crate::testing::codex_account("default", "/homes/me/.codex"),
             crate::testing::codex_account("again", "/homes/work"),
         ]);
-        assert_eq!(homes(&fleet), vec![default, CodexHome::new("/homes/work")]);
+        assert_eq!(
+            homes_after(Some(default.clone()), &fleet),
+            vec![default, CodexHome::new("/homes/work")]
+        );
+        // With no home directory to fall back to, the profiles' alone.
+        assert_eq!(
+            homes_after(None, &fleet),
+            vec![
+                CodexHome::new("/homes/work"),
+                CodexHome::new("/homes/me/.codex")
+            ]
+        );
         assert_eq!(landings(&fleet).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_refused_seat_moves_with_room_in_its_windows_and_one_without_windows_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let terms = terms(dir.path());
+        // 90% left in both windows, and the backend refuses ordinary work.
+        let mut refused = limits_answer(10.0, 10.0);
+        refused["rateLimits"]["rateLimitReachedType"] = json!("rate_limit_reached");
+        let (fake, fleet) = running_on_a(dir.path(), refused);
+        let backend = Backend::default().usage_answers(vec![ok(usage_body(40.0, 30.0))]);
+        let client = backend.client().await;
+        let home = CodexHome::new(fake.home.path());
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
+        assert!(matches!(look.outcome, Outcome::Moved { .. }), "{look}");
+        assert_eq!(fake.logins().len(), 1);
+
+        // An answer with no account-wide window is nothing to judge: no
+        // profile is probed and nothing is announced.
+        fake.set_limits(json!({"rateLimits": {}, "ordinaryUsageAllowed": true}));
+        let probes = backend.requests("/usage").len();
+        let look = look_at(&client, &fleet, &home, &terms, false).await;
+        assert_eq!(look.outcome, Outcome::NoWindows);
+        assert_eq!(look.kind(), "no-windows");
+        assert_eq!(backend.requests("/usage").len(), probes);
+        assert_eq!(fake.logins().len(), 1);
+    }
+
+    #[test]
+    fn a_seat_is_matched_by_account_id_before_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = profile(dir.path(), "a", "r-a");
+        let seat = |account_id: Option<&str>, email: &str| {
+            Seat::from_reported(
+                &ReportedLimits {
+                    account_id: account_id.map(str::to_owned),
+                    ..ReportedLimits::default()
+                },
+                Some(AccountInfo {
+                    email: Some(email.to_owned()),
+                    plan_type: None,
+                }),
+                0,
+            )
+        };
+        assert!(seat(Some("acct-a"), "renamed@x.y").is_on(&a));
+        // One login in two workspaces is two accounts.
+        assert!(!seat(Some("acct-other"), "a@x.y").is_on(&a));
+        // Without an id from the running Codex, the email decides.
+        assert!(seat(None, "a@x.y").is_on(&a));
+        assert!(!seat(None, "b@x.y").is_on(&a));
     }
 }

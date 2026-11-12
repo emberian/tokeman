@@ -462,4 +462,59 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn success_needs_both_the_flag_and_code_200() {
+        // Either alone is a refusal, in the envelope's own words.
+        assert_eq!(
+            parse(
+                r#"{"code":500,"msg":"no coding plan","success":true,"data":{"limits":[]}}"#,
+                NOW
+            ),
+            Err(ReadError::Http {
+                status: 500,
+                body: "no coding plan".into()
+            })
+        );
+        let half = LIVE.replace(r#""success":true"#, r#""success":false"#);
+        assert!(matches!(parse(&half, NOW), Err(ReadError::Other { .. })));
+        // An answer whose every limit is of a type this build does not know
+        // is not an empty account.
+        assert!(matches!(
+            parse(
+                r#"{"code":200,"success":true,"data":{"limits":[{"type":"SOMETHING_NEW","percentage":5}]}}"#,
+                NOW
+            ),
+            Err(ReadError::Decode { .. })
+        ));
+    }
+
+    #[test]
+    fn used_comes_from_remaining_when_the_count_is_missing_and_may_pass_the_limit() {
+        let body = r#"{"code":200,"success":true,"data":{"limits":[
+            {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"remaining":21000,"percentage":99},
+            {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":147000,"remaining":-7000,"percentage":105}]}}"#;
+        let (_, meters, _) = parse(body, NOW).unwrap();
+        assert_eq!(meters[0].window.used, 0.25);
+        assert_eq!(meters[0].amount.as_ref().unwrap().used, 7000.0);
+        assert_eq!(meters[1].window.used, 1.05);
+        assert!(!meters[1].window.above(0.0));
+    }
+
+    #[tokio::test]
+    async fn an_http_failure_is_reported_with_its_status() {
+        let app = Router::new().route(
+            QUOTA_PATH,
+            get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down\nfor now") }),
+        );
+        let base = crate::testing::serve(app).await;
+        let usage = read_from(&reqwest::Client::new(), &base, &account(), NOW).await;
+        assert_eq!(
+            usage.error,
+            Some(ReadError::Http {
+                status: 503,
+                body: "down for now".into()
+            })
+        );
+    }
 }

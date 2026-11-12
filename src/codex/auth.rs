@@ -25,7 +25,10 @@ impl CodexHome {
 
     /// `~/.codex`, Codex's own fallback.
     pub fn default_home() -> Result<Self> {
-        let home = dirs::home_dir().context("could not determine home directory")?;
+        let home = crate::paths::home();
+        if !home.is_absolute() {
+            bail!("could not determine home directory");
+        }
         Ok(Self::new(home.join(".codex")))
     }
 
@@ -377,6 +380,19 @@ pub(crate) mod tests {
         let other = CodexHome::new(dir.path().join("other"));
         seat(&bundle, &other).unwrap();
         assert_eq!(other.read().unwrap().account_id(), Some("from-claim"));
+        // A stored id is what Codex sends, whatever the id_token says.
+        other
+            .write_tokens(&TokenBundle {
+                account_id: Some("stored".into()),
+                ..bundle
+            })
+            .unwrap();
+        let auth = other.read().unwrap();
+        assert_eq!(
+            auth.claims().unwrap().chatgpt_account_id.as_deref(),
+            Some("from-claim")
+        );
+        assert_eq!(auth.effective_account_id().as_deref(), Some("stored"));
     }
 
     #[test]

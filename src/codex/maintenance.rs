@@ -221,6 +221,9 @@ mod tests {
             access_only: true,
             ..profile(dir.path(), "import", "")
         };
+        // Due by age and without a refresh token, as `orphan` is: only
+        // `access_only` keeps it from being reported.
+        age(&access_only, 8);
         let accounts = vec![rejected.clone(), fine, orphan.clone(), access_only];
         let new_id = id_token("rejected@x.y", "acct-rejected", "pro");
         let backend = Backend::default()

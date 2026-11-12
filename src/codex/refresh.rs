@@ -207,7 +207,9 @@ pub async fn refresh(
 mod tests {
     use super::*;
     use crate::codex::auth::tests::bundle;
+    use crate::codex::probe::tests::{Backend, profile};
     use reqwest::StatusCode;
+    use serde_json::json;
 
     /// An unroutable endpoint: failures must come before any request.
     fn dead_client() -> Client {
@@ -285,5 +287,56 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.failure, Failure::Transient);
         assert_eq!(home.read().unwrap().refresh_token(), Some("r"));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_lands_the_rotated_bundle_and_keeps_what_the_answer_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = CodexHome::new(profile(dir.path(), "one", "r-old").home());
+        let old_id_token = home.read().unwrap().id_token().unwrap().to_owned();
+        let backend = Backend::default().token_answers(vec![
+            // A 2xx answer with no access token is not a bundle.
+            (StatusCode::OK, json!({"id_token": "x.y.z"}).to_string()),
+            // Codex keeps the refresh token and the id_token an answer omits.
+            (
+                StatusCode::OK,
+                json!({"access_token": "access-2"}).to_string(),
+            ),
+            (
+                StatusCode::OK,
+                json!({"access_token": "access-3", "refresh_token": "r-3"}).to_string(),
+            ),
+        ]);
+        let client = backend.client().await;
+
+        let before = std::fs::read(home.auth_path()).unwrap();
+        let error = refresh_home(&client, &home).await.unwrap_err();
+        assert_eq!(error.failure, Failure::Transient);
+        assert_eq!(
+            std::fs::read(home.auth_path()).unwrap(),
+            before,
+            "an answer that is not a bundle writes nothing"
+        );
+
+        let bundle = refresh_home(&client, &home).await.unwrap();
+        assert_eq!(bundle.refresh_token, "r-old");
+        let auth = home.read().unwrap();
+        assert_eq!(auth.access_token(), Some("access-2"));
+        assert_eq!(auth.refresh_token(), Some("r-old"));
+        assert_eq!(auth.id_token(), Some(old_id_token.as_str()));
+        // The answer names no account; the id the profile had is stored.
+        assert_eq!(auth.account_id(), Some("acct-one"));
+
+        refresh_home(&client, &home).await.unwrap();
+        let auth = home.read().unwrap();
+        assert_eq!(auth.access_token(), Some("access-3"));
+        assert_eq!(auth.refresh_token(), Some("r-3"));
+        let sent: Vec<serde_json::Value> = backend
+            .requests("/token")
+            .iter()
+            .map(|seen| serde_json::from_str(&seen.body).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|body| body["refresh_token"] == "r-old"));
     }
 }
