@@ -13,9 +13,14 @@
 //! The per-account home ([`paths::agy_homes`]) holds that account's token
 //! file, conversations and logs, a link to every entry of the real home but
 //! `.gemini` and `Library` (so the commands agy runs find the user's git, ssh
-//! and toolchain settings), and links to the account-neutral agy settings in
-//! the real `~/.gemini` ([`SHARED`]). It is refreshed on every run; only links
-//! tokeman made are ever removed.
+//! and toolchain settings), links to what agy only reads from the real
+//! `~/.gemini` ([`SHARED`]), and its own copy of the files agy writes
+//! ([`SEEDED`]), taken from the real ones the first time. agy saves settings
+//! by replacing the file, so a link there would follow the real settings
+//! until the session's first save and then silently stop; a copy makes the
+//! session's model and trust choices its own from the start and never
+//! touches the normal login's. The home is refreshed on every run; only
+//! links tokeman made are ever removed.
 //!
 //! A running session refreshes its access token into its own file. Google
 //! does not rotate refresh tokens, so tokeman's stored grant stays valid.
@@ -38,14 +43,12 @@ use crate::quota::Service;
 /// Entries of the real home a per-account home does not link: agy's own data
 /// (the account's login lives there) and `Library` (the login keychain).
 const NOT_LINKED: &[&str] = &[".gemini", "Library"];
-/// Account-neutral agy settings under `~/.gemini`, linked into each
-/// per-account home when they exist.
-pub const SHARED: &[&str] = &[
-    "GEMINI.md",
-    "skills",
-    "antigravity-cli/settings.json",
-    "config/mcp_config.json",
-];
+/// What agy only reads under `~/.gemini`, linked into each per-account home
+/// when it exists.
+pub const SHARED: &[&str] = &["GEMINI.md", "skills", "config/mcp_config.json"];
+/// What agy writes under `~/.gemini` (the model, trusted folders), copied
+/// into a per-account home once, when the home has none.
+pub const SEEDED: &[&str] = &["antigravity-cli/settings.json"];
 const TOKEN_FILE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 
 /// The directory name of `account`'s home under [`paths::agy_homes`].
@@ -260,6 +263,7 @@ fn furnish(place: &Place, home: &Path, token_text: Option<&str>) -> Result<()> {
     }
     link_real_home(&place.real_home, home)?;
     link_shared(&place.real_home.join(".gemini"), &home.join(".gemini"))?;
+    seed_copies(&place.real_home.join(".gemini"), &home.join(".gemini"))?;
     if let Some(text) = token_text {
         write_atomic(&home.join(TOKEN_FILE), text.as_bytes(), 0o600)?;
     }
@@ -334,6 +338,28 @@ fn link_shared(real_gemini: &Path, gemini: &Path) -> Result<()> {
             set_mode(parent, 0o700)?;
         }
         symlink(&target, &link)?;
+    }
+    Ok(())
+}
+
+/// Copy each [`SEEDED`] file of `real_gemini` that exists into `gemini` (0600)
+/// where the home has none. A link to the real file, as earlier builds made,
+/// becomes a copy; a file of the home's own is kept.
+fn seed_copies(real_gemini: &Path, gemini: &Path) -> Result<()> {
+    for relative in SEEDED {
+        let source = real_gemini.join(relative);
+        let copy = gemini.join(relative);
+        if std::fs::read_link(&copy).is_ok_and(|target| target == source) {
+            std::fs::remove_file(&copy)
+                .with_context(|| format!("failed to remove {}", copy.display()))?;
+        }
+        if present(&copy)? {
+            continue;
+        }
+        let Some(bytes) = read_if_present(&source)? else {
+            continue;
+        };
+        write_atomic(&copy, bytes.as_bytes(), 0o600)?;
     }
     Ok(())
 }
@@ -483,9 +509,15 @@ mod tests {
             std::fs::read_link(home.join(".gemini/GEMINI.md")).unwrap(),
             real.join(".gemini/GEMINI.md")
         );
+        // The settings agy writes are the home's own copy, seeded from the real ones.
+        let settings = home.join(".gemini/antigravity-cli/settings.json");
+        assert!(std::fs::read_link(&settings).is_err());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{}");
+        assert_eq!(mode(&settings), 0o600);
+        std::fs::write(&settings, "{\"model\":\"other\"}").unwrap();
         assert_eq!(
-            std::fs::read_link(home.join(".gemini/antigravity-cli/settings.json")).unwrap(),
-            real.join(".gemini/antigravity-cli/settings.json")
+            std::fs::read_to_string(real.join(".gemini/antigravity-cli/settings.json")).unwrap(),
+            "{}"
         );
         assert_eq!(
             std::fs::read_link(home.join(".gemini/skills")).unwrap(),
@@ -545,6 +577,47 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.join(".gemini/antigravity-cli/settings.json")).unwrap(),
             "{\"model\":1}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_are_seeded_once_and_an_earlier_link_to_the_real_file_becomes_a_copy() {
+        let f = fixture().await;
+        let client = Client::new();
+        let b = account("b@example.com", "1//b");
+        let real = f
+            .place
+            .real_home
+            .join(".gemini/antigravity-cli/settings.json");
+        let home = f.place.homes.join("b@example.com");
+        let settings = home.join(".gemini/antigravity-cli/settings.json");
+        // A home an earlier build made: settings linked to the real file.
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &settings).unwrap();
+        std::fs::write(&real, r#"{"model":"normal"}"#).unwrap();
+
+        prepare_at(&client, &f.place, &b, false, vec![])
+            .await
+            .unwrap();
+        assert!(std::fs::read_link(&settings).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            r#"{"model":"normal"}"#
+        );
+
+        // The normal login changes its model; the session keeps its own.
+        std::fs::write(&real, r#"{"model":"changed"}"#).unwrap();
+        prepare_at(&client, &f.place, &b, false, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            r#"{"model":"normal"}"#
+        );
+        // What agy only reads stays linked.
+        assert_eq!(
+            std::fs::read_link(home.join(".gemini/GEMINI.md")).unwrap(),
+            f.place.real_home.join(".gemini/GEMINI.md")
         );
     }
 

@@ -532,8 +532,13 @@ Stopping them (by PID file) left the slot as it was and their token files in pla
 - A per-account home lacks the user's dotfiles, which the commands agy runs need (git identity,
   ssh, toolchains). Linking every entry of the real home except `.gemini` and `Library` restores
   them and keeps the keychain hidden. Shared from the real `~/.gemini` by link: `GEMINI.md`, `skills`,
-  `antigravity-cli/settings.json`, `config/mcp_config.json`; agy read the linked settings (`CLI
-  settings initialized`) and left the links in place. Not shared: the token file, conversations and
+  `config/mcp_config.json`. `antigravity-cli/settings.json` is a copy instead **[live]**: agy saves
+  it (a `/model` choice, a "trust this folder" answer) by replacing the file, which turned a link
+  into a regular file and left the link's target untouched. A link would follow the real settings
+  until the session's first save and then silently stop, so tokeman seeds a copy once and the
+  session's model and trust choices stay its own. A first interactive run in a new home shows agy's
+  onboarding again (theme, then the terms and the Interactions-data consent), because its status is
+  `antigravity-cli/cache/onboarding.json` in that home. Not shared: the token file, conversations and
   `conversation_summaries.db`, history, logs, `installation_id`. So `agy -c` in a per-account home
   resumes that home's last conversation, not the normal one's.
 - agy's background updater runs once per home (it writes `last_check.timestamp` there) and updates
