@@ -17,8 +17,8 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux
 hosting = "github"
 # Override macOS runners (dist defaults can emit invalid runner names)
 [dist.github-custom-runners]
-aarch64-apple-darwin = "macos-14"
-x86_64-apple-darwin = "macos-14"
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15"
 
 # Actions in the generated release.yml, pinned to the commit each tag named here pointed at.
 # Update by re-resolving the tag and re-running `dist generate`; never run pinact on release.yml.
