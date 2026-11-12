@@ -323,7 +323,7 @@ pub async fn record_session_from_hook(pid: u32, input: &[u8]) -> Result<()> {
         return Ok(());
     }
     let now = Utc::now().timestamp();
-    let account = match history::account_at(&history::timeline(), now) {
+    let account = match history::account_at(&history::load(), now) {
         Some(Some(account)) => account,
         Some(None) => return Ok(()),
         None => match std::env::var(ACCOUNT_ENV) {
@@ -604,7 +604,7 @@ pub fn scan_transcripts(accounts: &[Account]) -> Result<usize> {
         .iter()
         .map(|account| account.name.as_str())
         .collect();
-    let timeline = history::timeline();
+    let timeline = history::load();
     let mut incoming = Vec::new();
     let mut changed = false;
     for binding in state.sessions.values_mut() {
@@ -1285,5 +1285,43 @@ mod tests {
             Some("claude-fable-5-1")
         );
         assert_eq!(model_argument(&["claude", "--model"]), None);
+    }
+
+    #[test]
+    fn todays_state_file_loads_and_an_entry_it_cannot_read_is_dropped_alone() {
+        // The shape on disk on 2026-11-11 (names changed), plus a session
+        // and a limit in shapes this build does not read.
+        let json = r#"{
+            "sessions": {
+                "0a1b": {"session_id": "0a1b", "account": "ember", "transcript_path": "/t/0a1b.jsonl",
+                         "cwd": "/work", "source": "resume", "observed_at": 1794257446, "pid": 4831,
+                         "process_started_at": 1794257443, "scan_offset": 5769313,
+                         "last_model": "claude-opus-5-5"},
+                "odd": {"session_id": "odd", "observed_at": "yesterday"}
+            },
+            "limits": [
+                {"account": "ember", "model": "fable", "model_id": "claude-fable-5-2",
+                 "window": "weekly", "observed_at": 1, "reset": 1794657600, "session_id": "0a1b",
+                 "source": "observed Claude rejection"},
+                {"account": "ember", "model": "fable", "window": "fortnightly", "observed_at": 1,
+                 "reset": 2, "session_id": null, "source": "observed Claude rejection"}
+            ]
+        }"#;
+        let state: AdmissionState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.sessions.keys().collect::<Vec<_>>(), ["0a1b"]);
+        assert_eq!(state.sessions["0a1b"].scan_offset, 5_769_313);
+        assert_eq!(state.limits.len(), 1);
+        assert_eq!(state.limits[0].model, Some(ModelKey::new("fable52")));
+        // The limit it kept still lands on a reading as a model limit.
+        let mut result = reading("ember");
+        apply_limit(&mut result, &state.limits[0]);
+        let walled = models(&result);
+        assert_eq!(walled.len(), 1);
+        assert_eq!(walled[0].window, Window::new(1.0, 1_794_657_600));
+        assert_eq!(walled[0].source, Source::Observed);
+        // Today's empty list, as the file holds it now.
+        let empty: AdmissionState =
+            serde_json::from_str(r#"{"sessions": {}, "limits": []}"#).unwrap();
+        assert_eq!(empty, AdmissionState::default());
     }
 }

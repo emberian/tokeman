@@ -1119,4 +1119,45 @@ mod tests {
                 .starts_with("usage response parse failed")
         );
     }
+
+    #[test]
+    fn todays_cache_file_loads_and_an_entry_it_cannot_read_is_dropped_alone() {
+        // The shape on disk on 2026-11-11 (names changed, the body cut to
+        // the fields that are read), plus one entry in another shape.
+        let json = r#"{
+            "backoff": {"retry_after": 1794445549, "rate_limited": 1,
+                        "last_error": "/api/oauth/usage answered HTTP 429", "accounts": ["paused"]},
+            "entries": {
+                "ultra|usage": {"fetched_at": 1794436630, "retry_after": 0, "last_error": null,
+                    "body": {"amber_cistern": null, "cedar_ember": {"eligible": true, "grants": []},
+                        "five_hour": {"limit_dollars": null, "resets_at": "2026-11-11T22:00:00Z",
+                                      "utilization": 0.0},
+                        "limits": [
+                            {"kind": "weekly_all", "percent": 80, "resets_at": "2026-11-13T09:00:00Z"},
+                            {"kind": "weekly_scoped", "percent": 102, "resets_at": "2026-11-13T09:00:00Z",
+                             "scope": {"model": {"id": null, "display_name": "Fable"}}}],
+                        "weekly_scoped_shares": [{"limit_index": 1, "allowance_percent_of_weekly": 50}]}},
+                "odd|usage": {"fetched_at": "this morning", "body": 7}
+            }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-profile-reads.json");
+        std::fs::write(&path, json).unwrap();
+        let cache = Cache::at(path);
+        let file = cache.load();
+        assert_eq!(file.backoff.accounts, ["paused"]);
+        assert_eq!(file.entries.keys().collect::<Vec<_>>(), ["ultra|usage"]);
+        assert_eq!(cache.stored("odd", Endpoint::Usage), None);
+        let (fetched_at, body) = cache.stored("ultra", Endpoint::Usage).unwrap();
+        assert_eq!(fetched_at, 1_794_436_630);
+        // The cached body still becomes limits on a reading.
+        let mut reading = Reading::empty(Service::Claude, "ultra", 1_794_440_000);
+        merge(&mut reading, Some(parse(&body).map_err(|e| e.to_string())));
+        assert_eq!(reading.weekly(), Some(Window::new(0.8, 1_794_560_400)));
+        assert_eq!(reading.session_limit(), SessionLimit::Absent);
+        let fable = reading
+            .model_limit(&ModelKey::family_wide(Family::Fable))
+            .unwrap();
+        assert_eq!((fable.window.used, fable.share), (1.02, Some(0.5)));
+    }
 }

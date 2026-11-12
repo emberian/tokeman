@@ -4,16 +4,11 @@
 //! request on. The history answers which account a rejection seen in a
 //! transcript was charged to at the moment it happened. Entries carry
 //! fingerprints only; no secret is written here.
-//!
-//! Before this file existed the rotation log was the only record; its
-//! default-change lines are parsed once per log revision and merged in.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::path::Path;
 
 use crate::fs::{append_line, read_if_present, write_atomic};
 use crate::paths;
@@ -43,8 +38,6 @@ pub enum EventKind {
     Repair,
     /// Settings stopped offering a managed credential.
     Pause,
-    /// Reconstructed from the rotation log; account and moment only.
-    Legacy,
     /// Not an offer: the token with this fingerprint stopped working at `at`.
     Revoke,
     #[serde(other)]
@@ -63,7 +56,6 @@ impl EventKind {
             Self::Fallback => "fallback",
             Self::Repair => "repair",
             Self::Pause => "pause",
-            Self::Legacy => "legacy",
             Self::Revoke => "revoke",
             Self::Unknown => "unknown",
         }
@@ -99,7 +91,7 @@ pub struct Event {
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Fingerprint>,
-    /// Epoch seconds; `None` for a setup key or a legacy event.
+    /// Epoch seconds; `None` for a setup key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     pub kind: EventKind,
@@ -184,33 +176,6 @@ fn compact(path: &Path, now: i64) -> Result<()> {
     write_atomic(path, contents.as_bytes(), 0o600)
 }
 
-/// Recorded events with the rotation log's default changes filled in before
-/// the first recorded one.
-pub fn timeline() -> Vec<Event> {
-    with_legacy(load(), legacy_events())
-}
-
-pub fn with_legacy(
-    mut events: Vec<Event>,
-    legacy: impl IntoIterator<Item = (i64, Option<String>)>,
-) -> Vec<Event> {
-    let first_recorded = events.first().map(|event| event.at).unwrap_or(i64::MAX);
-    events.extend(
-        legacy
-            .into_iter()
-            .filter(|(at, _)| *at < first_recorded)
-            .map(|(at, account)| Event {
-                at,
-                account,
-                fingerprint: None,
-                expires_at: None,
-                kind: EventKind::Legacy,
-            }),
-    );
-    events.sort_by_key(|event| event.at);
-    events
-}
-
 /// The account settings offered at `at`. Outer `None`: nothing is known that
 /// early. Inner `None`: no managed credential was offered (paused).
 /// Revocations are not offers: a revoked token settings still offer is still
@@ -229,75 +194,6 @@ pub fn account_for(events: &[Event], fingerprint: &Fingerprint) -> Option<String
         .rev()
         .find(|event| event.fingerprint.as_ref() == Some(fingerprint))
         .and_then(|event| event.account.clone())
-}
-
-// Legacy: default changes parsed from the rotation log and its predecessor.
-
-type Stamp = Option<(u64, Option<SystemTime>)>;
-
-struct LegacyCache {
-    stamps: Vec<Stamp>,
-    events: Vec<(i64, Option<String>)>,
-}
-
-static LEGACY: Mutex<Option<LegacyCache>> = Mutex::new(None);
-
-fn stamp(path: &Path) -> Stamp {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.len(), metadata.modified().ok()))
-}
-
-fn legacy_events() -> Vec<(i64, Option<String>)> {
-    let log = paths::rotation_log();
-    let logs: [PathBuf; 2] = [log.with_extension("log.old"), log];
-    let stamps: Vec<Stamp> = logs.iter().map(|path| stamp(path)).collect();
-    let mut cache = LEGACY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(cached) = cache.as_ref()
-        && cached.stamps == stamps
-    {
-        return cached.events.clone();
-    }
-    let contents: Vec<String> = logs
-        .iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .collect();
-    let events = parse_log_events(contents.iter().map(String::as_str));
-    *cache = Some(LegacyCache {
-        stamps,
-        events: events.clone(),
-    });
-    events
-}
-
-fn parse_log_events<'a>(logs: impl IntoIterator<Item = &'a str>) -> Vec<(i64, Option<String>)> {
-    let mut events: Vec<_> = logs
-        .into_iter()
-        .flat_map(|contents| contents.lines().filter_map(parse_log_line))
-        .collect();
-    events.sort_by_key(|(at, _)| *at);
-    events
-}
-
-/// A rotation log line that changed the default: `explicitly activated X`,
-/// `switch A -> B; ...`, or `rotation paused; ...`.
-fn parse_log_line(line: &str) -> Option<(i64, Option<String>)> {
-    let (stamp, message) = line.split_once(' ')?;
-    let at = chrono::DateTime::parse_from_rfc3339(stamp)
-        .ok()?
-        .timestamp();
-    let account = if let Some(name) = message.strip_prefix("explicitly activated ") {
-        Some(name.trim().to_owned())
-    } else if let Some(rest) = message.strip_prefix("switch ") {
-        let (_, destination) = rest.split_once(" -> ")?;
-        Some(destination.split(';').next()?.trim().to_owned())
-    } else if message.starts_with("rotation paused;") {
-        None
-    } else {
-        return None;
-    };
-    Some((at, account))
 }
 
 #[cfg(test)]
@@ -341,17 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_events_fill_in_before_the_recorded_history() {
-        let merged = with_legacy(
-            vec![event(1_000, "b", "b0", None)],
-            [(10, Some("a".into())), (2_000, Some("z".into()))],
-        );
-        assert_eq!(merged.len(), 2);
-        assert_eq!(account_at(&merged, 500), Some(Some("a".into())));
-        assert_eq!(account_at(&merged, 5_000), Some(Some("b".into())));
-    }
-
-    #[test]
     fn fingerprints_are_stable_and_short() {
         assert_eq!(Fingerprint::of("abc"), Fingerprint::of("abc"));
         assert_ne!(Fingerprint::of("abc"), Fingerprint::of("abd"));
@@ -367,38 +252,5 @@ mod tests {
         let odd: Event =
             serde_json::from_str(r#"{"at":1,"account":null,"kind":"something-new"}"#).unwrap();
         assert_eq!(odd.kind, EventKind::Unknown);
-    }
-
-    #[test]
-    fn log_lines_that_change_the_default_are_events_and_others_are_not() {
-        let at = |line| parse_log_line(line);
-        assert_eq!(
-            at("2026-07-26T22:23:09Z explicitly activated boot@example.com")
-                .unwrap()
-                .1
-                .as_deref(),
-            Some("boot@example.com")
-        );
-        assert_eq!(
-            at("2026-07-26T22:23:19Z switch boot@example.com -> ember@example.com; threshold reached")
-                .unwrap()
-                .1
-                .as_deref(),
-            Some("ember@example.com")
-        );
-        assert_eq!(
-            at("2026-07-26T22:24:00Z rotation paused; removed settings OAuth token")
-                .unwrap()
-                .1,
-            None
-        );
-        assert!(at("2026-07-26T22:25:00Z kept ember@example.com").is_none());
-        let older = "2026-07-26T22:23:09Z explicitly activated a@example.com\n";
-        let newer = "2026-07-26T22:23:19Z switch a@example.com -> b@example.com; floor\n";
-        let accounts: Vec<_> = parse_log_events([newer, older])
-            .into_iter()
-            .map(|(_, a)| a.unwrap())
-            .collect();
-        assert_eq!(accounts, ["a@example.com", "b@example.com"]);
     }
 }

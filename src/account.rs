@@ -422,7 +422,6 @@ impl Fleet {
                 let record = Record::from(account.clone());
                 set(table, "name", value(&record.name));
                 set_opt(table, "key", record.key.as_deref().map(value));
-                table.remove("usage_key");
                 set_opt(
                     table,
                     "access_token",
@@ -591,7 +590,7 @@ struct Record {
     name: String,
     #[serde(default)]
     key: Option<String>,
-    #[serde(default, alias = "usage_key")]
+    #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
@@ -797,8 +796,8 @@ mod tests {
     }
 
     #[test]
-    fn rendering_keeps_comments_and_migrates_usage_key() {
-        let existing = "# fleet notes\n[[tokens]]\n# minted 2026-07-01\nname = \"acct\"\nkey = \"sk-ant-oat01-setup\"\nusage_key = \"old-captured\"\n";
+    fn rendering_keeps_comments() {
+        let existing = "# fleet notes\n[[tokens]]\n# minted 2026-07-01\nname = \"acct\"\nkey = \"sk-ant-oat01-setup\"\naccess_token = \"old-captured\"\n";
         let mut fleet = Fleet::parse(existing).unwrap();
         let login = fleet.accounts[0].login.as_mut().unwrap();
         assert_eq!(login.access_token.as_deref(), Some("old-captured"));
@@ -807,7 +806,6 @@ mod tests {
         assert!(rendered.contains("# fleet notes"), "{rendered}");
         assert!(rendered.contains("# minted 2026-07-01"), "{rendered}");
         assert!(rendered.contains("access_token = \"old-captured\""));
-        assert!(!rendered.contains("usage_key"));
         assert!(rendered.contains("refresh_token = \"r\""));
         let reparsed = Fleet::parse(&rendered).unwrap();
         assert_eq!(

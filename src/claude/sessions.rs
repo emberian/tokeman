@@ -79,7 +79,7 @@ pub(crate) async fn ps(args: &[&str], timeout: Duration) -> Result<String> {
 /// An error is a census that could not be taken, never an empty list.
 pub async fn live() -> Result<Vec<Session>> {
     let census = ps(&["-axo", "pid=,tty=,lstart=,comm="], CENSUS_TIMEOUT).await?;
-    let timeline = history::timeline();
+    let timeline = history::load();
     let now = Utc::now().timestamp();
     let mut sessions: Vec<Session> = census
         .lines()

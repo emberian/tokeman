@@ -390,4 +390,48 @@ mod tests {
         assert!(json.contains("\"header_samples\":{}"));
         assert_eq!(serde_json::from_str::<Cadence>(&json).unwrap(), cadence);
     }
+
+    #[test]
+    fn todays_state_file_loads_and_an_entry_it_cannot_read_is_dropped_alone() {
+        // The shape on disk on 2026-11-11, plus one sample and one backoff
+        // entry in shapes this build does not read.
+        let json = r#"{
+            "last_probe_epoch": 1794442423.346375,
+            "mode": "normal",
+            "probe_interval_secs": 120,
+            "consecutive_degraded_probes": 0,
+            "auth_backoff": {
+                "dead": {"failures": 3, "next_attempt_epoch": 1794443503.363156,
+                         "last_error": "HTTP 401: revoked", "credential": "71c09cf5294dc40a"},
+                "odd": {"failures": "many"}
+            },
+            "header_samples": {
+                "idle": {"sampled_at": 1794427420.185647, "answered": false, "window": null},
+                "sampled": {"sampled_at": 1794427420.0, "answered": true,
+                            "window": {"utilization": 0.37, "reset": 1794657600}},
+                "odd": {"sampled_at": 1.0, "answered": true,
+                        "window": {"span": "weekly", "used": 0.5}}
+            }
+        }"#;
+        let cadence: Cadence = serde_json::from_str(json).unwrap();
+        assert_eq!(cadence.mode, Some(Mode::Normal));
+        assert_eq!(cadence.probe_interval_secs, Some(120));
+        assert_eq!(cadence.backoff.keys().collect::<Vec<_>>(), ["dead"]);
+        assert_eq!(cadence.backoff["dead"].failures, 3);
+        assert_eq!(
+            cadence.samples.keys().collect::<Vec<_>>(),
+            ["idle", "sampled"]
+        );
+        assert_eq!(cadence.samples["idle"].window, None);
+        // The sampled window is still carried into a reading as a limit.
+        let mut readings = [fine("sampled")];
+        cadence.apply_samples(&mut readings, 1_794_442_423.0);
+        let carried = readings[0]
+            .model_limit(&ModelKey::family_wide(Family::Fable))
+            .unwrap();
+        assert_eq!(carried.window, Window::new(0.37, 1_794_657_600));
+        assert_eq!(carried.source, Source::Carried);
+        // A file that is not this state at all starts fresh.
+        assert!(serde_json::from_str::<Cadence>(r#"{"header_samples": 7}"#).is_err());
+    }
 }
