@@ -524,7 +524,9 @@ pub fn describe(credit: &ResetCredit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::probe::tests::{Backend, limited_body, ok, profile, weekly_only_body};
+    use crate::codex::probe::tests::{
+        Backend, limited_body, ok, profile, status, weekly_only_body,
+    };
     use axum::http::StatusCode;
 
     fn journal(dir: &std::path::Path) -> Journal {
@@ -655,6 +657,20 @@ mod tests {
             assert_eq!(error.to_string(), expected);
         }
         assert!(backend.requests("/credits/consume").is_empty());
+
+        // An account whose usage cannot be read is not judged limited.
+        let backend = Backend::default()
+            .usage_answers(vec![status(StatusCode::UNAUTHORIZED, "{}")])
+            .credit_answers(vec![(StatusCode::OK, credit_list_body().to_string())]);
+        let client = backend.client().await;
+        let error = plan(&client, &account, None, &journal).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<Refusal>(),
+                Some(Refusal::Unreadable(ReadError::Http { status: 401, .. }))
+            ),
+            "{error}"
+        );
         assert_eq!(
             journal.pending(Service::Codex, "one").unwrap(),
             None,
