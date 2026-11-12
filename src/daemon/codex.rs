@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::lock::is_paused;
 use crate::account::Fleet;
+use crate::codex::auth::CodexHome;
 use crate::codex::Client;
 use crate::codex::keep::{self, Tend, Tended};
 use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Terms};
@@ -32,6 +33,8 @@ pub struct Mover {
     store: PathBuf,
     moves: PathBuf,
     seats: Seats,
+    /// Codex's own fallback home, looked at before the profiles'.
+    default_home: Option<CodexHome>,
     next: Option<Instant>,
     running: Option<JoinHandle<Result<Round, String>>>,
     /// The outcome last seen per home, so only changes are logged.
@@ -46,6 +49,7 @@ impl Default for Mover {
             paths::snapshots_db(),
             paths::codex_moves(),
             Seats::default(),
+            CodexHome::default_home().ok(),
         )
     }
 }
@@ -84,11 +88,17 @@ impl Standing {
 }
 
 impl Mover {
-    pub fn recording_to(store: PathBuf, moves: PathBuf, seats: Seats) -> Self {
+    pub fn recording_to(
+        store: PathBuf,
+        moves: PathBuf,
+        seats: Seats,
+        default_home: Option<CodexHome>,
+    ) -> Self {
         Self {
             store,
             moves,
             seats,
+            default_home,
             next: None,
             running: None,
             last: BTreeMap::new(),
@@ -128,6 +138,7 @@ impl Mover {
             self.next = Some(Instant::now() + mover::INTERVAL);
             let fleet = fleet.clone();
             let seats = self.seats.clone();
+            let default_home = self.default_home.clone();
             self.running = Some(tokio::spawn(async move {
                 let client = match client {
                     Some(client) => client,
@@ -143,7 +154,7 @@ impl Mover {
                     let tended = keep::tend_all(&client, &fleet, &terms.seats, now).await;
                     let looks = match moves {
                         true => {
-                            let homes = mover::homes(&fleet);
+                            let homes = mover::homes_after(default_home, &fleet);
                             mover::sweep(&client, &fleet, &homes, &terms, false).await
                         }
                         false => Vec::new(),
@@ -222,7 +233,6 @@ impl Mover {
 mod tests {
     use super::*;
     use crate::codex::appserver::tests::{FakeAppServer, limits_answer};
-    use crate::codex::auth::CodexHome;
     use crate::codex::probe::tests::{Backend, ok, profile, usage_body};
     use crate::quota::Service;
 
@@ -248,6 +258,19 @@ mod tests {
         fleet.codex[1].parked = false;
         fleet.policy.codex_auto_move = false;
         assert_eq!(Standing::with_pause(&fleet, false), Standing::Off);
+    }
+
+    #[test]
+    fn a_test_run_looks_at_no_codex_home_outside_its_own() {
+        let test_home = std::path::Path::new(paths::TEST_HOME);
+        let live = Mover::default();
+        let fallback = live.default_home.expect("Codex has a fallback home");
+        assert!(fallback.path().starts_with(test_home), "{fallback:?}");
+        let homes = mover::homes(&Fleet::default());
+        assert_eq!(homes.len(), 1, "the fallback home alone");
+        assert!(homes[0].path().starts_with(test_home), "{homes:?}");
+        // A mover built without a fallback looks at the fleet's homes only.
+        assert!(mover::homes_after(None, &Fleet::default()).is_empty());
     }
 
     async fn finished(mover: &Mover) {
@@ -282,7 +305,7 @@ mod tests {
         let db = dir.path().join("s.db");
         let moves = dir.path().join("moves.jsonl");
         let seats = Seats::at(dir.path().join("codex-seats.json"));
-        let mut mover = Mover::recording_to(db.clone(), moves.clone(), seats.clone());
+        let mut mover = Mover::recording_to(db.clone(), moves.clone(), seats.clone(), None);
 
         // Off, paused or with one profile, no task starts.
         for standing in [
@@ -386,6 +409,7 @@ mod tests {
             dir.path().join("s.db"),
             dir.path().join("moves.jsonl"),
             seats.clone(),
+            None,
         );
 
         // Paused: nothing starts, nothing is sent.
@@ -446,6 +470,7 @@ mod tests {
             dir.path().join("s.db"),
             dir.path().join("moves.jsonl"),
             seats.clone(),
+            None,
         );
         let standing = Standing::FewProfiles { unparked: 1 };
         mover
@@ -520,6 +545,7 @@ mod tests {
             "/nonexistent/s.db".into(),
             "/nonexistent/m".into(),
             Seats::at("/nonexistent/seats.json"),
+            None,
         );
         let look = |outcome: Outcome| Look {
             home: "/h".into(),

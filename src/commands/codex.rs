@@ -72,9 +72,7 @@ pub struct Discovery {
 /// `~/.codex` and every directory under `~/.codex-homes` and `~/.codex-lanes`
 /// that holds an auth.json.
 pub fn discovery_roots() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
+    let home = crate::paths::home();
     let mut roots = vec![home.join(".codex")];
     for parent in [home.join(".codex-homes"), home.join(".codex-lanes")] {
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -226,9 +224,7 @@ pub fn import(from: &Path, homes_root: Option<&str>, register: bool) -> Result<V
         .with_context(|| format!("failed to read {}", from.display()))?;
     let root = match homes_root {
         Some(root) => expand_tilde(root),
-        None => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".codex-homes"),
+        None => crate::paths::home().join(".codex-homes"),
     };
     import_into(&text, &root, register).with_context(|| format!("importing {}", from.display()))
 }

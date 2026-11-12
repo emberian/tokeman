@@ -97,7 +97,7 @@ pub fn stop() {
 /// Write the shim and the plist for `binary`, then load and start the agent.
 #[cfg(target_os = "macos")]
 pub fn install(binary: &Path) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not find home directory")?;
+    let home = paths::home();
     let launcher = paths::daemon_launcher();
     let plist_path = paths::launch_agent_plist();
     let log = paths::launchd_log();
