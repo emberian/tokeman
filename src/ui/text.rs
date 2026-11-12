@@ -1300,20 +1300,36 @@ pub fn print_codex_used(used: &codex::Used) {
 }
 
 pub fn print_codex_watch(event: &codex::WatchEvent) {
+    use crate::daemon::codex::Standing;
+    let percent = |fraction: f64| format!("{:.0}%", fraction * 100.0);
     match event {
-        codex::WatchEvent::Watching {
-            target,
-            min_remaining,
-        } => println!(
-            "watching {} (migrate below {:.0}% left)",
-            tilde(target),
-            min_remaining * 100.0
+        codex::WatchEvent::Daemon(standing) => println!(
+            "{}",
+            match standing {
+                Standing::On => "the background service looks at every running Codex and moves a low one by itself".to_owned(),
+                Standing::Off => "codex_auto_move is off: the background service moves no Codex (tokeman settings set codex_auto_move true)".to_owned(),
+                Standing::Paused => "rotation is paused: the background service moves no Codex (tokeman rotate resume)".to_owned(),
+                Standing::FewProfiles { unparked } => format!(
+                    "the background service moves no Codex: {unparked} unparked profile(s) registered, and a move needs two"
+                ),
+            }
         ),
-        codex::WatchEvent::Headroom { remaining, span } => {
-            println!("{:.0}% left in the {span} window", remaining * 100.0)
-        }
-        codex::WatchEvent::Migrating => println!("below the threshold; migrating"),
-        codex::WatchEvent::Migrated(reseat) => println!("moved onto {}", reseat.account),
+        codex::WatchEvent::LastMove(moved) => println!(
+            "last move, {}: {moved}",
+            format_age(moved.at, Utc::now().timestamp())
+        ),
+        codex::WatchEvent::NowhereToMove { unparked } => println!(
+            "{unparked} unparked Codex profile(s) registered: nothing to move a running Codex to. Register another with `tokeman codex discover --adopt` or `tokeman codex add <name> <codex-home>`."
+        ),
+        codex::WatchEvent::Watching { target, floors } => println!(
+            "watching {} (leaves below {} of the 5h window or {} of a longer one; lands on {} / {} or more)",
+            tilde(target),
+            percent(floors.leave.session),
+            percent(floors.leave.weekly),
+            percent(floors.land.session),
+            percent(floors.land.weekly),
+        ),
+        codex::WatchEvent::Look(look) => println!("{look}"),
     }
 }
 
@@ -1445,6 +1461,61 @@ pub fn print_agy_run(launch: &crate::providers::antigravity::run::Launch) {
             launch.account,
             crate::paths::tilde(home)
         ),
+    }
+}
+
+/// The line before `tokeman agy launch` hands over: which account won, then
+/// what `agy run` says.
+pub fn print_agy_launch(launch: &crate::providers::antigravity::run::Launch, room: f64) {
+    eprintln!(
+        "{DIM}tokeman: agy on {}, {:.0}% left{RESET}",
+        launch.account,
+        room.max(0.0) * 100.0
+    );
+    print_agy_run(launch);
+}
+
+/// What a launch is about to start, in one line: the tool, the account, and
+/// the environment that seats it, a credential by name only.
+pub fn launch_line(launch: &crate::launch::Launch) -> String {
+    let room = launch
+        .room
+        .map(|room| format!(", {:.0}% left", room.max(0.0) * 100.0))
+        .unwrap_or_default();
+    let seated: Vec<String> = launch
+        .env()
+        .iter()
+        .filter(|var| !var.name.contains("_MODEL") || var.name == "ANTHROPIC_MODEL")
+        .map(|var| match var.secret {
+            true => format!("{} set", var.name),
+            false => format!("{}={}", var.name, tilde(std::path::Path::new(&var.value))),
+        })
+        .collect();
+    format!(
+        "tokeman: {} on {} account {}{room} ({})",
+        launch.program().to_string_lossy(),
+        launch.service.label(),
+        launch.account,
+        seated.join(", ")
+    )
+}
+
+/// The line before a launch hands the terminal over, on stderr so the
+/// tool's own output stays alone on stdout.
+pub fn print_launch(launch: &crate::launch::Launch) {
+    eprintln!("{DIM}{}{RESET}", launch_line(launch));
+}
+
+/// The accounts of a `best` that could not be read, on stderr.
+pub fn print_unread(best: &crate::commands::view::Best) {
+    for reading in &best.readings {
+        if let Some(error) = &reading.error {
+            eprintln!(
+                "{} could not be read: {}",
+                reading.account,
+                one_line(&error.to_string(), 120)
+            );
+        }
     }
 }
 
@@ -1616,6 +1687,25 @@ pub fn print_chart(chart: &crate::ui::chart::Rendered) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launch_line_names_a_credential_and_never_shows_it() {
+        let launch =
+            crate::launch::Launch::new(Service::Zai, "glm", Some(0.914), "claude", Vec::new())
+                .set("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
+                .set_secret("ANTHROPIC_AUTH_TOKEN", "the-key-itself")
+                .set("ANTHROPIC_MODEL", "glm-5.3")
+                .set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "glm-5.3-flash");
+        let line = launch_line(&launch);
+        assert_eq!(
+            line,
+            format!(
+                "tokeman: claude on {} account glm, 91% left (ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic, ANTHROPIC_AUTH_TOKEN set, ANTHROPIC_MODEL=glm-5.3)",
+                Service::Zai.label()
+            )
+        );
+        assert!(!line.contains("the-key-itself"));
+    }
     use crate::codex::probe::tests::{usage_body, weekly_only_body};
     use serde_json::json;
 

@@ -3,6 +3,7 @@
 //! what it manages.
 
 pub mod cadence;
+pub mod codex;
 pub mod cycle;
 pub mod lock;
 pub mod log;
@@ -53,6 +54,7 @@ pub async fn run() -> Result<()> {
     let mut refresh_backoff = refresh::Backoff::default();
     let mut codex_state = crate::codex::maintenance::MaintenanceState::default();
     let mut services_poller = services::Poller::default();
+    let mut codex_mover = codex::Mover::default();
     loop {
         wake.tick().await;
         if started_as.is_some() && executable_identity().is_some_and(|now| Some(now) != started_as)
@@ -75,6 +77,10 @@ pub async fn run() -> Result<()> {
         };
         // Runs in its own task; the cycle below never waits on it.
         for line in services_poller.tick(&fleet).await {
+            log(&line);
+        }
+        // Likewise: a look at the running Codexes, in its own bounded task.
+        for line in codex_mover.tick(&fleet).await {
             log(&line);
         }
         let scheduled = cycle::Options {

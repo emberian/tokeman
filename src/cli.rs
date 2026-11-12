@@ -54,24 +54,15 @@ pub enum Command {
         #[command(subcommand)]
         action: AgyAction,
     },
-    /// z.ai GLM Coding Plan accounts (read-only quota)
+    /// z.ai GLM Coding Plan accounts: quota, and Claude Code on the plan
     Glm {
         #[command(subcommand)]
         action: KeyAction,
     },
-    /// Kimi Code accounts (read-only quota)
+    /// Kimi Code accounts: quota, and Claude Code on the plan
     Kimi {
         #[command(subcommand)]
         action: KeyAction,
-    },
-    /// Launch claude on the best account
-    Launch {
-        /// Keep rotating the default while Claude runs
-        #[arg(long)]
-        auto: bool,
-        /// Arguments passed through to claude
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
     /// The rotation of Claude Code's default account, and its background service
     Rotate {
@@ -171,6 +162,15 @@ pub enum ClaudeAction {
     Use { name: String },
     /// Probe every account and rank them as the rotation would land
     Best,
+    /// Make the best account the default, then start claude
+    Launch {
+        /// Keep rotating the default while Claude runs
+        #[arg(long)]
+        auto: bool,
+        /// Arguments passed through to claude
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Usage-limit resets: list what is on offer, or use one on an account
     /// (asks first; needs a logged-in account)
     Reset {
@@ -237,16 +237,25 @@ pub enum CodexAction {
         json: bool,
     },
     /// Follow a running Codex and move it before its account runs out
+    ///
+    /// The foreground form of what the background service does by itself
+    /// (`codex_auto_move`): the same floors, judged on every update Codex
+    /// pushes instead of every few minutes.
     Watch {
         /// CODEX_HOME to watch (default: ~/.codex)
         #[arg(long)]
         codex_home: Option<String>,
-        /// Move once remaining headroom drops below this fraction
-        #[arg(long, default_value = "0.20")]
-        min_remaining: f64,
+        /// Leave once any window has less than this fraction left (default:
+        /// the codex_min_* floors in tokens.toml)
+        #[arg(long)]
+        min_remaining: Option<f64>,
         /// Evaluate once and exit
         #[arg(long)]
         once: bool,
+        /// Say what the background service would do now, for every
+        /// CODEX_HOME with a control socket; move nothing
+        #[arg(long, conflicts_with = "once")]
+        dry_run: bool,
     },
     /// Move a running Codex onto an account without restarting it, or (with
     /// --into) copy the account's credentials into another profile directory
@@ -272,6 +281,15 @@ pub enum CodexAction {
         /// Rank by a per-model limit (e.g. "spark") instead of the account windows
         #[arg(long)]
         limit: Option<String>,
+    },
+    /// Start codex on the profile with the most headroom (as its CODEX_HOME)
+    Launch {
+        /// Rank by a per-model limit (e.g. "spark") instead of the account windows
+        #[arg(long)]
+        limit: Option<String>,
+        /// Arguments passed through to codex
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Spend one rate-limit reset credit on an account at its limit (asks first)
     Reset {
@@ -328,6 +346,15 @@ pub enum AgyAction {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Start agy on the account with the most room, the way `run` does (macOS)
+    Launch {
+        /// Count only the limits whose group contains this text, e.g. "claude"
+        #[arg(long)]
+        group: Option<String>,
+        /// Arguments passed through to agy
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Start agy signed in to an account, beside the normal login (macOS)
     ///
     /// The account gets a home of its own under tokeman's data directory:
@@ -368,6 +395,21 @@ pub enum KeyAction {
         /// Count only the limits whose group contains this text
         #[arg(long)]
         group: Option<String>,
+    },
+    /// Start Claude Code on the plan, through the vendor's
+    /// Anthropic-compatible endpoint
+    ///
+    /// The endpoint, the account's key and the vendor's models go into that
+    /// one claude's environment. Claude Code's settings.json is not written,
+    /// so every other session stays on its Anthropic account.
+    Launch {
+        /// The vendor model for every Claude Code tier (default: the plan's
+        /// coding model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Arguments passed through to claude
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -496,7 +538,10 @@ pub enum SettingsAction {
     /// Print every launch setting
     Show,
     /// Set one (launch_args, dangerous_mode, terminal, claude_bin,
-    /// probe_interval_secs); an empty value clears it
+    /// probe_interval_secs, services_interval_secs, codex_auto_move,
+    /// codex_min_5h_remaining, codex_min_7d_remaining,
+    /// codex_land_min_5h_remaining, codex_land_min_7d_remaining); an empty
+    /// value clears it
     Set {
         key: String,
         #[arg(default_value = "", allow_hyphen_values = true)]
@@ -551,6 +596,10 @@ pub const REMOVED: &[(&[&str], &str)] = &[
     (
         &["services"],
         "tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)",
+    ),
+    (
+        &["launch"],
+        "tokeman claude launch [--auto] [-- <claude args>]",
     ),
     (&["login"], "tokeman claude login [<account>] [--more]"),
     (&["add"], "tokeman claude add <name> <key>"),
@@ -646,7 +695,17 @@ mod tests {
             "tokeman kimi add kimi --key-file ~/.kimi-key",
             "tokeman kimi list --json",
             "tokeman kimi best",
-            "tokeman launch --auto -- --model fable",
+            "tokeman claude launch",
+            "tokeman claude launch --auto -- --model fable",
+            "tokeman codex launch",
+            "tokeman codex launch --limit spark -- exec --json hi",
+            "tokeman codex watch --dry-run",
+            "tokeman codex watch --codex-home ~/.codex --min-remaining 0.1 --once",
+            "tokeman agy launch --group claude -- -c",
+            "tokeman glm launch",
+            "tokeman glm launch --model glm-5.3 -- -p hi",
+            "tokeman kimi launch -- --continue",
+            "tokeman settings set codex_auto_move false",
             "tokeman rotate run --dry-run",
             "tokeman rotate status --json",
             "tokeman rotate pause",
@@ -702,6 +761,8 @@ mod tests {
     #[test]
     fn a_removed_spelling_does_not_parse_and_names_its_replacement() {
         let old = [
+            ("launch", "tokeman claude launch"),
+            ("launch --auto -- --model fable", "tokeman claude launch"),
             ("login work", "tokeman claude login"),
             ("add work key", "tokeman claude add"),
             ("remove work", "tokeman claude remove"),
@@ -754,6 +815,9 @@ mod tests {
             "rotate status",
             "list",
             "agy use a",
+            "claude launch --auto",
+            "codex launch",
+            "glm launch",
         ] {
             let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
             assert_eq!(removed(&args), None, "{line}");

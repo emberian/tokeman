@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use super::view;
 use crate::account::{CodexAccount, Fleet};
 use crate::codex::Client;
-use crate::codex::appserver::{self, AccountInfo, AppServer, tightest_from_rate_limits};
+use crate::codex::appserver::{self, AccountInfo, AppServer};
 use crate::codex::auth::{self, CodexHome, IdClaims};
+use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Seat};
 use crate::codex::probe::{self, State};
 use crate::codex::refresh::{self, DEFAULT_MAX_AGE_DAYS, RefreshError};
 use crate::codex::resets::{self, CreditList};
+use crate::daemon::codex::Standing;
 use crate::paths::{expand_tilde, tilde};
-use crate::quota::{ReadError, Reading, Span};
+use crate::quota::{ReadError, Reading};
 
 /// Register a profile directory. It must already hold an auth.json.
 pub fn add(name: &str, codex_home: &str, label: Option<String>) -> Result<CodexAccount> {
@@ -515,70 +517,92 @@ async fn reseat_home(
         return Ok(result);
     }
 
-    let source = CodexHome::new(
-        fleet
-            .codex_account(&chosen.account)
-            .context("chosen account vanished from the fleet")?
-            .home(),
-    );
-    // The app-server takes the token as is and does not refresh it.
-    if let Err(error) =
-        refresh::refresh(client, &source, false, DEFAULT_MAX_AGE_DAYS, Utc::now()).await
-    {
+    let account = fleet
+        .codex_account(&chosen.account)
+        .context("chosen account vanished from the fleet")?;
+    let announced = mover::announce(client, account, &socket).await?;
+    if let Some(error) = announced.refresh_error {
         result.warnings.push(Warning::RefreshFailed {
             account: chosen.account.clone(),
             error,
         });
     }
-    let auth = source.read()?;
-    let access_token = auth
-        .access_token()
-        .context("chosen account has no access_token")?;
-    let account_id = auth
-        .effective_account_id()
-        .context("chosen account has no chatgpt_account_id")?;
-    let plan = auth.claims().and_then(|claims| claims.chatgpt_plan_type);
-
-    let mut server = AppServer::connect(&socket).await?;
-    let before = server.read_account().await.ok();
-    server
-        .reseat(access_token, &account_id, plan.as_deref())
-        .await?;
-    let after = server.read_account().await.ok();
-    server.close().await;
-    result.moved = Some(Moved { before, after });
+    result.moved = Some(Moved {
+        before: announced.before,
+        after: announced.after,
+    });
     Ok(result)
+}
+
+/// How `tokeman codex watch` runs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WatchOptions {
+    /// The CODEX_HOME to follow (default `~/.codex`; a dry run without one
+    /// looks at every home the daemon would).
+    pub codex_home: Option<String>,
+    /// One leaving floor for every window, instead of the `[rotation]` ones.
+    pub min_remaining: Option<f64>,
+    /// Look once and return.
+    pub once: bool,
+    /// Say what the daemon's look would do now; move and write nothing.
+    pub dry_run: bool,
 }
 
 /// What `watch` reports as it goes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WatchEvent {
+    /// A dry run: whether the daemon looks by itself.
+    Daemon(Standing),
+    /// A dry run: the newest recorded move.
+    LastMove(mover::Move),
+    /// Fewer than two unparked profiles: a Codex has nowhere to move.
+    NowhereToMove {
+        unparked: usize,
+    },
     Watching {
         target: PathBuf,
-        min_remaining: f64,
+        floors: MoveFloors,
     },
-    /// The tightest window the running Codex reports, and what is left in it.
-    Headroom {
-        remaining: f64,
-        span: Span,
-    },
-    /// Below the threshold; a migration follows.
-    Migrating,
-    Migrated(Reseat),
+    Look(Look),
 }
 
-/// Follow the Codex running against `codex_home` and move it once its
-/// headroom drops below `min_remaining`. The swap lands between turns, so
-/// the threshold is above zero: waiting for 100% costs the user a failed turn.
+fn floors_for(fleet: &Fleet, min_remaining: Option<f64>) -> Result<MoveFloors> {
+    let floors = MoveFloors::of(fleet);
+    match min_remaining {
+        None => Ok(floors),
+        Some(min) if (0.0..1.0).contains(&min) => Ok(floors.leaving_at(min)),
+        Some(min) => bail!("--min-remaining takes a fraction from 0 up to 1, not {min}"),
+    }
+}
+
+/// Follow the Codex running on a CODEX_HOME and move it between turns once
+/// it is below its leaving floor and another profile has the landing room:
+/// the daemon's look ([`mover::consider`]), run on every push from Codex
+/// instead of on a timer. `on_event` hears each look; a look that moved
+/// carries the probes to keep and the move to record.
 pub async fn watch(
     client: &Client,
     fleet: &Fleet,
-    codex_home: Option<&str>,
-    min_remaining: f64,
-    once: bool,
+    options: &WatchOptions,
     mut on_event: impl FnMut(WatchEvent),
 ) -> Result<()> {
-    let target = target_home(codex_home)?;
+    let floors = floors_for(fleet, options.min_remaining)?;
+    let unparked = mover::landings(fleet).len();
+    if unparked < 2 {
+        on_event(WatchEvent::NowhereToMove { unparked });
+        return Ok(());
+    }
+    if options.dry_run {
+        let homes = match &options.codex_home {
+            Some(home) => vec![target_home(Some(home))?],
+            None => mover::homes(fleet),
+        };
+        for look in mover::sweep(client, fleet, &homes, floors, true).await {
+            on_event(WatchEvent::Look(look));
+        }
+        return Ok(());
+    }
+    let target = target_home(options.codex_home.as_deref())?;
     let socket = appserver::control_socket_path(target.path());
     if !socket.exists() {
         bail!(
@@ -586,38 +610,44 @@ pub async fn watch(
             tilde(&socket)
         );
     }
-    let mut server = AppServer::connect(&socket).await?;
+    let mut server = Some(AppServer::connect(&socket).await?);
     on_event(WatchEvent::Watching {
         target: target.path().to_path_buf(),
-        min_remaining,
+        floors,
     });
-    // Evaluate the current limits before waiting for a push.
-    let mut pending = server.rate_limits().await.ok();
     loop {
-        if let Some((remaining, span)) = pending.as_ref().and_then(tightest_from_rate_limits) {
-            on_event(WatchEvent::Headroom { remaining, span });
-            if remaining < min_remaining {
-                on_event(WatchEvent::Migrating);
-                server.close().await;
-                let moved = reseat_home(client, fleet, &target, None, false, false).await?;
-                on_event(WatchEvent::Migrated(moved));
-                if once {
-                    return Ok(());
-                }
-                server = AppServer::connect(&socket).await?;
-                pending = server.rate_limits().await.ok();
-                continue;
-            }
+        let mut connected = match server.take() {
+            Some(connected) => connected,
+            None => AppServer::connect(&socket).await?,
+        };
+        let seat = Seat::read(&mut connected).await?;
+        // A move is announced on a connection of its own.
+        let low = !crate::policy::above(&seat.reading, floors.leave, None);
+        if low {
+            connected.close().await;
+        } else {
+            server = Some(connected);
         }
-        if once {
+        let look = mover::consider(client, fleet, &target, &seat, floors, false).await;
+        let moved = matches!(look.outcome, Outcome::Moved { .. });
+        on_event(WatchEvent::Look(look));
+        if options.once {
             return Ok(());
         }
-        // Codex pushes this whenever its view changes; nothing to poll.
-        pending = Some(
-            server
-                .next_notification("account/rateLimits/updated")
-                .await?,
-        );
+        if moved {
+            // Judge the account it landed on now.
+            continue;
+        }
+        let mut connected = match server.take() {
+            Some(connected) => connected,
+            None => AppServer::connect(&socket).await?,
+        };
+        // Codex pushes this whenever its view changes; nothing to poll. The
+        // push is sparse, so the next turn of the loop reads the whole view.
+        connected
+            .next_notification("account/rateLimits/updated")
+            .await?;
+        server = Some(connected);
     }
 }
 
@@ -665,8 +695,8 @@ pub async fn use_account(
             let account = account.context("name the account to copy into the profile")?;
             Ok(Used::Seated(seat(&client, fleet, account, into).await?))
         }
-        None => Ok(Used::Reseated(
-            reseat(
+        None => {
+            let reseat = reseat(
                 &client,
                 fleet,
                 options.codex_home.as_deref(),
@@ -674,27 +704,57 @@ pub async fn use_account(
                 options.dry_run,
                 options.force,
             )
-            .await?,
-        )),
+            .await?;
+            if let Some(moved) = &reseat.moved {
+                let from = moved.before.as_ref().and_then(|info| info.email.clone());
+                keep_move(&mover::Move {
+                    at: super::now(),
+                    home: tilde(&reseat.target),
+                    from,
+                    to: reseat.account.clone(),
+                    remaining: None,
+                    span: None,
+                    by: By::Use,
+                });
+            }
+            Ok(Used::Reseated(reseat))
+        }
     }
 }
 
-/// `tokeman codex watch`.
+/// Log a move and append it to the move history.
+fn keep_move(moved: &mover::Move) {
+    crate::daemon::log::log(&moved.to_string());
+    if let Err(error) = mover::record(moved) {
+        crate::notice::notice(&format!("the move was not recorded: {error:#}"));
+    }
+}
+
+/// `tokeman codex watch`: [`watch`] against the live backend, keeping what
+/// each look read and recording each move. A dry run first says where the
+/// daemon stands and what moved last, and writes nothing.
 pub async fn watch_running(
     fleet: &Fleet,
-    codex_home: Option<&str>,
-    min_remaining: f64,
-    once: bool,
-    on_event: impl FnMut(WatchEvent),
+    options: &WatchOptions,
+    mut on_event: impl FnMut(WatchEvent),
 ) -> Result<()> {
-    watch(
-        &Client::new()?,
-        fleet,
-        codex_home,
-        min_remaining,
-        once,
-        on_event,
-    )
+    if options.dry_run {
+        on_event(WatchEvent::Daemon(Standing::of(fleet)));
+        if let Some(last) = mover::moves().pop() {
+            on_event(WatchEvent::LastMove(last));
+        }
+    }
+    watch(&Client::new()?, fleet, options, |event| {
+        if let WatchEvent::Look(look) = &event
+            && !options.dry_run
+        {
+            view::record(&look.probed);
+            if let Some(moved) = look.moved(By::Watch, super::now()) {
+                keep_move(&moved);
+            }
+        }
+        on_event(event)
+    })
     .await
 }
 
@@ -737,7 +797,7 @@ pub async fn reset_claim(plan: &resets::ResetPlan) -> Result<resets::Claim> {
 mod tests {
     use super::*;
     use crate::codex::auth::tests::{id_token, jwt};
-    use crate::codex::probe::tests::{Backend, ok, profile, weekly_only_body};
+    use crate::codex::probe::tests::{Backend, ok, profile, usage_body, weekly_only_body};
     use crate::testing::codex_account;
     use axum::http::StatusCode;
     use serde_json::json;
@@ -831,6 +891,138 @@ mod tests {
         assert_eq!(json["detail"]["codex"]["reset_credits"]["available"], 0);
         assert_eq!(json["limits"][0]["span"], "weekly");
         assert_eq!(json["limits"][0]["scope"], "all");
+    }
+
+    /// Two profiles and a Codex running on the first one's account.
+    fn watched(
+        dir: &Path,
+        limits: serde_json::Value,
+    ) -> (crate::codex::appserver::tests::FakeAppServer, Fleet) {
+        use crate::codex::appserver::tests::{FakeAppServer, limits_answer};
+        let fleet = fleet_of(vec![profile(dir, "a", "r-a"), profile(dir, "b", "r-b")]);
+        let fake = FakeAppServer::start(vec![
+            ("acct-a", "a@x.y", limits),
+            ("acct-b", "b@x.y", limits_answer(10.0, 10.0)),
+        ]);
+        (fake, fleet)
+    }
+
+    #[tokio::test]
+    async fn watch_once_moves_a_low_codex_and_a_dry_run_only_says_so() {
+        use crate::codex::appserver::tests::limits_answer;
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, fleet) = watched(dir.path(), limits_answer(50.0, 85.0));
+        let backend = Backend::default().usage_answers(vec![ok(weekly_only_body(5.0))]);
+        let client = backend.client().await;
+        let home = fake.home.path().display().to_string();
+        let run = async |options: WatchOptions| {
+            let mut events = Vec::new();
+            watch(&client, &fleet, &options, |event| events.push(event))
+                .await
+                .unwrap();
+            events
+        };
+
+        let dry = run(WatchOptions {
+            codex_home: Some(home.clone()),
+            dry_run: true,
+            ..WatchOptions::default()
+        })
+        .await;
+        assert!(
+            matches!(&dry[..], [WatchEvent::Look(look)]
+                if look.outcome == Outcome::WouldMove { to: "b".into() }),
+            "{dry:?}"
+        );
+        assert!(fake.logins().is_empty());
+
+        // A floor under what is left keeps it where it is.
+        let kept = run(WatchOptions {
+            codex_home: Some(home.clone()),
+            min_remaining: Some(0.10),
+            once: true,
+            ..WatchOptions::default()
+        })
+        .await;
+        assert!(
+            matches!(&kept[..], [WatchEvent::Watching { floors, .. }, WatchEvent::Look(look)]
+                if look.outcome == Outcome::Healthy && floors.leave.weekly == 0.10),
+            "{kept:?}"
+        );
+
+        let moved = run(WatchOptions {
+            codex_home: Some(home),
+            once: true,
+            ..WatchOptions::default()
+        })
+        .await;
+        let [WatchEvent::Watching { .. }, WatchEvent::Look(look)] = &moved[..] else {
+            panic!("{moved:?}");
+        };
+        assert!(matches!(&look.outcome, Outcome::Moved { to, .. } if to == "b"));
+        assert_eq!(look.seated.as_deref(), Some("a"));
+        assert_eq!(look.probed.len(), 1);
+        assert_eq!(fake.account_id(), "acct-b");
+        assert_eq!(
+            look.moved(By::Watch, 1).unwrap().span,
+            Some(crate::quota::Span::Weekly)
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_with_one_profile_says_there_is_nowhere_to_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fleet = fleet_of(vec![profile(dir.path(), "only", "r")]);
+        let client = Backend::default().client().await;
+        let mut events = Vec::new();
+        let options = WatchOptions {
+            dry_run: true,
+            ..WatchOptions::default()
+        };
+        watch(&client, &fleet, &options, |event| events.push(event))
+            .await
+            .unwrap();
+        assert_eq!(events, vec![WatchEvent::NowhereToMove { unparked: 1 }]);
+        // A parked second profile is not somewhere to move.
+        fleet.codex.push(CodexAccount {
+            parked: true,
+            ..profile(dir.path(), "parked", "r")
+        });
+        events.clear();
+        watch(&client, &fleet, &WatchOptions::default(), |event| {
+            events.push(event)
+        })
+        .await
+        .unwrap();
+        assert_eq!(events, vec![WatchEvent::NowhereToMove { unparked: 1 }]);
+        let bad = WatchOptions {
+            min_remaining: Some(1.5),
+            ..WatchOptions::default()
+        };
+        assert!(watch(&client, &fleet, &bad, |_| {}).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn use_announces_the_named_account_to_the_running_codex() {
+        use crate::codex::appserver::tests::limits_answer;
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, fleet) = watched(dir.path(), limits_answer(10.0, 10.0));
+        let backend = Backend::default().usage_answers(vec![ok(usage_body(10.0, 10.0))]);
+        let client = backend.client().await;
+        let target = CodexHome::new(fake.home.path());
+        let dry = reseat_home(&client, &fleet, &target, Some("b"), true, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.moved, None);
+        assert!(fake.logins().is_empty());
+        let moved = reseat_home(&client, &fleet, &target, Some("b"), false, false)
+            .await
+            .unwrap();
+        let reported = moved.moved.unwrap();
+        assert_eq!(reported.before.unwrap().email.as_deref(), Some("a@x.y"));
+        assert_eq!(reported.after.unwrap().email.as_deref(), Some("b@x.y"));
+        assert_eq!(fake.logins()[0]["accessToken"], "access-b");
+        assert!(moved.warnings.is_empty());
     }
 
     #[test]

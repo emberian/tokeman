@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod launch;
 pub mod rotate;
 pub mod services;
 pub mod view;
