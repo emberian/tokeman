@@ -117,35 +117,6 @@ fn open_lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_held_lock_is_seen_as_contended_and_released_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("x.lock");
-        let held = FileLock::acquire(&path).unwrap();
-        assert!(FileLock::try_acquire(&path).unwrap().is_none());
-        drop(held);
-        assert!(FileLock::try_acquire(&path).unwrap().is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_writes_land_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("inner").join("f.txt");
-        write_atomic(&path, b"hi", 0o600).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"hi");
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
-        assert_eq!(read_if_present(&dir.path().join("missing")).unwrap(), None);
-    }
-}
-
 /// Deserialize a map entry by entry and leave out the entries that do not
 /// parse. A state file outlives the build that wrote it: one entry in an
 /// older or newer shape costs that entry, not the file.
@@ -176,4 +147,33 @@ where
         .into_iter()
         .filter_map(|value| serde_json::from_value(value).ok())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_lock_is_seen_as_contended_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let held = FileLock::acquire(&path).unwrap();
+        assert!(FileLock::try_acquire(&path).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_acquire(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_land_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inner").join("f.txt");
+        write_atomic(&path, b"hi", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hi");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(read_if_present(&dir.path().join("missing")).unwrap(), None);
+    }
 }

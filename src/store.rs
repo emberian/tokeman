@@ -450,7 +450,7 @@ mod tests {
             store
                 .since(Service::Claude, Some("acct"), 1_700_000_030)
                 .unwrap(),
-            [second.clone()]
+            std::slice::from_ref(second)
         );
         let recent = store.recent(Service::Claude, None, 2).unwrap();
         assert_eq!(

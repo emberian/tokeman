@@ -19,7 +19,93 @@ struct Window: Codable, Equatable {
     var remaining: Double { max(0, min(1, 1.0 - utilization)) }
 }
 
-struct Overview: Codable {
+/// One limit of one account, as tokeman's `quota::Limit` serializes: a
+/// window of some length (`span`) over the whole account, one model or one
+/// named group (`scope`).
+struct Limit: Decodable {
+    /// `5h`, `weekly`, `monthly`, or another length in words.
+    let span: String
+    /// The group the limit is scoped to (Antigravity's model families).
+    let group: String?
+    /// The model the limit is scoped to.
+    let model: String?
+    /// The server's name for the limit, or the span's when it gave none.
+    let label: String
+    let window: Window
+    let amount: Amount?
+
+    /// Whether the limit covers the whole account.
+    var isShared: Bool { group == nil && model == nil }
+
+    struct Amount: Decodable {
+        let used: Double
+        let limit: Double
+        let unit: String
+    }
+
+    private enum Keys: String, CodingKey { case span, scope, label, window, amount }
+    private enum ScopeKeys: String, CodingKey { case model, group }
+    private enum SpanKeys: String, CodingKey { case other }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        if let named = try? c.decode(String.self, forKey: .span) {
+            switch named {
+            case "five_hour": span = "5h"
+            case "unknown": span = "window"
+            default: span = named
+            }
+        } else {
+            let other = try c.nestedContainer(keyedBy: SpanKeys.self, forKey: .span)
+            span = Limit.spanText(try other.decode(Int64.self, forKey: .other))
+        }
+        if let scope = try? c.nestedContainer(keyedBy: ScopeKeys.self, forKey: .scope) {
+            group = try scope.decodeIfPresent(String.self, forKey: .group)
+            model = try scope.decodeIfPresent(String.self, forKey: .model)
+        } else {
+            group = nil
+            model = nil
+        }
+        let given = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        label = given.isEmpty ? span : given
+        window = try c.decode(Window.self, forKey: .window)
+        amount = try c.decodeIfPresent(Amount.self, forKey: .amount)
+    }
+
+    /// `daily`, `2d`, `90m`: a length in its largest whole unit.
+    private static func spanText(_ seconds: Int64) -> String {
+        if seconds == 86_400 { return "daily" }
+        for (size, suffix) in [(Int64(86_400), "d"), (3_600, "h"), (60, "m")] where seconds % size == 0 {
+            return "\(seconds / size)\(suffix)"
+        }
+        return "\(seconds)s"
+    }
+}
+
+/// Why a read produced no quota, as tokeman's `quota::ReadError` serializes,
+/// in words.
+struct ReadFailure: Decodable {
+    let text: String
+
+    private enum Keys: String, CodingKey { case kind, message, status, body, attempts }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        let message = try c.decodeIfPresent(String.self, forKey: .message)
+        let status = try c.decodeIfPresent(Int.self, forKey: .status)
+        switch kind {
+        case "no_credential": text = "no usable credential"
+        case "network": text = "network: \(message ?? "")"
+        case "http":
+            text = "HTTP \(status ?? 0): \(try c.decodeIfPresent(String.self, forKey: .body) ?? "")"
+        case "edge": text = "HTTP \(status ?? 0): Cloudflare challenge, not an auth failure"
+        default: text = message ?? kind
+        }
+    }
+}
+
+struct Overview: Decodable {
     let at: Int64
     /// `running`, `paused` or `not-installed`.
     let monitor: String
@@ -112,36 +198,24 @@ struct CodexAccount: Codable, Identifiable {
     }
 }
 
-struct ServiceAccount: Codable, Identifiable {
+struct ServiceAccount: Decodable, Identifiable {
     var id: String { "\(service)-\(name)" }
     let name: String
     let service: String
     let service_label: String
     let summary: String?
+    /// The stored reading, as tokeman's `quota::Reading` serializes.
     let usage: Usage?
 
-    struct Usage: Codable {
+    struct Usage: Decodable {
         let at: Int64
         let plan: String?
-        let meters: [Meter]
+        let limits: [Limit]
         let balances: [Balance]?
-        let error: String?
+        let error: ReadFailure?
     }
 
-    struct Meter: Codable {
-        let group: String?
-        let label: String
-        let window: Window
-        let amount: Amount?
-    }
-
-    struct Amount: Codable {
-        let used: Double
-        let limit: Double
-        let unit: String
-    }
-
-    struct Balance: Codable {
+    struct Balance: Decodable {
         let label: String
         let left_minor: Int64
         let total_minor: Int64?
@@ -151,27 +225,38 @@ struct ServiceAccount: Codable, Identifiable {
 
 // MARK: - History model (matches `tokeman history --json`)
 
-struct HistorySnapshot: Codable, Identifiable {
+/// One stored Claude reading (`quota::Reading`), read for its windows.
+struct HistorySnapshot: Decodable, Identifiable {
     var id: String { "\(account)-\(at)" }
     let account: String
-    let at: String
-    let session: Window?
-    let weekly: Window?
-    let overage: Window?
-    let buckets: [HistoryBucket]?
+    /// Epoch seconds.
+    let at: Int64
+    let limits: [Limit]
+    let detail: Detail?
 
-    struct HistoryBucket: Codable {
-        let label: String
-        let window: Window
+    struct Detail: Decodable {
+        let claude: Claude?
     }
 
-    var date: Date {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = formatter.date(from: at) { return d }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: at) ?? Date()
+    struct Claude: Decodable {
+        let overage: Overage?
     }
+
+    struct Overage: Decodable {
+        let window: Window?
+    }
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(at)) }
+
+    private func shared(_ span: String) -> Window? {
+        limits.first(where: { $0.isShared && $0.span == span })?.window
+    }
+
+    var session: Window? { shared("5h") }
+    var weekly: Window? { shared("weekly") }
+    var overage: Window? { detail?.claude?.overage?.window }
+    /// The per-model limits.
+    var buckets: [Limit] { limits.filter { $0.model != nil } }
 
     /// Percent left in the named series: `7d`, `5h`, `$$` or a bucket label.
     func remaining(for series: String) -> Double? {
@@ -180,7 +265,7 @@ struct HistorySnapshot: Codable, Identifiable {
         case "7d": window = weekly
         case "5h": window = session
         case "$$": window = overage
-        default: window = buckets?.first(where: { $0.label == series })?.window
+        default: window = buckets.first(where: { $0.label == series })?.window
         }
         return window.map { $0.remaining * 100 }
     }
@@ -670,7 +755,7 @@ struct AccountDetailChart: View {
     private var seriesNames: [String] {
         var names = ["7d", "5h"]
         for snapshot in snapshots {
-            for bucket in snapshot.buckets ?? [] where !names.contains(bucket.label) {
+            for bucket in snapshot.buckets where !names.contains(bucket.label) {
                 names.append(bucket.label)
             }
         }
@@ -918,9 +1003,9 @@ struct ServiceCard: View {
     let account: ServiceAccount
 
     /// The meters in the service's order, split where the group changes.
-    private var groups: [(name: String?, meters: [ServiceAccount.Meter])] {
-        var result: [(name: String?, meters: [ServiceAccount.Meter])] = []
-        for meter in account.usage?.meters ?? [] {
+    private var groups: [(name: String?, meters: [Limit])] {
+        var result: [(name: String?, meters: [Limit])] = []
+        for meter in account.usage?.limits ?? [] {
             if let last = result.indices.last, result[last].name == meter.group {
                 result[last].meters.append(meter)
             } else {
@@ -930,7 +1015,7 @@ struct ServiceCard: View {
         return result
     }
 
-    private func amountNote(_ meter: ServiceAccount.Meter) -> String? {
+    private func amountNote(_ meter: Limit) -> String? {
         guard let amount = meter.amount else { return nil }
         return "\(Int(amount.used.rounded()))/\(Int(amount.limit.rounded())) \(amount.unit)"
     }
@@ -952,7 +1037,7 @@ struct ServiceCard: View {
                 Spacer()
             }
             if let usage = account.usage {
-                if let error = usage.error { Caption(error, color: .red, lines: 3) }
+                if let error = usage.error { Caption(error.text, color: .red, lines: 3) }
                 ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
                     if let name = group.name {
                         Text(name).font(.system(size: 10, weight: .medium))
