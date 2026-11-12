@@ -94,18 +94,24 @@ pub fn antigravity_tokens() -> PathBuf {
     config_dir().join("antigravity-access-tokens.json")
 }
 
-/// Codex reset-credit claims sent without a definite answer, keyed by
-/// account, so a retry reuses the request id.
-pub fn codex_reset_journal() -> PathBuf {
+/// Reset claims (Claude grants, Codex credits) sent without a definite
+/// answer; written only by `claims`.
+pub fn claims_journal() -> PathBuf {
+    config_dir().join("claims.json")
+}
+
+pub fn claims_lock() -> PathBuf {
+    config_dir().join("claims.lock")
+}
+
+/// Where 0.3.x kept pending Codex credit claims; read by `claims`, never written.
+pub fn legacy_codex_reset_journal() -> PathBuf {
     config_dir().join("codex-reset-pending.json")
 }
 
-pub fn codex_reset_lock() -> PathBuf {
-    config_dir().join("codex-reset-pending.lock")
-}
-
-/// Reset claims whose outcome is not yet known, one file per account.
-pub fn reset_claims_dir() -> PathBuf {
+/// Where 0.3.x kept pending Claude grant claims, one file per account; read
+/// by `claims`, never written.
+pub fn legacy_reset_claims_dir() -> PathBuf {
     config_dir().join("reset-claims")
 }
 

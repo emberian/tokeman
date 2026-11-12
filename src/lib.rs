@@ -8,6 +8,7 @@
 
 pub mod account;
 pub mod anthropic;
+pub mod claims;
 pub mod claude;
 pub mod cli;
 pub mod codex;

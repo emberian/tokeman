@@ -123,8 +123,8 @@ pub async fn list_resets(only: Option<&str>) -> Result<()> {
         match resets::status(Client::shared(), &cache, account, false, now).await {
             Ok(status) => print_reset_status(
                 &status,
-                resets::Journal::default()
-                    .pending(&account.name)
+                crate::claims::Journal::default()
+                    .pending(crate::quota::Service::Claude, &account.name)
                     .ok()
                     .flatten()
                     .as_ref(),
@@ -138,7 +138,7 @@ pub async fn list_resets(only: Option<&str>) -> Result<()> {
 
 fn print_reset_status(
     status: &resets::ResetStatus,
-    pending: Option<&resets::PendingClaim>,
+    pending: Option<&crate::claims::Pending>,
     now: i64,
 ) {
     use resets::Standing;
@@ -179,7 +179,7 @@ fn print_reset_status(
     if let Some(pending) = pending {
         println!(
             "  ! a claim of grant {} has no known outcome; see `tokeman resets clear --help`",
-            pending.grant_id
+            pending.item.as_deref().unwrap_or_default()
         );
     }
     match &status.juniper_tide {
@@ -217,15 +217,12 @@ fn print_reset_status(
 
 /// Forget an account's pending grant claim.
 pub fn clear_pending_reset(name: &str) -> Result<()> {
-    let journal = resets::Journal::default();
-    match journal.pending(name)? {
-        Some(pending) => {
-            journal.clear(name)?;
-            println!(
-                "{name}: forgot the claim of grant {} (request {})",
-                pending.grant_id, pending.request_id
-            );
-        }
+    match crate::claims::Journal::default().clear(crate::quota::Service::Claude, name)? {
+        Some(pending) => println!(
+            "{name}: forgot the claim of grant {} (request {})",
+            pending.item.as_deref().unwrap_or_default(),
+            pending.request_id
+        ),
         None => println!("{name}: no claim pending"),
     }
     Ok(())
@@ -271,10 +268,11 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
                     .unwrap_or("no reason given")
             );
         }
-        let pending = resets::Journal::default().pending(name)?;
+        let pending =
+            crate::claims::Journal::default().pending(crate::quota::Service::Claude, name)?;
         let wanted = grant
             .map(str::to_owned)
-            .or_else(|| pending.as_ref().map(|pending| pending.grant_id.clone()))
+            .or_else(|| pending.as_ref().and_then(|pending| pending.item.clone()))
             .or_else(|| program.next_grant_id.clone());
         let chosen = program
             .grants()
@@ -314,7 +312,7 @@ pub async fn use_reset(name: &str, grant: Option<&str>, session: bool, yes: bool
         client,
         account,
         grant_id.as_deref(),
-        &resets::Journal::default(),
+        &crate::claims::Journal::default(),
         now,
     )
     .await?;

@@ -13,12 +13,11 @@
 //! spent on Fable and refills the 5h window. Neither moves the weekly reset.
 //!
 //! A grant claim whose outcome is unknown (no answer, an error, an unread
-//! body) leaves a journal entry. While it stands the account may only resend
-//! that same claim, which the server deduplicates by request id; it is never
-//! retried with another grant.
+//! body) leaves an entry in the claim journal ([`crate::claims`]). While it
+//! stands the account may only resend that same claim, which the server
+//! deduplicates by request id; it is never retried with another grant.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -27,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use super::profile::{Cache, Endpoint};
 use super::{Client, describe};
 use crate::account::Account;
-use crate::fs::write_atomic;
-use crate::paths;
+use crate::claims::{Conflict, Journal};
+use crate::quota::Service;
 use crate::util::one_line;
 
 /// What a grant resets.
@@ -261,7 +260,7 @@ pub struct ClaimResponse {
 fn profile_token(account: &Account, now: i64) -> Result<&str> {
     account.profile_token(now * 1000).with_context(|| {
         format!(
-            "{} has no live profile credential; run `tokeman login {}`",
+            "{} has no live profile credential; run `tokeman claude login {}`",
             account.name, account.name
         )
     })
@@ -362,75 +361,6 @@ async fn organization_uuid(client: &Client, bearer: &str) -> Result<String> {
         .context("the profile names no organization")
 }
 
-/// A grant claim sent without a known outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingClaim {
-    pub grant_id: String,
-    pub request_id: String,
-    /// Epoch seconds the claim was first sent.
-    pub sent_at: i64,
-}
-
-/// The pending-claim journal: one file per account, written before a grant
-/// claim is sent and removed only once the server's answer is read.
-#[derive(Debug, Clone)]
-pub struct Journal {
-    dir: PathBuf,
-}
-
-impl Default for Journal {
-    fn default() -> Self {
-        Self::at(paths::reset_claims_dir())
-    }
-}
-
-impl Journal {
-    pub fn at(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-
-    fn path(&self, account: &str) -> PathBuf {
-        let safe: String = account
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || "-_.@".contains(c) {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.dir.join(format!("{safe}.pending"))
-    }
-
-    /// The account's pending claim. An unreadable entry is reported as an
-    /// error rather than ignored: it still stands for a claim in flight.
-    pub fn pending(&self, account: &str) -> Result<Option<PendingClaim>> {
-        let path = self.path(account);
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .with_context(|| format!("unreadable pending claim {}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
-        }
-    }
-
-    fn record(&self, account: &str, claim: &PendingClaim) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(claim)?;
-        write_atomic(&self.path(account), &bytes, 0o600)
-    }
-
-    /// Forget the account's pending claim, once its outcome is known (also
-    /// from Claude's own Settings > Usage page).
-    pub fn clear(&self, account: &str) -> Result<()> {
-        match std::fs::remove_file(self.path(account)) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-            _ => Ok(()),
-        }
-    }
-}
-
 /// Claim one reset. `grant_id` selects a `cedar_ember` grant; `None` claims
 /// the `juniper_tide` session reset. A grant claim goes through `journal`:
 /// with a claim pending, only the same grant may be claimed, and it is
@@ -443,37 +373,35 @@ pub async fn claim(
     now: i64,
 ) -> Result<ClaimResponse> {
     let bearer = profile_token(account, now)?;
+    // Refused before any request: another grant's claim is still unanswered.
+    if let Some(grant_id) = grant_id
+        && let Some(pending) = journal.pending(Service::Claude, &account.name)?
+        && pending.item.as_deref() != Some(grant_id)
+    {
+        bail!(unanswered(&Conflict {
+            pending,
+            requested: grant_id.to_owned(),
+        }));
+    }
+    let organization = organization_uuid(client, bearer).await?;
     let pending = match grant_id {
-        Some(grant_id) => Some(match journal.pending(&account.name)? {
-            Some(pending) if pending.grant_id == grant_id => pending,
-            Some(pending) => bail!(
-                "a claim of grant {} sent at {} has no known outcome; check Settings > Usage on \
-                 claude.ai, then resend it with `tokeman resets use {} --grant {}` or forget it \
-                 with `tokeman resets clear {}`",
-                pending.grant_id,
-                DateTime::from_timestamp(pending.sent_at, 0).unwrap_or_default(),
-                account.name,
-                pending.grant_id,
-                account.name
-            ),
-            None => PendingClaim {
-                grant_id: grant_id.to_owned(),
-                request_id: request_id()?,
-                sent_at: now,
-            },
-        }),
+        Some(grant_id) => Some(
+            journal
+                .begin(Service::Claude, &account.name, Some(grant_id), now)
+                .map_err(|error| match error.downcast::<Conflict>() {
+                    Ok(conflict) => anyhow::anyhow!(unanswered(&conflict)),
+                    Err(error) => error,
+                })?
+                .0,
+        ),
         None => None,
     };
-    let organization = organization_uuid(client, bearer).await?;
     let body = match &pending {
-        Some(pending) => {
-            journal.record(&account.name, pending)?;
-            serde_json::json!({
-                "program": "cedar_ember",
-                "grant_id": pending.grant_id,
-                "request_id": pending.request_id,
-            })
-        }
+        Some(pending) => serde_json::json!({
+            "program": "cedar_ember",
+            "grant_id": pending.item,
+            "request_id": pending.request_id,
+        }),
         None => serde_json::json!({ "program": "juniper_tide" }),
     };
     let path = format!("/api/organizations/{organization}/reset_rate_limits");
@@ -490,20 +418,25 @@ pub async fn claim(
     }
     let response: ClaimResponse =
         serde_json::from_str(&text).context("unreadable reset response")?;
-    if pending.is_some() && response.result != ClaimResult::Unknown {
-        journal.clear(&account.name)?;
+    if let Some(pending) = &pending
+        && response.result != ClaimResult::Unknown
+    {
+        journal.finish(Service::Claude, &account.name, &pending.request_id)?;
     }
     Ok(response)
 }
 
-/// 16 random bytes as hex.
-fn request_id() -> Result<String> {
-    use std::io::Read;
-    let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .context("could not read /dev/urandom for a request id")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+/// Why a grant cannot be claimed while another grant's claim is unanswered.
+fn unanswered(conflict: &Conflict) -> String {
+    let pending = &conflict.pending;
+    let grant = pending.item.as_deref().unwrap_or_default();
+    format!(
+        "a claim of grant {grant} sent at {} has no known outcome; check Settings > Usage on \
+         claude.ai, then resend it with `tokeman claude reset {account} --grant {grant}` or \
+         forget it with `tokeman claude reset {account} --clear`",
+        DateTime::from_timestamp(pending.sent_at, 0).unwrap_or_default(),
+        account = pending.account,
+    )
 }
 
 /// Human names for the windows a grant clears.
@@ -703,12 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn request_ids_fit_the_server_format() {
-        let id = request_id().unwrap();
-        assert!(id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
     fn claim_results_are_named_and_unknown_ones_survive() {
         let response: ClaimResponse = serde_json::from_str(
             r#"{"result": "reset", "cleared": ["five_hour"], "resets_left": 0,
@@ -850,23 +777,29 @@ mod tests {
         ]);
         let client = serve(router).await;
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::at(dir.path().join("claims"));
+        let journal = Journal::at(dir.path());
         let account = profile_only_account("acct", "profile");
 
         let error = claim(&client, &account, Some("g1"), &journal, 100)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("HTTP 502"), "{error}");
-        let pending = journal.pending("acct").unwrap().expect("left pending");
-        assert_eq!(pending.grant_id, "g1");
+        let pending = journal
+            .pending(Service::Claude, "acct")
+            .unwrap()
+            .expect("left pending");
+        assert_eq!(pending.item.as_deref(), Some("g1"));
         assert_eq!(pending.sent_at, 100);
 
         // Another grant is refused before any request.
         let refused = claim(&client, &account, Some("g2"), &journal, 200)
             .await
             .unwrap_err();
+        let refused = refused.to_string();
+        assert!(refused.contains("no known outcome"), "{refused}");
         assert!(
-            refused.to_string().contains("no known outcome"),
+            refused.contains("`tokeman claude reset acct --grant g1`")
+                && refused.contains("`tokeman claude reset acct --clear`"),
             "{refused}"
         );
         assert_eq!(sent.lock().unwrap().len(), 1);
@@ -881,8 +814,8 @@ mod tests {
         assert_eq!(bodies[0]["program"], "cedar_ember");
         assert_eq!(bodies[0]["request_id"], bodies[1]["request_id"]);
         assert_eq!(bodies[1]["grant_id"], "g1");
-        assert_eq!(bodies[0]["request_id"].as_str().unwrap().len(), 32);
-        assert_eq!(journal.pending("acct").unwrap(), None);
+        assert_eq!(bodies[0]["request_id"], pending.request_id.as_str());
+        assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
 
         // The session reset carries no grant and no journal entry.
         let session = claim(&client, &account, None, &journal, 400).await.unwrap();
@@ -891,20 +824,73 @@ mod tests {
             sent.lock().unwrap()[2],
             serde_json::json!({"program": "juniper_tide"})
         );
-        assert_eq!(journal.pending("acct").unwrap(), None);
+        assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
     }
 
-    #[test]
-    fn the_journal_clears_and_reports_an_unreadable_entry() {
+    #[tokio::test]
+    async fn a_claim_left_pending_by_an_earlier_build_is_honoured() {
+        let (router, sent) = fake_api(vec![
+            (StatusCode::OK, r#"{"result": "something_new"}"#),
+            (StatusCode::OK, r#"{"result": "already_used"}"#),
+        ]);
+        let client = serve(router).await;
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::at(dir.path().to_owned());
-        journal.clear("nobody").unwrap();
-        std::fs::write(dir.path().join("a_b.pending"), "not json").unwrap();
-        assert!(
-            journal.pending("a/b").is_err(),
-            "a garbled entry still blocks"
+        crate::claims::tests::legacy_claude_fixture(
+            dir.path(),
+            "acct",
+            "fable52-launch",
+            "0123456789abcdef0123456789abcdef",
         );
-        journal.clear("a/b").unwrap();
-        assert_eq!(journal.pending("a/b").unwrap(), None);
+        let journal = Journal::at(dir.path());
+        let account = profile_only_account("acct", "profile");
+
+        // Another grant is refused without a request, and nothing is written.
+        let refused = claim(&client, &account, Some("other-grant"), &journal, 200)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("a claim of grant fable52-launch sent at 2025-11-11"),
+            "{refused}"
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(!dir.path().join("claims.json").exists());
+
+        // The same grant goes out with the request id the old file held. An
+        // answer this build cannot name leaves the claim pending.
+        let unknown = claim(&client, &account, Some("fable52-launch"), &journal, 300)
+            .await
+            .unwrap();
+        assert_eq!(unknown.result, ClaimResult::Unknown);
+        assert!(journal.pending(Service::Claude, "acct").unwrap().is_some());
+        let answered = claim(&client, &account, Some("fable52-launch"), &journal, 400)
+            .await
+            .unwrap();
+        assert_eq!(answered.result, ClaimResult::AlreadyUsed);
+        let bodies = sent.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert_eq!(
+                *body,
+                serde_json::json!({"program": "cedar_ember", "grant_id": "fable52-launch",
+                    "request_id": "0123456789abcdef0123456789abcdef"})
+            );
+        }
+        assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_organization_lookup_journals_nothing() {
+        let client = serve(Router::new()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        let account = profile_only_account("acct", "profile");
+        assert!(
+            claim(&client, &account, Some("g1"), &journal, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
     }
 }

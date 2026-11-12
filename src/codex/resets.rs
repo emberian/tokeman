@@ -1,23 +1,22 @@
 //! Rate-limit reset credits: list them, and claim one on an account that is
 //! at a limit. A claim carries a `redeem_request_id` the backend treats as an
-//! idempotency key; the id is written to a pending journal before the request
-//! goes out and removed only on a definite answer, so a retry after a lost
-//! answer reuses it and cannot spend a second credit.
+//! idempotency key; the id is written to the claim journal
+//! ([`crate::claims`]) before the request goes out and removed only on a
+//! definite answer, so a retry after a lost answer reuses it and cannot spend
+//! a second credit.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
 
 use super::Client;
 use super::auth::CodexHome;
 use super::probe::{self, State, epoch_of};
 use crate::account::CodexAccount;
-use crate::fs::{FileLock, read_if_present, write_atomic};
-use crate::quota::{ReadError, Reading};
+use crate::claims::{Conflict, Journal, Pending};
+use crate::quota::{ReadError, Reading, Service};
 
 /// Where a credit stands. Spellings the backend adds later are kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,141 +173,6 @@ pub struct Consumed {
     pub windows_reset: i64,
 }
 
-/// A claim sent without a definite answer yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingClaim {
-    pub redeem_request_id: String,
-    pub credit_id: Option<String>,
-    /// Epoch seconds when the id was minted.
-    pub started_at: i64,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct JournalFile {
-    #[serde(default)]
-    pending: BTreeMap<String, PendingClaim>,
-}
-
-/// The pending-claim journal. This type is its only writer; every change is
-/// a locked read-modify-write.
-#[derive(Debug, Clone)]
-pub struct Journal {
-    path: PathBuf,
-    lock: PathBuf,
-}
-
-impl Default for Journal {
-    fn default() -> Self {
-        Self::new(
-            crate::paths::codex_reset_journal(),
-            crate::paths::codex_reset_lock(),
-        )
-    }
-}
-
-impl Journal {
-    pub fn new(path: impl Into<PathBuf>, lock: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            lock: lock.into(),
-        }
-    }
-
-    /// An unreadable journal is an error, never an empty one: treating it as
-    /// empty would mint a second id for a claim that may have gone through.
-    fn read(&self) -> Result<JournalFile> {
-        match read_if_present(&self.path)? {
-            None => Ok(JournalFile::default()),
-            Some(text) => serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "{} is unreadable; fix or remove it by hand once no claim is in flight",
-                    self.path.display()
-                )
-            }),
-        }
-    }
-
-    fn write(&self, file: &JournalFile) -> Result<()> {
-        write_atomic(
-            &self.path,
-            serde_json::to_string_pretty(file)?.as_bytes(),
-            0o600,
-        )
-    }
-
-    fn locked(&self) -> Result<FileLock> {
-        FileLock::acquire_announced(&self.lock, "another tokeman codex reset")
-    }
-
-    pub fn pending(&self, account: &str) -> Result<Option<PendingClaim>> {
-        Ok(self.read()?.pending.remove(account))
-    }
-
-    /// The claim to send for `account`: the pending one if there is one,
-    /// else a new id, recorded before it is returned. `true` when new.
-    pub fn begin(
-        &self,
-        account: &str,
-        credit_id: Option<&str>,
-        now: i64,
-    ) -> Result<(PendingClaim, bool)> {
-        let _lock = self.locked()?;
-        let mut file = self.read()?;
-        if let Some(pending) = file.pending.get(account) {
-            if credit_id.is_some() && credit_id != pending.credit_id.as_deref() {
-                bail!(Refusal::PendingForOtherCredit {
-                    pending: pending.credit_id.clone(),
-                    requested: credit_id.unwrap_or_default().to_owned(),
-                });
-            }
-            return Ok((pending.clone(), false));
-        }
-        let claim = PendingClaim {
-            redeem_request_id: request_id()?,
-            credit_id: credit_id.map(str::to_owned),
-            started_at: now,
-        };
-        file.pending.insert(account.to_owned(), claim.clone());
-        self.write(&file)?;
-        Ok((claim, true))
-    }
-
-    /// Drop the pending claim once the backend answered it.
-    pub fn finish(&self, account: &str, redeem_request_id: &str) -> Result<()> {
-        let _lock = self.locked()?;
-        let mut file = self.read()?;
-        if file
-            .pending
-            .get(account)
-            .is_some_and(|pending| pending.redeem_request_id == redeem_request_id)
-        {
-            file.pending.remove(account);
-            self.write(&file)?;
-        }
-        Ok(())
-    }
-}
-
-/// A random UUID v4, the form Codex uses for its idempotency keys.
-fn request_id() -> Result<String> {
-    use std::io::Read;
-    let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .context("could not read /dev/urandom for a request id")?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    ))
-}
-
 /// Why a reset is not offered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
@@ -381,7 +245,7 @@ pub struct ResetPlan {
     /// The credit asked for; `None` lets the backend choose.
     pub credit_id: Option<String>,
     /// An earlier claim without a definite answer; this one retries it.
-    pub pending: Option<PendingClaim>,
+    pub pending: Option<Pending>,
 }
 
 impl ResetPlan {
@@ -401,12 +265,12 @@ pub async fn plan(
     credit: Option<&str>,
     journal: &Journal,
 ) -> Result<ResetPlan> {
-    let pending = journal.pending(&account.name)?;
+    let pending = journal.pending(Service::Codex, &account.name)?;
     let probe = probe::probe(client, account).await;
     let credits = list(client, account).await;
     let credit_id = credit
         .map(str::to_owned)
-        .or_else(|| pending.as_ref().and_then(|claim| claim.credit_id.clone()));
+        .or_else(|| pending.as_ref().and_then(|claim| claim.item.clone()));
     let plan = ResetPlan {
         account: account.clone(),
         probe,
@@ -415,9 +279,9 @@ pub async fn plan(
         pending,
     };
     if let Some(pending) = &plan.pending {
-        if credit.is_some() && credit != pending.credit_id.as_deref() {
+        if credit.is_some() && credit != pending.item.as_deref() {
             bail!(Refusal::PendingForOtherCredit {
-                pending: pending.credit_id.clone(),
+                pending: pending.item.clone(),
                 requested: credit.unwrap_or_default().to_owned(),
             });
         }
@@ -480,9 +344,22 @@ pub async fn claim(
     now: i64,
 ) -> Result<Claim> {
     let account = &plan.account;
-    let (pending, fresh) = journal.begin(&account.name, plan.credit_id.as_deref(), now)?;
-    let mut body = json!({ "redeem_request_id": pending.redeem_request_id });
-    if let Some(credit_id) = &pending.credit_id {
+    let (pending, fresh) = journal
+        .begin(
+            Service::Codex,
+            &account.name,
+            plan.credit_id.as_deref(),
+            now,
+        )
+        .map_err(|error| match error.downcast::<Conflict>() {
+            Ok(conflict) => anyhow::Error::new(Refusal::PendingForOtherCredit {
+                pending: conflict.pending.item,
+                requested: conflict.requested,
+            }),
+            Err(error) => error,
+        })?;
+    let mut body = json!({ "redeem_request_id": pending.request_id });
+    if let Some(credit_id) = &pending.item {
         body["credit_id"] = json!(credit_id);
     }
     let answer = match CodexHome::new(account.home()).read() {
@@ -506,15 +383,15 @@ pub async fn claim(
     };
     match answer {
         Ok(consumed) => {
-            journal.finish(&account.name, &pending.redeem_request_id)?;
+            journal.finish(Service::Codex, &account.name, &pending.request_id)?;
             Ok(Claim::Answered {
-                redeem_request_id: pending.redeem_request_id,
+                redeem_request_id: pending.request_id,
                 consumed,
                 retried: !fresh,
             })
         }
         Err(error) => Ok(Claim::Uncertain {
-            redeem_request_id: pending.redeem_request_id,
+            redeem_request_id: pending.request_id,
             error,
         }),
     }
@@ -547,7 +424,7 @@ mod tests {
     use axum::http::StatusCode;
 
     fn journal(dir: &std::path::Path) -> Journal {
-        Journal::new(dir.join("pending.json"), dir.join("pending.lock"))
+        Journal::at(dir.join("journal"))
     }
 
     /// The list body as the backend sent it on 2026-11-11, ids shortened.
@@ -616,39 +493,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_journal_keeps_one_id_per_account_until_it_is_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        assert_eq!(journal.pending("a").unwrap(), None);
-        let (first, fresh) = journal.begin("a", None, 10).unwrap();
-        assert!(fresh);
-        assert_eq!(first.redeem_request_id.len(), 36);
-        assert_eq!(&first.redeem_request_id[14..15], "4", "a v4 UUID");
-        let (again, fresh) = journal.begin("a", None, 20).unwrap();
-        assert!(!fresh);
-        assert_eq!(again, first, "a retry reuses the id and its start time");
-        let (other, _) = journal.begin("b", Some("c1"), 30).unwrap();
-        assert_ne!(other.redeem_request_id, first.redeem_request_id);
-        // A different credit while one is pending is refused, not minted.
-        let error = journal.begin("b", Some("c2"), 40).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<Refusal>(),
-            Some(Refusal::PendingForOtherCredit { .. })
-        ));
-        // Asking for no particular credit retries the pending one.
-        assert_eq!(journal.begin("b", None, 50).unwrap().0, other);
-        // Finishing with a stale id leaves the entry.
-        journal.finish("a", "not-the-id").unwrap();
-        assert_eq!(journal.pending("a").unwrap(), Some(first.clone()));
-        journal.finish("a", &first.redeem_request_id).unwrap();
-        assert_eq!(journal.pending("a").unwrap(), None);
-        assert_eq!(journal.pending("b").unwrap(), Some(other));
-        // A damaged journal stops claims instead of minting a new id.
-        std::fs::write(dir.path().join("pending.json"), "{oops").unwrap();
-        assert!(journal.begin("c", None, 60).is_err());
-    }
-
     fn consume_answer(code: &str) -> (StatusCode, String) {
         (
             StatusCode::OK,
@@ -708,7 +552,7 @@ mod tests {
         }
         assert!(backend.requests("/credits/consume").is_empty());
         assert_eq!(
-            journal.pending("one").unwrap(),
+            journal.pending(Service::Codex, "one").unwrap(),
             None,
             "a refusal mints nothing"
         );
@@ -759,7 +603,7 @@ mod tests {
         };
         assert_eq!(header("authorization"), "Bearer access-one");
         assert_eq!(header("chatgpt-account-id"), "acct-one");
-        assert_eq!(journal.pending("one").unwrap(), None);
+        assert_eq!(journal.pending(Service::Codex, "one").unwrap(), None);
     }
 
     #[tokio::test]
@@ -799,15 +643,33 @@ mod tests {
             }
         );
         assert_eq!(
-            journal.pending("one").unwrap().unwrap().redeem_request_id,
+            journal
+                .pending(Service::Codex, "one")
+                .unwrap()
+                .unwrap()
+                .request_id,
             first_id
         );
 
         let retry_plan = plan(&client, &account, None, &journal).await.unwrap();
-        assert_eq!(
-            retry_plan.pending.as_ref().unwrap().redeem_request_id,
-            first_id
-        );
+        assert_eq!(retry_plan.pending.as_ref().unwrap().request_id, first_id);
+        // Naming another credit while that claim is unanswered is refused
+        // before any request.
+        let other = plan(&client, &account, Some("RateLimitResetCredit_a"), &journal)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            other.downcast_ref::<Refusal>(),
+            Some(Refusal::PendingForOtherCredit { pending: None, .. })
+        ));
+        let mut stale = retry_plan.clone();
+        stale.credit_id = Some("RateLimitResetCredit_a".into());
+        let other = claim(&client, &stale, &journal, 150).await.unwrap_err();
+        assert!(matches!(
+            other.downcast_ref::<Refusal>(),
+            Some(Refusal::PendingForOtherCredit { .. })
+        ));
+        assert_eq!(backend.requests("/credits/consume").len(), 1);
         let retry = claim(&client, &retry_plan, &journal, 200).await.unwrap();
         assert_eq!(
             retry,
@@ -831,7 +693,7 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![first_id.clone(), first_id]);
-        assert_eq!(journal.pending("one").unwrap(), None);
+        assert_eq!(journal.pending(Service::Codex, "one").unwrap(), None);
     }
 
     #[tokio::test]
@@ -853,6 +715,49 @@ mod tests {
                 ..
             }
         ));
-        assert!(journal.pending("one").unwrap().is_some());
+        assert!(journal.pending(Service::Codex, "one").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_claim_left_pending_by_an_earlier_build_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = profile(dir.path(), "one", "r1");
+        let journal_dir = dir.path().join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        crate::claims::tests::legacy_codex_fixture(&journal_dir);
+        let journal = journal(dir.path());
+        let backend = Backend::default()
+            .usage_answers(vec![ok(weekly_only_body(0.0))])
+            .credit_answers(vec![(StatusCode::OK, credit_list_body().to_string())])
+            .consume_answers(vec![consume_answer("already_redeemed")]);
+        let client = backend.client().await;
+
+        // Another credit is refused while the old claim is unanswered.
+        let error = plan(&client, &account, Some("RateLimitResetCredit_b"), &journal)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Refusal>(),
+            Some(&Refusal::PendingForOtherCredit {
+                pending: Some("RateLimitResetCredit_a".into()),
+                requested: "RateLimitResetCredit_b".into(),
+            })
+        );
+        assert!(backend.requests("/credits/consume").is_empty());
+
+        // The retry resends the id and the credit the old file held.
+        let retry = plan(&client, &account, None, &journal).await.unwrap();
+        assert_eq!(retry.credit_id.as_deref(), Some("RateLimitResetCredit_a"));
+        let outcome = claim(&client, &retry, &journal, 1).await.unwrap();
+        assert!(matches!(outcome, Claim::Answered { retried: true, .. }));
+        let sent = backend.requests("/credits/consume");
+        assert_eq!(
+            serde_json::from_str::<Value>(&sent[0].body).unwrap(),
+            json!({"redeem_request_id": "0b0e3c1a-5a52-4c8e-9d0a-7f3e2b1c4d5e",
+                "credit_id": "RateLimitResetCredit_a"})
+        );
+        assert_eq!(journal.pending(Service::Codex, "one").unwrap(), None);
+        // The other account's old claim is still there.
+        assert!(journal.pending(Service::Codex, "two").unwrap().is_some());
     }
 }

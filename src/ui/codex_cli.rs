@@ -220,7 +220,7 @@ async fn reset(name: &str, credit: Option<&str>, yes: bool) -> Result<()> {
         .codex_account(name)
         .with_context(|| format!("no codex account named {name}"))?;
     let client = Client::new()?;
-    let journal = resets::Journal::default();
+    let journal = crate::claims::Journal::default();
     let plan = resets::plan(&client, account, credit, &journal).await?;
     let now = chrono::Utc::now().timestamp();
     println!("{}", commands::ROW_HEADER);
@@ -238,13 +238,13 @@ async fn reset(name: &str, credit: Option<&str>, yes: bool) -> Result<()> {
     if let Some(pending) = &plan.pending {
         println!(
             "an earlier claim (request {}, started {}) got no definite answer; this retries it with the same request id",
-            pending.redeem_request_id,
-            chrono::DateTime::from_timestamp(pending.started_at, 0)
+            pending.request_id,
+            chrono::DateTime::from_timestamp(pending.sent_at, 0)
                 .map(|at| at
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M")
                     .to_string())
-                .unwrap_or_else(|| pending.started_at.to_string())
+                .unwrap_or_else(|| pending.sent_at.to_string())
         );
     }
     let which = match (plan.chosen(), &plan.credit_id) {
