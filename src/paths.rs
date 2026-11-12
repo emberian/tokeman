@@ -13,14 +13,29 @@ use std::path::PathBuf;
 #[cfg(test)]
 pub(crate) const TEST_HOME: &str = "/nonexistent/tokeman-test-home";
 
+/// The user's home directory. Every module asks here, so a unit test never
+/// learns the real one.
 #[cfg(not(test))]
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     PathBuf::from(TEST_HOME)
+}
+
+/// The platform's per-user configuration directory (`~/Library/Application
+/// Support` on macOS, `$XDG_CONFIG_HOME` or `~/.config` elsewhere), where
+/// other applications keep their state.
+#[cfg(not(test))]
+pub fn platform_config_dir() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
+#[cfg(test)]
+pub fn platform_config_dir() -> Option<PathBuf> {
+    Some(home().join("platform-config"))
 }
 
 #[cfg(not(test))]
@@ -251,6 +266,8 @@ mod tests {
             launch_agent_plist(),
             claude_settings(),
             expand_tilde("~/x"),
+            super::home(),
+            platform_config_dir().unwrap(),
         ] {
             assert!(
                 path.starts_with(home),
