@@ -49,7 +49,7 @@ pub async fn run() -> Result<()> {
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_codex_sweep = Instant::now();
     let mut refresh_backoff = refresh::Backoff::default();
-    let mut codex_state = crate::codex::commands::MaintenanceState::default();
+    let mut codex_state = crate::codex::maintenance::MaintenanceState::default();
     let mut services_poller = services::Poller::default();
     loop {
         wake.tick().await;
@@ -88,8 +88,8 @@ pub async fn run() -> Result<()> {
             }
         }
         if Instant::now() >= next_codex_sweep {
-            next_codex_sweep = Instant::now() + crate::codex::commands::SWEEP_INTERVAL;
-            for event in crate::codex::commands::maintenance(&fleet, &mut codex_state).await {
+            next_codex_sweep = Instant::now() + crate::codex::maintenance::SWEEP_INTERVAL;
+            for event in crate::codex::maintenance::maintenance(&fleet, &mut codex_state).await {
                 log(&event.to_string());
             }
         }
@@ -184,7 +184,7 @@ pub async fn resume(fleet: &Fleet) -> Result<cycle::Outcome> {
     cycle::run(fleet, cycle::Options::default()).await
 }
 
-/// `tokeman rotate use <name>`: make this account the default now.
+/// `tokeman claude use <name>`: make this account the default now.
 pub fn activate(fleet: &Fleet, name: &str) -> Result<()> {
     let _lock = RotationLock::acquire()?;
     let account = fleet

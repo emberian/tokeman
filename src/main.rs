@@ -2,179 +2,74 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use tokeman::account::Fleet;
-use tokeman::cli::{Cli, Command, ResetAction, RotateAction, SettingsAction};
-use tokeman::daemon::{self, cycle};
+use tokeman::cli::{
+    self, AgyAction, ClaudeAction, Cli, CodexAction, Command, KeyAction, RotateAction,
+    SettingsAction,
+};
+use tokeman::commands::{claude, codex, rotate, services, view};
+use tokeman::daemon::cycle;
 use tokeman::quota::Service;
-use tokeman::store::{Stats, Store};
-use tokeman::ui::text;
+use tokeman::ui::{prompt, text};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tokeman::notice::set_sink(text::notice);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((old, new)) = cli::removed(&args) {
+        bail!("`{old}` was removed in 0.4; run `{new}`");
+    }
     let cli = Cli::parse();
     match cli.command {
         None if cli.watch => tokeman::ui::tui::run(Fleet::load()?).await,
-        None => probe_and_print(cli.json).await,
+        None => {
+            let fleet = Fleet::load()?;
+            if fleet.accounts.is_empty() && fleet.codex.is_empty() && fleet.services.is_empty() {
+                bail!("{}", text::NO_ACCOUNTS);
+            }
+            let readings = view::probe(&fleet, None).await;
+            if cli.json {
+                text::print_json(&readings)
+            } else {
+                text::print_everything(&readings);
+                Ok(())
+            }
+        }
         Some(command) => dispatch(command).await,
     }
 }
 
-/// `tokeman` with no subcommand: probe every account and print the gauges.
-async fn probe_and_print(json: bool) -> Result<()> {
-    let fleet = Fleet::load()?;
-    if fleet.accounts.is_empty() {
-        bail!(
-            "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
-        );
-    }
-    let mut readings = tokeman::anthropic::probe::probe_all(
-        tokeman::anthropic::Client::shared(),
-        fleet.accounts.iter(),
-        tokeman::anthropic::probe::PROBE_MODEL,
-        tokeman::anthropic::probe::PROBE_TIMEOUT,
-        chrono::Utc::now().timestamp(),
-    )
-    .await;
-    let _ = tokeman::observe::scan_transcripts(&fleet.accounts);
-    tokeman::observe::apply(&mut readings);
-    if let Ok(store) = Store::open() {
-        for reading in &readings {
-            let _ = store.insert(reading);
-        }
-    }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&readings)?);
-    } else {
-        text::print_readings(&readings, tokeman::anthropic::probe::PROBE_MODEL_LABEL);
-    }
-    Ok(())
-}
-
 async fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Add { name, key } => {
-            Fleet::update(|fleet| {
-                fleet.add_setup_key(&name, key);
-                Ok(())
-            })?;
-            daemon::reconcile_after_login()?;
-            println!("Added account '{name}'");
-        }
-        Command::Remove { name } => {
-            let (_, removed) = Fleet::update(|fleet| Ok(fleet.remove_account(&name)))?;
-            if !removed {
-                bail!("Account '{name}' not found");
-            }
-            println!("Removed account '{name}'");
-        }
-        Command::Login { name, more } => {
-            tokeman::ui::interactive::login_accounts(name.as_deref(), more).await?
-        }
-        Command::Refresh { name } => {
-            let refreshed = daemon::refresh::refresh_now(name.as_deref()).await?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            for account in Fleet::load()?
-                .accounts
-                .iter()
-                .filter(|account| name.as_deref().is_none_or(|name| account.name == name))
-                .filter(|account| account.is_refreshable())
-            {
-                println!(
-                    "  {} — {}",
-                    account.name,
-                    text::describe_login(account, now_ms)
-                );
-            }
-            println!("{refreshed} grant(s) refreshed.");
-        }
         Command::List { json } => {
             let fleet = Fleet::load()?;
-            let overview =
-                tokeman::ui::overview::Overview::stored(&fleet, chrono::Utc::now().timestamp());
+            let (overview, seated) = view::stored(&fleet).await;
             if json {
-                println!("{}", serde_json::to_string_pretty(&overview)?);
-                return Ok(());
-            }
-            if fleet.accounts.is_empty() && fleet.services.is_empty() && fleet.codex.is_empty() {
-                println!(
-                    "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
-                );
-            }
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            for account in &fleet.accounts {
-                let marker = if overview.default_account.as_deref() == Some(account.name.as_str()) {
-                    "*"
-                } else {
-                    " "
-                };
-                let setup = account
-                    .setup_key
-                    .as_deref()
-                    .map(text::mask_key)
-                    .unwrap_or_else(|| "no setup key".into());
-                println!(
-                    "{marker} {:<24} {setup}  {}",
-                    account.name,
-                    text::describe_login(account, now_ms)
-                );
-            }
-            text::print_codex_list(&overview.codex, overview.at);
-            let latest: Vec<_> = overview
-                .services
-                .iter()
-                .filter_map(|service| service.usage.clone())
-                .collect();
-            let seated = tokeman::ui::services_cli::seated(&fleet.services).await;
-            text::print_service_list(&fleet.services, &latest, seated.as_deref(), overview.at);
-            for offer in &overview.resets_on_offer {
-                println!(
-                    "\n reset on offer: {}: {} (`tokeman resets use`; read {})",
-                    offer.account,
-                    offer.offer,
-                    text::format_age(offer.read_at, overview.at)
-                );
+                text::print_json(&overview)?;
+            } else {
+                text::print_stored(&fleet, &overview, seated.as_deref());
             }
         }
+        Command::Claude { action } => claude_command(action).await?,
+        Command::Codex { action } => codex_command(action).await?,
+        Command::Agy { action } => agy_command(action).await?,
+        Command::Glm { action } => key_command(Service::Zai, action).await?,
+        Command::Kimi { action } => key_command(Service::Kimi, action).await?,
         Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
-        Command::Rotate { action } => rotate(action).await?,
+        Command::Rotate { action } => rotate_command(action).await?,
         Command::History {
             last,
             account,
             since,
             json,
         } => {
-            // Reading history writes nothing; no history yet reads as empty.
-            let snapshots = match Store::open_read_only() {
-                Ok(store) => match since {
-                    Some(hours) => {
-                        let cutoff = chrono::Utc::now().timestamp() - (hours * 3_600.0) as i64;
-                        store.since(Service::Claude, account.as_deref(), cutoff)?
-                    }
-                    None => store.recent(Service::Claude, account.as_deref(), last)?,
-                },
-                Err(_) => Vec::new(),
-            };
+            let readings = view::history(Service::Claude, account.as_deref(), last, since)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                text::print_json(&readings)?;
             } else {
-                text::print_history(&snapshots);
+                text::print_history(&readings);
             }
         }
-        Command::Stats => {
-            let store = Store::open()?;
-            let stats: Vec<Stats> = Fleet::load()?
-                .accounts
-                .iter()
-                .filter_map(|account| {
-                    let since = chrono::Utc::now().timestamp() - 7 * 86_400;
-                    let snapshots = store
-                        .since(Service::Claude, Some(&account.name), since)
-                        .ok()?;
-                    Some(Stats::compute(&account.name, &snapshots))
-                })
-                .collect();
-            text::print_stats(&stats);
-        }
+        Command::Stats => text::print_stats(&view::stats(&Fleet::load()?)?),
         Command::Chart {
             hours,
             metric,
@@ -182,94 +77,287 @@ async fn dispatch(command: Command) -> Result<()> {
             iterm,
             width,
             height,
-        } => tokeman::ui::chart::run(&tokeman::ui::chart::Request {
+        } => text::print_chart(&tokeman::ui::chart::run(&tokeman::ui::chart::Request {
             hours,
             metric,
             output,
             iterm,
             width,
             height,
-        })?,
-        Command::Resets { action } => match action.unwrap_or(ResetAction::List { name: None }) {
-            ResetAction::List { name } => {
-                tokeman::ui::interactive::list_resets(name.as_deref()).await?
-            }
-            ResetAction::Use {
-                name,
-                grant,
-                session,
-                yes,
-            } => tokeman::ui::interactive::use_reset(&name, grant.as_deref(), session, yes).await?,
-            ResetAction::Clear { name } => tokeman::ui::interactive::clear_pending_reset(&name)?,
-        },
+        })?),
         Command::Settings { action } => match action.unwrap_or(SettingsAction::Show) {
-            SettingsAction::Show => {
-                for (key, value) in Fleet::load()?.launch.entries() {
-                    println!("{key} = {value}");
-                }
-            }
+            SettingsAction::Show => text::print_settings(&view::settings()?),
             SettingsAction::Set { key, value } => {
-                Fleet::update(|fleet| fleet.launch.set(&key, &value))?;
-                println!("set {key} = {value}");
+                view::set_setting(&key, &value)?;
+                text::print_setting_set(&key, &value);
             }
         },
-        Command::Codex { action } => tokeman::ui::codex_cli::run(action).await?,
-        Command::Services { action, json } => tokeman::ui::services_cli::run(action, json).await?,
         #[cfg(feature = "tray")]
         Command::Tray => tokeman::ui::tray::run(Fleet::load()?)?,
     }
     Ok(())
 }
 
-async fn rotate(action: RotateAction) -> Result<()> {
+async fn claude_command(action: ClaudeAction) -> Result<()> {
+    match action {
+        ClaudeAction::Add { name, key } => {
+            claude::add(&name, key)?;
+            text::print_account_change("Added", &name);
+        }
+        ClaudeAction::Remove { name } => {
+            claude::remove(&name)?;
+            text::print_account_change("Removed", &name);
+        }
+        ClaudeAction::Login { name, more } => prompt::login(name.as_deref(), more).await?,
+        ClaudeAction::Refresh { name } => {
+            text::print_claude_refresh(&claude::refresh(name.as_deref()).await?)
+        }
+        ClaudeAction::List { json } => {
+            let fleet = Fleet::load()?;
+            if fleet.accounts.is_empty() {
+                bail!("{}", text::NO_ACCOUNTS);
+            }
+            let readings = view::probe(&fleet, Some(Service::Claude)).await;
+            if json {
+                text::print_json(&readings)?;
+            } else {
+                text::print_everything(&readings);
+            }
+        }
+        ClaudeAction::Use { name } => {
+            claude::use_account(&Fleet::load()?, &name)?;
+            text::print_claude_use(&name);
+        }
+        ClaudeAction::Best => best(Service::Claude, None).await?,
+        ClaudeAction::Reset { name: None, .. } => {
+            text::print_reset_offers(&claude::reset_offers(&Fleet::load()?).await)
+        }
+        ClaudeAction::Reset {
+            name: Some(name),
+            clear: true,
+            ..
+        } => text::print_reset_cleared(&name, claude::reset_clear(&name)?.as_ref()),
+        ClaudeAction::Reset {
+            name: Some(name),
+            grant,
+            session,
+            yes,
+            ..
+        } => {
+            let plan =
+                claude::reset_plan(&Fleet::load()?, &name, grant.as_deref(), session).await?;
+            text::print_reset_plan(&plan);
+            if !yes && !prompt::confirm("use it now?")? {
+                text::print_kept();
+                return Ok(());
+            }
+            text::print_reset_claimed(&claude::reset_claim(&plan).await?);
+        }
+    }
+    Ok(())
+}
+
+async fn codex_command(action: CodexAction) -> Result<()> {
+    match action {
+        CodexAction::Add {
+            name,
+            codex_home,
+            label,
+        } => text::print_codex_added(&codex::add(&name, &codex_home, label)?),
+        CodexAction::Remove { name } => {
+            codex::remove(&name)?;
+            text::print_removed(&name);
+        }
+        CodexAction::Discover { adopt } => {
+            text::print_codex_discovery(&codex::discover(adopt)?, adopt)
+        }
+        CodexAction::Import {
+            from,
+            homes_root,
+            no_register,
+        } => {
+            text::print_codex_imported(&codex::import(&from, homes_root.as_deref(), !no_register)?)
+        }
+        CodexAction::List { json } => {
+            let fleet = Fleet::load()?;
+            if fleet.codex.is_empty() {
+                text::print_no_codex();
+                return Ok(());
+            }
+            let listed = codex::list(&fleet).await?;
+            if json {
+                text::print_json(&listed)?;
+            } else {
+                text::print_codex_listed(&listed);
+            }
+        }
+        CodexAction::Refresh {
+            name,
+            force,
+            max_age_days,
+        } => {
+            let reports =
+                codex::refresh(&Fleet::load()?, name.as_deref(), force, max_age_days).await?;
+            text::print_codex_refresh(&reports);
+            let failed = reports
+                .iter()
+                .filter(|report| report.outcome.is_err())
+                .count();
+            if failed > 0 {
+                bail!("{failed} account(s) failed to refresh");
+            }
+        }
+        CodexAction::Use {
+            account,
+            into,
+            codex_home,
+            dry_run,
+            force,
+        } => {
+            let options = codex::UseOptions {
+                into,
+                codex_home,
+                dry_run,
+                force,
+            };
+            let used = codex::use_account(&Fleet::load()?, account.as_deref(), &options).await?;
+            text::print_codex_used(&used);
+        }
+        CodexAction::Watch {
+            codex_home,
+            min_remaining,
+            once,
+        } => {
+            codex::watch_running(
+                &Fleet::load()?,
+                codex_home.as_deref(),
+                min_remaining,
+                once,
+                |event| text::print_codex_watch(&event),
+            )
+            .await?
+        }
+        CodexAction::Reset {
+            account,
+            credit,
+            yes,
+        } => {
+            let plan = codex::reset_plan(&Fleet::load()?, &account, credit.as_deref()).await?;
+            let which = text::print_codex_reset_plan(&plan);
+            if !yes && !prompt::confirm(&format!("spend {which} on {account} now?"))? {
+                text::print_kept();
+                return Ok(());
+            }
+            let claim = codex::reset_claim(&plan).await?;
+            text::print_codex_reset_claimed(&account, &claim);
+            if let Some(uncertain) = text::codex_reset_uncertain(&account, &claim) {
+                bail!("{uncertain}");
+            }
+        }
+        CodexAction::Best { limit } => best(Service::Codex, limit.as_deref()).await?,
+    }
+    Ok(())
+}
+
+async fn agy_command(action: AgyAction) -> Result<()> {
+    match action {
+        AgyAction::Import => text::print_agy_imported(&services::import_antigravity().await?),
+        AgyAction::Remove { name } => {
+            services::remove(Service::Antigravity, &name)?;
+            text::print_removed(&name);
+        }
+        AgyAction::List { json } => service_list(Service::Antigravity, json).await?,
+        AgyAction::Use {
+            name,
+            previous,
+            force,
+            dry_run,
+        } => {
+            let name = name.filter(|_| !previous);
+            let report =
+                services::agy_use(&Fleet::load()?, name.as_deref(), force, dry_run).await?;
+            text::print_agy_use(&report);
+            if report.refused {
+                bail!("agy's login was not changed");
+            }
+        }
+        AgyAction::Best { group } => best(Service::Antigravity, group.as_deref()).await?,
+    }
+    Ok(())
+}
+
+async fn key_command(service: Service, action: KeyAction) -> Result<()> {
+    match action {
+        KeyAction::Add {
+            name,
+            key_file,
+            label,
+        } => {
+            let (registered, reading) = services::add(service, &name, &key_file, label).await?;
+            text::print_service_added(&registered, &reading);
+        }
+        KeyAction::Remove { name } => {
+            services::remove(service, &name)?;
+            text::print_removed(&name);
+        }
+        KeyAction::List { json } => service_list(service, json).await?,
+        KeyAction::Best { group } => best(service, group.as_deref()).await?,
+    }
+    Ok(())
+}
+
+async fn service_list(service: Service, json: bool) -> Result<()> {
+    let (readings, seated) = services::list(&Fleet::load()?, service).await;
+    if json {
+        text::print_json(&readings)
+    } else {
+        text::print_usages(service, &readings, seated.as_deref());
+        Ok(())
+    }
+}
+
+/// `tokeman <service> best`: read, rank, print; an error when nothing ranks.
+async fn best(service: Service, scope: Option<&str>) -> Result<()> {
+    let best = view::best(&Fleet::load()?, service, scope).await?;
+    text::print_best(&best);
+    if best.winner().is_none() {
+        bail!("{}", text::nothing_ranked(&best));
+    }
+    Ok(())
+}
+
+async fn rotate_command(action: RotateAction) -> Result<()> {
     match action {
         RotateAction::Run {
             force,
             dry_run,
             scheduled,
         } => {
-            let fleet = Fleet::load()?;
-            let outcome = cycle::run(
-                &fleet,
-                cycle::Options {
-                    force,
-                    dry_run,
-                    scheduled,
-                },
-            )
-            .await?;
-            println!("{}", outcome.message);
+            let options = cycle::Options {
+                force,
+                dry_run,
+                scheduled,
+            };
+            text::print_outcome(&rotate::run(&Fleet::load()?, options).await?);
         }
-        RotateAction::Daemon => daemon::run().await?,
+        RotateAction::Daemon => rotate::daemon().await?,
         RotateAction::Status { json } => {
-            let status = daemon::status::report(&Fleet::load()?).await?;
+            let status = rotate::status(&Fleet::load()?).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
+                text::print_json(&status)?;
             } else {
                 text::print_status(&status);
             }
         }
         RotateAction::Pause => {
-            daemon::pause()?;
-            println!("rotation paused; Claude Code will use /login credentials");
+            rotate::pause()?;
+            text::print_paused();
         }
-        RotateAction::Resume => {
-            let outcome = daemon::resume(&Fleet::load()?).await?;
-            println!("rotation resumed; {}", outcome.message);
-        }
-        RotateAction::Use { name } => {
-            daemon::activate(&Fleet::load()?, &name)?;
-            println!(
-                "set startup default to {name}; live sessions follow it from their next request"
-            );
-        }
-        RotateAction::Install => {
-            let plist = daemon::install()?;
-            println!("installed and started {}", plist.display());
-        }
+        RotateAction::Resume => text::print_resumed(&rotate::resume(&Fleet::load()?).await?),
+        RotateAction::Install => text::print_installed(&rotate::install()?),
         RotateAction::Uninstall => {
-            daemon::uninstall()?;
-            println!("uninstalled the rotation service");
+            rotate::uninstall()?;
+            text::print_uninstalled();
         }
         RotateAction::Quarantine {
             name,
@@ -278,30 +366,21 @@ async fn rotate(action: RotateAction) -> Result<()> {
             window,
             until,
         } => {
-            let fleet = Fleet::load()?;
-            if fleet.account(&name).is_none() {
-                bail!("account '{name}' is not configured");
-            }
-            tokeman::observe::quarantine(
-                &name,
-                model.family(),
-                exact_model.as_deref().map(tokeman::quota::ModelKey::new),
-                window.into(),
-                tokeman::observe::parse_reset_spec(&until)?,
-            )?;
-            println!("quarantined {name}");
-            let outcome = cycle::run(&fleet, cycle::Options::default()).await?;
-            println!("{}", outcome.message);
+            let quarantine = rotate::Quarantine {
+                family: model.family(),
+                exact_model,
+                window: window.into(),
+                until,
+            };
+            let outcome = rotate::quarantine(&Fleet::load()?, &name, quarantine).await?;
+            text::print_quarantined(&name, &outcome);
         }
-        RotateAction::ClearQuarantine { name, model } => {
-            let removed = tokeman::observe::clear_quarantine(&name, model.map(|m| m.family()))?;
-            println!("removed {removed} quarantine(s) for {name}");
-        }
+        RotateAction::ClearQuarantine { name, model } => text::print_quarantines_cleared(
+            &name,
+            rotate::clear_quarantine(&name, model.map(|model| model.family()))?,
+        ),
         RotateAction::ObserveSession { pid } => {
-            use std::io::Read;
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
-            tokeman::observe::record_session_from_hook(pid, &input).await?;
+            rotate::observe_session(pid, &prompt::stdin_bytes()?).await?
         }
     }
     Ok(())

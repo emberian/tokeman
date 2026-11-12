@@ -118,7 +118,7 @@ async fn refresh_where(
                 fleet.save(&fleet_lock)?;
                 changed += 1;
                 log(&format!(
-                    "ERROR login for {name} was refused permanently ({reason}); it falls back to {fallback} until `tokeman login {name}`"
+                    "ERROR login for {name} was refused permanently ({reason}); it falls back to {fallback} until `tokeman claude login {name}`"
                 ));
             }
             Err(error) => {

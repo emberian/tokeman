@@ -22,7 +22,6 @@ use crate::account::Fleet;
 use crate::anthropic::Client;
 use crate::anthropic::probe::{PROBE_MODEL, PROBE_MODEL_LABEL, PROBE_TIMEOUT, probe_all};
 use crate::claude::sessions::{self, Session};
-use crate::claude::settings as claude_settings;
 use crate::daemon;
 use crate::observe;
 use crate::policy::{self, Mode};
@@ -65,15 +64,6 @@ impl ChartWindow {
             Self::Weekly => Series::Weekly,
             Self::Model { key, .. } => Series::Model(key),
             Self::Overage => Series::Overage,
-        }
-    }
-
-    fn signal_label(&self) -> &'static str {
-        match self {
-            Self::Model { .. } => "profile usage + observed rejection signal",
-            Self::Session | Self::Weekly | Self::Overage => {
-                "Haiku signal + observed rejection feedback"
-            }
         }
     }
 }
@@ -144,7 +134,7 @@ impl App {
             history: BTreeMap::new(),
             refresh_interval,
             default_account,
-            target_model: target_model(),
+            target_model: current_model(),
             live_sessions: None,
             mode: Mode::Normal,
             services: Vec::new(),
@@ -174,7 +164,7 @@ impl App {
             at: Local::now(),
         };
         self.default_account = daemon::default_account(&self.fleet).ok().flatten();
-        self.target_model = target_model();
+        self.target_model = current_model();
         self.live_sessions = sessions::live().await.ok();
         self.mode = policy::safe_mode_for(
             &self.readings,
@@ -291,11 +281,6 @@ impl App {
         self.refresh_interval
             .saturating_sub(self.last_probe.elapsed())
     }
-}
-
-fn target_model() -> Option<String> {
-    let settings = claude_settings::load().ok()?;
-    claude_settings::target_model(&settings).map(str::to_owned)
 }
 
 /// Raw mode and the alternate screen, restored on drop whatever happens.
@@ -418,7 +403,7 @@ pub async fn run(fleet: Fleet) -> Result<()> {
     drop(terminal);
     drop(terminal_session);
     if executable_replaced {
-        eprintln!("tokeman was upgraded while --watch was open; rerun tokeman --watch");
+        super::text::notice("tokeman was upgraded while --watch was open; rerun tokeman --watch");
     }
     Ok(())
 }
@@ -601,7 +586,7 @@ fn draw_card(
         (false, false) => "  ",
     };
     let (status, level) = status_badge(reading);
-    let status_color = level.map_or(Color::DarkGray, level_color);
+    let status_color = level.map_or(Color::DarkGray, |level| super::level_color(level, LEVELS));
     let claim = reading
         .claude()
         .and_then(|claude| claude.claim.as_deref())
@@ -729,7 +714,9 @@ fn service_lines(app: &App, now: i64) -> Vec<Line<'static>> {
             };
             let color = match (&usage.error, usage.tightest()) {
                 (Some(_), _) => Color::Red,
-                (None, Some(meter)) => level_color(Level::of(meter.window.remaining())),
+                (None, Some(meter)) => {
+                    super::level_color(Level::of(meter.window.remaining()), LEVELS)
+                }
                 (None, None) => Color::DarkGray,
             };
             Line::from(vec![
@@ -750,12 +737,12 @@ fn draw_services(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(services, area);
 }
 
-fn level_color(level: Level) -> Color {
-    match level {
-        Level::Ok => Color::Green,
-        Level::Low => Color::Yellow,
-        Level::Critical => Color::Red,
-    }
+/// The terminal palette for [`super::level_color`].
+const LEVELS: [Color; 3] = [Color::Green, Color::Yellow, Color::Red];
+
+/// The model Claude Code starts with, as its settings name it.
+fn current_model() -> Option<String> {
+    crate::commands::view::target_model().map(|model| model.as_str().to_owned())
 }
 
 /// `O48`, with `!` when the bucket is an observed rejection.
@@ -770,7 +757,7 @@ fn gauge_line<'a>(label: &str, window: Window) -> Line<'a> {
     let filled = ((remaining * bar_width as f64).round() as usize).min(bar_width);
     let empty = bar_width - filled;
     let pct = (remaining * 100.0).round() as u8;
-    let color = level_color(Level::of(remaining));
+    let color = super::level_color(Level::of(remaining), LEVELS);
     let reset = format_reset_compact(window.resets_at);
 
     Line::from(vec![
@@ -902,7 +889,7 @@ fn draw_chart(f: &mut Frame, area: Rect, app: &App) {
                     app.chart_window.label(),
                     app.range_label(),
                     app.mode.label(),
-                    app.chart_window.signal_label(),
+                    crate::ui::chart::signal_label(&app.chart_window.series()),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),

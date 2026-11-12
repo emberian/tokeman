@@ -115,7 +115,7 @@ pub fn legacy_reset_claims_dir() -> PathBuf {
     config_dir().join("reset-claims")
 }
 
-/// The agy Keychain value the last `services use` replaced (0600).
+/// The agy Keychain value the last `tokeman agy use` replaced (0600).
 pub fn agy_login_backup() -> PathBuf {
     config_dir().join("agy-login-backup.json")
 }

@@ -95,21 +95,6 @@ pub(crate) fn limits_of(shared: Option<&Block>, extras: &[Extra]) -> Vec<Limit> 
     limits
 }
 
-/// Whether the backend would accept work on this account. A 200 with no
-/// limit block means no limit is being enforced.
-pub fn is_viable(reading: &Reading) -> bool {
-    reading.error.is_none() && reading.allows()
-}
-
-/// Least remaining across the account-wide windows: whichever bites first.
-/// `None` is no reading, which differs from no headroom.
-pub fn remaining(reading: &Reading) -> Option<f64> {
-    reading
-        .shared()
-        .map(|limit| limit.window.remaining().clamp(0.0, 1.0))
-        .reduce(f64::min)
-}
-
 /// Whether an account can take work right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -125,7 +110,7 @@ impl State {
                 error: error.clone(),
             };
         }
-        if is_viable(reading) {
+        if reading.accepts_work() {
             Self::Ok
         } else {
             Self::Limited {
@@ -767,9 +752,9 @@ pub(crate) mod tests {
         assert_eq!(reading.plan.as_deref(), Some("plus"));
         assert_eq!(reading.session(), Some(Window::new(0.4, 4_600)));
         assert_eq!(reading.weekly(), Some(Window::new(0.75, 1_800_000_000)));
-        assert_eq!(remaining(&reading), Some(0.25));
+        assert_eq!(reading.least_remaining(), Some(0.25));
         assert_eq!(reading.tightest().unwrap().span, Span::Weekly);
-        assert!(reading.allows() && is_viable(&reading));
+        assert!(reading.allows() && reading.accepts_work());
         let codex = reading.codex().unwrap();
         assert_eq!(codex.allowed, Some(true));
         assert_eq!(codex.email.as_deref(), Some("a@b.c"));
@@ -806,7 +791,7 @@ pub(crate) mod tests {
         assert_eq!(reading.session(), None);
         assert_eq!(reading.weekly(), Some(Window::new(0.42, 1_794_607_293)));
         assert_eq!(reading.limits.len(), 1, "additional_rate_limits: null");
-        assert!((remaining(&reading).unwrap() - 0.58).abs() < 1e-9);
+        assert!((reading.least_remaining().unwrap() - 0.58).abs() < 1e-9);
         let codex = reading.codex().unwrap();
         assert_eq!(
             codex.models,
@@ -899,7 +884,7 @@ pub(crate) mod tests {
         let reading = decode(&body, 0);
         let codex = reading.codex().unwrap();
         assert_eq!(codex.email.as_deref(), Some("a@b.c"));
-        assert_eq!(remaining(&reading), Some(0.8));
+        assert_eq!(reading.least_remaining(), Some(0.8));
         assert_eq!(codex.limit_reason.as_deref(), Some("secondary_window"));
         assert!(scoped_names(&reading).is_empty());
         assert_eq!(
@@ -928,7 +913,7 @@ pub(crate) mod tests {
             reading
         };
         assert!(
-            is_viable(&with(None, None)),
+            with(None, None).accepts_work(),
             "no limit block: nothing enforced"
         );
         assert_eq!(State::of(&with(None, None)), State::Ok);
@@ -939,7 +924,7 @@ pub(crate) mod tests {
             }),
             Some("primary_window"),
         );
-        assert!(!is_viable(&reached));
+        assert!(!reached.accepts_work());
         assert_eq!(State::of(&reached).to_string(), "limited (primary_window)");
         let refused = with(
             Some(Block {
@@ -959,7 +944,7 @@ pub(crate) mod tests {
             },
         );
         assert!(failed.is_refused());
-        assert!(!is_viable(&failed));
+        assert!(!failed.accepts_work());
         assert_eq!(
             State::of(&failed).to_string(),
             "ERROR: HTTP 401: nope, needs `tokeman codex refresh`"
@@ -975,9 +960,9 @@ pub(crate) mod tests {
         let probe = probe(&client, &account).await;
         assert_eq!(probe.error, None);
         assert_eq!(probe.account, "one");
-        assert_eq!(remaining(&probe), Some(0.4));
+        assert_eq!(probe.least_remaining(), Some(0.4));
         let spark = probe.scoped_to(Some("spark")).unwrap();
-        assert_eq!(remaining(&spark), Some(0.0));
+        assert_eq!(spark.least_remaining(), Some(0.0));
         assert_eq!(probe.scoped_to(Some("nothing")), None);
         assert_eq!(probe.codex().unwrap().email.as_deref(), Some("a@b.c"));
         assert_eq!(probe.plan.as_deref(), Some("plus"));
@@ -1011,7 +996,7 @@ pub(crate) mod tests {
         let client = backend.client().await;
         let probes = probe_all(&client, &[first, second]).await;
         assert_eq!(probes[0].error, None);
-        assert_eq!(remaining(&probes[0]), Some(1.0));
+        assert_eq!(probes[0].least_remaining(), Some(1.0));
         assert_eq!(
             probes[1].error,
             Some(ReadError::Http {

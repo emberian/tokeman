@@ -9,7 +9,7 @@ use crate::account::{Account, CodexAccount, Fleet};
 use crate::anthropic::profile::Cache;
 use crate::anthropic::resets;
 use crate::claude::settings as claude_settings;
-use crate::codex::probe::{self as codex_probe, State};
+use crate::codex::probe::State;
 use crate::daemon::{lock, service};
 use crate::providers::ServiceAccount;
 use crate::quota::{Limit, Reading, ResetCreditCount, Service, SessionLimit, Source, Window};
@@ -347,7 +347,7 @@ fn codex_view(account: &CodexAccount, probe: Option<&Reading>) -> CodexView {
                 email: codex.and_then(|codex| codex.email.clone()),
                 plan: probe.plan.clone(),
                 state: State::of(probe).to_string(),
-                viable: codex_probe::is_viable(probe),
+                viable: probe.accepts_work(),
                 windows: probe.shared().map(named).collect(),
                 extra: probe
                     .scoped()

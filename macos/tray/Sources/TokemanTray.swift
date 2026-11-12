@@ -8,7 +8,7 @@ import Charts
 // The background service keeps those stores fresh; only when no service is
 // installed does the app probe on its own interval, as `tokeman` would.
 // It changes things only through `tokeman settings set` and, for a Launch
-// button, `tokeman rotate use`.
+// button, `tokeman claude use`.
 
 // MARK: - JSON models (match `tokeman list --json`)
 
@@ -511,7 +511,7 @@ class TokemanViewModel: ObservableObject {
         guard overview?.claude.contains(where: { $0.name == name }) == true else { return }
         let cmd = claudeCommand
         Task {
-            let result = await shell(findTokeman(), args: ["rotate", "use", name])
+            let result = await shell(findTokeman(), args: ["claude", "use", name])
             guard !result.isEmpty else {
                 loadError = "Could not activate \(name) through tokeman"
                 return
@@ -1056,7 +1056,7 @@ struct ServiceCard: View {
                 }
                 Caption("read \(ageText(usage.at))", color: .secondary.opacity(0.6))
             } else {
-                Caption("not read yet (`tokeman services`)")
+                Caption("not read yet (run `tokeman`)")
             }
         }
     }
@@ -1152,7 +1152,7 @@ struct OverviewCards: View {
                 Card {
                     ForEach(overview.resets_on_offer) { offer in
                         Caption("\(offer.account): \(offer.offer)", color: .green)
-                        Caption("read \(ageText(offer.read_at)); use with `tokeman resets use`",
+                        Caption("read \(ageText(offer.read_at)); use with `tokeman claude reset \(offer.account)`",
                                 color: .secondary.opacity(0.6))
                     }
                 }

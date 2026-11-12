@@ -24,7 +24,7 @@ const COMPACT_ABOVE_BYTES: u64 = 512 * 1024;
 pub enum EventKind {
     /// The policy moved the default.
     Switch,
-    /// `tokeman rotate use`.
+    /// `tokeman claude use`.
     Activate,
     /// `tokeman rotate install` re-offered the managed account.
     Install,

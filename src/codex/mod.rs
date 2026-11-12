@@ -8,7 +8,7 @@
 
 pub mod appserver;
 pub mod auth;
-pub mod commands;
+pub mod maintenance;
 pub mod probe;
 pub mod refresh;
 pub mod resets;

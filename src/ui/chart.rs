@@ -108,17 +108,18 @@ impl Metric {
             }
         }
     }
+}
 
-    fn signal_label(&self) -> String {
-        match self {
-            Self::Model(_) => {
-                "PER-MODEL WEEKLY LIMIT · COLD-REQUEST ADMISSION CAN BE STRICTER".into()
-            }
-            Self::Session | Self::Weekly | Self::Overage => format!(
-                "{} QUOTA SIGNAL · PREMIUM ADMISSION UNMEASURED",
-                PROBE_MODEL_LABEL.to_uppercase()
-            ),
+/// What a chart of `series` measures, for its caption.
+pub fn signal_label(series: &Series) -> String {
+    match series {
+        Series::Model(_) => {
+            "PER-MODEL WEEKLY LIMIT · COLD-REQUEST ADMISSION CAN BE STRICTER".into()
         }
+        Series::Session | Series::Weekly | Series::Overage => format!(
+            "{} QUOTA SIGNAL · PREMIUM ADMISSION UNMEASURED",
+            PROBE_MODEL_LABEL.to_uppercase()
+        ),
     }
 }
 
@@ -197,7 +198,15 @@ pub fn format_duration_hours(hours: f64) -> String {
     }
 }
 
-pub fn run(request: &Request) -> Result<()> {
+/// A chart written to disk, and the escape sequence that shows it inline
+/// when the terminal is iTerm2 (or `--iterm` asked for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub output: std::path::PathBuf,
+    pub inline: Option<String>,
+}
+
+pub fn run(request: &Request) -> Result<Rendered> {
     if !request.hours.is_finite() || request.hours <= 0.0 {
         bail!("--hours must be greater than zero");
     }
@@ -229,15 +238,9 @@ pub fn run(request: &Request) -> Result<()> {
     std::fs::write(&output, &png)
         .with_context(|| format!("failed to write {}", output.display()))?;
 
-    if request.iterm || (is_iterm2() && std::env::var_os("TMUX").is_none()) {
-        print_iterm_image(&png);
-    } else {
-        println!(
-            "{} (run directly inside iTerm2, or pass --iterm, for an inline chart)",
-            output.display()
-        );
-    }
-    Ok(())
+    let inline = (request.iterm || (is_iterm2() && std::env::var_os("TMUX").is_none()))
+        .then(|| iterm_image(&png));
+    Ok(Rendered { output, inline })
 }
 
 fn is_iterm2() -> bool {
@@ -245,12 +248,13 @@ fn is_iterm2() -> bool {
         || std::env::var("LC_TERMINAL").is_ok_and(|value| value == "iTerm2")
 }
 
-fn print_iterm_image(png: &[u8]) {
+/// iTerm2's inline-image escape sequence for `png`.
+fn iterm_image(png: &[u8]) -> String {
     let name = base64::engine::general_purpose::STANDARD.encode("tokeman-chart.png");
     let data = base64::engine::general_purpose::STANDARD.encode(png);
-    println!(
+    format!(
         "\x1b]1337;File=name={name};inline=1;width=auto;height=auto;preserveAspectRatio=1:{data}\x07"
-    );
+    )
 }
 
 fn render_png(
@@ -307,7 +311,7 @@ fn render_png(
         52,
         &format!(
             "{} · LAST {}",
-            metric.signal_label(),
+            signal_label(&metric.series()),
             format_duration_hours(hours).to_uppercase()
         ),
         1,

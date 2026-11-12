@@ -1,4 +1,5 @@
-//! The command line, as clap sees it. No logic lives here.
+//! The command line, as clap sees it: definitions only. The one thing here
+//! that is not a definition is [`REMOVED`], the table of spellings 0.3 had.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use crate::observe::{Family, LimitWindow};
 #[derive(Parser)]
 #[command(
     name = "tokeman",
-    about = "Keeps Claude Code on an Anthropic account with room left"
+    about = "Keeps Claude Code, Codex and agy on a subscription account with room left, and shows the rest"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -16,45 +17,46 @@ pub struct Cli {
     /// Launch the live TUI dashboard
     #[arg(long)]
     pub watch: bool,
-    /// Output the probe as JSON
+    /// Output the reads as JSON
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Add an account with a `claude setup-token` key
-    Add {
-        /// Account name
-        name: String,
-        /// The key (sk-ant-oat01-...)
-        key: String,
-    },
-    /// Remove an account
-    Remove { name: String },
-    /// Grant an account the full OAuth scope set through the browser
-    ///
-    /// A setup token is inference-only; a login can read profile usage and
-    /// refreshes itself.
-    Login {
-        /// Account to log in (default: the first one still without a login)
-        name: Option<String>,
-        /// Walk every account that still needs it, in configured order
-        #[arg(long)]
-        more: bool,
-    },
-    /// Renew login grants now instead of waiting for the daemon
-    Refresh {
-        /// Account to refresh (default: every account with a login)
-        name: Option<String>,
-    },
-    /// List configured accounts, their credentials and the last stored reads
+    /// Everything stored about every account of every service
     ///
     /// Makes no request and writes nothing.
     List {
-        /// Everything stored about every account, as JSON (what the trays read)
+        /// The stored view as JSON (what the trays read)
         #[arg(long)]
         json: bool,
+    },
+    /// Anthropic accounts: the ones Claude Code is rotated across
+    Claude {
+        #[command(subcommand)]
+        action: ClaudeAction,
+    },
+    /// Codex (OpenAI) profiles, and moving a running Codex between them
+    Codex {
+        #[command(subcommand)]
+        action: CodexAction,
+    },
+    /// Google Antigravity accounts, and the one the agy CLI signs in as
+    #[command(alias = "antigravity")]
+    Agy {
+        #[command(subcommand)]
+        action: AgyAction,
+    },
+    /// z.ai GLM Coding Plan accounts (read-only quota)
+    Glm {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+    /// Kimi Code accounts (read-only quota)
+    Kimi {
+        #[command(subcommand)]
+        action: KeyAction,
     },
     /// Launch claude on the best account
     Launch {
@@ -65,12 +67,12 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Manage the default account newly started Claude Code processes use
+    /// The rotation of Claude Code's default account, and its background service
     Rotate {
         #[command(subcommand)]
         action: RotateAction,
     },
-    /// Show recent snapshots
+    /// Show recent stored reads
     History {
         #[arg(long, default_value = "20")]
         last: usize,
@@ -105,28 +107,10 @@ pub enum Command {
         #[arg(long, default_value = "680")]
         height: u32,
     },
-    /// Show or use usage-limit resets (needs a logged-in account)
-    Resets {
-        #[command(subcommand)]
-        action: Option<ResetAction>,
-    },
     /// Show or change the launch settings in tokens.toml
     Settings {
         #[command(subcommand)]
         action: Option<SettingsAction>,
-    },
-    /// Manage Codex (OpenAI) accounts and migrate running Codex sessions
-    Codex {
-        #[command(subcommand)]
-        action: CodexAction,
-    },
-    /// Read-only quota of other coding subscriptions (GLM, Kimi, Antigravity)
-    Services {
-        #[command(subcommand)]
-        action: Option<ServicesAction>,
-        /// Output the reads as JSON
-        #[arg(long)]
-        json: bool,
     },
     /// Run the tray application
     #[cfg(feature = "tray")]
@@ -134,16 +118,201 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
-pub enum ServicesAction {
-    /// Read every service account now and print the gauges
+pub enum ClaudeAction {
+    /// Add an account with a `claude setup-token` key
+    Add {
+        /// Account name
+        name: String,
+        /// The key (sk-ant-oat01-...)
+        key: String,
+    },
+    /// Remove an account
+    Remove { name: String },
+    /// Grant an account the full OAuth scope set through the browser
+    ///
+    /// A setup token is inference-only; a login can read profile usage and
+    /// refreshes itself.
+    Login {
+        /// Account to log in (default: the first one still without a login)
+        name: Option<String>,
+        /// Walk every account that still needs it, in configured order
+        #[arg(long)]
+        more: bool,
+    },
+    /// Renew login grants now instead of waiting for the daemon
+    Refresh {
+        /// Account to refresh (default: every account with a login)
+        name: Option<String>,
+    },
+    /// Probe every account now and print the gauges
     List {
         #[arg(long)]
         json: bool,
     },
-    /// Register an API-key service account
+    /// Make this account the default now
+    Use { name: String },
+    /// Probe every account and rank them as the rotation would land
+    Best,
+    /// Usage-limit resets: list what is on offer, or use one on an account
+    /// (asks first; needs a logged-in account)
+    Reset {
+        /// The account to reset (default: list every account's offers)
+        name: Option<String>,
+        /// Grant to use (default: the one the server offers next)
+        #[arg(long, requires = "name")]
+        grant: Option<String>,
+        /// Use the session reset instead of a grant
+        #[arg(long, requires = "name", conflicts_with = "grant")]
+        session: bool,
+        /// Do not ask
+        #[arg(long, requires = "name")]
+        yes: bool,
+        /// Forget a grant claim whose outcome is unknown, once Settings >
+        /// Usage on claude.ai shows what happened
+        #[arg(long, requires = "name", conflicts_with_all = ["grant", "session", "yes"])]
+        clear: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CodexAction {
+    /// Register a Codex profile directory (a CODEX_HOME)
     Add {
-        #[arg(value_enum)]
-        service: KeyService,
+        name: String,
+        /// Used as CODEX_HOME, e.g. ~/.codex-homes/work
+        codex_home: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Unregister a profile
+    Remove { name: String },
+    /// Find profiles on disk and optionally register them
+    Discover {
+        /// Register everything found
+        #[arg(long)]
+        adopt: bool,
+    },
+    /// Seed profiles from a file of `<name> <access-token>` lines
+    Import {
+        from: PathBuf,
+        /// Directory to create profiles under (default: ~/.codex-homes)
+        #[arg(long)]
+        homes_root: Option<String>,
+        /// Do not register the imported accounts
+        #[arg(long)]
+        no_register: bool,
+    },
+    /// Refresh OAuth tokens before they rot into a 401
+    Refresh {
+        /// Only this account
+        name: Option<String>,
+        /// Even if the stored bundle is fresh
+        #[arg(long)]
+        force: bool,
+        /// Refresh when last_refresh is older than this many days
+        #[arg(long, default_value_t = crate::codex::refresh::DEFAULT_MAX_AGE_DAYS)]
+        max_age_days: i64,
+    },
+    /// Probe every account's quota
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow a running Codex and move it before its account runs out
+    Watch {
+        /// CODEX_HOME to watch (default: ~/.codex)
+        #[arg(long)]
+        codex_home: Option<String>,
+        /// Move once remaining headroom drops below this fraction
+        #[arg(long, default_value = "0.20")]
+        min_remaining: f64,
+        /// Evaluate once and exit
+        #[arg(long)]
+        once: bool,
+    },
+    /// Move a running Codex onto an account without restarting it, or (with
+    /// --into) copy the account's credentials into another profile directory
+    Use {
+        /// Account to move to (default: the best viable)
+        account: Option<String>,
+        /// Copy the credentials into this CODEX_HOME instead of moving a
+        /// running Codex
+        #[arg(long, requires = "account", conflicts_with_all = ["codex_home", "dry_run", "force"])]
+        into: Option<String>,
+        /// CODEX_HOME whose app-server to migrate (default: ~/.codex)
+        #[arg(long)]
+        codex_home: Option<String>,
+        /// Report the decision without contacting the app-server
+        #[arg(long)]
+        dry_run: bool,
+        /// Even if the named account is rate limited
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the CODEX_HOME of the account with the most headroom
+    Best {
+        /// Rank by a per-model limit (e.g. "spark") instead of the account windows
+        #[arg(long)]
+        limit: Option<String>,
+    },
+    /// Spend one rate-limit reset credit on an account at its limit (asks first)
+    Reset {
+        account: String,
+        /// Credit to spend (default: the backend's choice); see `tokeman codex list`
+        #[arg(long)]
+        credit: Option<String>,
+        /// Do not ask
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgyAction {
+    /// Register the accounts agy and the Antigravity app are signed in to
+    /// on this machine
+    Import,
+    /// Unregister an account
+    Remove { name: String },
+    /// Read every account now and print the gauges
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign the agy CLI in as an account (macOS; manual, the daemon never
+    /// switches it)
+    ///
+    /// An open Antigravity app is told to follow. An interactive agy cannot
+    /// be told: it keeps its account and writes it back when it refreshes
+    /// its token, so the switch is refused while one runs unless --force.
+    Use {
+        /// The account to seat
+        #[arg(required_unless_present = "previous")]
+        name: Option<String>,
+        /// Put back the login the last `use` replaced
+        #[arg(long, conflicts_with = "name")]
+        previous: bool,
+        /// Switch even while an interactive agy runs; it undoes the switch
+        /// at its next token refresh
+        #[arg(long)]
+        force: bool,
+        /// Say what is running and what would happen; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read every account now and rank them by room left
+    Best {
+        /// Count only the limits whose group contains this text, e.g. "claude"
+        #[arg(long)]
+        group: Option<String>,
+    },
+}
+
+/// The verbs of a service whose accounts are an API key.
+#[derive(Subcommand)]
+pub enum KeyAction {
+    /// Register an account
+    Add {
         /// Unique across services
         name: String,
         /// File holding the API key, e.g. ~/.zai-key; read on every poll
@@ -152,54 +321,19 @@ pub enum ServicesAction {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Unregister a service account
+    /// Unregister an account
     Remove { name: String },
-    /// Register the accounts another app on this machine is signed in to
-    Import {
-        #[arg(value_enum)]
-        source: ImportSource,
+    /// Read every account now and print the gauges
+    List {
+        #[arg(long)]
+        json: bool,
     },
-    /// Sign the agy CLI in as an Antigravity account (macOS; manual, the
-    /// daemon never switches it). Quit running agy sessions first: they keep
-    /// their account and write it back when they refresh their token.
-    Use {
-        /// The Antigravity service account to seat
-        #[arg(required_unless_present = "previous")]
-        name: Option<String>,
-        /// Put back the login the last `use` replaced
-        #[arg(long, conflicts_with = "name")]
-        previous: bool,
-    },
-    /// Read a service's accounts now and rank them by room left
+    /// Read every account now and rank them by room left
     Best {
-        #[arg(value_enum)]
-        service: crate::quota::Service,
-        /// Count only the limits whose group contains this text, e.g. "claude"
+        /// Count only the limits whose group contains this text
         #[arg(long)]
         group: Option<String>,
     },
-}
-
-/// The services whose accounts are an API key.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum KeyService {
-    Zai,
-    Kimi,
-}
-
-impl KeyService {
-    pub fn service(self) -> crate::quota::Service {
-        match self {
-            Self::Zai => crate::quota::Service::Zai,
-            Self::Kimi => crate::quota::Service::Kimi,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ImportSource {
-    /// Google Antigravity: the agy Keychain item and the IDE's state database
-    Antigravity,
 }
 
 #[derive(Subcommand)]
@@ -228,8 +362,6 @@ pub enum RotateAction {
     Pause,
     /// Resume managing and run one cycle now
     Resume,
-    /// Make this account the default now
-    Use { name: String },
     /// Install and start the per-user background service
     Install,
     /// Stop and remove the background service
@@ -301,28 +433,6 @@ impl From<WindowArg> for LimitWindow {
 }
 
 #[derive(Subcommand)]
-pub enum ResetAction {
-    /// List each logged-in account's grants and session reset
-    List { name: Option<String> },
-    /// Use a reset on one account (asks first)
-    Use {
-        name: String,
-        /// Grant to use (default: the one the server offers next)
-        #[arg(long)]
-        grant: Option<String>,
-        /// Use the session reset instead of a grant
-        #[arg(long, conflicts_with = "grant")]
-        session: bool,
-        /// Do not ask
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Forget a grant claim whose outcome is unknown, once Settings > Usage
-    /// on claude.ai shows what happened
-    Clear { name: String },
-}
-
-#[derive(Subcommand)]
 pub enum SettingsAction {
     /// Print every launch setting
     Show,
@@ -335,98 +445,238 @@ pub enum SettingsAction {
     },
 }
 
-#[derive(Subcommand)]
-pub enum CodexAction {
-    /// Register a Codex profile directory (a CODEX_HOME)
-    Add {
-        name: String,
-        /// Used as CODEX_HOME, e.g. ~/.codex-homes/work
-        codex_home: String,
-        #[arg(long)]
-        label: Option<String>,
-    },
-    /// Unregister a profile
-    Remove { name: String },
-    /// Find profiles on disk and optionally register them
-    Discover {
-        /// Register everything found
-        #[arg(long)]
-        adopt: bool,
-    },
-    /// Seed profiles from a file of `<name> <access-token>` lines
-    Import {
-        from: PathBuf,
-        /// Directory to create profiles under (default: ~/.codex-homes)
-        #[arg(long)]
-        homes_root: Option<String>,
-        /// Do not register the imported accounts
-        #[arg(long)]
-        no_register: bool,
-    },
-    /// Probe every account's quota
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh OAuth tokens before they rot into a 401
-    Refresh {
-        /// Only this account
-        name: Option<String>,
-        /// Even if the stored bundle is fresh
-        #[arg(long)]
-        force: bool,
-        /// Refresh when last_refresh is older than this many days
-        #[arg(long, default_value_t = crate::codex::refresh::DEFAULT_MAX_AGE_DAYS)]
-        max_age_days: i64,
-    },
-    /// Copy an account's credentials into another profile directory
-    Seat {
-        account: String,
-        /// Target CODEX_HOME
-        #[arg(long)]
-        into: String,
-    },
-    /// Move a running Codex onto another account without restarting it
-    Reseat {
-        /// CODEX_HOME whose app-server to migrate (default: ~/.codex)
-        #[arg(long)]
-        codex_home: Option<String>,
-        /// Account to move to (default: the best viable)
-        #[arg(long)]
-        account: Option<String>,
-        /// Report the decision without contacting the app-server
-        #[arg(long)]
-        dry_run: bool,
-        /// Even if the named account is rate limited
-        #[arg(long)]
-        force: bool,
-    },
-    /// Follow a running Codex and move it before its account runs out
-    Watch {
-        /// CODEX_HOME to watch (default: ~/.codex)
-        #[arg(long)]
-        codex_home: Option<String>,
-        /// Move once remaining headroom drops below this fraction
-        #[arg(long, default_value = "0.20")]
-        min_remaining: f64,
-        /// Evaluate once and exit
-        #[arg(long)]
-        once: bool,
-    },
-    /// Spend one rate-limit reset credit on an account at its limit (asks first)
-    Reset {
-        account: String,
-        /// Credit to spend (default: the backend's choice); see `tokeman codex list`
-        #[arg(long)]
-        credit: Option<String>,
-        /// Do not ask
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Print the CODEX_HOME of the account with the most headroom
-    Best {
-        /// Rank by a per-model bucket (e.g. "spark") instead of the account window
-        #[arg(long)]
-        limit: Option<String>,
-    },
+/// A spelling 0.3 had and 0.4 does not: the words after `tokeman`, and what
+/// to run instead. Nothing here runs anything; `main` refuses the invocation
+/// with the replacement. Longer spellings come first.
+pub const REMOVED: &[(&[&str], &str)] = &[
+    (&["rotate", "use"], "tokeman claude use <account>"),
+    (&["resets", "list"], "tokeman claude reset"),
+    (
+        &["resets", "use"],
+        "tokeman claude reset <account> [--grant <id> | --session] [--yes]",
+    ),
+    (
+        &["resets", "clear"],
+        "tokeman claude reset <account> --clear",
+    ),
+    (&["resets"], "tokeman claude reset [<account>]"),
+    (
+        &["codex", "seat"],
+        "tokeman codex use <account> --into <codex-home>",
+    ),
+    (
+        &["codex", "reseat"],
+        "tokeman codex use [<account>] [--codex-home <dir>] [--dry-run] [--force]",
+    ),
+    (
+        &["services", "list"],
+        "tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)",
+    ),
+    (
+        &["services", "add"],
+        "tokeman glm add <name> --key-file <path> or tokeman kimi add <name> --key-file <path>",
+    ),
+    (
+        &["services", "remove"],
+        "tokeman agy remove <name>, tokeman glm remove <name> or tokeman kimi remove <name>",
+    ),
+    (&["services", "import"], "tokeman agy import"),
+    (
+        &["services", "use"],
+        "tokeman agy use <account> [--previous]",
+    ),
+    (
+        &["services", "best"],
+        "tokeman agy best [--group <text>], tokeman glm best or tokeman kimi best",
+    ),
+    (
+        &["services"],
+        "tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)",
+    ),
+    (&["login"], "tokeman claude login [<account>] [--more]"),
+    (&["add"], "tokeman claude add <name> <key>"),
+    (&["remove"], "tokeman claude remove <name>"),
+    (&["refresh"], "tokeman claude refresh [<account>]"),
+];
+
+/// The replacement for a removed spelling, when `args` (the words after the
+/// program name) start with one. Leading flags are skipped, so
+/// `tokeman --json services` is caught too.
+pub fn removed(args: &[String]) -> Option<(String, &'static str)> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .skip_while(|arg| arg.starts_with('-'))
+        .collect();
+    REMOVED
+        .iter()
+        .find(|(old, _)| words.len() >= old.len() && words[..old.len()] == **old)
+        .map(|(old, new)| (format!("tokeman {}", old.join(" ")), *new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(line.split_whitespace())
+    }
+
+    #[test]
+    fn the_service_first_tree_parses() {
+        for line in [
+            "tokeman",
+            "tokeman --watch",
+            "tokeman --json",
+            "tokeman list --json",
+            "tokeman claude add work sk-ant-oat01-x",
+            "tokeman claude remove work",
+            "tokeman claude login",
+            "tokeman claude login work --more",
+            "tokeman claude refresh work",
+            "tokeman claude list --json",
+            "tokeman claude use work",
+            "tokeman claude best",
+            "tokeman claude reset",
+            "tokeman claude reset work --grant g1 --yes",
+            "tokeman claude reset work --session",
+            "tokeman claude reset work --clear",
+            "tokeman codex add work ~/.codex-homes/work --label x",
+            "tokeman codex remove work",
+            "tokeman codex discover --adopt",
+            "tokeman codex import tokens.txt --no-register",
+            "tokeman codex refresh work --force",
+            "tokeman codex list --json",
+            "tokeman codex watch --once",
+            "tokeman codex use",
+            "tokeman codex use work --dry-run --force",
+            "tokeman codex use work --into ~/.codex-homes/other",
+            "tokeman codex best --limit spark",
+            "tokeman codex reset work --credit c1 --yes",
+            "tokeman agy import",
+            "tokeman antigravity import",
+            "tokeman agy remove a@example.com",
+            "tokeman agy list --json",
+            "tokeman agy use a@example.com --dry-run",
+            "tokeman agy use --previous --force",
+            "tokeman agy best --group claude",
+            "tokeman glm add glm --key-file ~/.zai-key --label x",
+            "tokeman glm remove glm",
+            "tokeman glm list",
+            "tokeman kimi add kimi --key-file ~/.kimi-key",
+            "tokeman kimi list --json",
+            "tokeman kimi best",
+            "tokeman launch --auto -- --model fable",
+            "tokeman rotate run --dry-run",
+            "tokeman rotate status --json",
+            "tokeman rotate pause",
+            "tokeman rotate resume",
+            "tokeman rotate install",
+            "tokeman rotate uninstall",
+            "tokeman rotate daemon",
+            "tokeman rotate quarantine work --model fable --window weekly --until 1900000000",
+            "tokeman rotate clear-quarantine work --model fable",
+            "tokeman history --last 5 --json",
+            "tokeman stats",
+            "tokeman chart --metric fable --hours 12",
+            "tokeman settings",
+            "tokeman settings show",
+            "tokeman settings set launch_args --model",
+        ] {
+            assert!(
+                parse(line).is_ok(),
+                "{line}: {:?}",
+                parse(line).err().map(|e| e.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn what_an_installed_0_3_service_and_hook_invoke_still_parses() {
+        // The launcher script 0.3 wrote ends in `exec "$binary" rotate daemon`.
+        assert!(matches!(
+            parse("tokeman rotate daemon").unwrap().command,
+            Some(Command::Rotate {
+                action: RotateAction::Daemon
+            })
+        ));
+        // The scheduled form older launchers passed.
+        assert!(parse("tokeman rotate run --scheduled").is_ok());
+        // The SessionStart hook 0.3 installed, as the shell hands it over.
+        let hook = Cli::try_parse_from([
+            "/usr/local/bin/tokeman",
+            "rotate",
+            "observe-session",
+            "--pid",
+            "4242",
+        ])
+        .unwrap();
+        assert!(matches!(
+            hook.command,
+            Some(Command::Rotate {
+                action: RotateAction::ObserveSession { pid: 4242 }
+            })
+        ));
+    }
+
+    #[test]
+    fn a_removed_spelling_does_not_parse_and_names_its_replacement() {
+        let old = [
+            ("login work", "tokeman claude login"),
+            ("add work key", "tokeman claude add"),
+            ("remove work", "tokeman claude remove"),
+            ("refresh", "tokeman claude refresh"),
+            ("resets", "tokeman claude reset"),
+            ("resets list", "tokeman claude reset"),
+            (
+                "resets use work --grant g",
+                "tokeman claude reset <account>",
+            ),
+            (
+                "resets clear work",
+                "tokeman claude reset <account> --clear",
+            ),
+            ("rotate use work", "tokeman claude use"),
+            (
+                "codex seat work --into x",
+                "tokeman codex use <account> --into",
+            ),
+            ("codex reseat --dry-run", "tokeman codex use"),
+            ("services", "tokeman agy list"),
+            ("--json services", "tokeman agy list"),
+            ("services list", "tokeman agy list"),
+            ("services add zai glm --key-file k", "tokeman glm add"),
+            ("services remove glm", "tokeman agy remove"),
+            ("services import antigravity", "tokeman agy import"),
+            ("services use a@example.com", "tokeman agy use"),
+            ("services best antigravity", "tokeman agy best"),
+        ];
+        for (line, replacement) in old {
+            let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+            let (spelling, new) =
+                removed(&args).unwrap_or_else(|| panic!("{line} is not in the table"));
+            assert!(new.starts_with(replacement), "{line}: {new}");
+            assert!(
+                line.trim_start_matches("--json ")
+                    .starts_with(spelling.trim_start_matches("tokeman ")),
+                "{line}: {spelling}"
+            );
+            // None of them is an alias: clap refuses every one.
+            assert!(
+                parse(&format!("tokeman {line}")).is_err(),
+                "{line} still parses"
+            );
+        }
+        // The new tree is never mistaken for an old spelling.
+        for line in [
+            "claude login",
+            "codex use work",
+            "rotate status",
+            "list",
+            "agy use a",
+        ] {
+            let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+            assert_eq!(removed(&args), None, "{line}");
+        }
+    }
 }

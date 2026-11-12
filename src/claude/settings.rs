@@ -113,7 +113,7 @@ pub fn install(
 ) -> Result<Event> {
     let credential = account.credential(now_ms).with_context(|| {
         format!(
-            "{} has no usable credential; run `tokeman login {}`",
+            "{} has no usable credential; run `tokeman claude login {}`",
             account.name, account.name
         )
     })?;
@@ -169,7 +169,7 @@ pub fn describe_credential(account: &Account, now_ms: i64) -> String {
                 .as_ref()
                 .is_some_and(|login| login.error.is_some())
             {
-                "its inference-only setup token (login refused; run `tokeman login`)".into()
+                "its inference-only setup token (login refused; run `tokeman claude login`)".into()
             } else {
                 "its inference-only setup token".into()
             }
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(event.expires_at, None);
         assert_eq!(
             describe_credential(&account, 0),
-            "its inference-only setup token (login refused; run `tokeman login`)"
+            "its inference-only setup token (login refused; run `tokeman claude login`)"
         );
         assert_eq!(
             describe_credential(&login_account("a", 8 * HOUR_MS), 0),
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn reinstall_reasons_distinguish_upgrade_refresh_and_repair() {
         let mut account = login_account("a", 8 * HOUR_MS);
-        // Settings still hold the setup token from before `tokeman login`.
+        // Settings still hold the setup token from before `tokeman claude login`.
         let mut settings = installed(&Account {
             login: None,
             ..account.clone()

@@ -16,7 +16,7 @@ const TAG: &str = " \x1b[1mtokeman:\x1b[0m";
 pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<()> {
     if fleet.accounts.is_empty() {
         bail!(
-            "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
+            "No accounts configured. Use `tokeman claude login <name>` or `tokeman claude add <name> <key>` to add one."
         );
     }
     notice(&format!(

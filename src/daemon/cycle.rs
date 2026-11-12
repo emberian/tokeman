@@ -199,7 +199,7 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
     fleet.policy.validate()?;
     if fleet.accounts.is_empty() {
         bail!(
-            "No accounts configured. Use `tokeman login <name>` or `tokeman add <name> <key>` to add one."
+            "No accounts configured. Use `tokeman claude login <name>` or `tokeman claude add <name> <key>` to add one."
         );
     }
     let _lock = RotationLock::acquire()?;

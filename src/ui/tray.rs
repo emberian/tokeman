@@ -17,7 +17,6 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::account::Fleet;
 use crate::anthropic::Client;
 use crate::anthropic::probe::{PROBE_MODEL, PROBE_TIMEOUT, probe_all};
-use crate::claude::settings as claude_settings;
 use crate::daemon;
 use crate::launch;
 use crate::observe;
@@ -79,11 +78,6 @@ fn make_icon(color: [u8; 3]) -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(rgba, size, size).ok()
 }
 
-fn target_model() -> Option<ModelKey> {
-    let settings = claude_settings::load().ok()?;
-    claude_settings::target_model(&settings).map(ModelKey::new)
-}
-
 fn select_best<'a>(
     readings: &'a [Reading],
     fleet: &Fleet,
@@ -92,17 +86,11 @@ fn select_best<'a>(
     policy::choose_landing(readings, &fleet.policy, target)
 }
 
-fn level_rgb(level: Level) -> [u8; 3] {
-    match level {
-        Level::Ok => [76, 175, 80],
-        Level::Low => [255, 193, 7],
-        Level::Critical => [244, 67, 54],
-    }
-}
+/// The tray palette for [`super::level_color`].
+const LEVELS: [[u8; 3]; 3] = [[76, 175, 80], [255, 193, 7], [244, 67, 54]];
 
-fn level_color(level: Level) -> egui::Color32 {
-    let [r, g, b] = level_rgb(level);
-    egui::Color32::from_rgb(r, g, b)
+fn level_rgb(level: Level) -> [u8; 3] {
+    super::level_color(level, LEVELS)
 }
 
 fn weekly_remaining(reading: &Reading) -> f64 {
@@ -125,7 +113,7 @@ fn spawn_bg_thread(
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("could not start the probe runtime: {error}");
+                super::text::notice(&format!("could not start the probe runtime: {error}"));
                 return;
             }
         };
@@ -134,7 +122,7 @@ fn spawn_bg_thread(
             let store = match Store::open() {
                 Ok(store) => Some(store),
                 Err(error) => {
-                    eprintln!("history will not be recorded: {error:#}");
+                    super::text::notice(&format!("history will not be recorded: {error:#}"));
                     None
                 }
             };
@@ -161,7 +149,7 @@ fn spawn_bg_thread(
                     state.overview = Some(Arc::new(overview));
                     state.readings = Arc::new(readings);
                     state.last_probe = Some(Instant::now());
-                    state.target_model = target_model();
+                    state.target_model = crate::commands::view::target_model();
                 }
                 ctx.request_repaint();
 
@@ -251,7 +239,7 @@ impl TrayApp {
         self.menu_quit_id = Some(quit.id().clone());
 
         let Some(icon) = make_icon(GRAY) else {
-            eprintln!("Failed to build the tray icon image");
+            super::text::notice(&format!("Failed to build the tray icon image"));
             return;
         };
         // Left click toggles the window; the menu is on right click.
@@ -263,7 +251,7 @@ impl TrayApp {
             .build();
         match built {
             Ok(tray_icon) => self.tray_icon = Some(tray_icon),
-            Err(error) => eprintln!("Failed to create tray icon: {error}"),
+            Err(error) => super::text::notice(&format!("Failed to create tray icon: {error}")),
         }
     }
 
@@ -304,14 +292,14 @@ impl TrayApp {
     /// Make the account the default, then open Claude in a terminal.
     fn launch_account(&self, name: &str) {
         if let Err(error) = daemon::activate(&self.fleet, name) {
-            eprintln!("Failed to activate account: {error:#}");
+            super::text::notice(&format!("Failed to activate account: {error:#}"));
             return;
         }
         let (binary, args) = self.fleet.launch.command([]);
         if let Err(error) =
             launch::in_terminal(&binary, &args, self.fleet.launch.terminal.as_deref())
         {
-            eprintln!("Failed to launch terminal: {error}");
+            super::text::notice(&format!("Failed to launch terminal: {error}"));
         }
     }
 
@@ -323,7 +311,7 @@ impl TrayApp {
             Ok(())
         }) {
             Ok((fresh, ())) => self.fleet = fresh,
-            Err(error) => eprintln!("Failed to save settings: {error:#}"),
+            Err(error) => super::text::notice(&format!("Failed to save settings: {error:#}")),
         }
         let _ = self.bg_tx.send(BgCmd::Fleet(Box::new(self.fleet.clone())));
     }
@@ -342,7 +330,8 @@ impl TrayApp {
         note: Option<&str>,
     ) {
         let remaining = window.remaining().clamp(0.0, 1.0);
-        let color = level_color(Level::of(remaining));
+        let [r, g, b] = level_rgb(Level::of(remaining));
+        let color = egui::Color32::from_rgb(r, g, b);
         let remaining = remaining as f32;
         let pct = (remaining * 100.0).round() as u32;
         let bar_bg = egui::Color32::from_white_alpha(30);
@@ -460,7 +449,7 @@ impl TrayApp {
                 }
             });
             let Some(usage) = &account.usage else {
-                Self::caption(ui, "not read yet (`tokeman services`)", DIM);
+                Self::caption(ui, "not read yet (run `tokeman`)", DIM);
                 return;
             };
             if let Some(error) = &usage.error {
@@ -552,7 +541,10 @@ impl TrayApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&reading.account).strong().size(14.0));
                 let (status, level) = status_badge(reading);
-                let status_color = level.map_or(egui::Color32::from_gray(120), level_color);
+                let status_color = level.map_or(egui::Color32::from_gray(120), |level| {
+                    let [r, g, b] = level_rgb(level);
+                    egui::Color32::from_rgb(r, g, b)
+                });
                 ui.label(egui::RichText::new(status).color(status_color).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -592,7 +584,7 @@ impl TrayApp {
                     if limit.source == Source::Observed {
                         label.push('!');
                     }
-                    let note = share_note(limit, reading.weekly().as_ref());
+                    let note = super::text::share_note(limit, reading.weekly().as_ref());
                     Self::draw_gauge_noted(ui, &label, 3, limit.window, note.as_deref());
                 }
                 if let Some(window) = crate::store::Series::Overage.window(reading) {
@@ -741,18 +733,6 @@ fn gauge_caption(window: Window, note: Option<&str>) -> String {
         Some(note) => format!("{reset}  ·  {note}"),
         None => reset,
     }
-}
-
-/// For a limit that is a share of the weekly: how much of the weekly it
-/// still allows.
-fn share_note(limit: &crate::quota::Limit, weekly: Option<&Window>) -> Option<String> {
-    limit.share.map(|share| {
-        format!(
-            "{:.0}% of the weekly, {:.0}% of the weekly left for it",
-            share * 100.0,
-            limit.room(weekly).max(0.0) * 100.0
-        )
-    })
 }
 
 fn settings_label(ui: &mut egui::Ui, text: &str) {
@@ -971,9 +951,9 @@ mod tests {
     fn a_shared_limit_is_noted_in_weekly_terms_and_an_idle_window_has_no_reset() {
         let weekly = Window::new(0.4, 0);
         let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
-        assert_eq!(share_note(&fable, Some(&weekly)), None);
+        assert_eq!(super::text::share_note(&fable, Some(&weekly)), None);
         fable.share = Some(0.5);
-        let note = share_note(&fable, Some(&weekly)).unwrap();
+        let note = super::text::share_note(&fable, Some(&weekly)).unwrap();
         assert_eq!(note, "50% of the weekly, 25% of the weekly left for it");
         assert_eq!(
             gauge_caption(Window::new(0.0, 0), Some(&note)),

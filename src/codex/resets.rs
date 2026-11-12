@@ -290,7 +290,7 @@ pub async fn plan(
     if let Some(error) = &plan.probe.error {
         bail!(Refusal::Unreadable(error.clone()));
     }
-    if probe::is_viable(&plan.probe) {
+    if plan.probe.accepts_work() {
         bail!(Refusal::NotLimited {
             state: State::of(&plan.probe)
         });

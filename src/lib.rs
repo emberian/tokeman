@@ -12,6 +12,7 @@ pub mod claims;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+pub mod commands;
 pub mod daemon;
 pub mod fs;
 pub mod history;

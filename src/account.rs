@@ -44,7 +44,7 @@ pub struct Login {
     pub refresh_expires_at: Option<i64>,
     pub scopes: Vec<String>,
     /// Why the refresh token was refused for good. While set, the account
-    /// falls back to its setup key until `tokeman login` runs again.
+    /// falls back to its setup key until `tokeman claude login` runs again.
     pub error: Option<String>,
 }
 

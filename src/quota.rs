@@ -1051,6 +1051,21 @@ impl Reading {
         }
     }
 
+    /// Whether the service would take work on the account now: the read
+    /// succeeded and nothing in it refuses. An answer with no limit at all
+    /// means none is being enforced.
+    pub fn accepts_work(&self) -> bool {
+        self.error.is_none() && self.allows()
+    }
+
+    /// The least fraction left across the account-wide windows: whichever
+    /// bites first. `None` is no window read, which differs from no room.
+    pub fn least_remaining(&self) -> Option<f64> {
+        self.shared()
+            .map(|limit| limit.window.remaining().clamp(0.0, 1.0))
+            .reduce(f64::min)
+    }
+
     /// The model-scoped limits that limit sessions on `model`.
     pub fn limits_for<'a>(
         &'a self,
