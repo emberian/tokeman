@@ -160,8 +160,8 @@ pub enum ServicesAction {
         source: ImportSource,
     },
     /// Sign the agy CLI in as an Antigravity account (macOS; manual, the
-    /// daemon never switches it). Running agy sessions keep their account
-    /// until restarted.
+    /// daemon never switches it). Quit running agy sessions first: they keep
+    /// their account and write it back when they refresh their token.
     Use {
         /// The Antigravity service account to seat
         #[arg(required_unless_present = "previous")]

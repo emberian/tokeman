@@ -90,8 +90,7 @@ pub async fn run(action: Option<ServicesAction>, json: bool) -> Result<()> {
             let running = agy::running().await;
             if seating.changed && running > 0 {
                 println!(
-                    "{running} running agy process(es) keep the account they started with; restart them to use {}",
-                    seating.email
+                    "{running} running agy process(es) keep the account they started with, and will write it back as agy's login when they next refresh their token (within the hour). Quit them, then run this again."
                 );
             }
         }

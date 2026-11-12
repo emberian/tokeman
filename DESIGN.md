@@ -86,7 +86,8 @@ src/
                  discover() from agy's Keychain item / token file and the app's state.vscdb (read-only)
     agy.rs       the agy CLI's login slot (Keychain item via /usr/bin/security, bounded): which account it holds,
                  seat an Antigravity account in it (locked, previous value backed up 0600, read back), put the previous back.
-                 Manual only (`services use`); the daemon never seats. Running agy processes keep their account.
+                 Manual only (`services use`); the daemon never seats. A running agy keeps its account and writes it back
+                 into the slot at its next token refresh, so a seating holds only once running agy processes have quit.
   daemon/
     mod.rs       the loop
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record

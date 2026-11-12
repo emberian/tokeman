@@ -8,8 +8,8 @@ Antigravity.app 2.0.1 (`/Applications/Antigravity.app`, May 2026). Each fact is 
 - **[code]** read from the installed binaries (strings / embedded proto descriptors) or local state
 - **[web]** from docs or open-source projects (cited)
 
-No tokens appear in this file. Emails are the two account identities, which are already in
-local plaintext state.
+No tokens appear in this file. The two accounts are written `first@example.com` (the one `agy`
+held) and `second@example.com`.
 
 ## The two accounts
 
@@ -166,7 +166,7 @@ Real response, `first@example.com`, Agy-hub User-Agent:
 
 Reading notes:
 - **An untouched window's `resetTime` floats** (now + 5h or now + 7d, different on every call).
-  Once the window is used, it is anchored (cmrx64's weekly anchor is 2026-11-18T08:38Z). Treat
+  Once the window is used, it is anchored (the first account's weekly anchor is 2026-11-18T08:38Z). Treat
   `remainingFraction == 1` with a floating reset as "window not started".
 - `remaining` is a oneof: `remainingAmount` (int64) can appear instead of `remainingFraction`.
   Nook PR #917 also saw the payload wrapped in `response`/`summary` and fractions left out
@@ -272,7 +272,7 @@ where JSON is `agy`'s own compact shape, in this field order:
 ```
 
 What was done and seen (no `agy` CLI process was running at the start; Antigravity.app was, and
-it does not use this slot):
+it was assumed not to use this slot; that was wrong, see "Telling a running client" below):
 
 1. Backup: the item's value (763 bytes with `security`'s trailing newline) and the credential
    files in `~/.gemini/antigravity-cli/` (`antigravity-oauth-token`, `settings.json`,
@@ -296,21 +296,31 @@ Findings:
 
 - **A newly started `agy` uses whatever the slot holds.** No restart of anything else, no
   re-login, no prompt.
-- **A running `agy` does not notice the swap.** A long-lived `agy acp` server signed in as
-  `second@example.com` kept that account for 90 s of idling and through a new session after the
-  slot went back to `first@example.com`; its log never printed `Stored token metadata changed
-  externally`. tokeman therefore counts running `agy` processes after a switch and says they
-  need a restart.
+- **A running `agy` does not notice the swap, and later undoes it.** A long-lived `agy acp`
+  server signed in as `second@example.com` kept that account for 90 s of idling and through new
+  sessions after the slot went back to `first@example.com`; its log never printed `Stored token
+  metadata changed externally`. Its access token expired at 15:40. When its refresh went through
+  at 15:54:19 (the network was down from about 15:32), it logged `token refreshed, new
+  expiry=…16:54:18` and the slot then held `second@example.com` with exactly that expiry, modified
+  at 15:54:19: the running process wrote its own account back over the other one. So a switch
+  made while an `agy` runs lasts at most until that process refreshes, within the hour. tokeman
+  counts running `agy` processes after a switch and says to quit them and switch again. After
+  the test server was stopped (by its PID) the original value was written back, and `agy models`
+  signed in as `first@example.com`.
 - **`agy` refreshes early and writes the slot when it does.** Started on an access token with
   143 s left, it refreshed at once (`token refreshed, new expiry=…`) and rewrote the item. So a
-  slot value with a stale access token is fine, and the item changes under tokeman whenever
-  `agy` refreshes; the backup is of the value at the moment of the switch.
-- **The fallback token file.** `~/.gemini/antigravity-cli/antigravity-oauth-token` held a copy
-  of the `cmrx64` grant from 2026-11-09. It was still there after the first swap and the first
-  `agy models`, and gone after the `agy acp` run that refreshed and saved the other account's
-  token; nothing in the log mentions it. It was put back from the backup. tokeman rewrites the
-  file with the seated account's JSON when it exists and does not create it when it does not;
-  with the file rewritten, `agy models` signed in from the Keychain as expected.
+  slot value with a stale access token is fine, and the item's bytes change whenever `agy`
+  refreshes; the backup is of the value at the moment of the switch. (Two `agy` runs that were
+  not part of this experiment, at 14:42 and 14:47, refreshed the original account's token the
+  same way.)
+- **The fallback token file is transient.** `~/.gemini/antigravity-cli/antigravity-oauth-token`
+  held a copy of the first account's grant from 2026-11-09. `agy` deletes it when it refreshes and saves
+  to the Keychain: it vanished after each of the three refreshes seen (14:40 and 15:54 by the
+  test server, 15:55 by `agy models` on the original account) and survived the runs that did not
+  refresh. Nothing in the log mentions it. It was put back from the backup twice; after the last
+  refresh, by `agy` itself on the original account, it was left absent, which is the state `agy`
+  chose. tokeman rewrites the file with the seated account's JSON when it exists and does not
+  create it when it does not; with the file rewritten, `agy models` signed in from the Keychain.
 - The client is shared and the refresh token does not rotate, so seating a grant never
   invalidates tokeman's copy, and seating the other one back restores the first account.
 - Not done, on purpose: running `agy` in file-storage mode (`SSH_TTY`). The binary contains
@@ -319,7 +329,115 @@ Findings:
 - Switching is manual. The daemon does not seat accounts. Expect the cost of a Claude switch:
   server-side caches are per account.
 
-**IDE (Antigravity.app): possible but not worth it.** Swapping means rewriting the protobuf in
+### Telling a running client about a new login **[live, 2026-11-11, `agy` 1.5.6, app 2.31.2]**
+
+Question: can a running `agy` be told to re-read the slot, so a switch reaches live sessions?
+Short answer: the Antigravity app can, an `agy acp` server can only through its own ACP client,
+and an interactive `agy` cannot; it has to be quit and resumed.
+
+The app in `/Applications` was replaced on 2026-11-11 by the 2.31.2 "hub" app. Its
+`language_server --subclient_type hub` **shares the `gemini`/`antigravity` slot with `agy`** (it
+wrote the slot at 15:57:30 with an extra `writer_id` field), so it is a third kind of running
+client. The same backup and restore discipline was used; the slot ended byte-identical to the
+backup on the first account, the app on the first account, and every process started for the
+tests was stopped by its PID file.
+
+**Two auth implementations in one binary [code].** `agy` in CLI mode uses `cli/backend/auth`
+(`ChainedAuth` → `keyringAuth`, log lines `keyringAuth: loaded token`, `ChainedAuth: authenticated
+via keyring`). The hub uses `language_server/auth_client.AuthClient`, which has
+`syncWithStoredToken`, `hasExternalStorageChange`, `hasStoredMetadataChanged`, `hydrateStoredToken`,
+`getWriterID`, `getLastSyncedTokenKey` and the messages `Stored token changed externally; hydrating
+updated session from storage`, `Stored token metadata changed externally; updating in-memory auth
+session`, `Stored token was removed externally; clearing in-memory auth session`, `Skipping
+refreshed token save because stored token changed externally`. Those strings are the hub's. A
+CLI-mode language server answers the hub-only RPCs with `interactive auth is only supported in
+antigravity-hub mode and is unavailable in cli, standalone, or stubby-auth modes`. This is why the
+earlier `agy acp` test never printed them and overwrote the slot at its refresh. There is no
+sidecar or metadata file to touch: the "metadata" is inside the slot value (`writer_id`, the
+token's identity), and nothing in CLI mode watches it.
+
+**Control surfaces found**
+
+| surface | hub app | `agy acp` | interactive `agy` |
+|---|---|---|---|
+| localhost ports (HTTPS and HTTP Connect RPC, `/exa.language_server_pb.LanguageServerService/<Method>`) | yes; ports and CSRF token in `~/.gemini/antigravity/daemon/hub_<port>.json` (0600) | yes, two ports, **no CSRF token needed**; found with `lsof -nP -p <pid>` | yes, two ports, CSRF required (`401 missing CSRF token`) and the token is not written anywhere |
+| `GetUserStatus` (which account) | works with the CSRF header `x-codeium-csrf-token` | works | not reachable |
+| `GetAuthStatus` | works, **and makes the hub re-read the slot** | works, read-only | not reachable |
+| `AuthLogout`, `GetLoginSession`, `Login…` RPCs | hub-only (not called) | refused: hub mode only | not reachable |
+| ACP `logout` / `authenticate` | n/a | works, but only from the ACP client that owns its stdio | n/a |
+| `/logout` slash command | n/a | n/a | exists; there is no `/login`, `/account` or `/auth` |
+| Unix sockets, named pipes, files under `~/.gemini/antigravity-cli`, `$TMPDIR` | none for control | none (one anonymous unix socket, pipes to children) | none |
+| signals | none found | none found | none found (`SIGHUP` is only "terminal gone, shutting down") **[code]** |
+| subcommands | n/a | `agy` has no `auth`, `login`, `logout`, `account`, `status` or `daemon` subcommand; `remote-control` manages an unrelated daemon | |
+
+**What each client did**
+
+- **Hub app: follows the slot when asked.** After the slot was swapped, `GetUserStatus` kept
+  answering the old account for 90 s (15 polls). One `GetAuthStatus` call later it answered the
+  new account. The 90 s wait was done once; on each of the other four swaps and restores the hub answered
+  the slot's account right after a `GetAuthStatus`.
+  It also survived the slot being deleted for under a second (below) and re-read it. Whether it
+  follows on its own (focus, timer, refresh) was not seen in 90 s. Its refresh-save path has the
+  `Skipping refreshed token save because stored token changed externally` guard **[code]**, so
+  it should not write a stale account back the way `agy` does; not observed.
+- **`agy acp`: ACP `logout`, then rewrite the slot, then ACP `authenticate`.**
+  - `authenticate {"methodId":"oauth-personal"}` on a signed-in server returns success at once
+    and re-reads nothing.
+  - `logout` answers `{}`, logs `ACP Request received: logout`, and **deletes the Keychain item**.
+    The server then reports `hasToken` empty and no user.
+  - With the slot rewritten, the next `authenticate` logs `keyringAuth: loaded token`,
+    `ChainedAuth: authenticated via keyring`, `OAuth: authenticated successfully as <the slot's
+    account>` and the server serves that account (confirmed by `GetUserStatus`), with no browser.
+    Done in both directions. `session/new` and `GetAuthStatus` alone did not trigger the re-read.
+  - These are requests on the server's stdin. tokeman is not that client; an editor is. The
+    tokenless local port does not help: `AuthLogout` there is refused in CLI mode.
+- **Interactive `agy`: no.** It did not notice the swap. `/logout` logged `Logging out current
+  user`, **deleted the Keychain item**, and showed `Select login method: 1. Google OAuth 2. Use a
+  Google Cloud project`. With the slot rewritten, choosing Google OAuth went straight to the
+  browser flow (`consumerOAuth: starting OAuth flow`) and ignored the slot. Leaving that screen
+  with Ctrl-C logged `Logging out current user` again and **deleted the rewritten item a second
+  time**. So `/logout` is not a way to switch, and a logged-out `agy` that is quit removes
+  whatever is in the slot.
+- Other things seen: something on this machine runs `agy -p /usage` from time to time (print
+  mode, `silent auth`); each run signs in from the slot, so it follows a switch by itself.
+
+**Quit and resume [code, flags from `agy help`; resuming across accounts not tested]**
+
+- On exit `agy` prints `Resume with -c (or command below):` and `agy --conversation=<id>`.
+  `agy -c` / `--continue` continues the most recent conversation, `--conversation <id>` a given
+  one, and `/resume` switches inside the TUI. ACP has `session/load`.
+- Conversations are local sqlite files, `~/.gemini/antigravity-cli/conversations/<id>.db`, with
+  an index in `conversation_summaries.db` that has no account column, so a conversation started
+  on one account should resume on the other. A test `agy acp` kept its sessions through a
+  logout and a sign-in as the other account. Loading a conversation with real history under the
+  other account was not tried (it would need a prompt).
+
+**Recommendation for `tokeman agy use`**
+
+1. Classify what is running before writing: the hub (`~/.gemini/antigravity/daemon/hub_*.json`
+   with a live `pid`), `agy acp` processes, and other `agy` processes (interactive or print).
+2. Hub: write the slot, then call `GetAuthStatus` on its `httpPort` with the CSRF token from the
+   daemon file, and confirm with `GetUserStatus`. This switches the open app live. Treat a
+   failure as a warning; the app's own save guard should keep it from undoing the switch.
+3. `agy acp`: tokeman cannot switch it. Ask it which account it holds (`GetUserStatus` on its
+   port needs no token) and, if it is the old one, say that the editor must restart its agent
+   (or log out and in from the editor). Until then it will write the old account back at its
+   next refresh.
+4. Interactive `agy`: refuse by default while one runs, because it reverses the switch within
+   the hour. Print, per process, its PID and working directory, and:
+   `quit it (Ctrl-C twice; it prints "agy --conversation=<id>"), run this command again, then
+   resume with "agy -c" or "agy --conversation=<id>"`. Offer `--force` to write anyway, with the
+   warning that the switch lasts only until that process refreshes.
+5. Never use `/logout` or ACP `logout` as part of a switch: both delete the slot, and for a
+   moment every other client sees no login. If tokeman ever sees the slot empty right after its
+   own write (a logged-out `agy` exiting), it should write again.
+6. A slot value without `writer_id` was accepted by `agy`, by the hub, and by `agy acp`. tokeman
+   need not write one.
+
+Left behind by the tests: a few empty conversations in `~/.gemini/antigravity-cli/conversations/`
+(from `session/new` on the test servers).
+
+**The old IDE build of Antigravity.app (2.0.1, replaced on 2026-11-11 by the hub app above): possible but not worth it.** Swapping means rewriting the protobuf in
 `state.vscdb` while the app is closed, and the cached `userStatus` would still show the old email.
 That app's state has not been touched since May. Treat the IDE grant as a source to import
 `second@example.com` from, not as a slot to manage.
