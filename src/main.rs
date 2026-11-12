@@ -6,7 +6,7 @@ use tokeman::cli::{
     self, AgyAction, ClaudeAction, Cli, CodexAction, Command, KeyAction, RotateAction,
     SettingsAction,
 };
-use tokeman::commands::{claude, codex, doctor, rotate, services, view};
+use tokeman::commands::{claude, codex, doctor, launch, rotate, services, view};
 use tokeman::daemon::cycle;
 use tokeman::quota::Service;
 use tokeman::ui::{prompt, text};
@@ -53,7 +53,6 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Agy { action } => agy_command(action).await?,
         Command::Glm { action } => key_command(Service::Zai, action).await?,
         Command::Kimi { action } => key_command(Service::Kimi, action).await?,
-        Command::Launch { auto, args } => tokeman::launch::run(Fleet::load()?, auto, args).await?,
         Command::Rotate { action } => rotate_command(action).await?,
         Command::History {
             service,
@@ -149,6 +148,9 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
             text::print_claude_use(&name);
         }
         ClaudeAction::Best => best(Service::Claude, None).await?,
+        ClaudeAction::Launch { auto, args } => {
+            tokeman::launch::run(Fleet::load()?, auto, args).await?
+        }
         ClaudeAction::Reset { name: None, .. } => {
             text::print_reset_offers(&claude::reset_offers(&Fleet::load()?).await)
         }
@@ -249,15 +251,24 @@ async fn codex_command(action: CodexAction) -> Result<()> {
             codex_home,
             min_remaining,
             once,
+            dry_run,
         } => {
-            codex::watch_running(
-                &Fleet::load()?,
-                codex_home.as_deref(),
+            let options = codex::WatchOptions {
+                codex_home,
                 min_remaining,
                 once,
-                |event| text::print_codex_watch(&event),
-            )
+                dry_run,
+            };
+            codex::watch_running(&Fleet::load()?, &options, |event| {
+                text::print_codex_watch(&event)
+            })
             .await?
+        }
+        CodexAction::Launch { limit, args } => {
+            let (fleet, best) = best_to_launch(Service::Codex, limit.as_deref()).await?;
+            let launch = launch::codex(&fleet, &best, args)?;
+            text::print_launch(&launch);
+            return Err(launch.exec());
         }
         CodexAction::Reset {
             account,
@@ -315,6 +326,12 @@ async fn agy_command(action: AgyAction) -> Result<()> {
             }
         }
         AgyAction::Best { group } => best(Service::Antigravity, group.as_deref()).await?,
+        AgyAction::Launch { group, args } => {
+            let (fleet, best) = best_to_launch(Service::Antigravity, group.as_deref()).await?;
+            let (launch, room) = launch::agy(&fleet, &best, args).await?;
+            text::print_agy_launch(&launch, room);
+            return Err(launch.exec());
+        }
         AgyAction::Run { name, args } => {
             let launch = services::agy_run(&Fleet::load()?, &name, args).await?;
             text::print_agy_run(&launch);
@@ -340,6 +357,12 @@ async fn key_command(service: Service, action: KeyAction) -> Result<()> {
         }
         KeyAction::List { json } => service_list(service, json).await?,
         KeyAction::Best { group } => best(service, group.as_deref()).await?,
+        KeyAction::Launch { model, args } => {
+            let (fleet, best) = best_to_launch(service, None).await?;
+            let launch = launch::vendor(&fleet, &best, model.as_deref(), args)?;
+            text::print_launch(&launch);
+            return Err(launch.exec());
+        }
     }
     Ok(())
 }
@@ -366,6 +389,18 @@ async fn best(service: Service, scope: Option<&str>) -> Result<()> {
         bail!("{}", text::nothing_ranked(&best));
     }
     Ok(())
+}
+
+/// Read `service`'s accounts and rank them for a launch; an error naming
+/// what could not be read when nothing ranks.
+async fn best_to_launch(service: Service, scope: Option<&str>) -> Result<(Fleet, view::Best)> {
+    let fleet = Fleet::load()?;
+    let best = view::best(&fleet, service, scope).await?;
+    if best.winner().is_none() {
+        text::print_unread(&best);
+        bail!("{}", text::nothing_ranked(&best));
+    }
+    Ok((fleet, best))
 }
 
 async fn rotate_command(action: RotateAction) -> Result<()> {

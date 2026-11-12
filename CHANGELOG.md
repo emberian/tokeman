@@ -64,6 +64,27 @@ rewrites the plist, launcher and hook for the new binary.
 - `tokeman codex use [<account>]` moves a running Codex (the best viable
   account when none is named) or, with `--into`, copies credentials into
   another profile.
+- The background service moves a running Codex by itself. Every five
+  minutes, in a bounded task the rotation never waits on, it asks each
+  control socket it finds (`~/.codex` and every registered profile) for the
+  account-wide windows. A Codex below the leaving floors
+  (`codex_min_5h_remaining`, `codex_min_7d_remaining`, default 20% left) is
+  moved between turns onto the best profile above the landing floors
+  (`codex_land_min_*`, default 30%); with nowhere to land it stays, and one
+  the backend refuses outright takes any profile with room. A healthy look
+  sends no request. It is on with two or more unparked profiles, off while
+  rotation is paused, and `tokeman settings set codex_auto_move false`
+  turns it off. Each move is logged and kept in `codex-moves.jsonl`, as are
+  the moves `codex use` and `codex watch` make. No reset credit is ever
+  spent this way.
+- `tokeman codex watch` is the same look in the foreground, on every update
+  Codex pushes. It judges the account-wide windows only (a spent per-model
+  limit no longer triggers a move), never lands on the account it is
+  leaving, and takes its floors from `[rotation]` unless `--min-remaining`
+  is given. `--dry-run` says what the service would do now and moves
+  nothing.
+- `tokeman codex launch [--limit <text>] [-- <codex args>]` starts codex on
+  the profile with the most headroom, as its `CODEX_HOME`.
 
 ### Antigravity, GLM, Kimi
 
@@ -88,6 +109,15 @@ rewrites the plist, launcher and hook for the new binary.
 - `tokeman agy|glm|kimi best [--group <text>]` ranks the accounts by room:
   weekly room expiring within 24 hours first, and an account with a spent
   limit is left out.
+- `tokeman agy launch [--group <text>] [-- <agy args>]` is `agy run` on the
+  account with the most room. The service still never switches agy.
+- `tokeman glm launch` and `tokeman kimi launch` start Claude Code on the
+  plan through the vendor's Anthropic-compatible endpoint
+  (`api.z.ai/api/anthropic`, `api.kimi.com/coding/`). The endpoint, the
+  account's key and the vendor's models are set in that one claude's
+  environment and nowhere else: settings.json is not written, so every
+  other session stays on its Anthropic account. `--model <id>` names the
+  vendor model.
 
 ### What needs you, and a forecast
 
@@ -138,7 +168,10 @@ rewrites the plist, launcher and hook for the new binary.
 
 - Service first: `tokeman claude|codex|agy|glm|kimi <verb>` with the same
   verbs wherever they apply (`add`, `remove`, `list`, `use`, `best`,
-  `reset`). `<service> list` reads that service now.
+  `launch`, `reset`). `<service> list` reads that service now.
+- `tokeman <service> launch` starts the tool that spends that service's
+  quota on its best account: claude (the former `tokeman launch`), codex,
+  agy, and claude on a GLM or Kimi plan.
 - `tokeman list` shows every account of every service from stored reads,
   with no request and no write; `tokeman list --json` is the fleet view the
   trays read.
@@ -174,6 +207,7 @@ rewrites the plist, launcher and hook for the new binary.
 | `tokeman services use` | `tokeman agy use <account> [--previous]` |
 | `tokeman services best` | `tokeman agy best [--group <text>], tokeman glm best or tokeman kimi best` |
 | `tokeman services` | `tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)` |
+| `tokeman launch` | `tokeman claude launch [--auto] [-- <claude args>]` |
 | `tokeman login` | `tokeman claude login [<account>] [--more]` |
 | `tokeman add` | `tokeman claude add <name> <key>` |
 | `tokeman remove` | `tokeman claude remove <name>` |

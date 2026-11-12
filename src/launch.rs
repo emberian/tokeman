@@ -1,12 +1,16 @@
-//! `tokeman launch`: pick the default, then start claude, in this terminal
-//! or a new one.
+//! Starting a tool on the account tokeman picked for it. `tokeman claude
+//! launch` picks the default and then starts claude, in this terminal or a
+//! new one; every other `tokeman <service> launch` is a [`Launch`]: a
+//! program, its arguments and the environment that seats the account.
 
 use anyhow::{Context, Result, bail};
+use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use crate::account::Fleet;
 use crate::daemon::cycle::{self, Options};
 use crate::notice::notice;
+use crate::quota::Service;
 use crate::util::shell_quote;
 
 const TAG: &str = " \x1b[1mtokeman:\x1b[0m";
@@ -79,6 +83,122 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// One variable of a launch's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: &'static str,
+    pub value: OsString,
+    /// A credential: named when the launch is described, never shown.
+    pub secret: bool,
+}
+
+/// A tool ready to start on one account. The account is seated through the
+/// child's environment alone: nothing is written to the tool's own files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Launch {
+    /// The service whose account pays.
+    pub service: Service,
+    pub account: String,
+    /// The fraction left on the account's tightest counted limit.
+    pub room: Option<f64>,
+    program: OsString,
+    args: Vec<String>,
+    env: Vec<EnvVar>,
+    /// Inherited variables the child must not see.
+    unset: Vec<&'static str>,
+}
+
+impl Launch {
+    pub fn new(
+        service: Service,
+        account: &str,
+        room: Option<f64>,
+        program: impl Into<OsString>,
+        args: Vec<String>,
+    ) -> Self {
+        Self {
+            service,
+            account: account.to_owned(),
+            room,
+            program: program.into(),
+            args,
+            env: Vec::new(),
+            unset: Vec::new(),
+        }
+    }
+
+    pub fn set(mut self, name: &'static str, value: impl Into<OsString>) -> Self {
+        self.env.push(EnvVar {
+            name,
+            value: value.into(),
+            secret: false,
+        });
+        self
+    }
+
+    pub fn set_secret(mut self, name: &'static str, value: impl Into<OsString>) -> Self {
+        self.env.push(EnvVar {
+            name,
+            value: value.into(),
+            secret: true,
+        });
+        self
+    }
+
+    pub fn unset(mut self, name: &'static str) -> Self {
+        self.unset.push(name);
+        self
+    }
+
+    pub fn program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn env(&self) -> &[EnvVar] {
+        &self.env
+    }
+
+    pub fn removed(&self) -> &[&'static str] {
+        &self.unset
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        for name in &self.unset {
+            command.env_remove(name);
+        }
+        for var in &self.env {
+            command.env(var.name, &var.value);
+        }
+        command
+    }
+
+    /// Replace this process with the tool, which takes over the terminal and
+    /// its signals. Returns only when it could not be started.
+    #[cfg(unix)]
+    pub fn exec(self) -> anyhow::Error {
+        use std::os::unix::process::CommandExt;
+        let error = self.command().exec();
+        anyhow::Error::new(error)
+            .context(format!("could not run {}", self.program.to_string_lossy()))
+    }
+
+    /// Run the tool in this terminal and exit with its status.
+    #[cfg(not(unix))]
+    pub fn exec(self) -> anyhow::Error {
+        match self.command().status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(error) => anyhow::Error::new(error)
+                .context(format!("could not run {}", self.program.to_string_lossy())),
+        }
+    }
 }
 
 /// Open a new terminal window running claude (the trays use this).
@@ -184,5 +304,41 @@ mod tests {
         assert!(script.contains("write text \"printf '\\\\033]1337;SetBadgeFormat="));
         assert!(script.contains("\\\"x\\\""));
         assert!(apple_script("Terminal", "'claude'").contains("do script \"'claude'\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_seats_the_account_in_the_childs_environment_only() {
+        let launch = Launch::new(
+            Service::Codex,
+            "work",
+            Some(0.5),
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf '%s|%s|%s' \"$SEATED\" \"$SECRET\" \"${GONE-unset}\"".into(),
+            ],
+        )
+        .set("SEATED", "home")
+        .set_secret("SECRET", "k")
+        .unset("GONE");
+        let output = launch.command().output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "home|k|unset");
+        // An inherited variable of that name is taken out of the child's
+        // environment, whatever this process holds.
+        let command = launch.command();
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        assert_eq!(removed, [OsStr::new("GONE")]);
+        assert_eq!(launch.removed(), ["GONE"]);
+        assert!(
+            launch
+                .env()
+                .iter()
+                .any(|var| var.secret && var.name == "SECRET")
+        );
     }
 }

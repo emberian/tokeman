@@ -9,6 +9,7 @@
 pub mod appserver;
 pub mod auth;
 pub mod maintenance;
+pub mod mover;
 pub mod probe;
 pub mod refresh;
 pub mod resets;

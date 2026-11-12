@@ -17,6 +17,8 @@ use crate::quota::Span;
 const CONTROL_SOCKET_DIR: &str = "app-server-control";
 const CONTROL_SOCKET_FILE: &str = "app-server-control.sock";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A socket file nothing listens behind must not hold a caller up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZE_REQUEST_ID: i64 = 0;
 
 /// Where a `CODEX_HOME` exposes its control socket. Not `ipc/ipc.sock`, which
@@ -69,15 +71,22 @@ impl AppServer {
     /// Connect and initialize. The experimental capability gates
     /// `chatgptAuthTokens`.
     pub async fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path).await.with_context(|| {
-            format!(
-                "failed to connect to {} (is a Codex app-server running? try `codex remote-control start`)",
-                socket_path.display()
-            )
-        })?;
-        let (socket, _response) = client_async("ws://localhost/", stream)
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path))
             .await
-            .with_context(|| format!("failed to upgrade {}", socket_path.display()))?;
+            .map_err(|_| anyhow!("timed out"))
+            .and_then(|connected| connected.map_err(anyhow::Error::new))
+            .with_context(|| {
+                format!(
+                    "failed to connect to {} (is a Codex app-server running? try `codex remote-control start`)",
+                    socket_path.display()
+                )
+            })?;
+        let (socket, _response) =
+            tokio::time::timeout(CONNECT_TIMEOUT, client_async("ws://localhost/", stream))
+                .await
+                .map_err(|_| anyhow!("timed out"))
+                .and_then(|upgraded| upgraded.map_err(anyhow::Error::new))
+                .with_context(|| format!("failed to upgrade {}", socket_path.display()))?;
         let mut server = Self {
             socket,
             next_id: INITIALIZE_REQUEST_ID + 1,
@@ -172,9 +181,11 @@ impl AppServer {
         .await
     }
 
-    /// The limits as the running Codex sees them.
-    pub async fn rate_limits(&mut self) -> Result<Value> {
-        self.request("account/rateLimits/read", json!({})).await
+    /// The account-wide limits as the running Codex sees them.
+    pub async fn rate_limits(&mut self) -> Result<ReportedLimits> {
+        self.request("account/rateLimits/read", json!({}))
+            .await
+            .map(|value| ReportedLimits::from_value(&value))
     }
 
     /// The account the running Codex is using. `chatgptAuthTokens` installs
@@ -219,79 +230,297 @@ pub fn json_values<'a>(value: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
-/// The fullest window in a rate-limits payload, whatever its nesting: what
-/// is left in it and its length (`windowDurationMins`, else unknown); `None`
-/// when no window reports a used percentage.
-pub fn tightest_from_rate_limits(value: &Value) -> Option<(f64, Span)> {
-    let mut windows = Vec::new();
-    collect_windows(value, &mut windows);
-    windows
-        .into_iter()
-        .max_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(used, span)| ((1.0 - used / 100.0).clamp(0.0, 1.0), span))
+/// One account-wide window as a running Codex reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportedWindow {
+    pub span: Span,
+    /// Fraction used; may exceed 1.0.
+    pub used: f64,
+    /// Epoch seconds; 0 when none was sent.
+    pub resets_at: i64,
 }
 
-fn collect_windows(value: &Value, out: &mut Vec<(f64, Span)>) {
-    match value {
-        Value::Object(map) => {
-            let used = map
-                .get("usedPercent")
-                .or_else(|| map.get("used_percent"))
-                .and_then(Value::as_f64);
-            if let Some(used) = used {
-                let seconds = map
-                    .get("windowDurationMins")
-                    .or_else(|| map.get("window_minutes"))
-                    .and_then(Value::as_i64)
-                    .map(|minutes| minutes * 60)
-                    .or_else(|| map.get("limit_window_seconds").and_then(Value::as_i64));
-                out.push((used, Span::from_seconds(seconds)));
-            }
-            for nested in map.values() {
-                collect_windows(nested, out);
-            }
+/// The account-wide view in an `account/rateLimits/read` answer or an
+/// `account/rateLimits/updated` push.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReportedLimits {
+    /// `rateLimits.primary` and `.secondary`, named by their length. The
+    /// per-feature buckets of `rateLimitsByLimitId` are metered apart and
+    /// are not here.
+    pub windows: Vec<ReportedWindow>,
+    /// The backend refuses ordinary work on the account.
+    pub refused: bool,
+    /// The account the snapshot is of, when the backend said.
+    pub account_id: Option<String>,
+}
+
+impl ReportedLimits {
+    pub fn from_value(value: &Value) -> Self {
+        let snapshot = value.get("rateLimits").unwrap_or(value);
+        let either = |map: &Value, camel: &str, snake: &str| -> Option<Value> {
+            map.get(camel).or_else(|| map.get(snake)).cloned()
+        };
+        let windows = ["primary", "secondary"]
+            .into_iter()
+            .filter_map(|slot| snapshot.get(slot))
+            .filter_map(|window| {
+                let used = either(window, "usedPercent", "used_percent")?.as_f64()?;
+                let minutes = either(window, "windowDurationMins", "window_minutes")
+                    .and_then(|minutes| minutes.as_i64());
+                let resets_at = either(window, "resetsAt", "resets_at")
+                    .and_then(|at| at.as_i64())
+                    .unwrap_or(0);
+                Some(ReportedWindow {
+                    span: Span::from_seconds(minutes.map(|minutes| minutes * 60)),
+                    used: used / 100.0,
+                    resets_at,
+                })
+            })
+            .collect();
+        let reached = snapshot
+            .get("rateLimitReachedType")
+            .is_some_and(|reached| !reached.is_null());
+        let disallowed = value.get("ordinaryUsageAllowed").and_then(Value::as_bool) == Some(false);
+        Self {
+            windows,
+            refused: reached || disallowed,
+            account_id: value
+                .get("accountId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         }
-        Value::Array(items) => {
-            for item in items {
-                collect_windows(item, out);
-            }
-        }
-        _ => {}
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::UnixListener;
+
+    /// What the fake app-server holds: the account it runs on, each
+    /// account's `account/rateLimits/read` answer, and every
+    /// `account/login/start` it was sent.
+    #[derive(Debug, Default)]
+    pub(crate) struct Running {
+        /// `chatgptAccountId` of the account in use.
+        pub account_id: String,
+        /// Per account id: its email and its rate-limit answer.
+        pub accounts: BTreeMap<String, (String, Value)>,
+        pub logins: Vec<Value>,
+    }
+
+    /// A Codex app-server on a control socket under a short-lived home.
+    /// Socket paths are short on every platform, so the home is under `/tmp`.
+    pub(crate) struct FakeAppServer {
+        pub home: tempfile::TempDir,
+        pub running: Arc<Mutex<Running>>,
+    }
+
+    impl FakeAppServer {
+        /// Serve `accounts` (`(account id, email, rate-limit answer)`), running on the first.
+        pub fn start(accounts: Vec<(&str, &str, Value)>) -> Self {
+            let home = tempfile::Builder::new()
+                .prefix("tk")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = control_socket_path(home.path());
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let running = Arc::new(Mutex::new(Running {
+                account_id: accounts[0].0.to_owned(),
+                accounts: accounts
+                    .into_iter()
+                    .map(|(id, email, limits)| (id.to_owned(), (email.to_owned(), limits)))
+                    .collect(),
+                logins: Vec::new(),
+            }));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let state = running.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(serve(stream, state.clone()));
+                }
+            });
+            Self { home, running }
+        }
+
+        pub fn logins(&self) -> Vec<Value> {
+            self.running.lock().unwrap().logins.clone()
+        }
+
+        pub fn account_id(&self) -> String {
+            self.running.lock().unwrap().account_id.clone()
+        }
+
+        /// Replace the rate-limit answer of the account in use.
+        pub fn set_limits(&self, limits: Value) {
+            let mut running = self.running.lock().unwrap();
+            let id = running.account_id.clone();
+            running.accounts.get_mut(&id).unwrap().1 = limits;
+        }
+    }
+
+    async fn serve(stream: UnixStream, state: Arc<Mutex<Running>>) {
+        let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(frame)) = socket.next().await {
+            let Message::Text(payload) = frame else {
+                continue;
+            };
+            let request: Value = serde_json::from_str(&payload).unwrap();
+            let Some(id) = request.get("id").cloned() else {
+                continue;
+            };
+            let result = {
+                let mut running = state.lock().unwrap();
+                match request["method"].as_str().unwrap_or_default() {
+                    "account/rateLimits/read" => {
+                        let mut limits = running.accounts[&running.account_id].1.clone();
+                        limits["accountId"] = json!(running.account_id);
+                        limits
+                    }
+                    "account/read" => json!({"account": {
+                        "type": "chatgpt",
+                        "email": running.accounts[&running.account_id].0,
+                        "planType": "plus",
+                    }}),
+                    "account/login/start" => {
+                        let params = request["params"].clone();
+                        if let Some(id) = params["chatgptAccountId"].as_str()
+                            && running.accounts.contains_key(id)
+                        {
+                            running.account_id = id.to_owned();
+                        }
+                        running.logins.push(params);
+                        json!({"type": "chatgptAuthTokens"})
+                    }
+                    _ => json!({}),
+                }
+            };
+            let answer = json!({"id": id, "result": result});
+            if socket
+                .send(Message::Text(answer.to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// A rate-limit answer with a 5-hour and a weekly window, in percent used.
+    pub(crate) fn limits_answer(session_used: f64, weekly_used: f64) -> Value {
+        json!({
+            "rateLimits": {
+                "primary": {"usedPercent": session_used, "windowDurationMins": 300, "resetsAt": 1_800_000_000},
+                "secondary": {"usedPercent": weekly_used, "windowDurationMins": 10080, "resetsAt": 1_800_500_000},
+                "rateLimitReachedType": null,
+            },
+            "ordinaryUsageAllowed": true,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_client_reads_limits_and_the_account_and_a_login_moves_the_server() {
+        let fake = FakeAppServer::start(vec![
+            ("acct-a", "a@x.y", limits_answer(90.0, 10.0)),
+            ("acct-b", "b@x.y", limits_answer(5.0, 5.0)),
+        ]);
+        let socket = control_socket_path(fake.home.path());
+        let mut server = AppServer::connect(&socket).await.unwrap();
+        let limits = server.rate_limits().await.unwrap();
+        assert_eq!(limits.account_id.as_deref(), Some("acct-a"));
+        assert_eq!(limits.windows[0].used, 0.9);
+        assert_eq!(
+            server.read_account().await.unwrap().email.as_deref(),
+            Some("a@x.y")
+        );
+        server
+            .reseat("token-b", "acct-b", Some("plus"))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.read_account().await.unwrap().email.as_deref(),
+            Some("b@x.y")
+        );
+        server.close().await;
+        assert_eq!(
+            fake.logins(),
+            vec![json!({
+                "type": "chatgptAuthTokens",
+                "accessToken": "token-b",
+                "chatgptAccountId": "acct-b",
+                "chatgptPlanType": "plus",
+            })]
+        );
+        // A socket file with nothing behind it fails within the connect bound.
+        let dead = tempfile::Builder::new()
+            .prefix("tk")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = control_socket_path(dead.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(AppServer::connect(&path).await.is_err());
+    }
 
     #[test]
-    fn the_tightest_window_is_found_at_any_depth_and_named_by_length() {
-        let limits = json!({
+    fn the_account_wide_windows_are_read_and_named_by_length() {
+        let limits = ReportedLimits::from_value(&json!({
+            "accountId": "acct-1",
+            "ordinaryUsageAllowed": true,
             "rateLimits": {
-                "primary": {"usedPercent": 30.0, "windowDurationMins": 300},
-                "secondary": {"used_percent": 75, "windowDurationMins": 10080},
-                "extra": [{"rateLimit": {"primary": {"usedPercent": 10}}}],
-            }
-        });
+                "primary": {"usedPercent": 30, "windowDurationMins": 300, "resetsAt": 1_800_000_000},
+                "secondary": {"usedPercent": 75, "windowDurationMins": 10080, "resetsAt": null},
+                "rateLimitReachedType": null,
+            },
+            // A per-feature bucket at its wall is not the account's.
+            "rateLimitsByLimitId": {
+                "codex_spark": {"primary": {"usedPercent": 100, "windowDurationMins": 300}},
+            },
+        }));
         assert_eq!(
-            tightest_from_rate_limits(&limits),
-            Some((0.25, Span::Weekly))
+            limits.windows,
+            vec![
+                ReportedWindow {
+                    span: Span::FiveHour,
+                    used: 0.30,
+                    resets_at: 1_800_000_000
+                },
+                ReportedWindow {
+                    span: Span::Weekly,
+                    used: 0.75,
+                    resets_at: 0
+                },
+            ]
         );
-        // Weekly-only: the weekly window arrives as `primary`.
-        let weekly_only = json!({
+        assert!(!limits.refused);
+        assert_eq!(limits.account_id.as_deref(), Some("acct-1"));
+        // Weekly-only: the weekly window arrives as `primary`. A push carries
+        // the snapshot alone.
+        let weekly_only = ReportedLimits::from_value(&json!({
             "rateLimits": {
                 "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1},
                 "secondary": null,
             }
-        });
-        let (remaining, span) = tightest_from_rate_limits(&weekly_only).unwrap();
-        assert!((remaining - 0.58).abs() < 1e-9);
-        assert_eq!(span, Span::Weekly);
-        assert_eq!(tightest_from_rate_limits(&json!({"other": 1})), None);
-        assert_eq!(
-            tightest_from_rate_limits(&json!({"usedPercent": 150})),
-            Some((0.0, Span::Unknown))
-        );
+        }));
+        assert_eq!(weekly_only.windows.len(), 1);
+        assert_eq!(weekly_only.windows[0].span, Span::Weekly);
+        assert!((weekly_only.windows[0].used - 0.42).abs() < 1e-9);
+        assert_eq!(ReportedLimits::from_value(&json!({"other": 1})).windows, []);
+        let refused = ReportedLimits::from_value(&json!({
+            "ordinaryUsageAllowed": false,
+            "rateLimits": {"primary": {"usedPercent": 150}},
+        }));
+        assert!(refused.refused);
+        assert_eq!(refused.windows[0].span, Span::Unknown);
+        assert_eq!(refused.windows[0].used, 1.5);
+        let reached = ReportedLimits::from_value(&json!({
+            "rateLimits": {"rateLimitReachedType": "rate_limit_reached"},
+        }));
+        assert!(reached.refused);
     }
 
     #[test]

@@ -132,6 +132,12 @@ pub fn legacy_reset_claims_dir() -> PathBuf {
     config_dir().join("reset-claims")
 }
 
+/// Every move of a running Codex between accounts (JSONL); written only by
+/// `codex::mover`.
+pub fn codex_moves() -> PathBuf {
+    config_dir().join("codex-moves.jsonl")
+}
+
 /// The agy Keychain value the last `tokeman agy use` replaced (0600).
 pub fn agy_login_backup() -> PathBuf {
     config_dir().join("agy-login-backup.json")

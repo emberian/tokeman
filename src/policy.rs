@@ -69,6 +69,22 @@ impl PolicySettings {
         }
     }
 
+    /// Where a running Codex leaves its account.
+    pub fn codex_floors(&self) -> Floors {
+        Floors {
+            session: self.codex_min_5h_remaining,
+            weekly: self.codex_min_7d_remaining,
+        }
+    }
+
+    /// The room an account must offer a running Codex that moves to it.
+    pub fn codex_landing_floors(&self) -> Floors {
+        Floors {
+            session: self.codex_land_min_5h_remaining,
+            weekly: self.codex_land_min_7d_remaining,
+        }
+    }
+
     pub fn interval_secs(&self, mode: Mode) -> u64 {
         match mode {
             Mode::Normal => self.normal_probe_interval_secs,
@@ -198,6 +214,42 @@ pub fn rank_above<'a>(
         .collect();
     ranked.sort_by(|a, b| landing_order(a, b, floors, model));
     ranked
+}
+
+/// What work running on one account should do, for a tool that can be moved
+/// between turns at no cost to the others.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Relocation<'a> {
+    /// The seat is above its floors.
+    Stay,
+    /// Below its floors, and nowhere offers the landing room: it drains in
+    /// place.
+    Drain,
+    Move(&'a Reading),
+}
+
+/// Whether work seated on `seat` should move to one of `others`. It leaves
+/// at `leave` for the best account above `land` ([`choose_above`]); a seat
+/// that takes no work at all leaves for any account that does.
+pub fn relocate<'a>(
+    seat: &Reading,
+    others: &'a [Reading],
+    leave: Floors,
+    land: Floors,
+) -> Relocation<'a> {
+    const ANY_ROOM: Floors = Floors {
+        session: 0.0,
+        weekly: 0.0,
+    };
+    if above(seat, leave, None) {
+        return Relocation::Stay;
+    }
+    let landing = choose_above(others, land, None).or_else(|| {
+        (!above(seat, ANY_ROOM, None))
+            .then(|| choose_above(others, ANY_ROOM, None))
+            .flatten()
+    });
+    landing.map_or(Relocation::Drain, Relocation::Move)
 }
 
 /// The better landing first.
@@ -1026,6 +1078,84 @@ mod tests {
             names(&rank_above(&expiring, NO_FLOOR, None)),
             ["both", "weekly-only", "daily-tight"]
         );
+    }
+
+    #[test]
+    fn a_seat_leaves_at_its_floor_for_real_room_and_a_spent_one_for_any() {
+        use crate::quota::{CodexDetail, Detail, Limit, Scope, Span};
+        let codex = |name: &str, session_used: f64, weekly_used: f64| Reading {
+            limits: vec![
+                Limit::new(
+                    Span::FiveHour,
+                    Scope::All,
+                    Window::new(session_used, 0),
+                    Source::Poll,
+                ),
+                Limit::new(
+                    Span::Weekly,
+                    Scope::All,
+                    Window::new(weekly_used, 0),
+                    Source::Poll,
+                ),
+            ],
+            detail: Detail::Codex(CodexDetail {
+                allowed: Some(true),
+                ..CodexDetail::default()
+            }),
+            ..Reading::empty(Service::Codex, name, 0)
+        };
+        let leave = Floors {
+            session: 0.20,
+            weekly: 0.20,
+        };
+        let land = Floors {
+            session: 0.30,
+            weekly: 0.30,
+        };
+        let to = |seat: &Reading, others: &[Reading]| match relocate(seat, others, leave, land) {
+            Relocation::Stay => "stay".to_owned(),
+            Relocation::Drain => "drain".to_owned(),
+            Relocation::Move(to) => to.account.clone(),
+        };
+        let roomy = codex("roomy", 0.1, 0.1);
+        let scraps = codex("scraps", 0.75, 0.2);
+        // Above both floors: nothing moves, however roomy the rest.
+        assert_eq!(
+            to(&codex("seat", 0.5, 0.79), std::slice::from_ref(&roomy)),
+            "stay"
+        );
+        // Either window at its floor leaves, for the account with landing room.
+        assert_eq!(
+            to(&codex("seat", 0.81, 0.1), &[scraps.clone(), roomy.clone()]),
+            "roomy"
+        );
+        assert_eq!(
+            to(&codex("seat", 0.1, 0.80), std::slice::from_ref(&roomy)),
+            "roomy"
+        );
+        // 25% left is over the leaving floor and under the landing floor: a
+        // low seat drains in place rather than land there.
+        assert_eq!(
+            to(&codex("seat", 0.85, 0.1), std::slice::from_ref(&scraps)),
+            "drain"
+        );
+        // A spent seat takes any room at all; nothing with room is a drain.
+        assert_eq!(
+            to(&codex("seat", 1.0, 0.1), std::slice::from_ref(&scraps)),
+            "scraps"
+        );
+        assert_eq!(
+            to(&codex("seat", 1.0, 0.1), &[codex("spent", 0.2, 1.0)]),
+            "drain"
+        );
+        // A seat the backend refuses is spent whatever its windows say.
+        let mut refused = codex("seat", 0.1, 0.1);
+        refused.detail = Detail::Codex(CodexDetail {
+            allowed: Some(false),
+            ..CodexDetail::default()
+        });
+        assert_eq!(to(&refused, std::slice::from_ref(&scraps)), "scraps");
+        assert_eq!(to(&refused, &[]), "drain");
     }
 
     #[test]

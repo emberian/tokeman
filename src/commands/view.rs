@@ -385,13 +385,30 @@ pub async fn notify_test() -> Delivery {
     .await
 }
 
-/// The launch settings, as `key = value` pairs.
+/// The launch settings and the Codex mover's, as `key = value` pairs.
 pub fn settings() -> Result<Vec<(&'static str, String)>> {
-    Ok(Fleet::load()?.launch.entries().to_vec())
+    let fleet = Fleet::load()?;
+    let mut entries = fleet.launch.entries().to_vec();
+    entries.extend(fleet.policy.entries());
+    Ok(entries)
 }
 
 pub fn set_setting(key: &str, value: &str) -> Result<()> {
-    Fleet::update(|fleet| fleet.launch.set(key, value))?;
+    use crate::settings::{LaunchSettings, PolicySettings};
+    if !LaunchSettings::KEYS.contains(&key) && !PolicySettings::KEYS.contains(&key) {
+        let known: Vec<&str> = LaunchSettings::KEYS
+            .into_iter()
+            .chain(PolicySettings::KEYS)
+            .collect();
+        bail!("unknown setting {key:?}; one of {}", known.join(", "));
+    }
+    Fleet::update(|fleet| {
+        if PolicySettings::KEYS.contains(&key) {
+            fleet.policy.set(key, value)
+        } else {
+            fleet.launch.set(key, value)
+        }
+    })?;
     Ok(())
 }
 

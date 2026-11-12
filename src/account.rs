@@ -567,9 +567,20 @@ impl Fleet {
             ("sip_min_7d_remaining", policy.sip_min_7d_remaining),
             ("land_min_5h_remaining", policy.land_min_5h_remaining),
             ("land_min_7d_remaining", policy.land_min_7d_remaining),
+            ("codex_min_5h_remaining", policy.codex_min_5h_remaining),
+            ("codex_min_7d_remaining", policy.codex_min_7d_remaining),
+            (
+                "codex_land_min_5h_remaining",
+                policy.codex_land_min_5h_remaining,
+            ),
+            (
+                "codex_land_min_7d_remaining",
+                policy.codex_land_min_7d_remaining,
+            ),
         ] {
             set(rotation, key, value(number));
         }
+        set(rotation, "codex_auto_move", value(policy.codex_auto_move));
         set(
             rotation,
             "normal_probe_interval_secs",
