@@ -452,6 +452,9 @@ mod tests {
         );
         let nameless = state_item(&[("userStatusSentinelKey", bytes_field(3, b"Some Name"))]);
         assert_eq!(vscdb::user_email(&nameless), None);
+        // Field 7 holding something that is not an address names nobody.
+        let odd = state_item(&[("userStatusSentinelKey", bytes_field(7, b"signed-out"))]);
+        assert_eq!(vscdb::user_email(&odd), None);
     }
 
     #[test]
@@ -481,6 +484,11 @@ mod tests {
             assert_eq!(account.expires_at, Some(1_794_431_222_251));
         }
         assert_eq!(parse_cli_grant(r#"{"token":{}}"#).unwrap(), None);
+        // A grant that names no account is refused, not kept under no name.
+        let error = parse_cli_grant(r#"{"token":{"refresh_token":"1//r"},"id_token_email":""}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("names no account"), "{error}");
         assert!(parse_cli_grant("go-keyring-base64:%%%").is_err());
     }
 }

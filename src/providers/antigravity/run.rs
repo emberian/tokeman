@@ -546,8 +546,11 @@ mod tests {
         // What agy writes after a refresh of the same grant.
         let refreshed = r#"{"token":{"access_token":"ya29.agy","token_type":"Bearer","refresh_token":"1//b","expiry":"2026-11-11T18:00:00-08:00","expires_in":3599},"auth_method":"consumer","id_token_email":"b@example.com"}"#;
         std::fs::write(&token, refreshed).unwrap();
-        // Entries agy and its tools made in the home are theirs.
+        // Entries agy and its tools made in the home are theirs, a link
+        // that leads nowhere included.
         std::fs::write(home.join(".zsh_history"), "ls").unwrap();
+        let elsewhere = f.dir.path().join("gone-tool-cache");
+        std::os::unix::fs::symlink(&elsewhere, home.join(".tool-cache")).unwrap();
         std::fs::remove_file(home.join(".gemini/antigravity-cli/settings.json")).unwrap();
         std::fs::write(
             home.join(".gemini/antigravity-cli/settings.json"),
@@ -573,6 +576,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.join(".zsh_history")).unwrap(),
             "ls"
+        );
+        assert_eq!(
+            std::fs::read_link(home.join(".tool-cache")).unwrap(),
+            elsewhere
         );
         assert_eq!(
             std::fs::read_to_string(home.join(".gemini/antigravity-cli/settings.json")).unwrap(),
