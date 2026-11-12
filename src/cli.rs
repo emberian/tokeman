@@ -105,7 +105,7 @@ pub enum Command {
         /// The limit to draw: a window by length (5h, weekly, monthly,
         /// daily), `overage`, or a limit by its model or group (fable,
         /// "Opus 4.8", gemini, "gemini 5h", spark). Default: the service's
-        /// first account-wide window
+        /// shortest account-wide window
         #[arg(long)]
         metric: Option<String>,
         /// Also save the PNG here

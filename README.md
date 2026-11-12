@@ -107,7 +107,7 @@ readings of one reset window there is no forecast, and `tokeman stats` says so.
 `chart --metric` names the limit to draw: a window by length (`5h`, `weekly`,
 `monthly`, `daily`), `overage`, or a limit by its model, group or label
 (`fable`, `"Opus 4.8"`, `gemini`, `"gemini 5h"`, `spark`); without it the
-service's first account-wide window is drawn. The PNG is saved under
+service's shortest account-wide window is drawn. The PNG is saved under
 `~/.cache/tokeman/chart.png` unless `--output` says otherwise. A value that
 did not change between reads is drawn as a step.
 

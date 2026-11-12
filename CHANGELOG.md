@@ -200,7 +200,7 @@ rewrites the plist, launcher and hook for the new binary.
 - `tokeman history`, `stats` and `chart` take `--service`. `chart --metric`
   names a window by length (`5h`, `weekly`, `monthly`, `daily`), `overage`,
   or a limit by its model, group or label (`fable`, `"Opus 4.8"`, `gemini`,
-  `"gemini 5h"`, `spark`); without it the service's first account-wide
+  `"gemini 5h"`, `spark`); without it the service's shortest account-wide
   window is drawn.
 - Removed spellings and what to run instead (the `services` ones were only
   in unreleased builds):
