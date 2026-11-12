@@ -125,6 +125,13 @@ pub fn agy_seat_lock() -> PathBuf {
     config_dir().join("agy-seat.lock")
 }
 
+/// `tokeman agy run`'s per-account homes (0700), one directory per account:
+/// that account's agy token file, conversations and logs, and links into the
+/// real home. Written only by `providers::antigravity::run`.
+pub fn agy_homes() -> PathBuf {
+    data_dir().join("agy-homes")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }
