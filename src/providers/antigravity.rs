@@ -24,10 +24,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{Meter, Service, ServiceAccount, Usage};
+use super::{ServiceAccount, failed, limit};
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::paths;
 use crate::quota::Window;
+use crate::quota::{Limit, Reading, Service};
 
 const API: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub(super) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -70,8 +71,8 @@ impl Endpoints {
 }
 
 /// One poll of one Antigravity account. Never fails: an error becomes
-/// [`Usage::error`].
-pub async fn read(client: &Client, account: &ServiceAccount, now: i64) -> Usage {
+/// the reading's `error`.
+pub async fn read(client: &Client, account: &ServiceAccount, now: i64) -> Reading {
     read_with(client, &Endpoints::live(), account, now).await
 }
 
@@ -80,10 +81,10 @@ async fn read_with(
     endpoints: &Endpoints,
     account: &ServiceAccount,
     now: i64,
-) -> Usage {
+) -> Reading {
     match poll(client, endpoints, account, now).await {
         Ok(usage) => usage,
-        Err(error) => Usage::failed(
+        Err(error) => failed(
             Service::Antigravity,
             &account.name,
             now,
@@ -97,7 +98,7 @@ async fn poll(
     endpoints: &Endpoints,
     account: &ServiceAccount,
     now: i64,
-) -> Result<Usage> {
+) -> Result<Reading> {
     let now_ms = now * 1000;
     let mut session = Session::start(client, endpoints, account, now_ms).await?;
 
@@ -113,14 +114,10 @@ async fn poll(
             &serde_json::json!({ "project": project }),
         )
         .await?;
-    Ok(Usage {
-        service: Service::Antigravity,
-        account: account.name.clone(),
-        at: now,
+    Ok(Reading {
         plan,
-        meters: meters(&summary, now)?,
-        balances: Vec::new(),
-        error: None,
+        limits: meters(&summary, now)?,
+        ..Reading::empty(Service::Antigravity, &account.name, now)
     })
 }
 
@@ -200,9 +197,9 @@ struct Bucket {
     reset_time: Option<String>,
 }
 
-/// Meters from a `retrieveUserQuotaSummary` answer (bare, or wrapped in
+/// Limits from a `retrieveUserQuotaSummary` answer (bare, or wrapped in
 /// `response`).
-fn meters(value: &Value, now: i64) -> Result<Vec<Meter>> {
+fn meters(value: &Value, now: i64) -> Result<Vec<Limit>> {
     let body = value.get("response").unwrap_or(value);
     let summary: Summary =
         serde_json::from_value(body.clone()).context("unexpected quota summary shape")?;
@@ -223,7 +220,7 @@ fn meters(value: &Value, now: i64) -> Result<Vec<Meter>> {
     Ok(meters)
 }
 
-fn meter(group: Option<String>, bucket: Bucket, now: i64) -> Option<Meter> {
+fn meter(group: Option<String>, bucket: Bucket, now: i64) -> Option<Limit> {
     let label = bucket.window.clone().or(bucket.bucket_id.clone())?;
     let span_secs = match bucket.window.as_deref() {
         Some("5h") => Some(FIVE_HOURS),
@@ -247,13 +244,13 @@ fn meter(group: Option<String>, bucket: Bucket, now: i64) -> Option<Meter> {
     };
     let idle = remaining >= 1.0 && floating;
     let resets_at = if idle { 0 } else { reset.unwrap_or(0) };
-    Some(Meter {
+    Some(limit(
         group,
         label,
-        window: Window::new(1.0 - remaining, resets_at),
         span_secs,
-        amount: None,
-    })
+        Window::new(1.0 - remaining, resets_at),
+        None,
+    ))
 }
 
 fn amount_is_zero(amount: &Value) -> bool {
@@ -872,7 +869,7 @@ mod tests {
         let meters = meters(&live_summary(), NOW).unwrap();
         let view: Vec<_> = meters
             .iter()
-            .map(|m| (m.group.as_deref().unwrap(), m.label.as_str(), m.span_secs))
+            .map(|m| (m.group().unwrap(), m.label.as_str(), m.span.seconds()))
             .collect();
         assert_eq!(
             view,
@@ -909,7 +906,7 @@ mod tests {
         assert!(
             meters
                 .iter()
-                .all(|m| m.group.as_deref() == Some("Claude and GPT models"))
+                .all(|m| m.group() == Some("Claude and GPT models"))
         );
     }
 
@@ -1105,7 +1102,7 @@ mod tests {
 
         assert_eq!(usage.error, None);
         assert_eq!(usage.plan.as_deref(), Some("g1-ultra-tier"));
-        assert_eq!(usage.meters.len(), 4);
+        assert_eq!(usage.limits.len(), 4);
         {
             let seen = fake.seen.lock().unwrap();
             let form = &seen.refreshes[0];
@@ -1179,8 +1176,8 @@ mod tests {
         fake.token_status = StatusCode::BAD_REQUEST;
         let (endpoints, _dir) = serve(fake.clone()).await;
         let usage = read_with(&Client::new(), &endpoints, &grant("c@example.com"), NOW).await;
-        assert!(usage.meters.is_empty());
-        let error = usage.error.unwrap();
+        assert!(usage.limits.is_empty());
+        let error = usage.error.unwrap().to_string();
         assert!(error.contains("sign in again"), "{error}");
         assert!(!error.contains("1//refresh"));
         assert!(fake.seen.lock().unwrap().bearers.is_empty());
@@ -1193,7 +1190,13 @@ mod tests {
         let mut account = grant("d@example.com");
         account.refresh_token = None;
         let usage = read_with(&Client::new(), &endpoints, &account, NOW).await;
-        assert!(usage.error.unwrap().contains("no refresh token"));
+        assert!(
+            usage
+                .error
+                .unwrap()
+                .to_string()
+                .contains("no refresh token")
+        );
         assert!(fake.seen.lock().unwrap().refreshes.is_empty());
     }
 
@@ -1216,10 +1219,10 @@ mod tests {
                 "{} plan={:?} error={:?}",
                 usage.account, usage.plan, usage.error
             );
-            for meter in &usage.meters {
+            for meter in &usage.limits {
                 println!(
                     "  {:<24} {:<7} used={:.4} resets_at={}",
-                    meter.group.as_deref().unwrap_or("-"),
+                    meter.group().unwrap_or("-"),
                     meter.label,
                     meter.window.used,
                     meter.window.resets_at

@@ -464,20 +464,20 @@ impl TrayApp {
                 return;
             };
             if let Some(error) = &usage.error {
-                Self::caption(ui, truncate_chars(error, 120), WARN);
+                Self::caption(ui, truncate_chars(&error.to_string(), 120), WARN);
             }
             let width = usage
-                .meters
+                .limits
                 .iter()
-                .map(|meter| meter.label.chars().count())
+                .map(|meter| meter.name().chars().count())
                 .max()
                 .unwrap_or(3);
             let mut group = None;
-            for meter in &usage.meters {
+            for meter in &usage.limits {
                 // A service's groups (Antigravity's model families) head their gauges.
-                if meter.group != group {
-                    group = meter.group.clone();
-                    if let Some(name) = &group {
+                if meter.group() != group {
+                    group = meter.group();
+                    if let Some(name) = group {
                         Self::caption(ui, name, egui::Color32::from_gray(170));
                     }
                 }
@@ -485,7 +485,7 @@ impl TrayApp {
                     .amount
                     .as_ref()
                     .map(|a| format!("{:.0}/{:.0} {}", a.used, a.limit, a.unit));
-                Self::draw_gauge_noted(ui, &meter.label, width, meter.window, amount.as_deref());
+                Self::draw_gauge_noted(ui, &meter.name(), width, meter.window, amount.as_deref());
             }
             for balance in &usage.balances {
                 let left = format_money(balance.left_minor, &balance.currency);

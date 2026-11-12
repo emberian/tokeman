@@ -173,7 +173,7 @@ pub enum ServicesAction {
     /// Read a service's accounts now and rank them by room left
     Best {
         #[arg(value_enum)]
-        service: crate::providers::Service,
+        service: crate::quota::Service,
         /// Count only the limits whose group contains this text, e.g. "claude"
         #[arg(long)]
         group: Option<String>,
@@ -188,10 +188,10 @@ pub enum KeyService {
 }
 
 impl KeyService {
-    pub fn service(self) -> crate::providers::Service {
+    pub fn service(self) -> crate::quota::Service {
         match self {
-            Self::Zai => crate::providers::Service::Zai,
-            Self::Kimi => crate::providers::Service::Kimi,
+            Self::Zai => crate::quota::Service::Zai,
+            Self::Kimi => crate::quota::Service::Kimi,
         }
     }
 }

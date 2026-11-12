@@ -11,7 +11,7 @@ use crate::anthropic::resets;
 use crate::claude::settings as claude_settings;
 use crate::codex::probe::{self as codex_probe, State};
 use crate::daemon::{lock, service};
-use crate::providers::{ServiceAccount, Usage};
+use crate::providers::ServiceAccount;
 use crate::quota::{Limit, Reading, ResetCreditCount, Service, SessionLimit, Source, Window};
 use crate::store::{Series, Store};
 use crate::ui::text;
@@ -137,15 +137,14 @@ pub struct ServiceView {
     pub service_label: &'static str,
     /// The read on one line, as `tokeman list` words it.
     pub summary: Option<String>,
-    pub usage: Option<Usage>,
+    pub usage: Option<Reading>,
 }
 
 /// What the stores hold, gathered before the view is built.
 #[derive(Debug, Clone, Default)]
 pub struct Stored {
-    /// The newest reading of each Claude and Codex account.
+    /// The newest reading of each account of each service.
     pub readings: Vec<Reading>,
-    pub usages: Vec<Usage>,
     /// Per account: when its reset offers were read, and the usable ones.
     pub offers: Vec<(String, i64, Vec<String>)>,
     pub default_account: Option<String>,
@@ -169,10 +168,6 @@ impl Stored {
             readings: store
                 .as_ref()
                 .and_then(|store| store.latest().ok())
-                .unwrap_or_default(),
-            usages: store
-                .as_ref()
-                .and_then(|store| store.latest_usage().ok())
                 .unwrap_or_default(),
             offers: fleet
                 .accounts
@@ -245,12 +240,7 @@ impl Overview {
                 .services
                 .iter()
                 .map(|account| {
-                    service_view(
-                        account,
-                        stored.usages.iter().find(|usage| {
-                            usage.service == account.service && usage.account == account.name
-                        }),
-                    )
+                    service_view(account, stored.reading(account.service, &account.name))
                 })
                 .collect(),
             default_account: stored.default_account,
@@ -374,7 +364,7 @@ fn codex_view(account: &CodexAccount, probe: Option<&Reading>) -> CodexView {
     }
 }
 
-fn service_view(account: &ServiceAccount, usage: Option<&Usage>) -> ServiceView {
+fn service_view(account: &ServiceAccount, usage: Option<&Reading>) -> ServiceView {
     ServiceView {
         name: account.name.clone(),
         service: account.service,
@@ -387,7 +377,6 @@ fn service_view(account: &ServiceAccount, usage: Option<&Usage>) -> ServiceView 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::Meter;
     use crate::quota::Span;
     use crate::testing::{codex_account, login_account, setup_account};
 
@@ -532,25 +521,21 @@ mod tests {
 
     #[test]
     fn services_and_reset_offers_come_from_what_was_stored() {
-        let usage = Usage {
-            service: Service::Kimi,
-            account: "kimi".into(),
-            at: NOW - 120,
+        let usage = Reading {
             plan: Some("Vivace".into()),
-            meters: vec![Meter {
-                group: None,
-                label: "weekly".into(),
-                window: Window::new(0.21, 0),
-                span_secs: None,
-                amount: None,
-            }],
-            balances: Vec::new(),
-            error: None,
+            limits: vec![crate::providers::limit(
+                None,
+                "weekly",
+                Some(Span::WEEK_SECS),
+                Window::new(0.21, 0),
+                None,
+            )],
+            ..Reading::empty(Service::Kimi, "kimi", NOW - 120)
         };
         let stored = Stored {
             // A read of another service under the same name is not this account's.
-            usages: vec![
-                Usage::failed(Service::Zai, "kimi", NOW, "wrong service"),
+            readings: vec![
+                crate::providers::failed(Service::Zai, "kimi", NOW, "wrong service"),
                 usage.clone(),
             ],
             offers: vec![

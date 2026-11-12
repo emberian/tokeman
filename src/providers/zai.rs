@@ -10,8 +10,8 @@
 
 use serde::Deserialize;
 
-use super::{Amount, Meter, Service, ServiceAccount, Usage, span_label};
-use crate::quota::Window;
+use super::{ServiceAccount, failed};
+use crate::quota::{Amount, Limit, Reading, Service, Span, Window};
 
 pub const BASE: &str = "https://api.z.ai";
 const QUOTA_PATH: &str = "/api/monitor/usage/quota/limit";
@@ -22,7 +22,7 @@ const DAY: i64 = 24 * HOUR;
 /// What a `TIME_LIMIT` entry's `unit: 5, number: 1` marker means.
 const MONTH: i64 = 30 * DAY;
 
-pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Usage {
+pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Reading {
     read_from(client, BASE, account, now).await
 }
 
@@ -31,8 +31,8 @@ pub(crate) async fn read_from(
     base: &str,
     account: &ServiceAccount,
     now: i64,
-) -> Usage {
-    let failed = |error: String| Usage::failed(Service::Zai, &account.name, now, error);
+) -> Reading {
+    let failed = |error: String| failed(Service::Zai, &account.name, now, error);
     let key = match account.api_key() {
         Ok(key) => key,
         Err(error) => return failed(format!("{error:#}")),
@@ -60,14 +60,10 @@ pub(crate) async fn read_from(
         ));
     }
     match parse(&body, now) {
-        Ok((plan, meters)) => Usage {
-            service: Service::Zai,
-            account: account.name.clone(),
-            at: now,
+        Ok((plan, limits)) => Reading {
             plan,
-            meters,
-            balances: Vec::new(),
-            error: None,
+            limits,
+            ..Reading::empty(Service::Zai, &account.name, now)
         },
         Err(error) => failed(error),
     }
@@ -88,7 +84,7 @@ struct Envelope {
 #[derive(Deserialize)]
 struct Quota {
     #[serde(default)]
-    limits: Vec<Limit>,
+    limits: Vec<RawLimit>,
     #[serde(default)]
     level: Option<String>,
 }
@@ -109,7 +105,7 @@ enum Kind {
 }
 
 #[derive(Deserialize)]
-struct Limit {
+struct RawLimit {
     #[serde(rename = "type")]
     kind: Kind,
     #[serde(default)]
@@ -131,7 +127,7 @@ struct Limit {
     next_reset_ms: Option<i64>,
 }
 
-impl Limit {
+impl RawLimit {
     fn span_secs(&self) -> Option<i64> {
         let number = self.number.filter(|&n| n > 0)?;
         if self.kind == Kind::Time && self.unit == Some(5) && number == 1 {
@@ -147,7 +143,7 @@ impl Limit {
         Some(number * unit)
     }
 
-    fn meter(&self, now: i64) -> Option<Meter> {
+    fn meter(&self, now: i64) -> Option<Limit> {
         let span_secs = self.span_secs();
         let limit = self.usage.filter(|&limit| limit > 0.0);
         let used_amount = limit.and_then(|limit| {
@@ -170,22 +166,22 @@ impl Limit {
             Kind::Time => (Some("MCP tools".to_owned()), "calls"),
             Kind::Other => return None,
         };
-        Some(Meter {
+        Some(super::limit(
             group,
-            label: span_secs.map_or_else(|| "window".into(), span_label),
-            window: Window::new(used, resets_at),
+            Span::from_seconds(span_secs).label(),
             span_secs,
-            amount: used_amount.zip(limit).map(|(used, limit)| Amount {
+            Window::new(used, resets_at),
+            used_amount.zip(limit).map(|(used, limit)| Amount {
                 used,
                 limit,
                 unit: unit.into(),
             }),
-        })
+        ))
     }
 }
 
 /// The plan level and one meter per known limit, shortest window first.
-fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Meter>), String> {
+fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Limit>), String> {
     let envelope: Envelope = serde_json::from_str(body)
         .map_err(|error| format!("unreadable answer ({error}): {}", super::snippet(body)))?;
     if !envelope.success || envelope.code != Some(200) {
@@ -198,7 +194,7 @@ fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Meter>), String> {
         ));
     }
     let quota = envelope.data.ok_or("the answer has no data")?;
-    let mut meters: Vec<Meter> = quota
+    let mut meters: Vec<Limit> = quota
         .limits
         .iter()
         .filter_map(|limit| limit.meter(now))
@@ -206,7 +202,12 @@ fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Meter>), String> {
     if meters.is_empty() {
         return Err("the answer lists no limits tokeman knows".into());
     }
-    meters.sort_by_key(|meter| (meter.group.is_some(), meter.span_secs.unwrap_or(i64::MAX)));
+    meters.sort_by_key(|meter| {
+        (
+            meter.group().is_some(),
+            meter.span.seconds().unwrap_or(i64::MAX),
+        )
+    });
     Ok((quota.level.filter(|level| !level.is_empty()), meters))
 }
 
@@ -236,7 +237,9 @@ mod tests {
         assert_eq!(meters.len(), 2);
         let session = &meters[0];
         assert_eq!(session.label, "5h");
-        assert_eq!(session.span_secs, Some(5 * HOUR));
+        assert_eq!(session.span, Span::FiveHour);
+        assert_eq!(session.scope, crate::quota::Scope::All);
+        assert_eq!(session.source, crate::quota::Source::Poll);
         // 177 of 28000, not the rounded-up `percentage: 1`.
         assert!((session.window.used - 177.0 / 28000.0).abs() < 1e-12);
         assert_eq!(session.window.resets_at, 1_794_429_533);
@@ -278,10 +281,11 @@ mod tests {
         assert_eq!(plan, None);
         assert_eq!(meters.len(), 2, "an unknown limit type is skipped");
         assert_eq!(meters[0].label, "5h");
-        assert_eq!(meters[0].group, None);
+        assert_eq!(meters[0].group(), None);
         assert!((meters[0].window.used - 0.40).abs() < 1e-12);
         assert_eq!(meters[0].amount, None);
-        assert_eq!(meters[1].group.as_deref(), Some("MCP tools"));
+        assert_eq!(meters[1].group(), Some("MCP tools"));
+        assert_eq!(meters[1].span, Span::Monthly);
         assert_eq!(meters[1].label, "monthly");
         assert_eq!(meters[1].window, Window::new(0.25, 1_796_000_000));
         assert_eq!(meters[1].amount.as_ref().unwrap().unit, "calls");
@@ -318,21 +322,27 @@ mod tests {
         assert_eq!(usage.account, "glm");
         assert_eq!(usage.at, NOW);
         assert_eq!(usage.plan.as_deref(), Some("max"));
-        assert_eq!(usage.meters.len(), 2);
+        assert_eq!(usage.limits.len(), 2);
 
         let wrong = ServiceAccount {
             key: Some("other".into()),
             ..account()
         };
         let usage = read_from(&client, &base, &wrong, NOW).await;
-        assert!(usage.meters.is_empty());
-        assert!(usage.error.unwrap().contains("code 1001"));
+        assert!(usage.limits.is_empty());
+        assert!(usage.error.unwrap().to_string().contains("code 1001"));
     }
 
     #[tokio::test]
     async fn a_missing_key_file_fails_without_a_request() {
         let missing = ServiceAccount::with_key_file(Service::Zai, "glm", "/nonexistent/zai-key");
         let usage = read_from(&reqwest::Client::new(), "http://127.0.0.1:9", &missing, NOW).await;
-        assert!(usage.error.unwrap().contains("/nonexistent/zai-key"));
+        assert!(
+            usage
+                .error
+                .unwrap()
+                .to_string()
+                .contains("/nonexistent/zai-key")
+        );
     }
 }

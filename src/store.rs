@@ -18,7 +18,6 @@ use serde::Serialize;
 use std::time::Duration;
 
 use crate::paths;
-use crate::providers::Usage;
 use crate::quota::{ModelKey, Reading, Service, Window};
 
 pub struct Store {
@@ -109,16 +108,7 @@ impl Store {
                 reading TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_readings_account_time
-                ON readings(service, account, at);
-            CREATE TABLE IF NOT EXISTS service_readings (
-                id INTEGER PRIMARY KEY,
-                service TEXT NOT NULL,
-                account TEXT NOT NULL,
-                at INTEGER NOT NULL,
-                usage TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_service_readings_account_time
-                ON service_readings(service, account, at);",
+                ON readings(service, account, at);",
         )?;
         Ok(())
     }
@@ -143,7 +133,7 @@ impl Store {
             "WHERE id IN (SELECT MAX(id) FROM readings GROUP BY service, account)",
             [],
         )?;
-        for service in [Service::Claude, Service::Codex] {
+        for service in Service::ALL {
             for reading in legacy::read(&self.conn, service, Rows::Latest)? {
                 let newer = latest
                     .iter()
@@ -218,65 +208,6 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT reading FROM readings {tail}"))?;
-        let rows = stmt
-            .query_map(params, |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .iter()
-            .filter_map(|json| serde_json::from_str(json).ok())
-            .collect())
-    }
-
-    pub fn insert_usage(&self, usage: &Usage) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO service_readings (service, account, at, usage) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                usage.service.name(),
-                usage.account,
-                usage.at,
-                serde_json::to_string(usage)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The newest reads, newest first, optionally of one service account.
-    pub fn recent_usage(
-        &self,
-        account: Option<(Service, &str)>,
-        limit: usize,
-    ) -> Result<Vec<Usage>> {
-        let limit = limit as i64;
-        match account {
-            Some((service, name)) => self.query_usage(
-                "WHERE service = ?1 AND account = ?2 ORDER BY at DESC, id DESC LIMIT ?3",
-                params![service.name(), name, limit],
-            ),
-            None => self.query_usage("ORDER BY at DESC, id DESC LIMIT ?1", params![limit]),
-        }
-    }
-
-    /// The newest read of each service account, in no particular order.
-    pub fn latest_usage(&self) -> Result<Vec<Usage>> {
-        self.query_usage(
-            "WHERE id IN (SELECT MAX(id) FROM service_readings GROUP BY service, account)",
-            [],
-        )
-    }
-
-    /// One service account's reads since `since` (epoch seconds), oldest first.
-    pub fn usage_since(&self, service: Service, account: &str, since: i64) -> Result<Vec<Usage>> {
-        self.query_usage(
-            "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
-            params![service.name(), account, since],
-        )
-    }
-
-    /// Rows that no longer parse (a field this build does not know) are skipped.
-    fn query_usage(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Usage>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT usage FROM service_readings {tail}"))?;
         let rows = stmt
             .query_map(params, |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -598,45 +529,39 @@ mod tests {
         assert_eq!(rows[0].at, 1_767_225_600);
     }
 
-    fn usage(service: Service, account: &str, at: i64, used: f64) -> Usage {
-        Usage {
-            service,
-            account: account.into(),
-            at,
+    fn usage(service: Service, account: &str, at: i64, used: f64) -> Reading {
+        Reading {
             plan: Some("max".into()),
-            meters: vec![crate::providers::Meter {
-                group: None,
-                label: "5h".into(),
-                window: Window::new(used, at + 3600),
-                span_secs: Some(18_000),
-                amount: None,
-            }],
-            balances: Vec::new(),
-            error: None,
+            limits: vec![crate::providers::limit(
+                None,
+                "5h",
+                Some(18_000),
+                Window::new(used, at + 3600),
+                None,
+            )],
+            ..Reading::empty(service, account, at)
         }
     }
 
     #[test]
-    fn service_reads_round_trip_and_the_latest_is_per_account() {
+    fn every_service_shares_the_table_and_the_latest_is_per_account() {
         let (_dir, store) = open();
-        store
-            .insert_usage(&usage(Service::Zai, "glm", 100, 0.1))
-            .unwrap();
-        store
-            .insert_usage(&usage(Service::Zai, "glm", 200, 0.2))
-            .unwrap();
-        store
-            .insert_usage(&usage(Service::Kimi, "glm", 150, 0.5))
-            .unwrap();
-        store
-            .insert_usage(&Usage::failed(Service::Kimi, "kimi", 300, "HTTP 401"))
-            .unwrap();
-        let glm = store.usage_since(Service::Zai, "glm", 150).unwrap();
+        let failed = crate::providers::failed(Service::Kimi, "kimi", 300, "HTTP 401");
+        for reading in [
+            usage(Service::Zai, "glm", 100, 0.1),
+            usage(Service::Zai, "glm", 200, 0.2),
+            usage(Service::Kimi, "glm", 150, 0.5),
+            failed.clone(),
+            reading(),
+        ] {
+            store.insert(&reading).unwrap();
+        }
+        let glm = store.since(Service::Zai, Some("glm"), 150).unwrap();
         assert_eq!(glm, [usage(Service::Zai, "glm", 200, 0.2)]);
-        let recent = store.recent_usage(Some((Service::Zai, "glm")), 5).unwrap();
+        let recent = store.recent(Service::Zai, Some("glm"), 5).unwrap();
         assert_eq!(recent.iter().map(|u| u.at).collect::<Vec<_>>(), [200, 100]);
         let mut latest: Vec<_> = store
-            .latest_usage()
+            .latest()
             .unwrap()
             .into_iter()
             .map(|u| (u.service, u.account, u.at))
@@ -645,14 +570,160 @@ mod tests {
         assert_eq!(
             latest,
             [
+                (Service::Claude, "acct".to_owned(), 1_700_000_000),
                 (Service::Zai, "glm".to_owned(), 200),
                 (Service::Kimi, "glm".to_owned(), 150),
                 (Service::Kimi, "kimi".to_owned(), 300)
             ]
         );
+        assert_eq!(store.recent(Service::Kimi, None, 1).unwrap(), [failed]);
+        assert_eq!(store.since(Service::Kimi, None, 0).unwrap().len(), 2);
+    }
+
+    /// `service_readings` and `codex_readings` as 0.3.x created them, with
+    /// rows in the shapes 0.3.x wrote (the service rows are today's, with
+    /// the account names changed).
+    const OLD_DOCUMENTS: &str = r#"
+        CREATE TABLE service_readings (id INTEGER PRIMARY KEY, service TEXT NOT NULL,
+            account TEXT NOT NULL, at INTEGER NOT NULL, usage TEXT NOT NULL);
+        CREATE INDEX idx_service_readings_account_time ON service_readings(service, account, at);
+        CREATE TABLE codex_readings (id INTEGER PRIMARY KEY, account TEXT NOT NULL,
+            at INTEGER NOT NULL, probe TEXT NOT NULL);
+        INSERT INTO service_readings (service, account, at, usage) VALUES
+        ('zai', 'glm', 100, '{"service":"zai","account":"glm","at":100,"plan":"max","meters":[{"label":"5h","window":{"utilization":0.005,"reset":1794448052},"span_secs":18000,"amount":{"used":159.0,"limit":28000.0,"unit":"credits"}},{"label":"weekly","window":{"utilization":0.01435,"reset":1794879119},"span_secs":604800,"amount":{"used":2009.0,"limit":140000.0,"unit":"credits"}},{"group":"MCP tools","label":"monthly","window":{"utilization":0.25,"reset":0},"span_secs":2592000}]}'),
+        ('kimi', 'kimi', 110, '{"service":"kimi","account":"kimi","at":110,"plan":"Vivace","meters":[{"label":"5h","window":{"utilization":0.0093,"reset":1794458418},"span_secs":18000},{"label":"monthly (Kimi Code share)","window":{"utilization":0.2258,"reset":1794519618}}],"balances":[{"label":"extra usage","left_minor":2196,"total_minor":5000,"currency":"USD"}]}'),
+        ('antigravity', 'a@example.com', 120, '{"service":"antigravity","account":"a@example.com","at":120,"plan":"g1-ultra-tier","meters":[{"group":"Gemini Models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800},{"group":"Gemini Models","label":"5h","window":{"utilization":0.1,"reset":0},"span_secs":18000},{"group":"Claude and GPT models","label":"weekly","window":{"utilization":0.0,"reset":0},"span_secs":604800}]}'),
+        ('antigravity', 'a@example.com', 130, '{"service":"antigravity","account":"a@example.com","at":130,"meters":[],"error":"sign in again: the grant was revoked"}'),
+        ('kimi', 'kimi', 140, '{"service":"a service this build does not know","account":"kimi","at":140}');
+        INSERT INTO codex_readings (account, at, probe) VALUES
+        ('work', 200, '{"account":"work","codex_home":"/homes/work","at":200,"usage":{"user_id":"u1","account_id":"acct-1","email":"w@example.com","plan":"plus","limit":{"allowed":true,"limit_reached":false,"windows":[{"span":"weekly","utilization":0.42,"reset":1794607293},{"span":"five_hour","utilization":0.1,"reset":4600},{"span":{"seconds":86400},"utilization":0.5,"reset":99}]},"credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":null,"balance":"0"},"limit_reason":null,"extra":[{"name":"codex_spark","feature":"gpt-5.3-codex-spark","model":null,"limit":{"allowed":false,"limit_reached":true,"windows":[{"span":"unknown","utilization":1.0,"reset":100}]}}],"models":[{"slug":"gpt-6-astra","available":true,"available_at":null,"credits_would_enable":false}],"spend_control":{"reached":false,"limit":null},"reset_credits":{"available":2,"applicable":0}},"error":null,"last_refresh":"2026-11-10T00:00:00Z","email_hint":"hint@example.com"}'),
+        ('work', 210, '{"account":"work","codex_home":"/homes/work","at":210,"usage":null,"error":{"kind":"challenged","status":403,"attempts":4},"last_refresh":null,"email_hint":"hint@example.com"}'),
+        ('gone', 220, '{"account":"gone","codex_home":"/homes/gone","at":220,"usage":null,"error":{"kind":"auth_file_has_no_access_token"},"last_refresh":null,"email_hint":null}');
+    "#;
+
+    #[test]
+    fn old_service_and_codex_rows_read_as_readings() {
+        use crate::quota::{CodexDetail, ReadError, ResetCreditCount};
+        let dir = tempfile::tempdir().unwrap();
+        let path = old_database(dir.path(), OLD_DOCUMENTS);
+        let bytes = std::fs::read(&path).unwrap();
+        let store = Store::open_read_only_at(&path).unwrap();
+
+        let glm = store
+            .recent(Service::Zai, Some("glm"), 5)
+            .unwrap()
+            .remove(0);
+        assert_eq!((glm.at, glm.plan.as_deref()), (100, Some("max")));
+        assert_eq!(glm.session(), Some(Window::new(0.005, 1_794_448_052)));
+        assert_eq!(glm.weekly(), Some(Window::new(0.01435, 1_794_879_119)));
+        assert_eq!(glm.limits[0].label, "5h");
+        assert_eq!(glm.limits[0].source, Source::Poll);
+        assert_eq!(glm.limits[0].amount.as_ref().unwrap().unit, "credits");
+        let mcp = &glm.limits[2];
+        assert_eq!((mcp.span, mcp.group()), (Span::Monthly, Some("MCP tools")));
+        assert_eq!(glm.detail, crate::quota::Detail::None);
+
+        let kimi = store.since(Service::Kimi, None, 0).unwrap();
+        assert_eq!(kimi.len(), 1, "a row this build cannot read is left out");
+        assert_eq!(kimi[0].limits[1].span, Span::Unknown);
+        assert_eq!(kimi[0].limits[1].label, "monthly (Kimi Code share)");
+        assert_eq!(kimi[0].balances[0].left_minor, 2196);
+
+        let agy = store
+            .since(Service::Antigravity, Some("a@example.com"), 0)
+            .unwrap();
+        assert_eq!(agy.iter().map(|r| r.at).collect::<Vec<_>>(), [120, 130]);
+        assert_eq!(agy[0].scoped().len(), 2);
+        assert!(!agy[0].has_quota());
+        assert!(
+            agy[0]
+                .scoped_to(Some("gemini"))
+                .unwrap()
+                .above(0.05, 0.05, None)
+        );
         assert_eq!(
-            store.recent_usage(None, 1).unwrap()[0].error.as_deref(),
-            Some("HTTP 401")
+            agy[1].error,
+            Some(ReadError::Other {
+                message: "sign in again: the grant was revoked".into()
+            })
+        );
+
+        let work = store.since(Service::Codex, Some("work"), 0).unwrap();
+        assert_eq!(work.len(), 2);
+        let read = &work[0];
+        assert_eq!((read.at, read.plan.as_deref()), (200, Some("plus")));
+        assert_eq!(read.weekly(), Some(Window::new(0.42, 1_794_607_293)));
+        assert_eq!(read.session(), Some(Window::new(0.1, 4_600)));
+        assert_eq!(
+            read.window(Span::Other(86_400), &Scope::All),
+            Some(Window::new(0.5, 99))
+        );
+        let spark = read
+            .limit(Span::Unknown, &Scope::Group("gpt-5.3-codex-spark".into()))
+            .unwrap();
+        assert_eq!(spark.label, "codex_spark");
+        assert!(spark.is_rejected());
+        let codex: &CodexDetail = read.codex().unwrap();
+        assert_eq!(codex.email.as_deref(), Some("w@example.com"));
+        assert_eq!(codex.allowed, Some(true));
+        assert_eq!(codex.models[0].slug, "gpt-6-astra");
+        assert_eq!(
+            codex.reset_credits,
+            Some(ResetCreditCount {
+                available: 2,
+                applicable: Some(0)
+            })
+        );
+        assert!(read.above(0.0, 0.0, None));
+        assert_eq!(
+            work[1].error,
+            Some(ReadError::Edge {
+                status: 403,
+                attempts: 4
+            })
+        );
+        assert_eq!(
+            work[1].codex().unwrap().email.as_deref(),
+            Some("hint@example.com"),
+            "the stored id token's email stands in"
+        );
+
+        let mut latest: Vec<_> = store
+            .latest()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.service, r.account, r.at))
+            .collect();
+        latest.sort();
+        assert_eq!(
+            latest,
+            [
+                (Service::Codex, "gone".to_owned(), 220),
+                (Service::Codex, "work".to_owned(), 210),
+                (Service::Antigravity, "a@example.com".to_owned(), 130),
+                (Service::Zai, "glm".to_owned(), 100),
+            ],
+            "kimi's newest row is unreadable, so it has no latest"
+        );
+        let gone = store.recent(Service::Codex, Some("gone"), 1).unwrap();
+        assert!(gone[0].is_refused());
+        assert_eq!(
+            gone[0].error.as_ref().unwrap().to_string(),
+            "auth.json has no access_token"
+        );
+        drop(store);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing is rewritten");
+
+        // A new read of an old account is the latest, and the history is one.
+        let store = Store::open_at(&path).unwrap();
+        store.insert(&usage(Service::Zai, "glm", 300, 0.3)).unwrap();
+        let history = store.since(Service::Zai, Some("glm"), 0).unwrap();
+        assert_eq!(history.iter().map(|r| r.at).collect::<Vec<_>>(), [100, 300]);
+        assert!(
+            store
+                .latest()
+                .unwrap()
+                .contains(&usage(Service::Zai, "glm", 300, 0.3))
         );
     }
 
@@ -727,6 +798,7 @@ mod tests {
             .unwrap();
         let store = Store::open_read_only_at(&old).unwrap();
         assert!(store.latest().unwrap().is_empty());
-        assert!(store.latest_usage().is_err());
+        assert!(store.since(Service::Codex, None, 0).unwrap().is_empty());
+        assert!(store.recent(Service::Kimi, None, 9).unwrap().is_empty());
     }
 }

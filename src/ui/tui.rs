@@ -26,7 +26,7 @@ use crate::claude::settings as claude_settings;
 use crate::daemon;
 use crate::observe;
 use crate::policy::{self, Mode};
-use crate::providers::{self, Usage};
+use crate::providers;
 use crate::quota::{Level, ModelKey, Reading, Service, Source, Window};
 use crate::store::{Series, Store};
 use crate::ui::chart::{Point, format_duration_hours, known_buckets, points, segments};
@@ -123,7 +123,7 @@ struct App {
     live_sessions: Option<Vec<Session>>,
     mode: Mode,
     /// The last read of each service account, seeded from the store.
-    services: Vec<Usage>,
+    services: Vec<Reading>,
     last_services_read: Option<Instant>,
 }
 
@@ -206,16 +206,16 @@ impl App {
                 .is_none_or(|at| at.elapsed() >= self.fleet.launch.services_interval())
     }
 
-    fn spawn_services_read(&mut self) -> JoinHandle<Vec<Usage>> {
+    fn spawn_services_read(&mut self) -> JoinHandle<Vec<Reading>> {
         let accounts = self.fleet.services.clone();
         tokio::spawn(async move {
             providers::read_all(providers::client(), &accounts, Utc::now().timestamp()).await
         })
     }
 
-    fn apply_services(&mut self, usages: Vec<Usage>) {
+    fn apply_services(&mut self, usages: Vec<Reading>) {
         for usage in &usages {
-            let _ = self.store.insert_usage(usage);
+            let _ = self.store.insert(usage);
         }
         self.services = usages;
         self.last_services_read = Some(Instant::now());
@@ -223,7 +223,7 @@ impl App {
 
     /// The stored reads of the configured service accounts, in fleet order.
     fn seed_services(&mut self) {
-        let latest = self.store.latest_usage().unwrap_or_default();
+        let latest = self.store.latest().unwrap_or_default();
         self.services = self
             .fleet
             .services
@@ -329,7 +329,7 @@ pub async fn run(fleet: Fleet) -> Result<()> {
     let terminal_session = TerminalSession::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mut active_probe: Option<JoinHandle<Vec<Reading>>> = None;
-    let mut active_services: Option<JoinHandle<Vec<Usage>>> = None;
+    let mut active_services: Option<JoinHandle<Vec<Reading>>> = None;
     let mut executable_replaced = false;
 
     loop {
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn each_service_account_gets_a_line_read_or_not() {
-        use crate::providers::{Meter, Service, ServiceAccount};
+        use crate::providers::ServiceAccount;
         let dir = tempfile::tempdir().unwrap();
         let fleet = Fleet {
             services: vec![
@@ -944,20 +944,15 @@ mod tests {
             ..Fleet::default()
         };
         let mut app = App::new(fleet, Store::open_at(&dir.path().join("s.db")).unwrap());
-        app.services = vec![Usage {
-            service: Service::Kimi,
-            account: "kimi".into(),
-            at: 1_000,
-            plan: None,
-            meters: vec![Meter {
-                group: None,
-                label: "weekly".into(),
-                window: Window::new(0.9, 0),
-                span_secs: None,
-                amount: None,
-            }],
-            balances: Vec::new(),
-            error: None,
+        app.services = vec![Reading {
+            limits: vec![crate::providers::limit(
+                None,
+                "weekly",
+                None,
+                Window::new(0.9, 0),
+                None,
+            )],
+            ..Reading::empty(Service::Kimi, "kimi", 1_000)
         }];
         let text: Vec<String> = service_lines(&app, 1_000 + 300)
             .iter()

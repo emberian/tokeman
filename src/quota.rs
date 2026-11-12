@@ -204,6 +204,14 @@ pub enum Service {
 }
 
 impl Service {
+    pub const ALL: [Service; 5] = [
+        Service::Claude,
+        Service::Codex,
+        Service::Antigravity,
+        Service::Zai,
+        Service::Kimi,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",

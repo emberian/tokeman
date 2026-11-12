@@ -5,7 +5,8 @@ use anyhow::{Result, bail};
 use crate::account::Fleet;
 use crate::cli::{ImportSource, ServicesAction};
 use crate::paths::tilde;
-use crate::providers::{self, Service, ServiceAccount, Usage, agy};
+use crate::providers::{self, ServiceAccount, agy};
+use crate::quota::{Reading, Service};
 use crate::store::Store;
 use crate::ui::text;
 
@@ -104,18 +105,19 @@ pub async fn run(action: Option<ServicesAction>, json: bool) -> Result<()> {
                 bail!("no {} accounts are registered", service.label());
             }
             let usages = read_and_record(&services).await;
-            let ranked = providers::by_room(&usages, service, group.as_deref());
+            let ranked = providers::ranked(&usages, service, group.as_deref());
             let seated = seated(&services).await;
             text::print_ranking(&ranked, seated.as_deref());
-            for usage in usages.iter().filter(|usage| usage.error.is_some()) {
-                println!(
-                    " -  {} could not be read: {}",
-                    usage.account,
-                    usage.error.as_deref().unwrap_or_default()
-                );
+            for usage in &usages {
+                if let Some(error) = &usage.error {
+                    println!(" -  {} could not be read: {error}", usage.account);
+                }
             }
             let Some((best, _)) = ranked.first() else {
-                bail!("no {} account has a readable limit", service.label());
+                bail!(
+                    "no {} account has room in a readable limit",
+                    service.label()
+                );
             };
             if service == Service::Antigravity && seated.as_deref() != Some(best.account.as_str()) {
                 println!("to switch agy: tokeman services use {}", best.account);
@@ -177,7 +179,7 @@ fn add(account: ServiceAccount) -> Result<bool> {
 }
 
 /// Read `accounts` now and keep the reads in the history.
-pub async fn read_and_record(accounts: &[ServiceAccount]) -> Vec<Usage> {
+pub async fn read_and_record(accounts: &[ServiceAccount]) -> Vec<Reading> {
     let usages = providers::read_all(
         providers::client(),
         accounts,
@@ -186,7 +188,7 @@ pub async fn read_and_record(accounts: &[ServiceAccount]) -> Vec<Usage> {
     .await;
     if let Ok(store) = Store::open() {
         for usage in &usages {
-            let _ = store.insert_usage(usage);
+            let _ = store.insert(usage);
         }
     }
     usages

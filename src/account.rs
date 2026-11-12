@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn services_keep_their_comments_and_replace_by_name() {
-        use crate::providers::Service;
+        use crate::quota::Service;
         let existing = "[[services]]\n# the GLM coding plan\nname = \"glm\"\nservice = \"zai\"\nkey_file = \"~/.zai-key\"\n";
         let mut fleet = Fleet::parse(existing).unwrap();
         assert_eq!(
@@ -1010,7 +1010,7 @@ mod tests {
             access_token: Some("ya29.access".into()),
             expires_at: Some(HOUR_MS),
             ..crate::providers::ServiceAccount::with_key_file(
-                crate::providers::Service::Antigravity,
+                crate::quota::Service::Antigravity,
                 "agy",
                 "unused",
             )

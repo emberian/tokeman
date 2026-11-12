@@ -10,15 +10,16 @@ use tokio::task::JoinHandle;
 
 use crate::account::Fleet;
 use crate::paths;
-use crate::providers::{self, Service, Usage};
+use crate::providers;
+use crate::quota::{ReadError, Reading, Service};
 use crate::store::Store;
 
 pub struct Poller {
     store: PathBuf,
     next: Option<Instant>,
-    running: Option<JoinHandle<Vec<Usage>>>,
+    running: Option<JoinHandle<Vec<Reading>>>,
     /// The last error of each account that is failing, so only changes are logged.
-    failing: BTreeMap<(Service, String), String>,
+    failing: BTreeMap<(Service, String), ReadError>,
 }
 
 impl Default for Poller {
@@ -66,17 +67,17 @@ impl Poller {
         lines
     }
 
-    fn record(&self, usages: &[Usage]) {
+    fn record(&self, usages: &[Reading]) {
         let Ok(store) = Store::open_at(&self.store) else {
             return;
         };
         for usage in usages {
-            let _ = store.insert_usage(usage);
+            let _ = store.insert(usage);
         }
     }
 
     /// One line per account that started failing, changed its error, or recovered.
-    fn transitions(&mut self, usages: &[Usage]) -> Vec<String> {
+    fn transitions(&mut self, usages: &[Reading]) -> Vec<String> {
         let mut lines = Vec::new();
         for usage in usages {
             let key = (usage.service, usage.account.clone());
@@ -138,13 +139,15 @@ mod tests {
             "the next poll waits for its interval"
         );
         assert_eq!(poller.next, Some(started));
-        let stored = Store::open_at(&db).unwrap().latest_usage().unwrap();
+        let stored = Store::open_at(&db).unwrap().latest().unwrap();
         assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].service, Service::Zai);
         assert!(
             stored[0]
                 .error
-                .as_deref()
+                .as_ref()
                 .unwrap()
+                .to_string()
                 .contains("/nonexistent/zai-key")
         );
     }
@@ -152,11 +155,8 @@ mod tests {
     #[test]
     fn only_changes_in_an_accounts_error_are_logged() {
         let mut poller = Poller::default();
-        let failed = |error: &str| vec![Usage::failed(Service::Kimi, "kimi", 0, error)];
-        let ok = Usage {
-            error: None,
-            ..Usage::failed(Service::Kimi, "kimi", 0, "")
-        };
+        let failed = |error: &str| vec![providers::failed(Service::Kimi, "kimi", 0, error)];
+        let ok = Reading::empty(Service::Kimi, "kimi", 0);
         assert_eq!(poller.transitions(&failed("HTTP 401")).len(), 1);
         assert!(poller.transitions(&failed("HTTP 401")).is_empty());
         let changed = poller.transitions(&failed("HTTP 500"));

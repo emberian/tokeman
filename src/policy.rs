@@ -945,4 +945,141 @@ mod tests {
             Decision::Stay { healthy: false }
         );
     }
+
+    const NO_FLOOR: Floors = Floors {
+        session: 0.0,
+        weekly: 0.0,
+    };
+
+    fn names<'a>(ranked: &[&'a Reading]) -> Vec<&'a str> {
+        ranked.iter().map(|r| r.account.as_str()).collect()
+    }
+
+    #[test]
+    fn the_same_ranking_serves_codex_readings() {
+        use crate::quota::{CodexDetail, Detail, Limit, Scope, Span};
+        let codex = |name: &str, windows: &[(Span, f64, i64)], allowed: bool| Reading {
+            limits: windows
+                .iter()
+                .map(|(span, used, reset)| {
+                    Limit::new(*span, Scope::All, Window::new(*used, *reset), Source::Poll)
+                })
+                .collect(),
+            detail: Detail::Codex(CodexDetail {
+                allowed: Some(allowed),
+                ..CodexDetail::default()
+            }),
+            ..Reading::empty(Service::Codex, name, 0)
+        };
+        let week = 7 * 86_400;
+        let fleet = [
+            // 5h nearly unused, but the weekly has 20% left.
+            codex(
+                "both",
+                &[(Span::FiveHour, 0.05, 3_600), (Span::Weekly, 0.80, week)],
+                true,
+            ),
+            // Weekly only, 58% left: the longest dwell.
+            codex("weekly-only", &[(Span::Weekly, 0.42, week)], true),
+            // Roomiest of all, but the backend refuses it.
+            codex("refused", &[(Span::Weekly, 0.01, week)], false),
+            codex("spent", &[(Span::Weekly, 1.0, week)], true),
+            // A daily window is held to the weekly floor and ranks like one.
+            codex(
+                "daily-tight",
+                &[(Span::Weekly, 0.10, week), (Span::Other(86_400), 0.90, 600)],
+                true,
+            ),
+            Reading::failed(
+                Service::Codex,
+                "dead",
+                0,
+                ReadError::Http {
+                    status: 401,
+                    body: String::new(),
+                },
+            ),
+        ];
+        assert_eq!(
+            names(&rank_above(&fleet, NO_FLOOR, None)),
+            ["weekly-only", "both", "daily-tight"]
+        );
+        assert_eq!(
+            choose_above(&fleet, NO_FLOOR, None).map(|r| r.account.as_str()),
+            Some("weekly-only")
+        );
+        // A floor applies to them as to Claude: 20% weekly left is under 25%.
+        let floors = Floors {
+            session: 0.05,
+            weekly: 0.25,
+        };
+        assert_eq!(names(&rank_above(&fleet, floors, None)), ["weekly-only"]);
+        // Weekly room about to expire is spent first, here too.
+        let mut expiring = fleet.to_vec();
+        expiring[0].set_window(
+            Span::Weekly,
+            Scope::All,
+            Window::new(0.80, 3_600),
+            Source::Poll,
+        );
+        assert_eq!(
+            names(&rank_above(&expiring, NO_FLOOR, None)),
+            ["both", "weekly-only", "daily-tight"]
+        );
+    }
+
+    #[test]
+    fn the_same_ranking_serves_antigravity_readings() {
+        use crate::quota::{Limit, Scope, Span};
+        let agy = |name: &str, groups: &[(&str, f64, f64)]| Reading {
+            limits: groups
+                .iter()
+                .flat_map(|(group, session, weekly)| {
+                    [(Span::FiveHour, *session), (Span::Weekly, *weekly)].map(|(span, used)| {
+                        Limit::new(
+                            span,
+                            Scope::Group((*group).into()),
+                            Window::new(used, 0),
+                            Source::Poll,
+                        )
+                    })
+                })
+                .collect(),
+            ..Reading::empty(Service::Antigravity, name, 0)
+        };
+        let fleet = [
+            agy(
+                "a",
+                &[
+                    ("Gemini Models", 0.9, 0.2),
+                    ("Claude and GPT models", 0.1, 0.1),
+                ],
+            ),
+            agy(
+                "b",
+                &[
+                    ("Gemini Models", 0.3, 0.3),
+                    ("Claude and GPT models", 0.5, 0.6),
+                ],
+            ),
+            agy("spent", &[("Gemini Models", 0.0, 1.0)]),
+        ];
+        // As read, no limit is account-wide, so nothing is a landing.
+        assert_eq!(choose_above(&fleet, NO_FLOOR, None), None);
+        let ranked_on = |group: Option<&str>| -> Vec<String> {
+            let counted: Vec<Reading> = fleet
+                .iter()
+                .filter_map(|reading| reading.scoped_to(group))
+                .collect();
+            rank_above(&counted, NO_FLOOR, None)
+                .iter()
+                .map(|r| r.account.clone())
+                .collect()
+        };
+        // Any group: a's Gemini 5h (10% left) is tighter than b's worst (40%).
+        assert_eq!(ranked_on(None), ["b", "a"]);
+        assert_eq!(ranked_on(Some("claude")), ["a", "b"]);
+        assert_eq!(ranked_on(Some("gemini")), ["b", "a"]);
+        assert!(ranked_on(Some("no such group")).is_empty());
+    }
 }

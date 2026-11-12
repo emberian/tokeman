@@ -5,8 +5,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::account::Account;
 use crate::claude::sessions;
 use crate::daemon::status::Report;
-use crate::providers::{Balance, Meter, Usage};
-use crate::quota::{Level, Limit, Reading, SessionLimit, Verdict};
+use crate::quota::{Balance, Level, Limit, Reading, SessionLimit, Verdict};
 use crate::store::{Series, Stats};
 
 const BAR_WIDTH: usize = 40;
@@ -391,21 +390,22 @@ fn balance_text(balance: &Balance) -> String {
     }
 }
 
-fn meter_name(meter: &Meter) -> String {
-    match &meter.group {
-        Some(group) => format!("{group} {}", meter.label),
-        None => meter.label.clone(),
+/// A service limit's name: its group, when it has one, then its label.
+fn meter_name(meter: &Limit) -> String {
+    match meter.group() {
+        Some(group) => format!("{group} {}", meter.name()),
+        None => meter.name(),
     }
 }
 
 /// `5h 99% · weekly 79% · extra usage $21.96 of $50.00 left`, or the error:
 /// one service account on one line, without colour.
-pub fn usage_summary(usage: &Usage) -> String {
+pub fn usage_summary(usage: &Reading) -> String {
     if let Some(error) = &usage.error {
-        return format!("error: {}", one_line(error, 100));
+        return format!("error: {}", one_line(&error.to_string(), 100));
     }
     let mut parts: Vec<String> = usage
-        .meters
+        .limits
         .iter()
         .map(|meter| {
             format!(
@@ -441,7 +441,7 @@ pub fn format_age(at: i64, now: i64) -> String {
 /// marked `*` like the Claude default.
 pub fn print_service_list(
     accounts: &[crate::providers::ServiceAccount],
-    latest: &[Usage],
+    latest: &[Reading],
     seated: Option<&str>,
     now: i64,
 ) {
@@ -542,7 +542,7 @@ pub fn print_codex_list(accounts: &[crate::ui::overview::CodexView], now: i64) {
 
 /// `tokeman services`: every service account with its gauges. `seated`
 /// names the Antigravity account the agy CLI is signed in as.
-pub fn print_usages(usages: &[Usage], seated: Option<&str>) {
+pub fn print_usages(usages: &[Reading], seated: Option<&str>) {
     if usages.is_empty() {
         println!(
             "No service accounts configured. Use `tokeman services add <zai|kimi> <name> --key-file <path>`."
@@ -570,12 +570,12 @@ pub fn print_usages(usages: &[Usage], seated: Option<&str>) {
             println!("   {RED}error: {error}{RESET}");
         }
         let width = usage
-            .meters
+            .limits
             .iter()
             .map(|meter| meter_name(meter).chars().count())
             .max()
             .unwrap_or(0);
-        for meter in &usage.meters {
+        for meter in &usage.limits {
             let amount = meter
                 .amount
                 .as_ref()
@@ -614,7 +614,7 @@ fn share_note(limit: &Limit, reading: &Reading) -> String {
 }
 
 /// `tokeman services best`: accounts by room left, most first.
-pub fn print_ranking(ranked: &[(&Usage, f64)], seated: Option<&str>) {
+pub fn print_ranking(ranked: &[(&Reading, f64)], seated: Option<&str>) {
     for (place, (usage, room)) in ranked.iter().enumerate() {
         let note = if seated == Some(usage.account.as_str()) {
             format!("  {GREEN}* agy's login{RESET}")
@@ -825,35 +825,39 @@ mod tests {
 
     #[test]
     fn a_usage_reads_as_one_line_of_room_left() {
-        use crate::providers::{Meter, Service};
-        use crate::quota::Window;
-        let meter = |label: &str, used: f64| Meter {
-            group: None,
-            label: label.into(),
-            window: Window::new(used, 0),
-            span_secs: None,
-            amount: None,
+        use crate::providers::{failed, limit};
+        use crate::quota::{Service, Window};
+        let meter = |group: Option<&str>, label: &str, used: f64| {
+            limit(
+                group.map(str::to_owned),
+                label,
+                None,
+                Window::new(used, 0),
+                None,
+            )
         };
-        let usage = Usage {
-            service: Service::Kimi,
-            account: "kimi".into(),
-            at: 0,
+        let usage = Reading {
             plan: Some("Vivace".into()),
-            meters: vec![meter("5h", 0.0057), meter("weekly", 1.2)],
+            limits: vec![meter(None, "5h", 0.0057), meter(None, "weekly", 1.2)],
             balances: vec![Balance {
                 label: "extra usage".into(),
                 left_minor: 2196,
                 total_minor: Some(5000),
                 currency: "USD".into(),
             }],
-            error: None,
+            ..Reading::empty(Service::Kimi, "kimi", 0)
         };
         assert_eq!(
             usage_summary(&usage),
             "5h 99% · weekly 0% · extra usage $21.96 of $50.00 left"
         );
-        let failed = Usage::failed(Service::Zai, "glm", 0, "z.ai refused:\n bad key");
+        let failed = failed(Service::Zai, "glm", 0, "z.ai refused:\n bad key");
         assert_eq!(usage_summary(&failed), "error: z.ai refused: bad key");
+        let grouped = Reading {
+            limits: vec![meter(Some("Gemini Models"), "5h", 0.5)],
+            ..Reading::empty(Service::Antigravity, "a", 0)
+        };
+        assert_eq!(usage_summary(&grouped), "Gemini Models 5h 50%");
         assert_eq!(format_money(-5, "EUR"), "-0.05 EUR");
         assert_eq!(format_age(100, 100 + 7200), "2h ago");
     }

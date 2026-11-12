@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Balance, Meter, Service, ServiceAccount, Usage};
-use crate::quota::Window;
+use super::{ServiceAccount, failed, limit};
+use crate::quota::{Balance, Limit, Reading, Service, Window};
 
 pub const BASE: &str = "https://api.kimi.com/coding/v1";
 
@@ -29,7 +29,7 @@ const KNOWN: [(&str, &str, Option<i64>); 4] = [
     ("limit_month_code", "monthly (Kimi Code share)", None),
 ];
 
-pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Usage {
+pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Reading {
     read_from(client, BASE, account, now).await
 }
 
@@ -38,8 +38,8 @@ pub(crate) async fn read_from(
     base: &str,
     account: &ServiceAccount,
     now: i64,
-) -> Usage {
-    let failed = |error: String| Usage::failed(Service::Kimi, &account.name, now, error);
+) -> Reading {
+    let failed = |error: String| failed(Service::Kimi, &account.name, now, error);
     let key = match account.api_key() {
         Ok(key) => key,
         Err(error) => return failed(format!("{error:#}")),
@@ -49,15 +49,12 @@ pub(crate) async fn read_from(
     let (usages, me) = futures::join!(get(client, &usages_url, &key), get(client, &me_url, &key),);
     let parsed = usages.and_then(|body| parse_usages(&body));
     match parsed {
-        Ok((meters, balances)) => Usage {
-            service: Service::Kimi,
-            account: account.name.clone(),
-            at: now,
+        Ok((limits, balances)) => Reading {
             // The plan is optional: a failed `/me` costs only the name.
             plan: me.ok().and_then(|body| parse_plan(&body)),
-            meters,
+            limits,
             balances,
-            error: None,
+            ..Reading::empty(Service::Kimi, &account.name, now)
         },
         Err(error) => failed(error),
     }
@@ -160,24 +157,24 @@ fn parse_reset(text: Option<&str>) -> i64 {
         .map_or(0, |at| at.timestamp())
 }
 
-fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Meter> {
-    Some(Meter {
-        group: None,
+fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
+    Some(limit(
+        None,
         label,
-        window: Window::new(
+        span_secs,
+        Window::new(
             number(pool.used_ratio.as_ref())?,
             parse_reset(pool.reset_time.as_deref()),
         ),
-        span_secs,
-        amount: None,
-    })
+        None,
+    ))
 }
 
-fn parse_usages(body: &str) -> Result<(Vec<Meter>, Vec<Balance>), String> {
+fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), String> {
     let parsed: UsagesBody = serde_json::from_str(body)
         .map_err(|error| format!("unreadable answer ({error}): {}", super::snippet(body)))?;
     let mut pools = parsed.usages.unwrap_or_default();
-    let mut meters: Vec<Meter> = KNOWN
+    let mut meters: Vec<Limit> = KNOWN
         .iter()
         .filter_map(|(key, label, span)| meter((*label).into(), *span, &pools.remove(*key)?))
         .collect();
@@ -237,6 +234,7 @@ fn parse_plan(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::Span;
     use axum::{Router, http::HeaderMap, http::StatusCode, routing::get};
 
     /// 2026-11-11 20:30 UTC, when the body below was captured (ids redacted).
@@ -263,15 +261,16 @@ mod tests {
         let (meters, balances) = parse_usages(LIVE).unwrap();
         let summary: Vec<_> = meters
             .iter()
-            .map(|m| (m.label.as_str(), m.window.used, m.span_secs))
+            .map(|m| (m.label.as_str(), m.window.used, m.span))
             .collect();
         assert_eq!(
             summary,
             [
-                ("5h", 0.0057, Some(5 * 3600)),
-                ("weekly", 0.2119, Some(7 * 86_400))
+                ("5h", 0.0057, Span::FiveHour),
+                ("weekly", 0.2119, Span::Weekly)
             ]
         );
+        assert!(meters.iter().all(Limit::is_shared));
         assert_eq!(
             meters[0].window.resets_at,
             chrono::DateTime::parse_from_rfc3339("2026-11-11T23:40:17Z")
@@ -360,7 +359,7 @@ mod tests {
         let usage = read_from(&client, &base, &account(), NOW).await;
         assert_eq!(usage.error, None);
         assert_eq!(usage.plan, None);
-        assert_eq!(usage.meters.len(), 2);
+        assert_eq!(usage.limits.len(), 2);
         assert_eq!(usage.balances.len(), 1);
 
         let wrong = ServiceAccount {
@@ -368,7 +367,7 @@ mod tests {
             ..account()
         };
         let usage = read_from(&client, &base, &wrong, NOW).await;
-        let error = usage.error.unwrap();
+        let error = usage.error.unwrap().to_string();
         assert!(error.contains("HTTP 401"), "{error}");
         assert!(error.contains("Invalid Authentication"), "{error}");
     }
