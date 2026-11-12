@@ -514,13 +514,13 @@ fn error_message(text: &str) -> String {
 
 // ---- access-token cache ----
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct TokenCache {
     #[serde(default)]
     tokens: BTreeMap<String, CachedToken>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CachedToken {
     access_token: String,
     /// Epoch milliseconds.

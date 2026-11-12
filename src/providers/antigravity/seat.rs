@@ -81,10 +81,18 @@ impl Place {
 }
 
 /// What the slot holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Slot {
     pub email: String,
     refresh_token: String,
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Slot {
@@ -245,7 +253,7 @@ pub(super) fn slot_values(
 }
 
 /// The slot value a seating replaced, so it can be put back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Backup {
     /// Epoch seconds.
     saved_at: i64,
@@ -497,7 +505,7 @@ pub async fn use_account(
 }
 
 /// The slot value to write and the grant it carries.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Prepared {
     target: Slot,
     value: String,
@@ -1096,6 +1104,11 @@ esac
             .unwrap();
         assert_eq!(slot.email, "a@example.com");
         assert!(slot.holds(&account("renamed", "1//a")));
+        let shown = format!("{slot:?}");
+        assert!(
+            shown.contains("a@example.com") && !shown.contains("1//"),
+            "{shown}"
+        );
         // The same account signed in again elsewhere has another refresh token.
         assert!(slot.holds(&account("a@example.com", "1//newer")));
         assert!(!slot.holds(&account("b@example.com", "1//b")));
