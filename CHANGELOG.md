@@ -1,5 +1,173 @@
 # Changelog
 
+## 0.4.0 - 2026-11-11
+
+tokeman now reads five services (Claude, Codex, Antigravity, GLM, Kimi)
+through one model: a read is a `Reading`, and what it reported is a list of
+`Limit`s, each a window named by its length over the whole account, one
+model or one named group. One history table, one ranking, one fleet view
+that every surface draws, and a command line that names the service first.
+The spellings 0.3 had are removed, not aliased; each fails naming its
+replacement (table below). tokens.toml, the settings.json keys, the hook
+and what the installed service invokes are unchanged, so an installed
+0.3 service keeps working across the upgrade; `tokeman rotate install`
+rewrites the plist, launcher and hook for the new binary.
+
+### Claude
+
+- The probe keeps everything the rate-limit headers say: each window's own
+  `-status` and `-surpassed-threshold`, every `unified-claim`, the fallback,
+  the upgrade paths, the low-priority lane and the grace allowance. Only a
+  window's own status takes part in viability (a window rejected by its own
+  status is above no floor); the rest is shown and never counted as room.
+  Use over 100% is kept as reported.
+- `/api/oauth/usage` is read from `limits[]`: session and weekly rows fill
+  the windows the headers left out, model-scoped rows become per-model
+  limits, and `weekly_scoped_shares` gives a limit its size as a share of
+  the weekly (Fable: half). A limit that is a share is judged on its room in
+  weekly terms.
+- An account whose `limits[]` has no session row has no 5-hour limit
+  (verified Ultra). Every surface says "no 5h limit" instead of treating the
+  missing window as unread.
+- A 429 from the usage endpoint holds back the account that drew it, and
+  every account once two have (doubling from ten minutes to an hour); each
+  account serves its last good answer meanwhile.
+- Landing spends expiring room first: among accounts above the landing
+  floors, one whose weekly window resets within 24 hours ranks first
+  (soonest first); otherwise the longest dwell lands, as before. This moves
+  where a switch lands, never whether one happens.
+- A login records the refresh token's reported expiry (`refresh_expires_at`
+  in tokens.toml; a refresh keeps the earlier date). `tokeman list` names
+  the date and says to log in again from three days before it.
+- Granted resets are read as Claude Code 2.1.322 reads them. A program the
+  server did not evaluate is listed as unknown, never as "no resets"; a
+  grant that gives back weekly use (the Fable launch resets) says so. A
+  claim is journaled before it is sent and resent with the same request id
+  until an answer is read; `tokeman claude reset <account> --clear` forgets
+  one.
+- `tokeman claude best` ranks the accounts as the rotation would land.
+
+### Codex
+
+- Windows are named by their length (5h, weekly, daily, any other), never
+  by their position in the usage body, which now puts a weekly-only
+  account's window first. Additional limits are scoped to their model or
+  feature. The body is decoded field by field, so one field changing shape
+  no longer loses the rest.
+- New from the usage body: per-model availability, the workspace spending
+  cap, reset credits. `tokeman codex reset <account>` spends one credit on
+  an account at its limit (asks first; a claim without a definite answer is
+  resent with the same request id, and `--clear` forgets it).
+- `tokeman codex best` ranks through the rotation's policy: ties fall to
+  the name, and a window at 100% is never a landing. `--limit <text>` ranks
+  on a per-model or per-feature limit.
+- `tokeman codex use [<account>]` moves a running Codex (the best viable
+  account when none is named) or, with `--into`, copies credentials into
+  another profile.
+
+### Antigravity, GLM, Kimi
+
+- New: `[[services]]` accounts in tokens.toml, read-only quota for the GLM
+  Coding Plan (`tokeman glm add`), Kimi Code (`tokeman kimi add`) and Google
+  Antigravity (`tokeman agy import`, from agy's Keychain item and the app's
+  state database). The daemon reads them on their own cadence
+  (`services_interval_secs`, default 300) in a task the rotation never
+  waits on; failures are typed and logged only when they change.
+- `tokeman agy use <account>` signs the agy CLI in as an account (macOS;
+  manual, the daemon never switches it), and `--previous` puts back the
+  login it replaced. An open Antigravity app is told to follow; an editor's
+  `agy acp` holding the old account is named; an interactive agy cannot be
+  told and writes its account back at its next token refresh, so the switch
+  is refused while one runs unless `--force`. Nothing is signalled or
+  logged out.
+- `tokeman agy|glm|kimi best [--group <text>]` ranks the accounts by room:
+  weekly room expiring within 24 hours first, and an account with a spent
+  limit is left out.
+
+### Commands
+
+- Service first: `tokeman claude|codex|agy|glm|kimi <verb>` with the same
+  verbs wherever they apply (`add`, `remove`, `list`, `use`, `best`,
+  `reset`). `<service> list` reads that service now.
+- `tokeman list` shows every account of every service from stored reads,
+  with no request and no write; `tokeman list --json` is the fleet view the
+  trays read.
+- Bare `tokeman`, `tokeman --watch` and both trays are viewers while the
+  background service runs: they show the stored view and send no request.
+  Without the service they read every account themselves. `tokeman
+  --fresh`, `r` in `--watch` and the trays' reload button read now. Every
+  view says whether it is stored and how old it is, and says STALE when the
+  service has not read for ten minutes.
+- `tokeman history`, `stats` and `chart` take `--service`. `chart --metric`
+  names a window by length (`5h`, `weekly`, `monthly`, `daily`), `overage`,
+  or a limit by its model, group or label (`fable`, `"Opus 4.8"`, `gemini`,
+  `"gemini 5h"`, `spark`); without it the service's first account-wide
+  window is drawn.
+- Removed spellings and what to run instead (the `services` ones were only
+  in unreleased builds):
+
+| 0.3 | 0.4 |
+| --- | --- |
+| `tokeman rotate use` | `tokeman claude use <account>` |
+| `tokeman resets list` | `tokeman claude reset` |
+| `tokeman resets use` | `tokeman claude reset <account> [--grant <id> \| --session] [--yes]` |
+| `tokeman resets clear` | `tokeman claude reset <account> --clear` |
+| `tokeman resets` | `tokeman claude reset [<account>]` |
+| `tokeman codex seat` | `tokeman codex use <account> --into <codex-home>` |
+| `tokeman codex reseat` | `tokeman codex use [<account>] [--codex-home <dir>] [--dry-run] [--force]` |
+| `tokeman services list` | `tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)` |
+| `tokeman services add` | `tokeman glm add <name> --key-file <path> or tokeman kimi add <name> --key-file <path>` |
+| `tokeman services remove` | `tokeman agy remove <name>, tokeman glm remove <name> or tokeman kimi remove <name>` |
+| `tokeman services import` | `tokeman agy import` |
+| `tokeman services use` | `tokeman agy use <account> [--previous]` |
+| `tokeman services best` | `tokeman agy best [--group <text>], tokeman glm best or tokeman kimi best` |
+| `tokeman services` | `tokeman agy list, tokeman glm list or tokeman kimi list (tokeman list shows every service from stored reads)` |
+| `tokeman login` | `tokeman claude login [<account>] [--more]` |
+| `tokeman add` | `tokeman claude add <name> <key>` |
+| `tokeman remove` | `tokeman claude remove <name>` |
+| `tokeman refresh` | `tokeman claude refresh [<account>]` |
+
+### Behaviour changes to know about
+
+- `--json` output is the new model: `tokeman --json`, `tokeman list --json`
+  and `tokeman rotate status --json` print the fleet view; `<service> list
+  --json` and `history --json` print `Reading`s.
+- Bare `tokeman` covers every service, and while the service runs it shows
+  stored reads instead of probing (`--fresh` probes).
+- `tokeman list` no longer prints masked setup keys; it says which
+  credential each Claude account offers.
+- One-day windows are labelled `daily`. `history` on a missing database
+  reads as empty.
+- `stats` reports every limit of an account, and its mean and deviation
+  weight each interval by its length (the latest and peak rates are as
+  before).
+- `chart --metric` no longer takes `opus-weekly` / `sonnet-weekly`; name the
+  model.
+- Chart lines from before 0.3 (the Opus/Sonnet columns) and credential
+  events reconstructed from the old rotation log are no longer read, and
+  the `usage_key` spelling in tokens.toml is no longer accepted.
+
+### Internals
+
+- `quota::{Service, Span, Scope, Limit, Reading, ReadError, Detail}` is the
+  one model; every reader returns a `Reading`, and `policy::rank_above` is
+  the one ranking behind the rotation's landing and every `best`.
+- History: every read is one JSON row in `readings`. The tables of earlier
+  builds are read where they are and never altered. A reading that says
+  what the account's last row says adds no row for ten minutes; the last
+  confirmation is kept apart, and a change is written after a row that
+  closes the hold, so charts draw a held value as a step and burn rates are
+  the same as from one row per read. `tokeman list` asks the old tables only
+  for an account that has no new row.
+- `ui::overview::Overview` is the one fleet view; each surface has one limit
+  renderer. `commands/` returns data, every print is in `ui/text.rs`, every
+  terminal read in `ui/prompt.rs`; the library reports progress through
+  `notice`.
+- `claims.rs` is the one journal of uncertain reset claims (Claude grants,
+  Codex credits); the two 0.3 layouts are folded in on the first change.
+- Cadence state, the admission state and the profile cache load entry by
+  entry: one in a shape this build does not read is dropped alone.
+
 ## 0.3.1 - 2026-10-31
 
 - A reading no longer needs both shared windows. Since late October the

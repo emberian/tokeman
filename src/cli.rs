@@ -563,6 +563,24 @@ pub fn removed(args: &[String]) -> Option<(String, &'static str)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_changelog_table_is_the_removed_table() {
+        let changelog = include_str!("../CHANGELOG.md");
+        for (old, new) in REMOVED {
+            let row = format!(
+                "| `tokeman {}` | `{}` |",
+                old.join(" "),
+                new.replace('|', "\\|")
+            );
+            assert!(changelog.contains(&row), "CHANGELOG.md lacks: {row}");
+        }
+        let rows = changelog
+            .lines()
+            .filter(|line| line.starts_with("| `tokeman "))
+            .count();
+        assert_eq!(rows, REMOVED.len(), "CHANGELOG.md has a row REMOVED lacks");
+    }
+
     fn parse(line: &str) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(line.split_whitespace())
     }

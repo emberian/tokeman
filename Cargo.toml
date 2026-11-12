@@ -1,8 +1,8 @@
 [package]
 name = "tokeman"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
-description = "Keeps Claude Code on an Anthropic account with room left"
+description = "Keeps Claude Code, Codex and agy on a subscription account with room left, and shows the rest"
 repository = "https://github.com/emberian/tokeman"
 
 [features]
