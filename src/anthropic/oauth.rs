@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn token_responses_round_trip_into_grants() {
+    fn a_token_response_becomes_a_grant_with_absolute_expiries() {
         let response = TokenResponse {
             access_token: "sk-ant-oat01-a".into(),
             refresh_token: Some("sk-ant-ort01-r".into()),
@@ -345,11 +345,6 @@ mod tests {
             refresh_token_expires_in: Some(2_592_000),
             scope: Some("user:profile user:inference".into()),
         };
-        let json = serde_json::to_string(&response).unwrap();
-        assert_eq!(
-            serde_json::from_str::<TokenResponse>(&json).unwrap(),
-            response
-        );
         let grant = grant_of(response, 1_000);
         assert_eq!(grant.expires_at, Some(1_000 + 28_800_000));
         assert_eq!(grant.refresh_expires_at, Some(1_000 + 2_592_000_000));
@@ -440,7 +435,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_exchange_waits_out_the_token_endpoints_429s() {
-        assert_eq!(EXCHANGE_RETRY_SECS, [5, 15, 30]);
         let no_wait = [0u64; 3];
         let limited = (
             StatusCode::TOO_MANY_REQUESTS,

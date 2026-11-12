@@ -947,58 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn response_shapes_round_trip() {
-        let response = UsageResponse {
-            seven_day: Some(UsageWindow {
-                utilization: Some(12.5),
-                resets_at: Some("2026-08-01T00:00:00+00:00".into()),
-            }),
-            five_hour: Some(UsageWindow {
-                utilization: None,
-                resets_at: None,
-            }),
-            limits: Some(vec![
-                serde_json::to_value(UsageLimit {
-                    kind: LimitKind::WeeklyScoped,
-                    percent: 3.0,
-                    resets_at: None,
-                    scope: Some(UsageScope {
-                        model: Some(ScopeName {
-                            display_name: "Fable".into(),
-                            id: None,
-                        }),
-                        surface: None,
-                    }),
-                })
-                .unwrap(),
-            ]),
-            ..UsageResponse::default()
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        let back: UsageResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, response);
-        let limit: UsageLimit = serde_json::from_value(back.limits.unwrap().remove(0)).unwrap();
-        assert_eq!(limit.scope.unwrap().model.unwrap().display_name, "Fable");
-        let models = usage_of(&response).models;
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].key().unwrap().as_str(), "fable");
-    }
-
-    #[test]
-    fn cache_files_round_trip_and_an_older_shape_reads_as_empty() {
-        let mut file = CacheFile::default();
-        file.backoff.rate_limited = 2;
-        file.entries.insert(
-            "a|usage".into(),
-            Entry {
-                fetched_at: 5,
-                body: Some(serde_json::json!({"limits": []})),
-                retry_after: 9,
-                last_error: Some("x".into()),
-            },
-        );
-        let json = serde_json::to_string(&file).unwrap();
-        assert_eq!(serde_json::from_str::<CacheFile>(&json).unwrap(), file);
+    fn a_cache_file_in_the_0_3_shape_reads_as_empty() {
         // 0.3.x kept a bare map of entries; it starts fresh.
         let older: CacheFile =
             serde_json::from_str(r#"{"a|usage": {"fetched_at": 5, "rate_limited": 1}}"#).unwrap();

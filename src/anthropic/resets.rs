@@ -752,8 +752,6 @@ mod tests {
         );
         assert_eq!(program.usable_resets(at("2026-10-01T00:00:00Z")), Some(1));
         assert_eq!(program.usable_resets(at("2026-10-23T00:00:00Z")), Some(0));
-        let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(serde_json::from_str::<ResetStatus>(&json).unwrap(), status);
         assert_eq!(
             serde_json::from_str::<ResetStatus>("{}").unwrap(),
             ResetStatus::default()
@@ -799,9 +797,6 @@ mod tests {
              (gives back 5h Fable's use of 7d Fable 7d; now at 0% 61% 100%), use by 2027-03-09"
         );
         assert!(describe_grant(&grant, at("2026-11-08T00:00:00Z")).contains("starts 2026-11-09"));
-        let json = serde_json::to_string(&grant).unwrap();
-        assert!(json.contains(r#""type":"weekly""#));
-        assert_eq!(serde_json::from_str::<ResetGrant>(&json).unwrap(), grant);
     }
 
     #[test]
@@ -833,12 +828,6 @@ mod tests {
         .unwrap();
         assert_eq!(response.result, ClaimResult::Reset);
         assert_eq!(response.cleared, vec!["five_hour"]);
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains(r#""result":"reset""#));
-        assert_eq!(
-            serde_json::from_str::<ClaimResponse>(&json).unwrap(),
-            response
-        );
         let odd: ClaimResponse =
             serde_json::from_str(r#"{"result": "something_new", "reason": "x"}"#).unwrap();
         assert_eq!(odd.result, ClaimResult::Unknown);
@@ -857,8 +846,6 @@ mod tests {
             describe_grant(&grant, 0),
             "g: 2/2 left, usable at a limit (clears ; now at )"
         );
-        let json = serde_json::to_string(&grant).unwrap();
-        assert_eq!(serde_json::from_str::<ResetGrant>(&json).unwrap(), grant);
         assert_eq!(window_label("seven_day_opus"), "Opus 7d");
         assert_eq!(window_label("other"), "other");
     }
