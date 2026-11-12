@@ -53,6 +53,11 @@ src/
                  known about an account's room, for every service. The one model of a limit and of a read.
   policy.rs      PURE. Mode, Floors, viability, landing choice, Decision. No IO, no clock, no strings.
   history.rs     credential history: Event, fingerprint, account_at (JSONL, same format as today)
+  claims.rs      the claim journal: reset claims (Claude grants, Codex credits) sent without a definite answer, keyed by
+                 (Service, account); one request id per claim, resent verbatim; the only writer of claims.json
+  notice.rs      progress lines (a lock being waited on, a retry sleeping, dry-run narration, the daemon's log echo) go to a
+                 sink the binary installs; the library itself never writes to the terminal
+  util.rs        pure helpers shared across domains, once each: one_line, shell_quote, parse_reset, backoff_secs
   store.rs       sqlite read history: every read of every service is one JSON Reading in `readings`; latest/recent/since
                  over it and the old tables; Series, Stats; a read-only open that creates no file, table or row
   store/legacy.rs  the tables earlier builds wrote (snapshots, codex_readings, service_readings), converted to Readings
@@ -63,7 +68,7 @@ src/
     probe.rs     the Haiku probe and the optional target-model sample -> Reading (the header shape is private to it)
     profile.rs   /api/oauth/usage: limits[] parser -> model Limits, on-disk cache, fleet-wide 429 backoff
     oauth.rs     PKCE login, code exchange with retry, refresh (incl. refresh-token expiry)
-    resets.rs    cedar_ember / juniper_tide offers and claims; pending-claim journal
+    resets.rs    cedar_ember / juniper_tide offers and claims (through the claim journal)
   claude/
     settings.rs  ~/.claude/settings.json env block: install, clear, inspect (the only writer, 0600)
     keychain.rs  macOS: capture, suppress and restore the /login Keychain record
@@ -73,21 +78,26 @@ src/
     auth.rs      auth.json read/write, seating
     appserver.rs JSON-RPC over the app-server Unix socket
     probe.rs     usage probe -> Reading: account-wide windows named by length, additional limits scoped to their
-                 model or feature, the rest in CodexDetail; State, is_viable
+                 model or feature, the rest in CodexDetail; State (ok / limited / error, as words)
     refresh.rs   token refresh
-    resets.rs    reset credits: list, claim, and the pending-claim journal (its only writer)
-    commands.rs  add/discover/import/list/refresh/best/seat/reseat/watch (best ranks through policy::choose_above)
+    resets.rs    reset credits: list, plan, claim (through the claim journal)
+    maintenance.rs  the daemon's half-hour sweep: probe, refresh what is due or rejected, report login needs once
   providers/
     mod.rs       ServiceAccount: read-only quota of services tokeman does not rotate; read (dispatch by service) ->
-                 Reading, read_all (concurrent, each read bounded), ranked (policy::rank_above), the shared client
+                 Reading, read_all (concurrent, each read bounded), the shared client; failures are typed ReadErrors
     zai.rs       GLM Coding Plan: /api/monitor/usage/quota/limit, raw key; errors arrive as HTTP 200 with the code in the body
     kimi.rs      Kimi Code: /coding/v1/usages (Bearer) -> Limits + booster Balance; plan name from /coding/v1/me
-    antigravity.rs  Google OAuth refresh (own access-token cache), retrieveUserQuotaSummary -> Limits scoped to their group,
-                 discover() from agy's Keychain item / token file and the app's state.vscdb (read-only)
-    agy.rs       the agy CLI's login slot (Keychain item via /usr/bin/security, bounded): which account it holds,
-                 seat an Antigravity account in it (locked, previous value backed up 0600, read back), put the previous back.
-                 Manual only (`services use`); the daemon never seats. A running agy keeps its account and writes it back
-                 into the slot at its next token refresh, so a seating holds only once running agy processes have quit.
+    antigravity/
+      mod.rs     the quota read: retrieveUserQuotaSummary -> Limits scoped to their group; own access-token cache keyed
+                 on history::Fingerprint
+      grant.rs   the Google OAuth refresh exchange; discover() from agy's Keychain item or token file and the app's
+                 state.vscdb (read-only protobuf decode)
+      seat.rs    agy's login slot through `/usr/bin/security -i` (locked, previous value backed up 0600, read back,
+                 written once more if it reads empty); use_account -> UseReport. Manual only (`tokeman agy use`); the
+                 daemon never seats
+      clients.rs the running clients of that slot: the hub app (its daemon file), `agy acp`, interactive agy, print-mode
+                 agy. Bounded read-only ps/lsof census; GetUserStatus and GetAuthStatus on loopback; the resume command
+                 from agy's history. Never a signal, never a logout
   daemon/
     mod.rs       the loop
     cycle.rs     one cycle: refresh due grants, probe, observe, decide, install, record
@@ -95,19 +105,28 @@ src/
     lock.rs      the rotation lock
     services.rs  the service-quota poll: its own task every services_interval_secs, recorded; rotation never waits on it
     service.rs   launchd plist, install/uninstall (macOS)
+  commands/      what each command does, returning data; nothing here prints or reads the terminal
+    claude.rs    add, remove, the browser login in two halves, refresh, use, reset offers / plan / claim / clear
+    codex.rs     add, remove, discover, import, list, refresh, use (move a running Codex, or copy into a profile), watch,
+                 reset plan / claim
+    services.rs  agy / glm / kimi: add, remove, import, list, the account agy holds, agy use
+    rotate.rs    run, status, pause, resume, install, uninstall, quarantine, clear-quarantine, the hook's record
+    view.rs      probe (read every service now, record), stored, ranked (the one ranking behind every `best`), best,
+                 history, stats, settings
   ui/
-    text.rs      gauges, tables, status (every println in one module)
-    chart.rs     PNG + iTerm2 inline, shared segment logic
+    text.rs      gauges, tables, status, and what every command says (every println and eprintln in the crate)
+    prompt.rs    the only reader of the terminal: confirmations, the hook's stdin, the browser-login conversation
+    chart.rs     PNG, the iTerm2 inline escape as data, shared segment logic
     tui.rs       --watch (cards, chart, a services strip)
-    services_cli.rs  `tokeman services`: list, add, remove, import antigravity
     overview.rs  the stored view: everything last read about every account (Claude, reset offers, Codex, services),
                  built without a request or a write; `tokeman list --json` prints it and both trays draw it
     tray.rs      egui tray (feature "tray"): Claude cards from its own probe, the rest from the stored view
-  cli.rs         clap definitions and dispatch; no logic
+  cli.rs         clap definitions, and REMOVED: the 0.3 spellings and what replaced each (never an alias)
+  main.rs        dispatch: parse, call commands/, hand the result to ui/text
   launch.rs      the claude launch command and terminal handoff
 macos/tray/      Swift menu-bar app; a viewer of `tokeman list --json`, `history --json` and `settings show` that never
                  opens tokens.toml; probes only when no service is installed; writes only through
-                 `tokeman settings set` and `tokeman rotate use`
+                 `tokeman settings set` and `tokeman claude use`
 ```
 
 Dropped from the tree (history keeps them): the web dashboard and its D3
@@ -193,11 +212,26 @@ pub struct Fleet { pub accounts: Vec<Account>, pub codex: Vec<CodexAccount>, pub
 
 // providers/mod.rs  (each service module: `pub async fn read(&reqwest::Client, &ServiceAccount, now) -> Reading`, never Err)
 pub struct ServiceAccount { name, service, key, key_file, refresh_token, access_token, expires_at, label }
-pub fn ranked(&[Reading], Service, group) -> Vec<(&Reading, f64)>   // policy::rank_above on scoped_to(group); failed reads left out
-// providers/agy.rs
+// providers/antigravity/seat.rs
 pub struct Slot { email, refresh_token }  impl Slot { fn holds(&ServiceAccount) -> bool }   // same grant or same email
-pub struct Seated { email, previous: Option<String>, changed: bool }
-pub fn slot() -> Result<Option<Slot>> ; pub async fn seat(&Client, &ServiceAccount) -> Result<Seated> ; pub async fn seat_previous() -> Result<Seated>
+pub enum UseTarget<'a> { Account(&'a ServiceAccount), Previous }
+pub struct UseOptions { force, dry_run }
+pub struct UseReport { email, previous, outcome: Written | Unchanged | Refused, dry_run, rewritten, census_error, clients: Vec<ClientReport> }
+pub struct ClientReport { kind: Hub | Acp | Interactive | Print, pid, cwd, account, conversation, result: ClientResult }
+pub fn slot() -> Result<Option<Slot>> ; pub async fn use_account(&Client, UseTarget, UseOptions) -> Result<UseReport>
+    // a refusal (an interactive agy runs, no --force) is Ok(report) with nothing written; lines() is what to say
+
+// claims.rs
+pub struct Pending { service, account, item: Option<String> /* grant or credit; None = the backend's choice */, request_id, sent_at }
+impl Journal { fn pending(service, account) ; fn begin(service, account, item, now) -> (Pending, new) ; fn finish(..) ; fn clear(..) }
+    // with a claim pending, begin returns it (same request id) or refuses a different item: an uncertain claim is
+    // never retried as another grant or credit
+
+// commands/view.rs
+pub enum RankOn<'a> { Account, Limits(Option<&'a str>) }
+pub fn ranked(&[Reading], Floors, model, RankOn) -> Vec<(&Reading, f64)>   // policy::rank_above; failed reads left out
+pub async fn probe(&Fleet, only: Option<Service>) -> Vec<Reading>          // read now, record
+pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // every `tokeman <service> best`
 impl Fleet { fn load() ; fn update(|&mut Fleet| -> T) -> T  /* locked RMW, comments kept */ }
 
 // policy.rs  (pure; the tests are the spec). Landing spends expiring room
@@ -209,7 +243,8 @@ pub struct Policy { normal: Floors, sip: Floors, landing: Floors, intervals: Int
 pub enum Decision<'a> { Stay, Switch { to: &'a Reading, why: Reason }, Drain, NoneViable }
 pub fn choose_above(readings: &[Reading], floors: Floors, model: Option<&ModelKey>) -> Option<&Reading>
 pub fn rank_above(readings: &[Reading], floors: Floors, model: Option<&ModelKey>) -> Vec<&Reading>
-    // the one ranking: Claude's landing, `codex best`, `services best`. Never matches on Service.
+    // the one ranking: Claude's landing and every `tokeman <service> best` (through commands::view::ranked).
+    // Never matches on Service.
 pub fn decide(fleet: &[Reading], current: Option<&str>, mode: Mode, target: Option<&ModelKey>, policy: &Policy) -> Decision
 pub fn mode_for(fleet: &[Reading], expected: usize, previous: Mode, policy: &Policy, target: Option<&ModelKey>) -> Mode
 
@@ -238,7 +273,10 @@ Rules the types enforce:
 - Exactly one writer per file: `claude/settings.rs` for settings.json,
   `account.rs` for tokens.toml, `daemon/cadence.rs` for the cycle state,
   `observe.rs` for the admission state, `history.rs` for the JSONL,
-  `codex/resets.rs` for the Codex pending-claim journal.
+  `claims.rs` for `claims.json`.
+- Nothing outside `ui/text.rs` prints, and nothing outside `ui/prompt.rs`
+  reads the terminal. `commands/` and the domain modules return data; a
+  long operation reports progress through `notice.rs`.
 - Every subprocess wait has a timeout. Every lock acquire tries first and
   says when it waits.
 - Dry run means no write anywhere, and the cycle says what it would have done.
@@ -261,11 +299,21 @@ Rules the types enforce:
   reading)`. The `snapshots`, `codex_readings` and `service_readings` tables
   of earlier builds are read where they are, by column name, and never
   altered, migrated or written; a row that no longer reads is left out.
-- CLI commands and flags as documented in the README. `browse` is removed.
+- The command line is service first (`tokeman claude|codex|agy|glm|kimi
+  <verb>`). The 0.3 spellings (`login`, `add`, `resets`, `rotate use`,
+  `codex seat`, `codex reseat`, `services ...`) are removed, not aliased: each
+  fails with a message naming its replacement (`cli::REMOVED`). What an
+  installed service and hook invoke did not change: the launchd agent runs
+  `tokeman rotate daemon` and the hook `tokeman rotate observe-session`, so
+  both keep working across the upgrade; `tokeman rotate install` rewrites the
+  plist, the launcher and the hook for the binary that runs it.
 - Cadence state, the admission state and the profile-read cache load entry
   by entry: one in a shape this build does not read is dropped alone.
-- `reset-claims/<account>.pending`: a grant claim sent without a known
-  outcome. It is never deleted except by a read answer or `tokeman resets clear`.
+- `claims.json`: a reset claim sent without a known outcome. Dropped only by
+  a read answer or `tokeman claude reset <account> --clear`.
+  `reset-claims/<account>.pending` and `codex-reset-pending.json` from 0.3 are
+  read where they are; the first change to the journal folds them in and
+  renames each to `<name>.imported`.
 
 ## Facts the design rests on
 

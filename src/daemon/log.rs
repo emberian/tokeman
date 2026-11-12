@@ -20,9 +20,3 @@ pub fn log(message: &str) {
     let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let _ = append_line(&path, &format!("{stamp} {message}"));
 }
-
-/// Log, and print to stderr as well, for commands run by hand.
-pub fn log_and_say(message: &str) {
-    log(message);
-    crate::notice::notice(message);
-}

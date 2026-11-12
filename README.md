@@ -3,7 +3,12 @@
 tokeman keeps a fleet of Anthropic subscription accounts and makes sure the
 one credential slot Claude Code reads always holds an account with room left.
 It also keeps Codex (OpenAI) accounts alive and can move a running Codex
-between them.
+between them, signs the `agy` CLI in as the Antigravity account you choose,
+and shows the quota of GLM and Kimi coding plans beside the rest.
+
+Commands are service first: `tokeman claude|codex|agy|glm|kimi <verb>`, with
+the same verbs (`add`, `remove`, `list`, `use`, `best`, `reset`, ...) wherever
+they apply.
 
 ```
  tokeman — 4/4 accounts probed with Haiku 4.5
@@ -39,11 +44,11 @@ Prebuilt binaries for macOS and Linux are on the
 Log each account in through the browser:
 
 ```sh
-tokeman login "my-account"       # one account (added if it is new)
-tokeman login --more             # every configured account that still needs it
-tokeman refresh [<name>]         # renew grants now (the daemon does this before expiry)
-tokeman list                     # accounts, what each one offers, the last stored reads
-tokeman list --json              # everything stored about every account; no request, no write
+tokeman claude login "my-account"   # one account (added if it is new)
+tokeman claude login --more         # every configured account that still needs it
+tokeman claude refresh [<name>]     # renew grants now (the daemon does this before expiry)
+tokeman list                        # every account of every service, from the last stored reads
+tokeman list --json                 # everything stored about every account; no request, no write
 ```
 
 Each round prints a claude.com URL; sign in as that account and paste the code
@@ -54,7 +59,7 @@ background.
 A long-lived `claude setup-token` key also works, as a fallback or on its own:
 
 ```sh
-tokeman add "work" "sk-ant-oat01-..."
+tokeman claude add "work" "sk-ant-oat01-..."
 ```
 
 A setup token is inference-only: a session running on one cannot send
@@ -70,15 +75,17 @@ account.
 ## Usage
 
 ```sh
-tokeman                          # probe every account, print gauges, save a snapshot
+tokeman                          # read every account of every service, print gauges, save the reads
 tokeman --json                   # the same as JSON
+tokeman claude list              # the same for one service (also codex, agy, glm, kimi)
+tokeman claude best              # the accounts ranked as the rotation would land
 tokeman --watch                  # live TUI dashboard
 tokeman launch [-- claude args]  # pick the default, then start claude
 tokeman launch --auto [-- args]  # keep rotating while claude runs
 tokeman rotate install           # install the background service (macOS)
 tokeman rotate status            # the default, live sessions, every account's room
 tokeman rotate run --dry-run     # what the policy would do now; writes nothing
-tokeman rotate use <name>        # make an account the default now
+tokeman claude use <name>        # make an account the default now
 tokeman rotate pause             # stop managing; /login gets its precedence back
 tokeman rotate resume            # manage again and run one cycle
 tokeman rotate quarantine <name> --model fable --window weekly --until 2026-08-01T09:00:00-04:00
@@ -86,9 +93,10 @@ tokeman rotate clear-quarantine <name>
 tokeman history [--last N]       # recent snapshots
 tokeman stats                    # burn rates and time to depletion
 tokeman chart [--metric fable]   # PNG chart, inline in iTerm2
-tokeman resets [use <name>]      # usage-limit resets on offer
+tokeman claude reset [<name>]    # usage-limit resets on offer; with a name, use one (asks first)
 tokeman settings [set <key> <value>]   # launch settings; the trays write through this
 tokeman codex ...                # Codex accounts (below)
+tokeman agy|glm|kimi ...         # the other services (below)
 ```
 
 ### How the default is chosen
@@ -165,10 +173,13 @@ not see itself.
 
 Anthropic offers some accounts resets that refill their limits on request:
 grants (a number of resets, a use-by date, the windows they refill) and a
-session reset paid from the weekly limit. `tokeman resets` lists what is on
-offer; `tokeman resets use <name>` shows what a reset would clear and asks
-before claiming. Resets are scarce and irreversible, so nothing uses one on
-its own. Both need a login.
+session reset paid from the weekly limit. `tokeman claude reset` lists what
+is on offer; `tokeman claude reset <name>` (with `--grant <id>` or `--session`
+to choose) shows what a reset would clear and asks before claiming. Resets are
+scarce and irreversible, so nothing uses one on its own. Both need a login. A
+claim that got no definite answer is kept in `~/.config/tokeman/claims.json`
+and is only ever resent as the same claim; `tokeman claude reset <name>
+--clear` forgets it once claude.ai shows what happened.
 
 ### Launch
 
@@ -230,8 +241,8 @@ tokeman codex import <file>             # seed profiles from `<name> <access-tok
 tokeman codex list                      # probe every account's quota (5h / weekly windows, reset credits)
 tokeman codex refresh                   # renew OAuth tokens before they rot into a 401
 tokeman codex best                      # the CODEX_HOME with the most headroom
-tokeman codex seat <account> --into <dir>
-tokeman codex reseat                    # move a running Codex onto another account
+tokeman codex use [<account>]           # move a running Codex onto an account (default: the best)
+tokeman codex use <account> --into <dir>   # copy its credentials into another profile instead
 tokeman codex watch                     # follow a running Codex and move it in time
 tokeman codex reset <account> [--credit <id>] [--yes]   # spend one reset credit on an account at its limit
 ```
@@ -240,7 +251,7 @@ Windows are named by their length (`limit_window_seconds`), not by which
 field the backend put them in: an account whose only window is the weekly one
 shows `-` under 5H. `reset` refuses unless the account is at a limit and the
 backend counts a credit that applies now. Its request id is kept in
-`~/.config/tokeman/codex-reset-pending.json` until the backend answers, so
+`~/.config/tokeman/claims.json` until the backend answers, so
 re-running after a lost answer resends the same id and cannot spend a second
 credit.
 
@@ -248,16 +259,47 @@ A migration is announced to the running Codex over its app-server socket,
 because Codex's own 401 recovery refuses a swapped account. The daemon
 refreshes every registered profile on a half-hour sweep.
 
+### Antigravity, GLM and Kimi
+
+These are read, not rotated: tokeman polls each account's usage endpoint and
+shows its limits beside Claude's and Codex's.
+
+```sh
+tokeman agy import                      # register the accounts agy and the Antigravity app are signed in to
+tokeman agy list                        # read every Antigravity account now
+tokeman agy best [--group claude]       # rank them by room left (on one model group, or on all)
+tokeman agy use <account>               # sign the agy CLI in as that account (macOS)
+tokeman agy use --previous              # put back the login the last `use` replaced
+tokeman glm add <name> --key-file ~/.zai-key     # z.ai GLM Coding Plan
+tokeman kimi add <name> --key-file ~/.kimi-key   # Kimi Code
+tokeman glm list | best ; tokeman kimi list | best
+```
+
+`agy`, the Antigravity app and an editor's `agy acp` server share one login
+in the Keychain. `agy use` looks at what is running before it writes:
+
+- The Antigravity app is told to re-read the login and switches live.
+- An `agy acp` server cannot be told from outside; if it holds the old
+  account, restart the agent from the editor, or it writes the old account
+  back when it next refreshes its token.
+- An interactive `agy` cannot be told either, so the switch is refused while
+  one runs, with each process's PID, directory and the command that resumes
+  its conversation (`agy --conversation=<id>` or `agy -c`). Quit it, run the
+  command again, resume. `--force` switches anyway; it lasts until that
+  process refreshes, within the hour.
+
+`--dry-run` says what is running and what would happen, and writes nothing.
+
 ## Files
 
 | Path | Contents |
 |------|----------|
-| `~/.config/tokeman/tokens.toml` | Accounts, setup keys, login grants, settings, Codex profiles |
+| `~/.config/tokeman/tokens.toml` | Accounts, setup keys, login grants, settings, Codex profiles, service accounts |
 | `~/.config/tokeman/claude-credential-history.jsonl` | Which credential settings offered when (fingerprints only) |
 | `~/.config/tokeman/claude-admission-state.json` | Session bindings and reset-bounded rejection quarantines |
 | `~/.config/tokeman/claude-rotate-state.json` | Cadence, mode, backoffs, carried samples |
 | `~/.config/tokeman/claude-rotate.log` | Rotation events (names and headroom only) |
-| `~/.config/tokeman/codex-reset-pending.json` | Codex reset-credit claims sent without a definite answer |
+| `~/.config/tokeman/claims.json` | Reset claims (Claude grants, Codex credits) sent without a definite answer |
 | `~/.config/tokeman/claude-login-keychain-backup.json` | The `/login` Keychain record set aside while managed |
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.local/share/tokeman/snapshots.db` | Probe history (sqlite) |

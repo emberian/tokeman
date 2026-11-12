@@ -113,7 +113,7 @@ fn spawn_bg_thread(
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
-                super::text::notice(&format!("could not start the probe runtime: {error}"));
+                crate::ui::text::notice(&format!("could not start the probe runtime: {error}"));
                 return;
             }
         };
@@ -122,7 +122,7 @@ fn spawn_bg_thread(
             let store = match Store::open() {
                 Ok(store) => Some(store),
                 Err(error) => {
-                    super::text::notice(&format!("history will not be recorded: {error:#}"));
+                    crate::ui::text::notice(&format!("history will not be recorded: {error:#}"));
                     None
                 }
             };
@@ -239,7 +239,7 @@ impl TrayApp {
         self.menu_quit_id = Some(quit.id().clone());
 
         let Some(icon) = make_icon(GRAY) else {
-            super::text::notice(&format!("Failed to build the tray icon image"));
+            crate::ui::text::notice("Failed to build the tray icon image");
             return;
         };
         // Left click toggles the window; the menu is on right click.
@@ -251,7 +251,7 @@ impl TrayApp {
             .build();
         match built {
             Ok(tray_icon) => self.tray_icon = Some(tray_icon),
-            Err(error) => super::text::notice(&format!("Failed to create tray icon: {error}")),
+            Err(error) => crate::ui::text::notice(&format!("Failed to create tray icon: {error}")),
         }
     }
 
@@ -292,14 +292,14 @@ impl TrayApp {
     /// Make the account the default, then open Claude in a terminal.
     fn launch_account(&self, name: &str) {
         if let Err(error) = daemon::activate(&self.fleet, name) {
-            super::text::notice(&format!("Failed to activate account: {error:#}"));
+            crate::ui::text::notice(&format!("Failed to activate account: {error:#}"));
             return;
         }
         let (binary, args) = self.fleet.launch.command([]);
         if let Err(error) =
             launch::in_terminal(&binary, &args, self.fleet.launch.terminal.as_deref())
         {
-            super::text::notice(&format!("Failed to launch terminal: {error}"));
+            crate::ui::text::notice(&format!("Failed to launch terminal: {error}"));
         }
     }
 
@@ -311,7 +311,7 @@ impl TrayApp {
             Ok(())
         }) {
             Ok((fresh, ())) => self.fleet = fresh,
-            Err(error) => super::text::notice(&format!("Failed to save settings: {error:#}")),
+            Err(error) => crate::ui::text::notice(&format!("Failed to save settings: {error:#}")),
         }
         let _ = self.bg_tx.send(BgCmd::Fleet(Box::new(self.fleet.clone())));
     }
@@ -584,7 +584,7 @@ impl TrayApp {
                     if limit.source == Source::Observed {
                         label.push('!');
                     }
-                    let note = super::text::share_note(limit, reading.weekly().as_ref());
+                    let note = crate::ui::text::share_note(limit, reading.weekly().as_ref());
                     Self::draw_gauge_noted(ui, &label, 3, limit.window, note.as_deref());
                 }
                 if let Some(window) = crate::store::Series::Overage.window(reading) {
@@ -951,9 +951,9 @@ mod tests {
     fn a_shared_limit_is_noted_in_weekly_terms_and_an_idle_window_has_no_reset() {
         let weekly = Window::new(0.4, 0);
         let mut fable = crate::testing::model_limit("fable", "Fable", 0.5, Source::Profile);
-        assert_eq!(super::text::share_note(&fable, Some(&weekly)), None);
+        assert_eq!(crate::ui::text::share_note(&fable, Some(&weekly)), None);
         fable.share = Some(0.5);
-        let note = super::text::share_note(&fable, Some(&weekly)).unwrap();
+        let note = crate::ui::text::share_note(&fable, Some(&weekly)).unwrap();
         assert_eq!(note, "50% of the weekly, 25% of the weekly left for it");
         assert_eq!(
             gauge_caption(Window::new(0.0, 0), Some(&note)),

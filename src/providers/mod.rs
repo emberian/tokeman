@@ -18,7 +18,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
-use crate::policy::{self, Floors};
 use crate::quota::{Amount, Limit, ReadError, Reading, Scope, Service, Source, Span, Window};
 
 /// Every request a service read makes is bounded by this.
@@ -209,95 +208,9 @@ pub(crate) fn decode(message: impl Into<String>) -> ReadError {
     }
 }
 
-/// The accounts of `service` that answered, as the rotation policy ranks
-/// them ([`policy::rank_above`] with no floor): room in every limit that
-/// counts, expiring weekly room first. With `group`, only the limits whose
-/// group contains it (any case) count; without, every group's, since work
-/// may land in any. Each comes with the fraction left on its tightest
-/// counted limit.
-pub fn ranked<'a>(
-    readings: &'a [Reading],
-    service: Service,
-    group: Option<&str>,
-) -> Vec<(&'a Reading, f64)> {
-    let counted: Vec<Reading> = readings
-        .iter()
-        .filter(|reading| reading.service == service)
-        .filter_map(|reading| reading.scoped_to(group))
-        .collect();
-    let floors = Floors {
-        session: 0.0,
-        weekly: 0.0,
-    };
-    policy::rank_above(&counted, floors, None)
-        .into_iter()
-        .filter_map(|best| {
-            let original = readings
-                .iter()
-                .find(|reading| reading.service == service && reading.account == best.account)?;
-            let room = best.tightest()?.window.remaining();
-            Some((original, room))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn reading(account: &str, limits: &[(&str, f64)]) -> Reading {
-        Reading {
-            limits: limits
-                .iter()
-                .map(|(group, used)| {
-                    limit(
-                        Some((*group).into()),
-                        "weekly",
-                        Some(Span::WEEK_SECS),
-                        Window::new(*used, 0),
-                        None,
-                    )
-                })
-                .collect(),
-            ..Reading::empty(Service::Antigravity, account, 0)
-        }
-    }
-
-    #[test]
-    fn accounts_rank_by_their_tightest_limit_within_the_asked_group() {
-        let readings = [
-            reading(
-                "a",
-                &[("Gemini Models", 0.9), ("Claude and GPT models", 0.1)],
-            ),
-            reading(
-                "b",
-                &[("Gemini Models", 0.3), ("Claude and GPT models", 0.5)],
-            ),
-            failed(Service::Antigravity, "down", 0, "refused"),
-            reading("spent", &[("Gemini Models", 1.0)]),
-            Reading {
-                service: Service::Zai,
-                ..reading("glm", &[("x", 0.0)])
-            },
-        ];
-        let names = |group: Option<&str>| -> Vec<&str> {
-            ranked(&readings, Service::Antigravity, group)
-                .iter()
-                .map(|(reading, _)| reading.account.as_str())
-                .collect()
-        };
-        // Overall, a's Gemini limit (10% left) is tighter than b's worst (50%).
-        assert_eq!(names(None), ["b", "a"]);
-        assert_eq!(names(Some("claude")), ["a", "b"]);
-        assert_eq!(names(Some("gemini")), ["b", "a"]);
-        assert_eq!(names(Some("no such group")), Vec::<&str>::new());
-        let ranked_claude = ranked(&readings, Service::Antigravity, Some("claude"));
-        assert!((ranked_claude[0].1 - 0.9).abs() < 1e-9);
-        // The original reading comes back, groups and all.
-        assert_eq!(ranked_claude[0].0, &readings[0]);
-        assert_eq!(ranked(&readings, Service::Zai, None).len(), 1);
-    }
 
     #[test]
     fn the_key_comes_inline_or_trimmed_from_its_file() {
