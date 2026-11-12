@@ -618,9 +618,15 @@ mod tests {
         ];
         assert_eq!(mode_for(&readings, &policy, opus().as_ref()), Mode::Sip);
         assert_eq!(best(&readings, Mode::Sip, opus().as_ref()), None);
+        // Sip mode samples fast even when the default itself has room.
+        let roomy = reading("default", 0.20, 0.20);
         assert_eq!(
-            policy.interval_secs(Mode::Sip),
+            next_interval_secs(Mode::Sip, Some(&roomy), true, &policy),
             policy.sip_probe_interval_secs
+        );
+        assert_eq!(
+            next_interval_secs(Mode::Normal, Some(&roomy), true, &policy),
+            policy.normal_probe_interval_secs
         );
     }
 
@@ -636,7 +642,7 @@ mod tests {
 
     #[test]
     fn replacement_ranks_by_dwell_then_headroom_then_the_limiting_reset() {
-        let cases: [(&str, Vec<Reading>, &str); 5] = [
+        let cases: [(&str, Vec<Reading>, &str); 7] = [
             (
                 "the landing score includes known opus capacity",
                 vec![
@@ -656,9 +662,11 @@ mod tests {
             ),
             (
                 "the soonest limiting reset breaks a headroom tie",
+                // The 5h window is the tighter one of both; neither weekly
+                // expires within a day.
                 vec![
-                    reading_with_resets("same-dwell-later", 0.10, 0.20, 900, 3_600),
-                    reading_with_resets("same-dwell-first", 0.10, 0.20, 900, 600),
+                    reading_with_resets("same-dwell-later", 0.60, 0.20, 3_600, 5 * 86_400),
+                    reading_with_resets("same-dwell-first", 0.60, 0.20, 600, 5 * 86_400),
                 ],
                 "same-dwell-first",
             ),
@@ -671,12 +679,26 @@ mod tests {
                 "soon-but-tight",
             ),
             (
-                "with one weekly reset, only the limiting window's reset counts",
+                "only the limiting window's reset counts",
+                // The roomy weekly of the first resets sooner; its tight 5h later.
                 vec![
-                    reading_with_resets("non-limiting-reset", 0.00, 0.50, 60, 9_000),
-                    reading_with_resets("limiting-reset", 0.40, 0.10, 600, 9_000),
+                    reading_with_resets("non-limiting-reset", 0.60, 0.20, 3_600, 5 * 86_400),
+                    reading_with_resets("limiting-reset", 0.60, 0.20, 600, 6 * 86_400),
                 ],
                 "limiting-reset",
+            ),
+            (
+                "equal dwell and reset: the less used 5h window",
+                vec![
+                    reading("a-more-used", 0.30, 0.50),
+                    reading("z-less-used", 0.10, 0.50),
+                ],
+                "z-less-used",
+            ),
+            (
+                "nothing to tell them apart: by name, whatever the order",
+                vec![reading("b", 0.10, 0.50), reading("a", 0.10, 0.50)],
+                "a",
             ),
         ];
         for (why, readings, want) in cases {
@@ -754,6 +776,22 @@ mod tests {
         fresh.at = late.at;
         fresh.set_weekly(Some(Window::new(0.0, late.at + 6 * 86_400)));
         assert_eq!(land(&[fresh, late]), Some("expiring-later-read".into()));
+        // An unreported reset is not an expiring one.
+        assert_eq!(
+            land(&[
+                reading_with_resets("unknown-tight", 0.0, 0.6, 0, 0),
+                reading_with_resets("known-roomy", 0.0, 0.1, 0, 6 * 86_400),
+            ]),
+            Some("known-roomy".into())
+        );
+        // Expiring room below the landing floors does not beat real room.
+        assert_eq!(
+            land(&[
+                reading_with_resets("scrap-expiring", 0.0, 0.93, 0, 3_600),
+                reading_with_resets("roomy-next-week", 0.0, 0.2, 0, 6 * 86_400),
+            ]),
+            Some("roomy-next-week".into())
+        );
         // Below the landing floors it still falls back to the sip floors.
         assert_eq!(
             land(&[
@@ -871,6 +909,13 @@ mod tests {
         };
         assert_eq!(interval(0.10, 0.10, false), fast);
         assert_eq!(interval(0.88, 0.20, true), fast);
+        assert_eq!(interval(0.20, 0.91, true), fast, "twice the weekly floor");
+        assert_eq!(next_interval_secs(Mode::Normal, None, true, &policy), fast);
+        let unread = crate::testing::refused("a");
+        assert_eq!(
+            next_interval_secs(Mode::Normal, Some(&unread), true, &policy),
+            fast
+        );
         assert_eq!(
             interval(0.20, 0.20, true),
             policy.normal_probe_interval_secs
@@ -937,6 +982,17 @@ mod tests {
             safe_mode_for(&partial, 2, &policy, Mode::Sip, opus().as_ref()),
             Mode::Sip
         );
+        // One roomy account is enough to know the fleet is not sipping.
+        let roomy = [reading("only-response", 0.10, 0.10)];
+        assert_eq!(
+            safe_mode_for(&roomy, 2, &policy, Mode::Sip, opus().as_ref()),
+            Mode::Normal
+        );
+        // Every account answered: what they say stands.
+        assert_eq!(
+            safe_mode_for(&partial, 1, &policy, Mode::Normal, opus().as_ref()),
+            Mode::Sip
+        );
     }
 
     #[test]
@@ -995,6 +1051,125 @@ mod tests {
         assert_eq!(
             decide(&situation(draining, Some("cur"), false), &policy),
             Decision::Stay { healthy: false }
+        );
+    }
+
+    #[test]
+    fn dwell_is_room_above_each_windows_own_floor_as_a_share_of_what_the_floor_leaves() {
+        let floors = Floors {
+            session: 0.25,
+            weekly: 0.10,
+        };
+        let land =
+            |readings: &[Reading]| choose_above(readings, floors, None).map(|r| r.account.clone());
+        // 40% of the 5h is 15 points over its floor of 25 (0.20 of the 75
+        // the floor leaves); 30% of the weekly is 20 over its floor of 10
+        // (0.22 of 90). Held to each other's floors the first would win.
+        assert_eq!(
+            land(&[
+                reading("five-hour-tight", 0.60, 0.10),
+                reading("weekly-tight", 0.10, 0.70)
+            ]),
+            Some("weekly-tight".into())
+        );
+        // 45% of the 5h is 0.267 of what its floor leaves; 32% of the
+        // weekly is 0.244. In raw points over the floor (20 against 22) the
+        // weekly-tight one would win.
+        assert_eq!(
+            land(&[
+                reading("five-hour-tight", 0.55, 0.10),
+                reading("weekly-tight", 0.10, 0.68)
+            ]),
+            Some("five-hour-tight".into())
+        );
+    }
+
+    #[test]
+    fn a_landing_is_held_to_the_landing_floor_of_each_window() {
+        let policy = PolicySettings::default();
+        assert!(policy.land_min_5h_remaining > policy.land_min_7d_remaining + 0.02);
+        let exists = |r: Reading| landing_exists(&[r], &policy, opus().as_ref());
+        // Just under the 5h landing floor, which is over the weekly one.
+        assert!(!exists(reading(
+            "five-hour-short",
+            1.0 - policy.land_min_5h_remaining + 0.01,
+            0.0
+        )));
+        // Just over the weekly landing floor, which is under the 5h one.
+        assert!(exists(reading(
+            "weekly-enough",
+            0.0,
+            1.0 - policy.land_min_7d_remaining - 0.01
+        )));
+        assert!(!exists(reading(
+            "weekly-short",
+            0.0,
+            1.0 - policy.land_min_7d_remaining + 0.01
+        )));
+    }
+
+    #[test]
+    fn force_decides_on_what_was_read_and_every_switch_says_why() {
+        let policy = PolicySettings::default();
+        let model = opus();
+        let decide_on = |readings: &[Reading], expected, current, force| {
+            let situation = Situation {
+                readings,
+                expected,
+                current,
+                model: model.as_ref(),
+                force,
+            };
+            match decide(&situation, &policy) {
+                Decision::Hold(hold) => format!("hold {hold:?}"),
+                Decision::Stay { healthy } => format!("stay healthy={healthy}"),
+                Decision::Switch { to, trigger } => format!("{} {trigger:?}", to.account),
+                Decision::NoneViable => "none".to_owned(),
+            }
+        };
+        let healthy = [reading("cur", 0.30, 0.50), reading("fresh", 0.0, 0.0)];
+        // One of three accounts did not answer: nothing is decided, unless forced.
+        assert_eq!(
+            decide_on(&healthy, 3, Some("cur"), false),
+            "hold PartialProbe"
+        );
+        assert_eq!(decide_on(&healthy, 3, Some("cur"), true), "fresh Forced");
+        // Forced, a healthy default still stays when it is the best there is.
+        assert_eq!(
+            decide_on(&healthy, 2, Some("fresh"), true),
+            "stay healthy=true"
+        );
+        assert_eq!(
+            decide_on(&healthy, 2, Some("cur"), false),
+            "stay healthy=true"
+        );
+        // The default is managed and has no reading among a complete set.
+        assert_eq!(
+            decide_on(&healthy, 2, Some("unread"), false),
+            "hold DefaultUnreadable"
+        );
+        assert_eq!(
+            decide_on(&healthy, 2, Some("unread"), true),
+            "fresh NoDefault"
+        );
+        // A refused default leaves because it is refused, not for a floor.
+        let refused = [crate::testing::refused("cur"), reading("fresh", 0.0, 0.0)];
+        assert_eq!(decide_on(&refused, 2, Some("cur"), false), "fresh Refused");
+        // Nowhere above the landing floors: the default drains to its sip
+        // floor, then takes the scrap.
+        let scraps = |session_used| {
+            [
+                reading("cur", session_used, 0.50),
+                reading("scrap", 0.90, 0.24),
+            ]
+        };
+        assert_eq!(
+            decide_on(&scraps(0.95), 2, Some("cur"), false),
+            "stay healthy=false"
+        );
+        assert_eq!(
+            decide_on(&scraps(0.99), 2, Some("cur"), false),
+            "scrap SipFloor"
         );
     }
 
