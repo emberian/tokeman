@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn only_changes_in_an_accounts_error_are_logged() {
-        let mut poller = Poller::default();
+        let mut poller = Poller::recording_to("/nonexistent/s.db".into());
         let failed = |error: &str| vec![providers::failed(Service::Kimi, "kimi", 0, error)];
         let ok = Reading::empty(Service::Kimi, "kimi", 0);
         assert_eq!(poller.transitions(&failed("HTTP 401")).len(), 1);

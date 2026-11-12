@@ -20,7 +20,7 @@ use super::lock::is_paused;
 use crate::account::Fleet;
 use crate::codex::Client;
 use crate::codex::keep::{self, Tend, Tended};
-use crate::codex::mover::{self, By, Look, Outcome, Terms};
+use crate::codex::mover::{self, By, Look, MoveFloors, Outcome, Terms};
 use crate::codex::seats::Seats;
 use crate::paths;
 use crate::store::Store;
@@ -134,8 +134,9 @@ impl Mover {
                     None => Client::new().map_err(|error| format!("{error:#}"))?,
                 };
                 let terms = Terms {
+                    floors: MoveFloors::of(&fleet),
                     seats,
-                    ..Terms::of(&fleet, By::Daemon)
+                    by: By::Daemon,
                 };
                 tokio::time::timeout(mover::SWEEP_TIMEOUT, async {
                     let now = chrono::Utc::now().timestamp();
