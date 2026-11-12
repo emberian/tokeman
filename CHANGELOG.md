@@ -71,12 +71,26 @@ rewrites the plist, launcher and hook for the new binary.
   (`codex_min_5h_remaining`, `codex_min_7d_remaining`, default 20% left) is
   moved between turns onto the best profile above the landing floors
   (`codex_land_min_*`, default 30%); with nowhere to land it stays, and one
-  the backend refuses outright takes any profile with room. A healthy look
-  sends no request. It is on with two or more unparked profiles, off while
+  the backend refuses outright takes any profile with room. For a healthy
+  look tokeman sends no request (Codex fetches its own usage to answer). It is on with two or more unparked profiles, off while
   rotation is paused, and `tokeman settings set codex_auto_move false`
   turns it off. Each move is logged and kept in `codex-moves.jsonl`, as are
   the moves `codex use` and `codex watch` make. No reset credit is ever
   spent this way.
+- A moved Codex is kept alive. Codex holds a pushed token in memory and
+  never renews it; on a 401 it asks its connected clients for a new one for
+  ten seconds and then fails the turn. So every push (`codex use`, `codex
+  watch`, the service) is recorded in `codex-seats.json`, and on each look
+  the service renews a seat whose token has less than a day left (they live
+  ten days) through the profile's own refresh, and pushes the new token. A
+  seat whose Codex can no longer read its limits is checked against the
+  backend and renewed at once if its token is dead. A seat whose Codex has
+  exited or logged in elsewhere is forgotten. This runs whatever
+  `codex_auto_move` says, and stops only while rotation is paused.
+- A seat that was not renewed is an attention item before the session
+  fails: in `tokeman`, `list`, the tray and as a notification, with when
+  the token stops working, why (login refused, renewal failed, socket not
+  answering, rotation paused, no service running) and the command to run.
 - `tokeman codex watch` is the same look in the foreground, on every update
   Codex pushes. It judges the account-wide windows only (a spent per-model
   limit no longer triggers a move), never lands on the account it is

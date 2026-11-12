@@ -240,7 +240,8 @@ registered profile on a half-hour sweep.
 
 The service also moves a running Codex by itself. Every five minutes it asks
 each control socket it finds (`~/.codex` and every registered profile) for
-the account-wide windows, which costs no request. A Codex with less than 20%
+the account-wide windows (tokeman sends no request for this; Codex fetches
+its own usage to answer). A Codex with less than 20%
 left in one (`codex_min_5h_remaining`, `codex_min_7d_remaining` in
 `[rotation]`) is moved between turns onto the best other profile with at
 least 30% left (`codex_land_min_5h_remaining`, `codex_land_min_7d_remaining`).
@@ -252,6 +253,22 @@ socket, stops while rotation is paused, and is turned off with
 rotation log and in `codex-moves.jsonl`. `tokeman codex watch` does the same
 in the foreground on every update Codex pushes; `--dry-run` says what the
 service would do now and moves nothing.
+
+A Codex that was moved (by the service, `codex use` or `codex watch`) runs on
+a token it was handed and cannot renew: Codex keeps it in memory, never
+refreshes it ahead of time, and when the backend rejects it asks its
+connected clients for another for ten seconds before failing the turn. The
+service is the one that renews it. Every push is recorded in
+`codex-seats.json`; on each look the service renews a seat whose token has
+less than a day of its ten left, through the profile's own refresh token, and
+pushes the new one. It does this whether or not `codex_auto_move` is on, and
+forgets a seat whose Codex exited or logged in as something else. When it
+cannot (the profile's login was refused, the socket does not answer, rotation
+is paused, no service runs), that is an attention item with the time the
+token stops working and the command that fixes it, shown in `tokeman`,
+`tokeman list` and the tray and sent as a notification. Without a running
+service, re-run `tokeman codex use <account> --codex-home <dir>` before that
+time.
 
 ## Antigravity
 
@@ -424,6 +441,7 @@ fleet view gives it.
 | `~/.config/tokeman/claude-profile-reads.json` | Cached profile-endpoint answers and their backoff |
 | `~/.config/tokeman/antigravity-access-tokens.json` | Access tokens minted from the Antigravity grants |
 | `~/.config/tokeman/agy-login-backup.json` | The agy login the last `agy use` replaced |
+| `~/.config/tokeman/codex-seats.json` | The running Codexes holding a token tokeman pushed: which account, the token's fingerprint and expiry, the last failed renewal |
 | `~/.config/tokeman/codex-moves.jsonl` | Each move of a running Codex: when, which home, from and to which account, who asked |
 | `~/.local/share/tokeman/agy-homes/<account>/` | The home of a `tokeman agy run` session: its login file and conversations |
 | `~/.local/share/tokeman/snapshots.db` | Read history (sqlite): one row per reading that differs from the last, or per ten minutes |
