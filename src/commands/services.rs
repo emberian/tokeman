@@ -7,7 +7,8 @@ use std::path::Path;
 use super::view;
 use crate::account::Fleet;
 use crate::paths::tilde;
-use crate::providers::{self, ServiceAccount, agy};
+use crate::providers::antigravity::seat;
+use crate::providers::{self, ServiceAccount};
 use crate::quota::{Reading, Service};
 
 /// A registration: the account as stored, and whether it replaced one.
@@ -117,7 +118,7 @@ pub async fn seated(accounts: &[ServiceAccount]) -> Option<String> {
         return None;
     }
     let accounts = accounts.to_vec();
-    tokio::task::spawn_blocking(move || agy::seated(&accounts))
+    tokio::task::spawn_blocking(move || seat::seated(&accounts))
         .await
         .ok()?
 }
@@ -154,34 +155,23 @@ async fn read(accounts: &[ServiceAccount]) -> Vec<Reading> {
     readings
 }
 
-/// What `tokeman agy use` did, as lines to show.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgyUse {
-    pub lines: Vec<String>,
-    /// Nothing was written because a running client would undo it.
-    pub refused: bool,
-}
-
 /// Sign the agy CLI in as `name`, or put back the login the last use
-/// replaced when `name` is `None`.
+/// replaced when `name` is `None`. Running clients are looked at first: an
+/// open Antigravity app is told to follow, an interactive agy refuses the
+/// switch unless `force`. A refusal is a report, not an error.
 pub async fn agy_use(
     fleet: &Fleet,
     name: Option<&str>,
-    force: bool,
-    dry_run: bool,
-) -> Result<AgyUse> {
-    let _ = (force, dry_run);
-    let seating = match name {
-        Some(name) => {
-            let account = fleet
+    options: seat::UseOptions,
+) -> Result<seat::UseReport> {
+    let target = match name {
+        Some(name) => seat::UseTarget::Account(
+            fleet
                 .service_account(name)
-                .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?;
-            agy::seat(providers::client(), account).await?
-        }
-        None => agy::seat_previous().await?,
+                .filter(|account| account.service == Service::Antigravity)
+                .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?,
+        ),
+        None => seat::UseTarget::Previous,
     };
-    Ok(AgyUse {
-        lines: vec![format!("agy signs in as {}", seating.email)],
-        refused: false,
-    })
+    seat::use_account(providers::client(), target, options).await
 }

@@ -274,10 +274,10 @@ async fn agy_command(action: AgyAction) -> Result<()> {
             dry_run,
         } => {
             let name = name.filter(|_| !previous);
-            let report =
-                services::agy_use(&Fleet::load()?, name.as_deref(), force, dry_run).await?;
+            let options = tokeman::providers::antigravity::seat::UseOptions { force, dry_run };
+            let report = services::agy_use(&Fleet::load()?, name.as_deref(), options).await?;
             text::print_agy_use(&report);
-            if report.refused {
+            if report.refused() {
                 bail!("agy's login was not changed");
             }
         }

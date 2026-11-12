@@ -1484,8 +1484,8 @@ pub fn print_agy_imported(imported: &crate::commands::services::Imported) {
     print_gauges(&imported.readings, imported.seated.as_deref());
 }
 
-pub fn print_agy_use(report: &crate::commands::services::AgyUse) {
-    for line in &report.lines {
+pub fn print_agy_use(report: &crate::providers::antigravity::seat::UseReport) {
+    for line in &report.lines() {
         println!("{line}");
     }
 }

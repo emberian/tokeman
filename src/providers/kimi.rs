@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ServiceAccount, failed, limit};
-use crate::quota::{Balance, Limit, Reading, Service, Window};
+use super::{ServiceAccount, credential, decode, limit, network};
+use crate::quota::{Balance, Limit, ReadError, Reading, Service, Window};
+use crate::util::one_line;
 
 pub const BASE: &str = "https://api.kimi.com/coding/v1";
 
@@ -39,10 +40,10 @@ pub(crate) async fn read_from(
     account: &ServiceAccount,
     now: i64,
 ) -> Reading {
-    let failed = |error: String| failed(Service::Kimi, &account.name, now, error);
+    let failed = |error: ReadError| Reading::failed(Service::Kimi, &account.name, now, error);
     let key = match account.api_key() {
         Ok(key) => key,
-        Err(error) => return failed(format!("{error:#}")),
+        Err(error) => return failed(credential(format!("{error:#}"))),
     };
     let base = base.trim_end_matches('/');
     let (usages_url, me_url) = (format!("{base}/usages"), format!("{base}/me"));
@@ -60,30 +61,33 @@ pub(crate) async fn read_from(
     }
 }
 
-async fn get(client: &reqwest::Client, url: &str, key: &str) -> Result<String, String> {
+async fn get(client: &reqwest::Client, url: &str, key: &str) -> Result<String, ReadError> {
     let response = client
         .get(url)
         .bearer_auth(key)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| format!("request failed: {error}"))?;
+        .map_err(|error| network(format!("request failed: {error}")))?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|error| format!("reading the response failed: {error}"))?;
+        .map_err(|error| network(format!("reading the response failed: {error}")))?;
     if status.is_success() {
         return Ok(body);
     }
     let message = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|value| value["error"]["message"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| super::snippet(&body));
-    Err(match status.as_u16() {
-        401 => format!("Kimi refused the key (HTTP 401): {message}"),
-        404 => format!("no usage endpoint for this key (HTTP 404): {message}"),
-        code => format!("HTTP {code}: {message}"),
+        .unwrap_or_else(|| one_line(&body, 160));
+    Err(ReadError::Http {
+        status: status.as_u16(),
+        body: match status.as_u16() {
+            401 => format!("Kimi refused the key: {message}"),
+            404 => format!("no usage endpoint for this key: {message}"),
+            _ => message,
+        },
     })
 }
 
@@ -165,9 +169,13 @@ fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
     ))
 }
 
-fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), String> {
-    let parsed: UsagesBody = serde_json::from_str(body)
-        .map_err(|error| format!("unreadable answer ({error}): {}", super::snippet(body)))?;
+fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), ReadError> {
+    let parsed: UsagesBody = serde_json::from_str(body).map_err(|error| {
+        decode(format!(
+            "unreadable answer ({error}): {}",
+            one_line(body, 160)
+        ))
+    })?;
     let mut pools = parsed.usages.unwrap_or_default();
     let mut meters: Vec<Limit> = KNOWN
         .iter()
@@ -177,7 +185,7 @@ fn parse_usages(body: &str) -> Result<(Vec<Limit>, Vec<Balance>), String> {
         meter(key.strip_prefix("limit_").unwrap_or(key).into(), None, pool)
     }));
     if meters.is_empty() {
-        return Err("the answer has no usage windows".into());
+        return Err(decode("the answer has no usage windows"));
     }
     let balances = parsed
         .booster_wallet
