@@ -2,8 +2,13 @@
 //! task of its own bounded by [`mover::SWEEP_TIMEOUT`], it asks each control
 //! socket for its limits and moves a Codex below the `[rotation]` Codex
 //! floors onto a profile with room. The rotation cycle never waits on it.
-//! Off when `codex_auto_move` is false, while rotation is paused, and with
-//! fewer than two unparked profiles.
+//! Moving is off when `codex_auto_move` is false, while rotation is paused,
+//! and with fewer than two unparked profiles.
+//!
+//! The same task first tends every seat tokeman pushed (`codex::keep`): a
+//! Codex on a pushed token cannot renew it, so the daemon does, a day ahead
+//! of its expiry, whoever pushed it (itself, `codex use`, `codex watch`) and
+//! whatever `codex_auto_move` says. Only a paused rotation stops that.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,22 +19,34 @@ use tokio::task::JoinHandle;
 use super::lock::is_paused;
 use crate::account::Fleet;
 use crate::codex::Client;
-use crate::codex::mover::{self, By, Look, MoveFloors, Outcome};
+use crate::codex::keep::{self, Tend, Tended};
+use crate::codex::mover::{self, By, Look, Outcome, Terms};
+use crate::codex::seats::Seats;
 use crate::paths;
 use crate::store::Store;
+
+/// What one round did: the pushed seats it tended, then its looks.
+type Round = (Vec<Tend>, Vec<Look>);
 
 pub struct Mover {
     store: PathBuf,
     moves: PathBuf,
+    seats: Seats,
     next: Option<Instant>,
-    running: Option<JoinHandle<Result<Vec<Look>, String>>>,
+    running: Option<JoinHandle<Result<Round, String>>>,
     /// The outcome last seen per home, so only changes are logged.
     last: BTreeMap<PathBuf, &'static str>,
+    /// Likewise for each pushed seat, by its home.
+    last_tended: BTreeMap<String, &'static str>,
 }
 
 impl Default for Mover {
     fn default() -> Self {
-        Self::recording_to(paths::snapshots_db(), paths::codex_moves())
+        Self::recording_to(
+            paths::snapshots_db(),
+            paths::codex_moves(),
+            Seats::default(),
+        )
     }
 }
 
@@ -54,10 +71,10 @@ impl Standing {
 
     fn with_pause(fleet: &Fleet, paused: bool) -> Self {
         let unparked = mover::landings(fleet).len();
-        if !fleet.policy.codex_auto_move {
-            Self::Off
-        } else if paused {
+        if paused {
             Self::Paused
+        } else if !fleet.policy.codex_auto_move {
+            Self::Off
         } else if unparked < 2 {
             Self::FewProfiles { unparked }
         } else {
@@ -67,13 +84,15 @@ impl Standing {
 }
 
 impl Mover {
-    pub fn recording_to(store: PathBuf, moves: PathBuf) -> Self {
+    pub fn recording_to(store: PathBuf, moves: PathBuf, seats: Seats) -> Self {
         Self {
             store,
             moves,
+            seats,
             next: None,
             running: None,
             last: BTreeMap::new(),
+            last_tended: BTreeMap::new(),
         }
     }
 
@@ -92,26 +111,44 @@ impl Mover {
         let mut lines = Vec::new();
         if let Some(look) = self.running.take_if(|look| look.is_finished()) {
             match look.await {
-                Ok(Ok(looks)) => lines = self.take_in(&looks),
+                Ok(Ok((tended, looks))) => {
+                    lines = self.tended(&tended);
+                    lines.extend(self.take_in(&looks));
+                }
                 Ok(Err(message)) => lines.push(format!("ERROR codex mover: {message}")),
                 Err(error) => lines.push(format!("ERROR codex mover task failed: {error}")),
             }
         }
         let due = self.next.is_none_or(|next| Instant::now() >= next);
-        if self.running.is_none() && due && standing == Standing::On {
+        let moves = standing == Standing::On;
+        // A paused rotation manages nothing; otherwise a pushed seat is
+        // tended whether or not moving is on.
+        let tends = standing != Standing::Paused && !self.seats.load().is_empty();
+        if self.running.is_none() && due && (moves || tends) {
             self.next = Some(Instant::now() + mover::INTERVAL);
             let fleet = fleet.clone();
+            let seats = self.seats.clone();
             self.running = Some(tokio::spawn(async move {
                 let client = match client {
                     Some(client) => client,
                     None => Client::new().map_err(|error| format!("{error:#}"))?,
                 };
-                let homes = mover::homes(&fleet);
-                let floors = MoveFloors::of(&fleet);
-                tokio::time::timeout(
-                    mover::SWEEP_TIMEOUT,
-                    mover::sweep(&client, &fleet, &homes, floors, false),
-                )
+                let terms = Terms {
+                    seats,
+                    ..Terms::of(&fleet, By::Daemon)
+                };
+                tokio::time::timeout(mover::SWEEP_TIMEOUT, async {
+                    let now = chrono::Utc::now().timestamp();
+                    let tended = keep::tend_all(&client, &fleet, &terms.seats, now).await;
+                    let looks = match moves {
+                        true => {
+                            let homes = mover::homes(&fleet);
+                            mover::sweep(&client, &fleet, &homes, &terms, false).await
+                        }
+                        false => Vec::new(),
+                    };
+                    (tended, looks)
+                })
                 .await
                 .map_err(|_| {
                     format!(
@@ -120,6 +157,30 @@ impl Mover {
                     )
                 })
             }));
+        }
+        lines
+    }
+
+    /// What tending the pushed seats did, said when it changes: a renewal
+    /// and an ended seat once, trouble when it starts or changes.
+    fn tended(&mut self, tended: &[Tend]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for tend in tended {
+            let kind = tend.kind();
+            let before = match tend.outcome {
+                Tended::Ended => self.last_tended.remove(&tend.home),
+                _ => self.last_tended.insert(tend.home.clone(), kind),
+            };
+            let said = match tend.outcome {
+                Tended::Renewed { .. } | Tended::Ended => true,
+                Tended::Troubled(_) => before != Some(kind),
+                Tended::Fine => {
+                    before.is_some_and(|before| before != "fine" && before != "renewed")
+                }
+            };
+            if said {
+                lines.push(tend.to_string());
+            }
         }
         lines
     }
@@ -219,7 +280,8 @@ mod tests {
         let client = backend.client().await;
         let db = dir.path().join("s.db");
         let moves = dir.path().join("moves.jsonl");
-        let mut mover = Mover::recording_to(db.clone(), moves.clone());
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
+        let mut mover = Mover::recording_to(db.clone(), moves.clone(), seats.clone());
 
         // Off, paused or with one profile, no task starts.
         for standing in [
@@ -291,9 +353,173 @@ mod tests {
         assert_eq!(fake.logins().len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_pushed_seat_is_renewed_with_moving_off_and_left_alone_while_paused() {
+        use crate::codex::keep::tests::{access, profile_expiring, pushed_from};
+        use axum::http::StatusCode;
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let fake = FakeAppServer::start(vec![("acct-b", "b@x.y", limits_answer(10.0, 10.0))]);
+        // One profile, moving off: only tending is left to do.
+        let account = profile_expiring(dir.path(), "b", now + 3_600);
+        let mut fleet = Fleet {
+            codex: vec![account.clone()],
+            ..Fleet::default()
+        };
+        fleet.policy.codex_auto_move = false;
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
+        let seat = pushed_from(fake.home.path(), &account);
+        seats.put(seat.clone()).unwrap();
+        let later = now + 240 * 3_600;
+        let backend = Backend::default().token_answers(vec![(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": access("b", later),
+                "refresh_token": "r-new",
+                "id_token": crate::codex::auth::tests::id_token("b@x.y", "acct-b", "plus"),
+            })
+            .to_string(),
+        )]);
+        let client = backend.client().await;
+        let mut mover = Mover::recording_to(
+            dir.path().join("s.db"),
+            dir.path().join("moves.jsonl"),
+            seats.clone(),
+        );
+
+        // Paused: nothing starts, nothing is sent.
+        mover
+            .tick_with(&fleet, Standing::Paused, Some(client.clone()))
+            .await;
+        assert!(mover.running.is_none());
+
+        mover
+            .tick_with(&fleet, Standing::Off, Some(client.clone()))
+            .await;
+        finished(&mover).await;
+        let lines = mover
+            .tick_with(&fleet, Standing::Off, Some(client.clone()))
+            .await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("seat on b renewed"), "{lines:?}");
+        assert_eq!(fake.logins().len(), 1);
+        assert_eq!(fake.logins()[0]["accessToken"], access("b", later));
+        assert_eq!(seats.on(&seat.home).unwrap().expires_at, Some(later));
+        assert_eq!(backend.requests("/token").len(), 1);
+
+        // The next look has nothing to do and nothing to say.
+        mover.next = None;
+        mover
+            .tick_with(&fleet, Standing::Off, Some(client.clone()))
+            .await;
+        finished(&mover).await;
+        let lines = mover.tick_with(&fleet, Standing::Off, Some(client)).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(fake.logins().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_renewal_reaches_the_fleet_view_as_an_attention_item_with_its_fix() {
+        use crate::attention::{Attention, Unkept};
+        use crate::codex::keep::tests::{profile_expiring, pushed_from};
+        use crate::codex::seats::Cause;
+        use crate::ui::overview::{Facts, Monitor, Overview};
+        use axum::http::StatusCode;
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let fake = FakeAppServer::start(vec![("acct-b", "b@x.y", limits_answer(10.0, 10.0))]);
+        let account = profile_expiring(dir.path(), "b", now + 2 * 3_600);
+        let fleet = Fleet {
+            codex: vec![account.clone()],
+            ..Fleet::default()
+        };
+        let seats = Seats::at(dir.path().join("codex-seats.json"));
+        let seat = pushed_from(fake.home.path(), &account);
+        seats.put(seat.clone()).unwrap();
+        let backend = Backend::default().token_answers(vec![(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"refresh_token_invalidated"}"#.into(),
+        )]);
+        let client = backend.client().await;
+        let mut mover = Mover::recording_to(
+            dir.path().join("s.db"),
+            dir.path().join("moves.jsonl"),
+            seats.clone(),
+        );
+        let standing = Standing::FewProfiles { unparked: 1 };
+        mover
+            .tick_with(&fleet, standing, Some(client.clone()))
+            .await;
+        finished(&mover).await;
+        let lines = mover
+            .tick_with(&fleet, standing, Some(client.clone()))
+            .await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ERROR codex ") && lines[0].contains("(refused)"),
+            "{lines:?}"
+        );
+        assert!(fake.logins().is_empty(), "no token, nothing pushed");
+        // Still refused at the next look: recorded, not logged again.
+        mover.next = None;
+        mover
+            .tick_with(&fleet, standing, Some(client.clone()))
+            .await;
+        finished(&mover).await;
+        assert!(
+            mover
+                .tick_with(&fleet, standing, Some(client))
+                .await
+                .is_empty()
+        );
+
+        // What every surface and the notifier read.
+        let facts = Facts {
+            codex_seats: seats.load(),
+            monitor: Monitor::Running,
+            ..Facts::default()
+        };
+        let overview = Overview::build(&fleet, facts, None, now);
+        let [item] = &overview.attention[..] else {
+            panic!("{:?}", overview.attention);
+        };
+        assert_eq!(
+            item.item,
+            Attention::CodexSeatExpires {
+                home: seat.home.clone(),
+                account: "b".into(),
+                profile_home: Some(crate::paths::tilde(&account.home())),
+                expires_at: seat.expires_at,
+                why: Unkept::Tried(Cause::Refused),
+            }
+        );
+        assert!(
+            item.text
+                .contains("runs on a token of b that stops working")
+                && item.text.ends_with("its login was refused"),
+            "{}",
+            item.text
+        );
+        assert_eq!(
+            item.fix.as_deref(),
+            Some(
+                format!(
+                    "CODEX_HOME={} codex login, then tokeman codex use b --codex-home {}",
+                    crate::paths::tilde(&account.home()),
+                    seat.home
+                )
+                .as_str()
+            )
+        );
+    }
+
     #[test]
     fn only_changes_are_logged_and_quiet_states_only_after_trouble() {
-        let mut mover = Mover::recording_to("/nonexistent/s.db".into(), "/nonexistent/m".into());
+        let mut mover = Mover::recording_to(
+            "/nonexistent/s.db".into(),
+            "/nonexistent/m".into(),
+            Seats::at("/nonexistent/seats.json"),
+        );
         let look = |outcome: Outcome| Look {
             home: "/h".into(),
             seated: Some("a".into()),

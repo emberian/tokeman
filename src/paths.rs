@@ -132,6 +132,12 @@ pub fn legacy_reset_claims_dir() -> PathBuf {
     config_dir().join("reset-claims")
 }
 
+/// The seats tokeman pushed to running Codexes and when each token expires;
+/// written only by `codex::seats`.
+pub fn codex_seats() -> PathBuf {
+    config_dir().join("codex-seats.json")
+}
+
 /// Every move of a running Codex between accounts (JSONL); written only by
 /// `codex::mover`.
 pub fn codex_moves() -> PathBuf {

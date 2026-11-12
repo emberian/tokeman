@@ -309,6 +309,9 @@ pub(crate) mod tests {
         /// Per account id: its email and its rate-limit answer.
         pub accounts: BTreeMap<String, (String, Value)>,
         pub logins: Vec<Value>,
+        /// Answer `account/rateLimits/read` with an error, as a Codex whose
+        /// token the backend rejects does.
+        pub limits_fail: bool,
     }
 
     /// A Codex app-server on a control socket under a short-lived home.
@@ -334,6 +337,7 @@ pub(crate) mod tests {
                     .map(|(id, email, limits)| (id.to_owned(), (email.to_owned(), limits)))
                     .collect(),
                 logins: Vec::new(),
+                limits_fail: false,
             }));
             let listener = UnixListener::bind(&socket).unwrap();
             let state = running.clone();
@@ -373,6 +377,22 @@ pub(crate) mod tests {
             let Some(id) = request.get("id").cloned() else {
                 continue;
             };
+            let failed =
+                request["method"] == "account/rateLimits/read" && state.lock().unwrap().limits_fail;
+            if failed {
+                let answer = json!({"id": id, "error": {
+                    "code": -32603,
+                    "message": "failed to fetch codex rate limits: 401 Unauthorized",
+                }});
+                if socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
             let result = {
                 let mut running = state.lock().unwrap();
                 match request["method"].as_str().unwrap_or_default() {
@@ -393,6 +413,8 @@ pub(crate) mod tests {
                         {
                             running.account_id = id.to_owned();
                         }
+                        // A new token is one the backend accepts.
+                        running.limits_fail = false;
                         running.logins.push(params);
                         json!({"type": "chatgptAuthTokens"})
                     }

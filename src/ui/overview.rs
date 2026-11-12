@@ -7,6 +7,7 @@
 //! service keeps the stores fresh; a caller that has just read the accounts
 //! itself puts its readings on top with [`Facts::with_fresh`].
 
+use crate::codex::seats::{Pushed, Seats};
 use serde::Serialize;
 
 use crate::account::{Account, Fleet};
@@ -97,8 +98,22 @@ pub struct Overview {
     /// Per service, when its accounts run dry at the recent rate; a service
     /// whose history cannot support a forecast has none.
     pub forecasts: Vec<ForecastView>,
+    /// The running Codexes holding a token tokeman pushed; such a token is
+    /// only renewed by the background service.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub codex_seats: Vec<SeatView>,
     /// What needs the user, the critical items first.
     pub attention: Vec<AttentionView>,
+}
+
+/// A pushed Codex seat, and where its profile logs in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SeatView {
+    #[serde(flatten)]
+    pub seat: Pushed,
+    /// The profile's CODEX_HOME, `~`-relative; `None` when the profile is
+    /// no longer registered.
+    pub profile_home: Option<String>,
 }
 
 /// One thing that needs the user: what it is, and how the surfaces say it.
@@ -290,6 +305,8 @@ pub struct Facts {
     pub coverage: Option<String>,
     pub sampling: Option<String>,
     pub live_sessions: Option<Vec<Session>>,
+    /// The seats tokeman pushed to running Codexes.
+    pub codex_seats: Vec<Pushed>,
 }
 
 impl Default for Facts {
@@ -310,6 +327,7 @@ impl Default for Facts {
             coverage: None,
             sampling: None,
             live_sessions: None,
+            codex_seats: Vec::new(),
         }
     }
 }
@@ -376,6 +394,7 @@ impl Facts {
             coverage: None,
             sampling: None,
             live_sessions: None,
+            codex_seats: Seats::default().load(),
         }
     }
 
@@ -538,6 +557,17 @@ impl Overview {
             default_account: facts.default_account,
             target_model: facts.target_model,
             forecasts,
+            codex_seats: facts
+                .codex_seats
+                .into_iter()
+                .filter(|_| wants(Service::Codex))
+                .map(|seat| SeatView {
+                    profile_home: fleet
+                        .codex_account(&seat.account)
+                        .map(|account| crate::paths::tilde(&account.home())),
+                    seat,
+                })
+                .collect(),
             attention: Vec::new(),
         };
         overview.attention = attention::find(&overview, now)

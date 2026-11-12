@@ -8,11 +8,13 @@
 
 pub mod appserver;
 pub mod auth;
+pub mod keep;
 pub mod maintenance;
 pub mod mover;
 pub mod probe;
 pub mod refresh;
 pub mod resets;
+pub mod seats;
 
 use anyhow::Result;
 use std::time::Duration;
