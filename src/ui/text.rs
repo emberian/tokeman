@@ -930,9 +930,8 @@ pub fn print_notify_test(delivery: &Delivery) {
         Delivery::NoNotifier => println!(
             "this system has no notifier tokeman knows (notify-send is not on PATH): what needs you goes to the rotation log alone"
         ),
-        Delivery::Failed { reason, .. } => {
-            eprintln!("the notification was not delivered: {reason}")
-        }
+        // `main` fails with the reason.
+        Delivery::Failed { .. } => {}
     }
 }
 
