@@ -10,8 +10,9 @@
 
 use serde::Deserialize;
 
-use super::{ServiceAccount, failed};
-use crate::quota::{Amount, Limit, Reading, Service, Span, Window};
+use super::{ServiceAccount, credential, decode, network};
+use crate::quota::{Amount, Limit, ReadError, Reading, Service, Span, Window};
+use crate::util::one_line;
 
 pub const BASE: &str = "https://api.z.ai";
 const QUOTA_PATH: &str = "/api/monitor/usage/quota/limit";
@@ -32,10 +33,10 @@ pub(crate) async fn read_from(
     account: &ServiceAccount,
     now: i64,
 ) -> Reading {
-    let failed = |error: String| failed(Service::Zai, &account.name, now, error);
+    let failed = |error: ReadError| Reading::failed(Service::Zai, &account.name, now, error);
     let key = match account.api_key() {
         Ok(key) => key,
-        Err(error) => return failed(format!("{error:#}")),
+        Err(error) => return failed(credential(format!("{error:#}"))),
     };
     let response = match client
         .get(format!("{}{QUOTA_PATH}", base.trim_end_matches('/')))
@@ -45,19 +46,20 @@ pub(crate) async fn read_from(
         .await
     {
         Ok(response) => response,
-        Err(error) => return failed(format!("request failed: {error}")),
+        Err(error) => return failed(network(format!("request failed: {error}"))),
     };
     let status = response.status();
     let body = match response.text().await {
         Ok(body) => body,
-        Err(error) => return failed(format!("reading the response failed: {error}")),
+        Err(error) => {
+            return failed(network(format!("reading the response failed: {error}")));
+        }
     };
     if !status.is_success() {
-        return failed(format!(
-            "HTTP {}: {}",
-            status.as_u16(),
-            super::snippet(&body)
-        ));
+        return failed(ReadError::Http {
+            status: status.as_u16(),
+            body: one_line(&body, 160),
+        });
     }
     match parse(&body, now) {
         Ok((plan, limits)) => Reading {
@@ -181,26 +183,39 @@ impl RawLimit {
 }
 
 /// The plan level and one meter per known limit, shortest window first.
-fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Limit>), String> {
-    let envelope: Envelope = serde_json::from_str(body)
-        .map_err(|error| format!("unreadable answer ({error}): {}", super::snippet(body)))?;
+fn parse(body: &str, now: i64) -> Result<(Option<String>, Vec<Limit>), ReadError> {
+    let envelope: Envelope = serde_json::from_str(body).map_err(|error| {
+        decode(format!(
+            "unreadable answer ({error}): {}",
+            one_line(body, 160)
+        ))
+    })?;
     if !envelope.success || envelope.code != Some(200) {
-        return Err(format!(
-            "z.ai refused: {} (code {})",
-            envelope.msg.as_deref().unwrap_or("no message"),
-            envelope
-                .code
-                .map_or_else(|| "none".to_owned(), |code| code.to_string())
-        ));
+        let message = envelope.msg.as_deref().unwrap_or("no message");
+        // The envelope carries the HTTP status the transport did not.
+        return Err(match envelope.code {
+            Some(code @ 400..=599) => ReadError::Http {
+                status: code as u16,
+                body: message.to_owned(),
+            },
+            code => ReadError::Other {
+                message: format!(
+                    "z.ai refused: {message} (code {})",
+                    code.map_or_else(|| "none".to_owned(), |code| code.to_string())
+                ),
+            },
+        });
     }
-    let quota = envelope.data.ok_or("the answer has no data")?;
+    let quota = envelope
+        .data
+        .ok_or_else(|| decode("the answer has no data"))?;
     let mut meters: Vec<Limit> = quota
         .limits
         .iter()
         .filter_map(|limit| limit.meter(now))
         .collect();
     if meters.is_empty() {
-        return Err("the answer lists no limits tokeman knows".into());
+        return Err(decode("the answer lists no limits tokeman knows"));
     }
     meters.sort_by_key(|meter| {
         (
@@ -298,9 +313,27 @@ mod tests {
             NOW,
         )
         .unwrap_err();
-        assert!(error.contains("token expired or incorrect"), "{error}");
-        assert!(error.contains("401"), "{error}");
-        assert!(parse("<html>", NOW).is_err());
+        // The envelope's code is the status the transport did not carry.
+        assert_eq!(
+            error,
+            ReadError::Http {
+                status: 401,
+                body: "token expired or incorrect".into()
+            }
+        );
+        assert!(error.is_definitive());
+        assert!(matches!(
+            parse(r#"{"code":1001,"msg":"busy","success":false}"#, NOW),
+            Err(ReadError::Other { .. })
+        ));
+        assert!(matches!(
+            parse("<html>", NOW),
+            Err(ReadError::Decode { .. })
+        ));
+        assert!(matches!(
+            parse(r#"{"code":200,"success":true}"#, NOW),
+            Err(ReadError::Decode { .. })
+        ));
     }
 
     #[tokio::test]

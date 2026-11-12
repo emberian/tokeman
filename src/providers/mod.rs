@@ -7,7 +7,6 @@
 //! account: &ServiceAccount, now: i64) -> Reading` and never panics or
 //! returns `Err`: a failure is a `Reading` with `error` set.
 
-pub mod agy;
 pub mod antigravity;
 pub mod kimi;
 pub mod zai;
@@ -189,6 +188,27 @@ pub(crate) fn failed(
     )
 }
 
+/// The key or grant could not be read or was refused for good.
+pub(crate) fn credential(message: impl Into<String>) -> ReadError {
+    ReadError::Credential {
+        message: message.into(),
+    }
+}
+
+/// The request never completed.
+pub(crate) fn network(message: impl Into<String>) -> ReadError {
+    ReadError::Network {
+        message: message.into(),
+    }
+}
+
+/// The answer was not in a shape this build reads.
+pub(crate) fn decode(message: impl Into<String>) -> ReadError {
+    ReadError::Decode {
+        message: message.into(),
+    }
+}
+
 /// The accounts of `service` that answered, as the rotation policy ranks
 /// them ([`policy::rank_above`] with no floor): room in every limit that
 /// counts, expiring weekly room first. With `group`, only the limits whose
@@ -219,16 +239,6 @@ pub fn ranked<'a>(
             Some((original, room))
         })
         .collect()
-}
-
-/// A response body cut to one short line, for an error message.
-pub(crate) fn snippet(body: &str) -> String {
-    const MAX_CHARS: usize = 160;
-    let single = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    match single.char_indices().nth(MAX_CHARS) {
-        Some((cut, _)) => format!("{}…", &single[..cut]),
-        None => single,
-    }
 }
 
 #[cfg(test)]

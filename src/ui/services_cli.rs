@@ -5,7 +5,8 @@ use anyhow::{Result, bail};
 use crate::account::Fleet;
 use crate::cli::{ImportSource, ServicesAction};
 use crate::paths::tilde;
-use crate::providers::{self, ServiceAccount, agy};
+use crate::providers::antigravity::seat as agy;
+use crate::providers::{self, ServiceAccount};
 use crate::quota::{Reading, Service};
 use crate::store::Store;
 use crate::ui::text;
@@ -76,22 +77,22 @@ pub async fn run(action: Option<ServicesAction>, json: bool) -> Result<()> {
             );
         }
         ServicesAction::Use { name, previous } => {
-            let seating = match name {
-                Some(name) if !previous => {
-                    let fleet = Fleet::load()?;
-                    let account = fleet
-                        .service_account(&name)
-                        .ok_or_else(|| anyhow::anyhow!("no service account named '{name}'"))?;
-                    agy::seat(providers::client(), account).await?
-                }
-                _ => agy::seat_previous().await?,
+            let fleet = Fleet::load()?;
+            let target = match &name {
+                Some(name) if !previous => agy::UseTarget::Account(
+                    fleet
+                        .service_account(name)
+                        .ok_or_else(|| anyhow::anyhow!("no service account named '{name}'"))?,
+                ),
+                _ => agy::UseTarget::Previous,
             };
-            println!("{}", seating_line(&seating));
-            let running = agy::running().await;
-            if seating.changed && running > 0 {
-                println!(
-                    "{running} running agy process(es) keep the account they started with, and will write it back as agy's login when they next refresh their token (within the hour). Quit them, then run this again."
-                );
+            let report =
+                agy::use_account(providers::client(), target, agy::UseOptions::default()).await?;
+            for line in report.lines() {
+                println!("{line}");
+            }
+            if report.refused() {
+                bail!("agy's login was not changed");
             }
         }
         ServicesAction::Best { service, group } => {
@@ -124,17 +125,6 @@ pub async fn run(action: Option<ServicesAction>, json: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn seating_line(seating: &agy::Seated) -> String {
-    match (&seating.previous, seating.changed) {
-        (_, false) => format!("agy is already signed in as {}", seating.email),
-        (Some(previous), true) => format!(
-            "agy now signs in as {} (was {previous}; `tokeman services use --previous` puts it back)",
-            seating.email
-        ),
-        (None, true) => format!("agy now signs in as {}", seating.email),
-    }
 }
 
 /// The name of the account in `accounts` the agy CLI is signed in as. Asks
