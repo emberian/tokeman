@@ -85,12 +85,23 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
 }
 
 /// One variable of a launch's environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnvVar {
     pub name: &'static str,
     pub value: OsString,
     /// A credential: named when the launch is described, never shown.
     pub secret: bool,
+}
+
+impl std::fmt::Debug for EnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value: &dyn std::fmt::Debug = if self.secret { &"<set>" } else { &self.value };
+        f.debug_struct("EnvVar")
+            .field("name", &self.name)
+            .field("value", value)
+            .field("secret", &self.secret)
+            .finish()
+    }
 }
 
 /// A tool ready to start on one account. The account is seated through the
@@ -232,6 +243,9 @@ mod tests {
             .collect();
         assert_eq!(removed, [OsStr::new("GONE")]);
         assert_eq!(launch.removed(), ["GONE"]);
+        let shown = format!("{launch:?}");
+        assert!(shown.contains(r#"value: "home""#), "{shown}");
+        assert!(!shown.contains(r#""k""#), "{shown}");
         assert!(
             launch
                 .env()

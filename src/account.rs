@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::paths;
-use crate::providers::ServiceAccount;
+use crate::providers::{ServiceAccount, held};
 use crate::settings::{LaunchSettings, PolicySettings};
 
 /// Refresh this long before expiry. Claude keeps its cached token until it is
@@ -27,7 +27,7 @@ const MIN_REFRESH_AGE_MS: i64 = 5 * 60 * 1000;
 const MIN_INSTALL_LIFETIME_MS: i64 = 2 * 60 * 1000;
 
 /// A browser login: full scope, refreshable, short-lived access token.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Login {
     pub access_token: Option<String>,
     /// Single-use: every refresh returns a replacement.
@@ -46,6 +46,23 @@ pub struct Login {
     /// Why the refresh token was refused for good. While set, the account
     /// falls back to its setup key until `tokeman claude login` runs again.
     pub error: Option<String>,
+}
+
+// The types that hold a credential say `<set>` for it when formatted.
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("access_token", &held(&self.access_token))
+            .field("refresh_token", &held(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("obtained_at", &self.obtained_at)
+            .field("logged_in_at", &self.logged_in_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("scopes", &self.scopes)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl Login {
@@ -81,7 +98,7 @@ impl Login {
 }
 
 /// What the token endpoint returns for a login or a refresh.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Grant {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -91,7 +108,19 @@ pub struct Grant {
     pub scopes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grant")
+            .field("access_token", &"<set>")
+            .field("refresh_token", &held(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Account {
     pub name: String,
     /// A `claude setup-token`: long-lived, inference-only.
@@ -99,8 +128,18 @@ pub struct Account {
     pub login: Option<Login>,
 }
 
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("name", &self.name)
+            .field("setup_key", &held(&self.setup_key))
+            .field("login", &self.login)
+            .finish()
+    }
+}
+
 /// The credential tokeman hands Claude, or probes with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Credential<'a> {
     Setup(&'a str),
     Login {
@@ -109,6 +148,22 @@ pub enum Credential<'a> {
         expires_at: Option<i64>,
         scopes: &'a [String],
     },
+}
+
+impl std::fmt::Debug for Credential<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(_) => f.write_str("Setup(<set>)"),
+            Self::Login {
+                expires_at, scopes, ..
+            } => f
+                .debug_struct("Login")
+                .field("token", &"<set>")
+                .field("expires_at", expires_at)
+                .field("scopes", scopes)
+                .finish(),
+        }
+    }
 }
 
 impl<'a> Credential<'a> {
@@ -623,7 +678,7 @@ impl Fleet {
 }
 
 /// tokens.toml as it is on disk.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 struct File {
     #[serde(default)]
     tokens: Vec<Record>,
@@ -638,7 +693,7 @@ struct File {
 }
 
 /// One `[[tokens]]` table: an account's fields, flat.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 struct Record {
     name: String,
     #[serde(default)]
@@ -1116,6 +1171,40 @@ mod tests {
         });
         assert!(failed.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn no_credential_is_shown_when_an_account_is_formatted() {
+        let mut fleet = Fleet::default();
+        fleet.accounts.push(login_account("acct", HOUR_MS));
+        let account = &fleet.accounts[0];
+        let grant = Grant {
+            access_token: "sk-ant-oat01-granted".into(),
+            refresh_token: Some("sk-ant-ort01-granted".into()),
+            ..Grant::default()
+        };
+        let shown = format!(
+            "{fleet:?} {fleet:#?} {:?} {:?} {grant:?}",
+            account.credential(0).unwrap(),
+            Credential::Setup(account.setup_key.as_deref().unwrap()),
+        );
+        for secret in [
+            "sk-ant-oat01-setup-acct",
+            "sk-ant-oat01-access-acct",
+            "sk-ant-ort01-refresh",
+            "sk-ant-oat01-granted",
+            "sk-ant-ort01-granted",
+        ] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        // What is held is still said, and the rest still shown.
+        assert!(shown.contains(r#"setup_key: Some("<set>")"#), "{shown}");
+        assert!(shown.contains(r#"refresh_token: Some("<set>")"#), "{shown}");
+        assert!(shown.contains("user:profile"), "{shown}");
+        assert!(
+            format!("{:?}", Account::new("bare")).contains("setup_key: None"),
+            "a missing credential is not shown as held"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{Client, describe};
@@ -29,11 +29,22 @@ pub const SCOPES: &str =
 const EXCHANGE_RETRY_SECS: [u64; 3] = [5, 15, 30];
 
 /// A login in progress: the URL to open and what redeems its code.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pkce {
     pub verifier: String,
     pub state: String,
     pub url: String,
+}
+
+/// The verifier redeems the code; it is never shown. The state is in the URL.
+impl fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pkce")
+            .field("verifier", &"<set>")
+            .field("state", &self.state)
+            .field("url", &self.url)
+            .finish()
+    }
 }
 
 /// Whether a refusal will hold until a new browser login.
@@ -154,19 +165,34 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub refresh_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub expires_in: Option<i64>,
     /// Seconds the refresh token has left. It does not slide: a refresh
     /// reports what remains of the browser login's lifetime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub refresh_token_expires_in: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<set>")
+            .field(
+                "refresh_token",
+                &crate::providers::held(&self.refresh_token),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token_expires_in", &self.refresh_token_expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// `expires_at` in epoch milliseconds, as Claude's own Keychain record keeps it.
@@ -302,6 +328,7 @@ mod tests {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.verifier.as_bytes()));
         assert!(pkce.url.contains(&format!("code_challenge={challenge}&")));
         assert_eq!(pkce.verifier.len(), 43, "32 bytes, unpadded");
+        assert!(!format!("{pkce:?}").contains(&pkce.verifier));
     }
 
     #[tokio::test]
@@ -345,6 +372,11 @@ mod tests {
             refresh_token_expires_in: Some(2_592_000),
             scope: Some("user:profile user:inference".into()),
         };
+        let shown = format!("{response:?}");
+        assert!(
+            !shown.contains("sk-ant-oat01-a") && !shown.contains("sk-ant-ort01-r"),
+            "{shown}"
+        );
         let grant = grant_of(response, 1_000);
         assert_eq!(grant.expires_at, Some(1_000 + 28_800_000));
         assert_eq!(grant.refresh_expires_at, Some(1_000 + 2_592_000_000));

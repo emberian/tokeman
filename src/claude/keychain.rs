@@ -29,12 +29,23 @@ pub enum BackupState {
     Suppressed,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoginBackup {
     version: u32,
     pub state: BackupState,
     #[serde(rename = "claudeAiOauth")]
     pub login: Option<Value>,
+}
+
+/// The login record holds tokens: formatted, it only says whether it is there.
+impl std::fmt::Debug for LoginBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginBackup")
+            .field("version", &self.version)
+            .field("state", &self.state)
+            .field("login", &crate::providers::held(&self.login))
+            .finish()
+    }
 }
 
 impl LoginBackup {
@@ -284,6 +295,10 @@ mod tests {
         let backup: LoginBackup = serde_json::from_str(json).unwrap();
         assert_eq!(backup.state, BackupState::Captured);
         assert_eq!(serde_json::to_string(&backup).unwrap(), json);
+        assert_eq!(
+            format!("{backup:?}"),
+            r#"LoginBackup { version: 1, state: Captured, login: Some("<set>") }"#
+        );
         assert!(serde_json::from_str::<LoginBackup>(r#"{"version":1,"state":"lost"}"#).is_err());
     }
 }
