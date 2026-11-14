@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 - 2026-11-14
+
+- `tokeman claude reset` now opens an interactive picker of available resets,
+  with an effects preview. Add an account name to narrow the choices, or use
+  `--list` for plain output. Explicit reset selections and `--yes` skip the picker.
+- Reset confirmations pair each usage limit with its before-and-after percentage,
+  and show the remaining resets and expiry separately. Help explains what a
+  reset spends and how session resets use the weekly allowance.
+
 ## 0.4.1 - 2026-11-13
 
 - Rotation polls faster near the selected model's quota floor, including

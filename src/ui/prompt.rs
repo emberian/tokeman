@@ -88,43 +88,42 @@ fn reset_options(listings: &[claude::ResetListing], now: i64) -> Vec<ResetOption
         let Some(Ok(status)) = &listing.status else {
             continue;
         };
-        if let Some(program) = &status.cedar_ember {
-            if program.standing() == resets::Standing::Eligible {
-                let mut grants = program.grants();
-                grants.sort_by_key(|grant| program.next_grant_id.as_deref() != Some(&grant.id));
-                for grant in grants {
-                    if !grant.is_usable(now) || !grant.usable_now {
-                        continue;
-                    }
-                    if listing
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.item.as_deref() != Some(&grant.id))
-                    {
-                        continue;
-                    }
-                    let label = if grant.label.is_empty() {
-                        &grant.id
-                    } else {
-                        &grant.label
-                    };
-                    let mut details = vec![label.clone()];
-                    details.extend(resets::grant_effects(&grant));
-                    details.push(format!("Resets left: {}", grant.resets_left));
-                    if let Some(end) = &grant.ends_at {
-                        details.push(format!("Expires: {}", end.get(..10).unwrap_or(end)));
-                    }
-                    if listing.pending.is_some() {
-                        details
-                            .push("Resends the previous request whose outcome is unknown.".into());
-                    }
-                    options.push(ResetOption {
-                        account: listing.account.clone(),
-                        label: format!("{} · {label}", listing.account),
-                        details: details.join("\n"),
-                        grant: Some(grant.id),
-                    });
+        if let Some(program) = &status.cedar_ember
+            && program.standing() == resets::Standing::Eligible
+        {
+            let mut grants = program.grants();
+            grants.sort_by_key(|grant| program.next_grant_id.as_deref() != Some(&grant.id));
+            for grant in grants {
+                if !grant.is_usable(now) || !grant.usable_now {
+                    continue;
                 }
+                if listing
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.item.as_deref() != Some(&grant.id))
+                {
+                    continue;
+                }
+                let label = if grant.label.is_empty() {
+                    &grant.id
+                } else {
+                    &grant.label
+                };
+                let mut details = vec![label.clone()];
+                details.extend(resets::grant_effects(&grant));
+                details.push(format!("Resets left: {}", grant.resets_left));
+                if let Some(end) = &grant.ends_at {
+                    details.push(format!("Expires: {}", end.get(..10).unwrap_or(end)));
+                }
+                if listing.pending.is_some() {
+                    details.push("Resends the previous request whose outcome is unknown.".into());
+                }
+                options.push(ResetOption {
+                    account: listing.account.clone(),
+                    label: format!("{} · {label}", listing.account),
+                    details: details.join("\n"),
+                    grant: Some(grant.id),
+                });
             }
         }
         if listing.pending.is_none()

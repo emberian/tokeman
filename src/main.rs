@@ -178,25 +178,26 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
         } => {
             let mut fleet = Fleet::load()?;
             let pick = !list && !yes && grant.is_none() && !session && prompt::interactive();
-            let (name, grant, session) = if list || name.is_none() || pick {
-                if let Some(name) = &name {
-                    if fleet.account(name).is_none() {
-                        bail!("no configured account named {name}");
+            let (name, grant, session) = match name {
+                Some(name) if !list && !pick => (name, grant, session),
+                name => {
+                    if let Some(name) = &name {
+                        if fleet.account(name).is_none() {
+                            bail!("no configured account named {name}");
+                        }
+                        fleet.accounts.retain(|account| &account.name == name);
                     }
-                    fleet.accounts.retain(|account| &account.name == name);
+                    let listings = claude::reset_offers(&fleet).await;
+                    if !pick {
+                        text::print_reset_offers(&listings);
+                        return Ok(());
+                    }
+                    let Some(selected) = prompt::choose_reset(&listings)? else {
+                        return Ok(());
+                    };
+                    let session = selected.grant.is_none();
+                    (selected.account, selected.grant, session)
                 }
-                let listings = claude::reset_offers(&fleet).await;
-                if !pick {
-                    text::print_reset_offers(&listings);
-                    return Ok(());
-                }
-                let Some(selected) = prompt::choose_reset(&listings)? else {
-                    return Ok(());
-                };
-                let session = selected.grant.is_none();
-                (selected.account, selected.grant, session)
-            } else {
-                (name.unwrap(), grant, session)
             };
             let plan = claude::reset_plan(&fleet, &name, grant.as_deref(), session).await?;
             text::print_reset_plan(&plan);

@@ -1,6 +1,6 @@
 [package]
 name = "tokeman"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Keeps Claude Code, Codex and agy on a subscription account with room left, and shows the rest"
 repository = "https://github.com/emberian/tokeman"
