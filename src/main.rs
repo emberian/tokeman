@@ -163,26 +163,45 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
         ClaudeAction::Launch { auto, args } => {
             tokeman::launch::run(Fleet::load()?, auto, args).await?
         }
-        ClaudeAction::Reset { name: None, .. } => {
-            text::print_reset_offers(&claude::reset_offers(&Fleet::load()?).await)
-        }
         ClaudeAction::Reset {
             name: Some(name),
             clear: true,
             ..
         } => text::print_reset_cleared(&name, claude::reset_clear(&name)?.as_ref()),
         ClaudeAction::Reset {
-            name: Some(name),
+            name,
             grant,
             session,
             yes,
+            list,
             ..
         } => {
-            let plan =
-                claude::reset_plan(&Fleet::load()?, &name, grant.as_deref(), session).await?;
+            let mut fleet = Fleet::load()?;
+            let pick = !list && !yes && grant.is_none() && !session && prompt::interactive();
+            let (name, grant, session) = if list || name.is_none() || pick {
+                if let Some(name) = &name {
+                    if fleet.account(name).is_none() {
+                        bail!("no configured account named {name}");
+                    }
+                    fleet.accounts.retain(|account| &account.name == name);
+                }
+                let listings = claude::reset_offers(&fleet).await;
+                if !pick {
+                    text::print_reset_offers(&listings);
+                    return Ok(());
+                }
+                let Some(selected) = prompt::choose_reset(&listings)? else {
+                    return Ok(());
+                };
+                let session = selected.grant.is_none();
+                (selected.account, selected.grant, session)
+            } else {
+                (name.unwrap(), grant, session)
+            };
+            let plan = claude::reset_plan(&fleet, &name, grant.as_deref(), session).await?;
             text::print_reset_plan(&plan);
-            if !yes && !prompt::confirm("use it now?")? {
-                text::print_kept();
+            if !yes && !prompt::confirm("Use one reset now?")? {
+                println!("Cancelled; no reset used.");
                 return Ok(());
             }
             text::print_reset_claimed(&claude::reset_claim(&plan).await?);

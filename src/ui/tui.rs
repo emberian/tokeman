@@ -227,10 +227,10 @@ impl App {
 }
 
 /// Raw mode and the alternate screen, restored on drop whatever happens.
-struct TerminalSession;
+pub(super) struct TerminalSession;
 
 impl TerminalSession {
-    fn enter() -> Result<Self> {
+    pub(super) fn enter() -> Result<Self> {
         enable_raw_mode()?;
         if let Err(error) = std::io::stdout().execute(EnterAlternateScreen) {
             let _ = disable_raw_mode();

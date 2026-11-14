@@ -209,18 +209,26 @@ pub enum ClaudeAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Usage-limit resets: list what is on offer, or use one on an account
-    /// (asks first; needs a logged-in account)
+    /// Spend a limited reset to restore Claude usage allowance (asks first)
+    ///
+    /// Interactively choose an available reset, optionally for NAME, then review
+    /// its effect and confirm. Use --list for plain output; without NAME,
+    /// piped output also lists offers.
+    /// Explicit --grant or --session skips the picker. Requires a login.
+    /// Weekly reset dates stay unchanged.
     Reset {
-        /// The account to reset (default: list every account's offers)
+        /// Limit the choices to this account (default: all accounts)
         name: Option<String>,
-        /// Grant to use (default: the one the server offers next)
+        /// List offers without opening the picker or spending a reset
+        #[arg(long, conflicts_with_all = ["grant", "session", "yes", "clear"])]
+        list: bool,
+        /// Choose a reset offer by ID (default: Claude's recommended offer)
         #[arg(long, requires = "name")]
         grant: Option<String>,
-        /// Use the session reset instead of a grant
+        /// Refill only the 5-hour allowance; subsequent usage still counts toward the weekly limit
         #[arg(long, requires = "name", conflicts_with = "grant")]
         session: bool,
-        /// Do not ask
+        /// Spend the reset without confirmation
         #[arg(long, requires = "name")]
         yes: bool,
         /// Forget a grant claim whose outcome is unknown, once Settings >
@@ -812,6 +820,7 @@ mod tests {
                     session,
                     yes,
                     clear,
+                    ..
                 },
         }) = parse("tokeman claude reset work").unwrap().command
         else {

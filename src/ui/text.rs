@@ -1469,11 +1469,32 @@ pub fn print_reset_plan(plan: &crate::commands::claude::ResetPlan) {
             "{}: session reset (refills the 5-hour limit, paid from the weekly limit)",
             plan.account.name
         ),
-        ResetChoice::Grant(grant) => println!(
-            "{}: {}",
-            plan.account.name,
-            resets::describe_grant(grant, plan.at)
-        ),
+        ResetChoice::Grant(grant) => {
+            println!("{}", plan.account.name);
+            println!(
+                "  {}",
+                if grant.label.is_empty() {
+                    &grant.id
+                } else {
+                    &grant.label
+                }
+            );
+            for effect in resets::grant_effects(grant) {
+                println!("  {effect}");
+            }
+            if grant.clears.is_empty() {
+                println!("  Reset scope not reported.");
+            }
+            println!(
+                "  Resets left: {}{}",
+                grant.resets_left,
+                grant
+                    .ends_at
+                    .as_deref()
+                    .map(|end| format!(" · expires {}", end.get(..10).unwrap_or(end)))
+                    .unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -1485,15 +1506,15 @@ pub fn print_reset_claimed(outcome: &resets::ClaimResponse) {
         .collect();
     match &outcome.result {
         resets::ClaimResult::Reset => println!(
-            "reset: cleared {}{}",
+            "Reset applied: {}{}",
             if cleared.is_empty() {
                 "nothing reported".to_string()
             } else {
-                cleared.join(" ")
+                cleared.join(", ")
             },
             outcome
                 .resets_left
-                .map(|left| format!("; {left} left"))
+                .map(|left| format!("; resets left: {left}"))
                 .unwrap_or_default()
         ),
         other => println!(

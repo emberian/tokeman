@@ -125,7 +125,7 @@ tokeman claude refresh [<name>]          # renew grants now (the service does th
 tokeman claude list                      # read every account now
 tokeman claude best                      # the accounts ranked as the rotation would land
 tokeman claude use <name>                # make an account the default now
-tokeman claude reset [<name>]            # usage-limit resets on offer; with a name, use one (asks first)
+tokeman claude reset [<name>]            # choose a usage-limit reset, review, then confirm
 tokeman claude launch [--auto] [-- claude args]   # pick the default, then start claude
 ```
 
@@ -215,9 +215,14 @@ rejection tokeman did not see itself.
 ### Usage-limit resets
 
 Anthropic offers some accounts resets that refill their limits on request.
-`tokeman claude reset` lists what is on offer; `tokeman claude reset <name>`
-(with `--grant <id>` or `--session` to choose) shows what a reset would clear
-and asks before claiming. Nothing uses one on its own. A claim that got no
+`tokeman claude reset` opens a picker of available resets; add `<name>` to
+limit it to one account. Use arrow keys to browse the offers and their effects,
+Enter to review and confirm, or Esc to cancel. `--list` prints offers without
+opening the picker; bare `reset` also lists when piped. `--grant <id>` or
+`--session` selects directly, and `--yes` skips confirmation. A grant spends
+one of the account's limited resets; a session reset refills the 5-hour
+allowance while usage still counts toward the weekly limit. Weekly reset dates
+stay unchanged. Nothing uses one on its own. A claim that got no
 definite answer is kept in `claims.json` and is only ever resent as the same
 claim; `--clear` forgets it once claude.ai shows what happened.
 

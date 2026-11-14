@@ -631,11 +631,11 @@ fn unanswered(conflict: &Conflict) -> String {
 /// Human names for the windows a grant clears.
 pub fn window_label(window: &str) -> &str {
     match window {
-        "five_hour" => "5h",
-        "seven_day" => "7d",
-        "seven_day_overage_included" => "Fable 7d",
-        "seven_day_opus" => "Opus 7d",
-        "seven_day_sonnet" => "Sonnet 7d",
+        "five_hour" => "5-hour",
+        "seven_day" => "weekly",
+        "seven_day_overage_included" => "Fable weekly",
+        "seven_day_opus" => "Opus weekly",
+        "seven_day_sonnet" => "Sonnet weekly",
         other => other,
     }
 }
@@ -647,28 +647,33 @@ fn restores(grant: &ResetGrant) -> String {
         .clears
         .iter()
         .map(|window| match window.as_str() {
-            "seven_day" if grant.gives_back_weekly => "Fable's use of 7d",
+            "seven_day" if grant.gives_back_weekly => "Fable's share of weekly usage",
             other => window_label(other),
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(", ")
 }
 
-/// One line per grant, e.g. `Claude Opus 5.5 launch: 1/1 left, usable now
-/// (clears 5h 7d Fable 7d; now at 0% 0% 0%), use by 2026-10-22`. `now` is
-/// epoch seconds.
-pub fn describe_grant(grant: &ResetGrant, now: i64) -> String {
-    let used = grant
+/// Per-limit effects for the confirmation, with usage next to its limit.
+pub fn grant_effects(grant: &ResetGrant) -> Vec<String> {
+    grant
         .clears
         .iter()
-        .map(
-            |window| match grant.percent_used.get(window).and_then(|v| v.as_f64()) {
-                Some(percent) => format!("{percent:.0}%"),
-                None => "?".into(),
-            },
-        )
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(|window| {
+            if window == "seven_day" && grant.gives_back_weekly {
+                return "Weekly usage: refund Fable's share only".to_owned();
+            }
+            let label = window_label(window);
+            match grant.percent_used.get(window).and_then(|v| v.as_f64()) {
+                Some(percent) => format!("{label} usage: {percent:.0}% → 0%"),
+                None => format!("{label} usage: reset to 0%"),
+            }
+        })
+        .collect()
+}
+
+/// Compact offer summary; detailed effects belong in the confirmation.
+pub fn describe_grant(grant: &ResetGrant, now: i64) -> String {
     let day = |at: &str| at.get(..10).unwrap_or(at).to_owned();
     let when = match grant.state(now) {
         GrantState::Paused => "paused".to_owned(),
@@ -685,26 +690,26 @@ pub fn describe_grant(grant: &ResetGrant, now: i64) -> String {
             None => "not usable yet".to_owned(),
         },
     };
-    let verb = if grant.gives_back_weekly {
-        "gives back"
-    } else {
-        "clears"
-    };
     let deadline = grant
         .ends_at
         .as_deref()
         .map(|end| format!(", use by {}", day(end)))
         .unwrap_or_default();
     format!(
-        "{}: {}/{} left, {when} ({verb} {}; now at {used}){deadline}",
+        "{}: {} left, {when}{deadline}; {}",
         if grant.label.is_empty() {
             &grant.id
         } else {
             &grant.label
         },
         grant.resets_left,
-        grant.resets_total.max(grant.resets_left),
-        restores(grant),
+        if grant.clears.is_empty() {
+            "reset scope not reported".to_owned()
+        } else if grant.gives_back_weekly {
+            format!("restores {}", restores(grant))
+        } else {
+            format!("resets {} usage", restores(grant))
+        },
     )
 }
 
@@ -747,8 +752,16 @@ mod tests {
         assert_eq!(grants.len(), 1, "a malformed grant is skipped, not fatal");
         assert_eq!(
             describe_grant(&grants[0], at("2026-10-01T00:00:00Z")),
-            "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max: 1/1 left, \
-             usable now (clears 5h 7d Fable 7d; now at 0% 12% 0%), use by 2026-10-22"
+            "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max: 1 left, \
+             usable now, use by 2026-10-22; resets 5-hour, weekly, Fable weekly usage"
+        );
+        assert_eq!(
+            grant_effects(&grants[0]),
+            [
+                "5-hour usage: 0% → 0%",
+                "weekly usage: 12% → 0%",
+                "Fable weekly usage: 0% → 0%",
+            ]
         );
         assert_eq!(program.usable_resets(at("2026-10-01T00:00:00Z")), Some(1));
         assert_eq!(program.usable_resets(at("2026-10-23T00:00:00Z")), Some(0));
@@ -800,10 +813,18 @@ mod tests {
         // A Fable grant gives back what Fable used, not the whole weekly.
         assert_eq!(
             describe_grant(&grant, at("2026-11-11T00:00:00Z")),
-            "fable52-launch: 2/3 left, not usable now: cooldown \
-             (gives back 5h Fable's use of 7d Fable 7d; now at 0% 61% 100%), use by 2027-03-09"
+            "fable52-launch: 2 left, not usable now: cooldown, use by 2027-03-09; \
+             restores 5-hour, Fable's share of weekly usage, Fable weekly"
         );
         assert!(describe_grant(&grant, at("2026-11-08T00:00:00Z")).contains("starts 2026-11-09"));
+        assert_eq!(
+            grant_effects(&grant),
+            [
+                "5-hour usage: 0% → 0%",
+                "Weekly usage: refund Fable's share only",
+                "Fable weekly usage: 100% → 0%",
+            ]
+        );
         // So it refills the weekly window for Fable work alone.
         assert_eq!(grant.weekly_refills(None), 0);
         assert_eq!(
@@ -872,9 +893,9 @@ mod tests {
         assert_eq!(grant.kind, None);
         assert_eq!(
             describe_grant(&grant, 0),
-            "g: 2/2 left, usable at a limit (clears ; now at )"
+            "g: 2 left, usable at a limit; reset scope not reported"
         );
-        assert_eq!(window_label("seven_day_opus"), "Opus 7d");
+        assert_eq!(window_label("seven_day_opus"), "Opus weekly");
         assert_eq!(window_label("other"), "other");
     }
 
