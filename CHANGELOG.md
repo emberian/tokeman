@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Rotation polls faster near the selected model's quota floor, including
+  Fable's share of the weekly allowance, even when the general weekly
+  window still has plenty left.
+
 ## 0.4.0 - 2026-11-11
 
 tokeman now reads five services (Claude, Codex, Antigravity, GLM, Kimi)

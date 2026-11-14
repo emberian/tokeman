@@ -361,7 +361,13 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
             .as_ref()
             .map(|_| "unmanaged OAuth token".to_string())
     });
-    let next_interval = policy::next_interval_secs(mode, current_reading, complete, &fleet.policy);
+    let next_interval = policy::next_interval_secs(
+        mode,
+        current_reading,
+        complete,
+        &fleet.policy,
+        model.as_ref(),
+    );
     cadence.last_probe_epoch = started;
     cadence.mode = Some(mode);
     cadence.probe_interval_secs = Some(next_interval);

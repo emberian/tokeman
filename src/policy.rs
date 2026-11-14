@@ -370,15 +370,14 @@ pub fn next_interval_secs(
     current: Option<&Reading>,
     complete: bool,
     policy: &PolicySettings,
+    model: Option<&ModelKey>,
 ) -> u64 {
     let near_floor = |reading: &Reading| {
-        !reading.has_quota()
-            || reading
-                .session_remaining()
-                .is_some_and(|left| left <= policy.normal_min_5h_remaining * 2.0)
-            || reading
-                .weekly_remaining()
-                .is_some_and(|left| left <= policy.normal_min_7d_remaining * 2.0)
+        !reading.above(
+            policy.normal_min_5h_remaining * 2.0,
+            policy.normal_min_7d_remaining * 2.0,
+            model,
+        )
     };
     if mode == Mode::Sip
         || !complete
@@ -621,11 +620,11 @@ mod tests {
         // Sip mode samples fast even when the default itself has room.
         let roomy = reading("default", 0.20, 0.20);
         assert_eq!(
-            next_interval_secs(Mode::Sip, Some(&roomy), true, &policy),
+            next_interval_secs(Mode::Sip, Some(&roomy), true, &policy, None),
             policy.sip_probe_interval_secs
         );
         assert_eq!(
-            next_interval_secs(Mode::Normal, Some(&roomy), true, &policy),
+            next_interval_secs(Mode::Normal, Some(&roomy), true, &policy, None),
             policy.normal_probe_interval_secs
         );
     }
@@ -905,20 +904,70 @@ mod tests {
         let fast = policy.sip_probe_interval_secs;
         let interval = |session, weekly, healthy| {
             let current = reading("a", session, weekly);
-            next_interval_secs(Mode::Normal, Some(&current), healthy, &policy)
+            next_interval_secs(Mode::Normal, Some(&current), healthy, &policy, None)
         };
         assert_eq!(interval(0.10, 0.10, false), fast);
         assert_eq!(interval(0.88, 0.20, true), fast);
         assert_eq!(interval(0.20, 0.91, true), fast, "twice the weekly floor");
-        assert_eq!(next_interval_secs(Mode::Normal, None, true, &policy), fast);
+        assert_eq!(
+            next_interval_secs(Mode::Normal, None, true, &policy, None),
+            fast
+        );
         let unread = crate::testing::refused("a");
         assert_eq!(
-            next_interval_secs(Mode::Normal, Some(&unread), true, &policy),
+            next_interval_secs(Mode::Normal, Some(&unread), true, &policy, None),
             fast
         );
         assert_eq!(
             interval(0.20, 0.20, true),
             policy.normal_probe_interval_secs
+        );
+    }
+
+    #[test]
+    fn fable_room_drives_cadence_and_rotation_even_with_a_roomy_weekly() {
+        let policy = PolicySettings {
+            normal_min_7d_remaining: 0.02,
+            sip_min_7d_remaining: 0.005,
+            ..PolicySettings::default()
+        };
+        let fable = key("claude-fable-5-2");
+        let account = |name, used| {
+            let mut r = reading_with_model(name, 0.1, 0.4, "fable", "Fable", used);
+            r.limits
+                .iter_mut()
+                .find(|l| l.key().is_some())
+                .unwrap()
+                .share = Some(0.5);
+            r
+        };
+        // Six percent of Fable is three percent of the shared weekly:
+        // above the leave floor, but already close enough to poll quickly.
+        let nearing = account("current", 0.94);
+        assert_eq!(
+            next_interval_secs(Mode::Normal, Some(&nearing), true, &policy, Some(&fable)),
+            policy.sip_probe_interval_secs
+        );
+        assert_eq!(
+            next_interval_secs(Mode::Normal, Some(&nearing), true, &policy, opus().as_ref()),
+            policy.normal_probe_interval_secs
+        );
+        let fleet = [account("current", 0.98), account("fresh", 0.1)];
+        assert_eq!(
+            decide(
+                &Situation {
+                    readings: &fleet,
+                    expected: fleet.len(),
+                    current: Some("current"),
+                    model: Some(&fable),
+                    force: false,
+                },
+                &policy
+            ),
+            Decision::Switch {
+                to: &fleet[1],
+                trigger: Trigger::NormalFloor
+            }
         );
     }
 
@@ -965,7 +1014,7 @@ mod tests {
             Some("idle")
         );
         assert_eq!(
-            next_interval_secs(Mode::Normal, Some(&idle), true, &policy),
+            next_interval_secs(Mode::Normal, Some(&idle), true, &policy, None),
             policy.normal_probe_interval_secs
         );
     }

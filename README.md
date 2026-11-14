@@ -198,7 +198,11 @@ and every surface says so. Profile answers are cached and backed off on 429.
 
 Only limits on the startup model (read from `~/.claude/settings.json`) take
 part in rotation; they are marked `*`. An exhausted Opus 4.8 limit does not
-block Opus 5 sessions. When the startup model's limit is only in its own
+block Opus 5 sessions. Keep that setting aligned with the model you use:
+session `--model` overrides do not change the daemon's selection model.
+`tokeman rotate status` shows the selection model. Polling speeds up near
+its quota floor, including model-specific limits such as Fable's.
+When the startup model's limit is only in its own
 responses' headers, accounts without profile reads get one probe with that
 model every `target_model_sample_secs` (0 disables).
 
