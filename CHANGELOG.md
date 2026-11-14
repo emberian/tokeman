@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 - 2026-11-13
 
 - Rotation polls faster near the selected model's quota floor, including
   Fable's share of the weekly allowance, even when the general weekly
   window still has plenty left.
+- Clarify that rotation follows the global Claude startup model; session
+  `--model` overrides do not change the daemon's selection model.
 
 ## 0.4.0 - 2026-11-11
 

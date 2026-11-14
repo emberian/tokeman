@@ -488,8 +488,8 @@ x86_64). Bump `version` in `Cargo.toml`, add the section to `CHANGELOG.md`
 (the release notes come from it), then:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.4.1
+git push origin v0.4.1
 ```
 
 ## License
