@@ -27,7 +27,7 @@ use crate::ui::overview::Monitor;
 /// against these.
 pub const VERIFIED_CLAUDE_CODE: &str = "2.1.322";
 pub const VERIFIED_CODEX: &str = "0.167.0";
-pub const VERIFIED_AGY: &str = "1.5.6";
+pub const VERIFIED_AGY: &str = "1.5.13";
 pub const VERIFIED_ANTIGRAVITY_HUB: &str = "2.31.2";
 
 /// How long a tool may take to say its version.
@@ -344,7 +344,9 @@ fn credential_fix(service: Service, name: &str) -> String {
     match service {
         Service::Claude => format!("tokeman claude login {name}"),
         Service::Codex => format!("tokeman codex refresh {name}"),
-        Service::Antigravity => "sign in with `agy`, then `tokeman agy import`".to_owned(),
+        Service::Antigravity => {
+            format!("tokeman agy login {name} (or sign in with `agy`, then `tokeman agy import`)")
+        }
         Service::Zai => format!("tokeman glm add {name} --key-file <file with a working key>"),
         Service::Kimi => format!("tokeman kimi add {name} --key-file <file with a working key>"),
     }

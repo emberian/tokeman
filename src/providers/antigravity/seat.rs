@@ -56,15 +56,57 @@ pub(super) fn token_file() -> PathBuf {
     paths::expand_tilde("~/.gemini/antigravity-cli/antigravity-oauth-token")
 }
 
+/// The fallback token file of the standalone Antigravity desktop app, which
+/// shares `agy`'s Keychain item.
+fn jetski_token_file() -> PathBuf {
+    paths::expand_tilde("~/.gemini/jetski-standalone-oauth-token")
+}
+
+/// `agy`'s persistent settings file, where `/model` records the chosen model.
+fn settings_file() -> PathBuf {
+    paths::expand_tilde("~/.gemini/antigravity-cli/settings.json")
+}
+
+/// Which Antigravity quota group a model name draws from: Claude/GPT when it
+/// names one of those families, Gemini otherwise (`agy`'s default model and
+/// Orchestrator both draw from Gemini).
+pub fn model_group(model: Option<&str>) -> &'static str {
+    let lower = model.unwrap_or_default().to_ascii_lowercase();
+    if lower.contains("claude")
+        || lower.contains("opus")
+        || lower.contains("sonnet")
+        || lower.contains("gpt")
+    {
+        "claude"
+    } else {
+        "gemini"
+    }
+}
+
+/// The quota group of the model `agy` is configured to start with.
+pub fn startup_group() -> &'static str {
+    startup_group_at(&settings_file())
+}
+
+fn startup_group_at(settings_path: &Path) -> &'static str {
+    let model = read_if_present(settings_path)
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("model")?.as_str().map(str::to_owned));
+    model_group(model.as_deref())
+}
+
 /// Where a seating happens; tests point every field at a temporary directory.
 #[derive(Debug, Clone)]
 struct Place {
     security: PathBuf,
     token_url: String,
-    token_file: PathBuf,
+    token_files: Vec<PathBuf>,
     backup: PathBuf,
     lock: PathBuf,
     lookout: Lookout,
+    cwd: Option<PathBuf>,
 }
 
 impl Place {
@@ -72,10 +114,11 @@ impl Place {
         Self {
             security: security_bin(),
             token_url: grant::TOKEN_URL.into(),
-            token_file: token_file(),
+            token_files: vec![token_file(), jetski_token_file()],
             backup: paths::agy_login_backup(),
             lock: paths::agy_seat_lock(),
             lookout: Lookout::live(),
+            cwd: std::env::current_dir().ok(),
         }
     }
 }
@@ -373,7 +416,7 @@ pub struct ClientReport {
 }
 
 /// What `tokeman agy use` did, or with `dry_run` would do.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UseReport {
     /// The account the slot holds after a write, or would hold.
     pub email: String,
@@ -383,6 +426,17 @@ pub struct UseReport {
     pub dry_run: bool,
     /// The slot read empty right after the write and was written a second time.
     pub rewritten: bool,
+    /// Fraction left on the tightest counted limit, when `use` ranked the
+    /// accounts to choose `email`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<f64>,
+    /// The quota group `room` was measured in, when only one group counted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The conversation `agy` last recorded for the caller's directory, when
+    /// a switch happened and none blocked it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_here: Option<String>,
     /// Why the running clients could not be listed (only with `--force` or
     /// a dry run; otherwise that is an error).
     pub census_error: Option<String>,
@@ -403,6 +457,13 @@ impl UseReport {
             Some(previous) => format!(" ({text} {previous})"),
             None => String::new(),
         };
+        let room_note = match (self.room, self.group.as_deref()) {
+            (Some(room), Some(group)) => {
+                format!(", {:.0}% left in {group}", room.max(0.0) * 100.0)
+            }
+            (Some(room), None) => format!(", {:.0}% left", room.max(0.0) * 100.0),
+            (None, _) => String::new(),
+        };
         match (self.outcome, self.dry_run) {
             (UseOutcome::Refused, _) => {
                 let blocking = self
@@ -415,18 +476,19 @@ impl UseReport {
                     if self.dry_run { " (dry run)" } else { "" }
                 ));
             }
-            (UseOutcome::Unchanged, _) => {
-                lines.push(format!("agy is already signed in as {email}"))
-            }
+            (UseOutcome::Unchanged, _) => match room_note.strip_prefix(", ") {
+                Some(room) => lines.push(format!("agy is already signed in as {email} ({room})")),
+                None => lines.push(format!("agy is already signed in as {email}")),
+            },
             (UseOutcome::Written, true) => lines.push(format!(
-                "dry run: agy would sign in as {email}{}; nothing was written",
+                "dry run: agy would sign in as {email}{room_note}{}; nothing was written",
                 was("now")
             )),
             (UseOutcome::Written, false) => lines.push(match &self.previous {
                 Some(previous) => format!(
-                    "agy now signs in as {email} (was {previous}; `tokeman agy use --previous` puts it back)"
+                    "agy now signs in as {email}{room_note} (was {previous}; `tokeman agy use --previous` puts it back)"
                 ),
-                None => format!("agy now signs in as {email}"),
+                None => format!("agy now signs in as {email}{room_note}"),
             }),
         }
         if self.rewritten {
@@ -481,6 +543,13 @@ impl UseReport {
                     format!("{who}: a print-mode run; the next one signs in as {email}")
                 }
             });
+        }
+        if !self.refused()
+            && let Some(id) = &self.resume_here
+        {
+            lines.push(format!(
+                "resume here: `agy --conversation={id}` (or `agy -c`)"
+            ));
         }
         if self.refused() {
             lines.push(
@@ -638,16 +707,26 @@ async fn use_at(
             reason: "not asked".into(),
         },
     };
+    let outcome = match (blocked, already) {
+        (true, _) => UseOutcome::Refused,
+        (false, true) => UseOutcome::Unchanged,
+        (false, false) => UseOutcome::Written,
+    };
+    let resume_for_cwd = place
+        .cwd
+        .as_deref()
+        .and_then(|cwd| clients::latest_conversation(&history, cwd));
     let mut report = UseReport {
         email: email.clone(),
         previous,
-        outcome: match (blocked, already) {
-            (true, _) => UseOutcome::Refused,
-            (false, true) => UseOutcome::Unchanged,
-            (false, false) => UseOutcome::Written,
-        },
+        outcome,
         dry_run: options.dry_run,
         rewritten: false,
+        room: None,
+        group: None,
+        resume_here: (outcome == UseOutcome::Written)
+            .then_some(resume_for_cwd.clone())
+            .flatten(),
         census_error,
         clients: Vec::new(),
     };
@@ -668,6 +747,9 @@ async fn use_at(
     } else {
         UseOutcome::Unchanged
     };
+    report.resume_here = (report.outcome == UseOutcome::Written)
+        .then_some(resume_for_cwd)
+        .flatten();
     for (client, held) in running.iter().zip(&held) {
         let result = match untouched(client, held) {
             // The hub follows the slot once it is asked for its auth status.
@@ -727,16 +809,28 @@ fn install(place: &Place, prepared: &Prepared) -> Result<Seated> {
         write_raw(&place.security, value)?;
         kept = read_raw(&place.security)?;
     }
-    if kept.as_deref() != Some(value) {
+    let kept_matches = kept.as_deref() == Some(value)
+        || kept
+            .as_deref()
+            .and_then(|raw| Slot::parse(raw).ok().flatten())
+            .as_ref()
+            == Some(target);
+    if !kept_matches {
         // Leave agy with the login it had rather than an unknown one.
         if let Some(raw) = &current {
             let _ = write_raw(&place.security, raw);
         }
         bail!("the Keychain did not keep the new agy login; the earlier one was put back");
     }
-    // agy reads this file when the Keychain is slow to answer; one that names
-    // another account would sign it back in as that account.
-    if place.token_file.exists() {
+    // agy and the standalone desktop app read these files when the Keychain is
+    // slow to answer; one that names another account would sign back in as it.
+    let existing: Vec<&Path> = place
+        .token_files
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.exists())
+        .collect();
+    if !existing.is_empty() {
         let text = match &prepared.file_text {
             Some(text) => text.clone(),
             None => String::from_utf8(
@@ -745,8 +839,14 @@ fn install(place: &Place, prepared: &Prepared) -> Result<Seated> {
                     .context("the saved agy login is not go-keyring base64")?,
             )?,
         };
-        write_atomic(&place.token_file, text.as_bytes(), 0o600)
-            .context("the Keychain was updated, but agy's fallback token file was not")?;
+        for file in existing {
+            write_atomic(file, text.as_bytes(), 0o600).with_context(|| {
+                format!(
+                    "the Keychain was updated, but fallback token file {} was not",
+                    file.display()
+                )
+            })?;
+        }
     }
     Ok(Seated {
         email: target.email.clone(),
@@ -850,10 +950,14 @@ esac
         let place = Place {
             security: fake_security(dir.path(), behaviour),
             token_url: token_server().await,
-            token_file: dir.path().join("antigravity-oauth-token"),
+            token_files: vec![
+                dir.path().join("antigravity-oauth-token"),
+                dir.path().join("jetski-standalone-oauth-token"),
+            ],
             backup: dir.path().join("agy-login-backup.json"),
             lock: dir.path().join("agy-seat.lock"),
             lookout: lookout(dir.path(), &[]),
+            cwd: None,
         };
         (place, dir)
     }
@@ -1056,17 +1160,16 @@ esac
         seat_at(&client, place.clone(), &account("a@example.com", "1//a"))
             .await
             .unwrap();
-        assert!(!place.token_file.exists());
+        for file in &place.token_files {
+            assert!(!file.exists());
+        }
 
-        std::fs::write(
-            &place.token_file,
-            r#"{"token":{},"id_token_email":"old@example.com"}"#,
-        )
-        .unwrap();
+        for file in &place.token_files {
+            std::fs::write(file, r#"{"token":{},"id_token_email":"old@example.com"}"#).unwrap();
+        }
         seat_at(&client, place.clone(), &account("b@example.com", "1//b"))
             .await
             .unwrap();
-        let file = std::fs::read_to_string(&place.token_file).unwrap();
         let slot_json = STANDARD
             .decode(
                 item(dir.path())
@@ -1075,17 +1178,19 @@ esac
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(file.as_bytes(), slot_json);
-        let mode = std::fs::metadata(&place.token_file)
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        for path in &place.token_files {
+            let file = std::fs::read_to_string(path).unwrap();
+            assert_eq!(file.as_bytes(), slot_json);
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
 
         restore(&place).unwrap();
-        let file: Value =
-            serde_json::from_str(&std::fs::read_to_string(&place.token_file).unwrap()).unwrap();
-        assert_eq!(file["id_token_email"], "a@example.com");
+        for path in &place.token_files {
+            let file: Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(file["id_token_email"], "a@example.com");
+        }
     }
 
     #[tokio::test]
@@ -1572,5 +1677,57 @@ esac
             email_of(&item(dir.path()).unwrap()).as_deref(),
             Some("a@example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn a_completed_switch_prints_the_room_and_the_resume_command_for_this_directory() {
+        let (mut place, _dir) = place_on_a("", &[]).await;
+        place.cwd = Some(PathBuf::from("/work/repo"));
+        std::fs::write(
+            &place.lookout.history,
+            r#"{"display":"fix it","timestamp":1794442000000,"workspace":"/work/repo","conversationId":"abc12345-1111-2222-3333-444444444444"}
+"#,
+        )
+        .unwrap();
+        let mut report = use_b(&place, UseOptions::default()).await;
+        report.room = Some(0.95);
+        report.group = Some("gemini".into());
+        let lines = report.lines();
+        assert_eq!(
+            lines[0],
+            "agy now signs in as b@example.com, 95% left in gemini (was a@example.com; `tokeman agy use --previous` puts it back)"
+        );
+        assert_eq!(
+            lines[1],
+            "resume here: `agy --conversation=abc12345-1111-2222-3333-444444444444` (or `agy -c`)"
+        );
+
+        let mut unchanged = use_b(&place, UseOptions::default()).await;
+        unchanged.room = Some(0.95);
+        assert_eq!(unchanged.outcome, UseOutcome::Unchanged);
+        assert_eq!(unchanged.resume_here, None);
+        assert_eq!(
+            unchanged.lines(),
+            ["agy is already signed in as b@example.com (95% left)"]
+        );
+    }
+
+    #[test]
+    fn startup_group_follows_the_saved_model_and_defaults_to_gemini() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(startup_group_at(&path), "gemini");
+        for (model, expected) in [
+            ("Gemini 4 Neon (High)", "gemini"),
+            ("Gemini 4 Carbon (High)", "gemini"),
+            ("Orchestrator (Neon)", "gemini"),
+            ("", "gemini"),
+            ("Claude Opus 5.5 (High)", "claude"),
+            ("claude-sonnet-5-5-medium", "claude"),
+            ("GPT-OSS 120B", "claude"),
+        ] {
+            std::fs::write(&path, serde_json::json!({ "model": model }).to_string()).unwrap();
+            assert_eq!(startup_group_at(&path), expected, "{model}");
+        }
     }
 }

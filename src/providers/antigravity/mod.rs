@@ -33,7 +33,7 @@ use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use self::grant::discover;
+pub use self::grant::{LoginSession, begin_login, discover, exchange_code};
 use self::grant::{TOKEN_URL, exchange};
 use super::{ServiceAccount, decode, limit, network};
 use crate::drift::Unrecognized;
@@ -445,7 +445,7 @@ impl<'a> Session<'a> {
             .as_deref()
             .filter(|token| !token.is_empty())
             .ok_or_else(|| ReadError::Credential {
-                message: "no refresh token; run `agy` and sign in, then `tokeman agy import`"
+                message: "no refresh token; run `tokeman agy login` (or sign in with `agy`, then `tokeman agy import`)"
                     .into(),
             })?;
         let grant = exchange(self.client, &self.endpoints.token_url, refresh_token).await?;

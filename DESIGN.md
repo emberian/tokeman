@@ -108,17 +108,18 @@ src/
     kimi.rs      Kimi Code: Limits and the booster Balance
     antigravity/
       mod.rs     the quota read -> Limits scoped to their model group; its own access-token cache
-      grant.rs   the Google OAuth refresh exchange; discover() from agy's Keychain item or token file and the app's
-                 state.vscdb (read-only protobuf decode)
+      grant.rs   browser PKCE login (`agy login`), the Google OAuth refresh exchange; discover() from agy's Keychain item
+                 or token file and the app's state.vscdb (read-only protobuf decode)
       seat.rs    agy's login slot through `/usr/bin/security -i` (locked, previous value backed up 0600, read back,
-                 written once more if it reads empty); use_account -> UseReport. Manual only (`tokeman agy use`); the
-                 daemon never seats
+                 written once more if it reads empty, fallback files synced); use_account -> UseReport. Manual only
+                 (`tokeman agy use`); the daemon never seats
       clients.rs the running clients of that slot: the hub app (its daemon file), `agy acp`, interactive agy, print-mode
-                 agy. Bounded read-only ps/lsof census; GetUserStatus and GetAuthStatus on loopback; the resume command
-                 from agy's history. Never a signal, never a logout. An agy whose HOME (ps -E) is a per-account home
-                 is a Session, not a client
+                 agy (incl. one-shot subcommands; file-only helpers ignored). Bounded read-only ps/lsof census;
+                 GetUserStatus and GetAuthStatus on loopback; the resume command from agy's history. Never a signal, never
+                 a logout. An agy whose HOME (ps -E) is a per-account home is a Session, not a client
       run.rs     `tokeman agy run`: a per-account home under paths::agy_homes (token file from tokeman's grant, links
-                 to the real home but .gemini and Library), HOME + SSH_TTY so agy keeps its login in that file; exec
+                 to the real home but .gemini and Library), HOME + SSH_TTY + TOKEMAN_REAL_HOME so agy keeps its login in
+                 that file and tokeman still finds the real home; exec
   daemon/
     mod.rs       the loop; install, uninstall, pause, resume, activate
     cycle.rs     one rotation cycle: refresh due grants, probe, observe, decide, install, record
@@ -140,7 +141,8 @@ src/
                  pending claims -> Findings; Report::assemble (pure) decides what is a problem and names its fix
     launch.rs    `<service> launch`: codex on the best profile's CODEX_HOME, agy run on the best account, claude on
                  a GLM or Kimi plan (Endpoint: base URL, key variable, models)
-    services.rs  agy / glm / kimi: add, remove, import, the account agy holds, agy use, agy run
+    services.rs  agy / glm / kimi: add, remove, agy login, import, the account agy holds, agy use (named, best or
+                 previous), agy run
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
     view.rs      probe (read now, record), stored / fresh / overview (the fleet view), ranked and best, history,

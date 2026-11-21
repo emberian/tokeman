@@ -147,17 +147,79 @@ fn is_agy(command: &str) -> bool {
     command == "agy" || command.ends_with("/agy")
 }
 
-/// What an `agy` command line is: an `acp` word makes it an editor's agent
-/// server, a print flag a one-prompt run, anything else interactive.
-fn classify(args: &str) -> ClientKind {
+/// Flags of `agy` that take the following word as their value when written
+/// without `=`.
+const VALUE_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--agent",
+    "--app_data_dir",
+    "--cli_dir_name",
+    "--conversation",
+    "--csrf_token",
+    "--effort",
+    "--gemini_dir",
+    "--host_bridge_token",
+    "--host_bridge_url",
+    "-i",
+    "--input-format",
+    "--json-schema",
+    "--log-file",
+    "--mode",
+    "--model",
+    "--output-format",
+    "-p",
+    "--print",
+    "--print-timeout",
+    "--project",
+    "--prompt",
+    "--prompt-interactive",
+    "--settings",
+];
+
+fn is_print_flag(word: &str) -> bool {
+    matches!(
+        word,
+        "-p" | "--print" | "--prompt" | "--version" | "-v" | "--help" | "-h"
+    ) || word.starts_with("--print=")
+        || word.starts_with("--prompt=")
+}
+
+/// What an `agy` command line is: `acp` makes it an editor's agent server,
+/// a print flag or one-shot subcommand (`models`, `changelog`, `mcp`,
+/// `plugin`, ...) exits as soon as it answers, `remote-control` and
+/// `mic-serve` are background helpers that do not use the Keychain slot
+/// (`None`), and anything else is an interactive terminal session.
+fn classify(args: &str) -> Option<ClientKind> {
     let mut words = args.split_whitespace().skip(1);
-    if words.clone().any(|word| word == "acp") {
-        return ClientKind::Acp;
+    let mut subcommand = None;
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if is_print_flag(word) {
+            return Some(ClientKind::Print);
+        }
+        if word.starts_with('-') {
+            if VALUE_FLAGS.contains(&word) {
+                let _ = words.next();
+            }
+            continue;
+        }
+        // `ps -E` appends `KEY=VALUE` environment entries after the arguments.
+        if word.contains('=') {
+            break;
+        }
+        subcommand.get_or_insert(word);
     }
-    if words.any(|word| word == "-p" || word == "--print" || word.starts_with("--print=")) {
-        return ClientKind::Print;
+    match subcommand {
+        Some("acp") => Some(ClientKind::Acp),
+        Some(
+            "agent" | "agents" | "changelog" | "help" | "install" | "mcp" | "models" | "plugin"
+            | "plugins" | "update",
+        ) => Some(ClientKind::Print),
+        Some("mic-serve" | "remote-control") => None,
+        Some(_) | None => Some(ClientKind::Interactive),
     }
-    ClientKind::Interactive
 }
 
 #[derive(Deserialize)]
@@ -326,7 +388,7 @@ async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
     let lines = output(&lookout.ps, &args, CENSUS_TIMEOUT).await?;
     let mut processes: Vec<(u32, ClientKind, Option<String>)> = pid_lines(&lines)
         .filter(|(pid, _)| agy.contains(pid))
-        .map(|(pid, line)| (pid, classify(line), own_home(line, &lookout.homes)))
+        .filter_map(|(pid, line)| Some((pid, classify(line)?, own_home(line, &lookout.homes))))
         .collect();
     processes.sort_by_key(|(pid, _, _)| *pid);
     for (pid, kind, home) in processes {
@@ -337,6 +399,9 @@ async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
                 home,
                 cwd: cwd(lookout, pid).await,
             });
+            continue;
+        }
+        if clients.iter().any(|client| client.pid == pid) {
             continue;
         }
         clients.push(Running {
@@ -624,13 +689,49 @@ cat "$dir/$kind-$pid"
 
     #[test]
     fn an_agy_command_line_is_an_acp_server_a_print_run_or_interactive() {
-        assert_eq!(classify("/Users/x/.local/bin/agy acp"), ClientKind::Acp);
-        assert_eq!(classify("agy --model gemini acp"), ClientKind::Acp);
-        assert_eq!(classify("agy -p /usage"), ClientKind::Print);
-        assert_eq!(classify("agy --print=hello"), ClientKind::Print);
-        assert_eq!(classify("agy"), ClientKind::Interactive);
-        assert_eq!(classify("agy -c"), ClientKind::Interactive);
-        assert_eq!(classify("agy --conversation=abc"), ClientKind::Interactive);
+        assert_eq!(
+            classify("/Users/x/.local/bin/agy acp"),
+            Some(ClientKind::Acp)
+        );
+        assert_eq!(classify("agy --model gemini acp"), Some(ClientKind::Acp));
+        assert_eq!(classify("agy -p /usage"), Some(ClientKind::Print));
+        assert_eq!(classify("agy --print=hello"), Some(ClientKind::Print));
+        assert_eq!(classify("agy --prompt hi"), Some(ClientKind::Print));
+        assert_eq!(classify("agy --prompt=hi"), Some(ClientKind::Print));
+        for sub in [
+            "agy models",
+            "agy --version",
+            "agy -v",
+            "agy changelog",
+            "agy mcp list",
+            "agy plugin list",
+            "agy agents",
+            "agy update",
+        ] {
+            assert_eq!(classify(sub), Some(ClientKind::Print), "{sub}");
+        }
+        // Helpers that do not use the Keychain slot never block a switch.
+        assert_eq!(classify("agy remote-control serve"), None);
+        assert_eq!(classify("agy mic-serve"), None);
+        assert_eq!(classify("agy"), Some(ClientKind::Interactive));
+        assert_eq!(classify("agy -c"), Some(ClientKind::Interactive));
+        assert_eq!(
+            classify("agy -c PATH=/bin HOME=/Users/x"),
+            Some(ClientKind::Interactive)
+        );
+        assert_eq!(
+            classify("agy -i models"),
+            Some(ClientKind::Interactive),
+            "-i takes a prompt, not a subcommand"
+        );
+        assert_eq!(
+            classify("agy --prompt-interactive=hi"),
+            Some(ClientKind::Interactive)
+        );
+        assert_eq!(
+            classify("agy --conversation=abc"),
+            Some(ClientKind::Interactive)
+        );
         assert!(is_agy("/Users/x/.local/bin/agy") && is_agy("agy"));
         assert!(!is_agy("/usr/bin/magy") && !is_agy("/opt/agy/bin/node"));
         assert!(!is_agy(

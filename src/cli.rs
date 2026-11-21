@@ -355,6 +355,14 @@ pub enum CodexAction {
 
 #[derive(Subcommand)]
 pub enum AgyAction {
+    /// Sign in to a Google account through the browser and register it
+    ///
+    /// agy's own login is not touched, so running sessions stay where they
+    /// are.
+    Login {
+        /// Account email or alias (an email pre-fills Google's sign-in prompt)
+        name: Option<String>,
+    },
     /// Register the accounts agy and the Antigravity app are signed in to
     /// on this machine
     Import,
@@ -368,13 +376,17 @@ pub enum AgyAction {
     /// Sign the agy CLI in as an account (macOS; manual, the daemon never
     /// switches it)
     ///
-    /// An open Antigravity app is told to follow. An interactive agy cannot
-    /// be told: it keeps its account and writes it back when it refreshes
-    /// its token, so the switch is refused while one runs unless --force.
+    /// Without NAME, reads every registered account and seats the one with
+    /// the most room. An open Antigravity app is told to follow. An
+    /// interactive agy cannot be told: it keeps its account and writes it
+    /// back when it refreshes its token, so the switch is refused while one
+    /// runs unless --force.
     Use {
-        /// The account to seat
-        #[arg(required_unless_present = "previous")]
+        /// The account to seat (default: the account with the most room)
         name: Option<String>,
+        /// Count only the limits whose group contains this text, e.g. "claude"
+        #[arg(long, conflicts_with_all = ["name", "previous"])]
+        group: Option<String>,
         /// Put back the login the last `use` replaced
         #[arg(long, conflicts_with = "name")]
         previous: bool,
@@ -729,10 +741,14 @@ mod tests {
             "tokeman codex use work --into ~/.codex-homes/other",
             "tokeman codex best --limit spark",
             "tokeman codex reset work --credit c1 --yes",
+            "tokeman agy login",
+            "tokeman agy login a@example.com",
             "tokeman agy import",
             "tokeman antigravity import",
             "tokeman agy remove a@example.com",
             "tokeman agy list --json",
+            "tokeman agy use",
+            "tokeman agy use --group claude --dry-run",
             "tokeman agy use a@example.com --dry-run",
             "tokeman agy use --previous --force",
             "tokeman agy best --group claude",

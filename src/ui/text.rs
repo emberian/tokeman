@@ -1829,6 +1829,29 @@ pub fn print_agy_imported(imported: &crate::commands::services::Imported) {
     }
 }
 
+pub fn print_agy_login_step(name: Option<&str>, url: &str) {
+    match name {
+        Some(name) => println!("Sign in to Google for {name} (agy's login is not changed):\n"),
+        None => {
+            println!("Sign in to the Google account to register (agy's login is not changed):\n")
+        }
+    }
+    println!("  {url}\n");
+    print_question(
+        "Waiting for localhost redirect (or paste the redirect URL if on another machine; `q` cancels): ",
+    );
+}
+
+pub fn print_agy_login_cancelled() {
+    println!("cancelled.");
+}
+
+pub fn print_agy_logged_in(logged_in: &crate::commands::services::LoggedIn) {
+    println!("\n{}", registration_line(&logged_in.registered));
+    println!();
+    print_reading(&logged_in.reading, logged_in.seated);
+}
+
 pub fn print_agy_use(report: &crate::providers::antigravity::seat::UseReport) {
     for line in &report.lines() {
         println!("{line}");

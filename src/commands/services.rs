@@ -7,9 +7,10 @@ use std::path::Path;
 use super::view;
 use crate::account::Fleet;
 use crate::paths::tilde;
-use crate::providers::antigravity::{run, seat};
+use crate::providers::antigravity::{LoginSession, run, seat};
 use crate::providers::{self, ServiceAccount};
 use crate::quota::{Reading, Service};
+use crate::util::one_line;
 
 /// A registration: the account as stored, and whether it replaced one.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,25 +146,179 @@ async fn read(accounts: &[ServiceAccount]) -> Vec<Reading> {
     readings
 }
 
-/// Sign the agy CLI in as `name`, or put back the login the last use
-/// replaced when `name` is `None`. Running clients are looked at first: an
+/// What `tokeman agy login` registered and read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedIn {
+    pub registered: Registered,
+    pub reading: Reading,
+    /// Whether `agy`'s Keychain slot currently holds this account.
+    pub seated: bool,
+}
+
+/// Start a browser login for an Antigravity account (`tokeman agy login`).
+/// `agy`'s Keychain slot is never touched.
+pub async fn begin_agy_login(name: Option<&str>) -> Result<LoginSession> {
+    providers::antigravity::begin_login(name).await
+}
+
+fn resolve_login_account(
+    requested: Option<&str>,
+    mut granted: ServiceAccount,
+) -> Result<ServiceAccount> {
+    let email = granted.name.clone();
+    match requested.map(str::trim).filter(|name| !name.is_empty()) {
+        None => Ok(granted),
+        Some(wanted) if wanted.contains('@') => {
+            if !wanted.eq_ignore_ascii_case(&email) {
+                bail!("signed in as {email}, not {wanted}; nothing was stored");
+            }
+            Ok(granted)
+        }
+        Some(alias) => {
+            granted.name = alias.to_owned();
+            granted.label = Some(email);
+            Ok(granted)
+        }
+    }
+}
+
+/// Exchange the authorization code from [`begin_agy_login`], register the
+/// account in `tokens.toml`, and read its quota once.
+pub async fn finish_agy_login(
+    name: Option<&str>,
+    session: &LoginSession,
+    code: &str,
+) -> Result<LoggedIn> {
+    let now_ms = super::now() * 1000;
+    let granted =
+        providers::antigravity::exchange_code(providers::client(), session, code, now_ms).await?;
+    let account = resolve_login_account(name, granted)?;
+    let replaced = register(account.clone())?;
+    let slice = std::slice::from_ref(&account);
+    let mut readings = read(slice).await;
+    let reading = readings
+        .pop()
+        .unwrap_or_else(|| Reading::empty(Service::Antigravity, &account.name, super::now()));
+    let is_seated = seated(slice).await.as_deref() == Some(account.name.as_str());
+    Ok(LoggedIn {
+        registered: Registered { account, replaced },
+        reading,
+        seated: is_seated,
+    })
+}
+
+/// Which login `tokeman agy use` puts in `agy`'s slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgyPick<'a> {
+    /// This registered Antigravity account.
+    Named(&'a str),
+    /// The registered Antigravity account with the most room left.
+    Best { group: Option<&'a str> },
+    /// The login the last `use` replaced.
+    Previous,
+}
+
+/// Pick the best Antigravity account from `readings`. With no explicit
+/// `group`, accounts with room in every group rank first; if every account
+/// has at least one exhausted group, fall back to `startup_group` (`agy`'s
+/// configured model group) so an exhausted unused group does not block a swap.
+fn pick_best_agy<'a>(
+    fleet: &'a Fleet,
+    readings: &[Reading],
+    group: Option<&str>,
+    startup_group: &'static str,
+) -> Result<(&'a ServiceAccount, f64, Option<String>)> {
+    let rank = |scope: Option<&str>| {
+        view::ranked(readings, view::ANY_ROOM, None, view::RankOn::Limits(scope))
+    };
+    let (winner, chosen_group) = match rank(group).into_iter().next() {
+        Some(winner) => (Some(winner), group.map(str::to_owned)),
+        None if group.is_none() => (
+            rank(Some(startup_group)).into_iter().next(),
+            Some(startup_group.to_owned()),
+        ),
+        None => (None, group.map(str::to_owned)),
+    };
+    if let Some((reading, room)) = winner {
+        let account = fleet
+            .service_account(&reading.account)
+            .filter(|account| account.service == Service::Antigravity)
+            .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{}'", reading.account))?;
+        return Ok((account, room, chosen_group));
+    }
+    let unread: Vec<String> = readings
+        .iter()
+        .filter_map(|reading| {
+            let error = reading.error.as_ref()?;
+            Some(format!(
+                "{}: {}",
+                reading.account,
+                one_line(&error.to_string(), 120)
+            ))
+        })
+        .collect();
+    let scope_note = match group {
+        Some(group) => format!(" for group '{group}'"),
+        None => String::new(),
+    };
+    if unread.is_empty() {
+        bail!("no Antigravity account has room in a readable limit{scope_note}");
+    }
+    bail!(
+        "no Antigravity account has room in a readable limit{scope_note} ({})",
+        unread.join("; ")
+    )
+}
+
+/// Sign the agy CLI in as `pick`. Running clients are looked at first: an
 /// open Antigravity app is told to follow, an interactive agy refuses the
 /// switch unless `force`. A refusal is a report, not an error.
 pub async fn agy_use(
     fleet: &Fleet,
-    name: Option<&str>,
+    pick: AgyPick<'_>,
     options: seat::UseOptions,
 ) -> Result<seat::UseReport> {
-    let target = match name {
-        Some(name) => seat::UseTarget::Account(
-            fleet
-                .service_account(name)
-                .filter(|account| account.service == Service::Antigravity)
-                .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?,
+    let (target, chosen_room) = match pick {
+        AgyPick::Previous => (seat::UseTarget::Previous, None),
+        AgyPick::Named(name) => (
+            seat::UseTarget::Account(
+                fleet
+                    .service_account(name)
+                    .filter(|account| account.service == Service::Antigravity)
+                    .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?,
+            ),
+            None,
         ),
-        None => seat::UseTarget::Previous,
+        AgyPick::Best { group } => {
+            let accounts: Vec<ServiceAccount> = fleet
+                .services
+                .iter()
+                .filter(|account| account.service == Service::Antigravity)
+                .cloned()
+                .collect();
+            if accounts.is_empty() {
+                bail!(
+                    "no Antigravity accounts are registered; run `tokeman agy import` or `tokeman agy login`"
+                );
+            }
+            let readings = providers::read_all(providers::client(), &accounts, super::now()).await;
+            if !options.dry_run {
+                view::record(&readings);
+            }
+            let (account, room, chosen_group) =
+                pick_best_agy(fleet, &readings, group, seat::startup_group())?;
+            (
+                seat::UseTarget::Account(account),
+                Some((room, chosen_group)),
+            )
+        }
     };
-    seat::use_account(providers::client(), target, options).await
+    let mut report = seat::use_account(providers::client(), target, options).await?;
+    if let Some((room, group)) = chosen_room {
+        report.room = Some(room);
+        report.group = group;
+    }
+    Ok(report)
 }
 
 /// Get agy ready to run as `name` beside the normal login: plain `agy` when
@@ -190,4 +345,117 @@ pub async fn agy_run(fleet: &Fleet, name: &str, args: Vec<String>) -> Result<run
 /// The agy sessions `tokeman agy run` started that are still running.
 pub async fn agy_sessions(fleet: &Fleet) -> Result<Vec<run::Session>> {
     run::sessions(&fleet.services).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quota::{ReadError, Window};
+
+    fn agy_account(name: &str) -> ServiceAccount {
+        ServiceAccount {
+            name: name.to_owned(),
+            service: Service::Antigravity,
+            key: None,
+            key_file: None,
+            refresh_token: Some("1//r".into()),
+            access_token: None,
+            expires_at: None,
+            label: None,
+        }
+    }
+
+    fn agy_reading(account: &str, gemini_used: f64, claude_used: f64) -> Reading {
+        Reading {
+            limits: vec![
+                providers::limit(
+                    Some("Gemini Models".into()),
+                    "weekly",
+                    Some(7 * 86_400),
+                    Window::new(gemini_used, 0),
+                    None,
+                ),
+                providers::limit(
+                    Some("Claude and GPT models".into()),
+                    "weekly",
+                    Some(7 * 86_400),
+                    Window::new(claude_used, 0),
+                    None,
+                ),
+            ],
+            ..Reading::empty(Service::Antigravity, account, 0)
+        }
+    }
+
+    #[test]
+    fn best_agy_for_use_prefers_all_groups_and_falls_back_to_the_startup_group() {
+        let fleet = Fleet {
+            services: vec![agy_account("a@example.com"), agy_account("b@example.com")],
+            ..Fleet::default()
+        };
+        // Only b has room in every group (a spent Gemini).
+        let readings = [
+            agy_reading("a@example.com", 1.0, 0.0),
+            agy_reading("b@example.com", 0.1, 0.2),
+        ];
+        let (chosen, room, group) = pick_best_agy(&fleet, &readings, None, "gemini").unwrap();
+        assert_eq!(chosen.name, "b@example.com");
+        assert!((room - 0.8).abs() < 1e-9);
+        assert_eq!(group, None);
+
+        // Both exhausted Claude, b still has 85% Gemini: fallback to startup_group lands on b.
+        let readings = [
+            agy_reading("a@example.com", 1.0, 1.0),
+            agy_reading("b@example.com", 0.15, 1.0),
+        ];
+        let (chosen, room, group) = pick_best_agy(&fleet, &readings, None, "gemini").unwrap();
+        assert_eq!(chosen.name, "b@example.com");
+        assert!((room - 0.85).abs() < 1e-9);
+        assert_eq!(group.as_deref(), Some("gemini"));
+
+        // Explicit --group claude refuses when Claude is spent everywhere.
+        let err = pick_best_agy(&fleet, &readings, Some("claude"), "gemini")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("for group 'claude'"), "{err}");
+
+        // Read errors are named when nothing ranks.
+        let failed = [Reading::failed(
+            Service::Antigravity,
+            "a@example.com",
+            0,
+            ReadError::Network {
+                message: "offline".into(),
+            },
+        )];
+        let err = pick_best_agy(&fleet, &failed, None, "gemini")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a@example.com") && err.contains("offline"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn login_account_keeps_email_catches_wrong_account_and_labels_aliases() {
+        let granted = agy_account("real@example.com");
+        assert_eq!(
+            resolve_login_account(None, granted.clone()).unwrap().name,
+            "real@example.com"
+        );
+        assert_eq!(
+            resolve_login_account(Some("REAL@example.com"), granted.clone())
+                .unwrap()
+                .name,
+            "real@example.com"
+        );
+        let wrong = resolve_login_account(Some("other@example.com"), granted.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(wrong.contains("signed in as real@example.com"), "{wrong}");
+        let aliased = resolve_login_account(Some("personal"), granted).unwrap();
+        assert_eq!(aliased.name, "personal");
+        assert_eq!(aliased.label.as_deref(), Some("real@example.com"));
+    }
 }

@@ -1,7 +1,9 @@
-//! Antigravity's Google OAuth grant: the refresh exchange, and finding the
-//! logins already on this machine (`agy`'s Keychain item or token file, and
-//! the Antigravity app's `state.vscdb`). Read-only.
+//! Antigravity's Google OAuth grant: the browser login (`tokeman agy login`),
+//! the refresh exchange, and finding the logins already on this machine
+//! (`agy`'s Keychain item or token file, and the Antigravity app's
+//! `state.vscdb`).
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,18 +12,30 @@ use chrono::DateTime;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{REQUEST_TIMEOUT, error_message, seat};
 use crate::fs::read_if_present;
-use crate::providers::ServiceAccount;
+use crate::providers::{ServiceAccount, held};
 use crate::quota::{ReadError, Service};
 
 pub(super) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub(super) const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 /// Antigravity's installed-app OAuth client, as shipped in `agy` and the
 /// app's `language_server`; both sign-ins (`auth_method: consumer`) use it.
 pub(super) const CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 pub(super) const CLIENT_SECRET: &str = "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";
+/// The scopes `agy`'s consumer Google OAuth sign-in requests.
+pub(super) const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
+    https://www.googleapis.com/auth/cclog \
+    https://www.googleapis.com/auth/userinfo.profile \
+    openid \
+    https://www.googleapis.com/auth/experimentsandconfigs \
+    https://www.googleapis.com/auth/userinfo.email";
+const CALLBACK_PATH: &str = "/auth/callback";
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CALLBACK_MAX_BYTES: usize = 8 * 1024;
 
 #[derive(Deserialize)]
 pub(super) struct Grant {
@@ -78,7 +92,7 @@ pub(super) async fn exchange(
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if value.get("error").and_then(Value::as_str) == Some("invalid_grant") {
             return Err(ReadError::Credential {
-                message: "refresh token revoked or expired; sign in again with `agy`, then `tokeman agy import`".into(),
+                message: "refresh token revoked or expired; sign in again with `tokeman agy login` (or `agy`, then `tokeman agy import`)".into(),
             });
         }
         return Err(ReadError::Http {
@@ -89,6 +103,334 @@ pub(super) async fn exchange(
     serde_json::from_str(&text).map_err(|_| ReadError::Decode {
         message: "token refresh answer carried no access_token".into(),
     })
+}
+
+// ---- browser login ----
+
+/// A browser login in progress: the authorize URL to open, the loopback
+/// listener Google redirects to, and the PKCE verifier that redeems the code.
+pub struct LoginSession {
+    url: String,
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+    listener: tokio::net::TcpListener,
+}
+
+impl fmt::Debug for LoginSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginSession")
+            .field("url", &self.url)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("verifier", &"<set>")
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct CodeGrant {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+impl fmt::Debug for CodeGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodeGrant")
+            .field("access_token", &"<set>")
+            .field("refresh_token", &held(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .field("id_token", &held(&self.id_token))
+            .finish()
+    }
+}
+
+fn random_b64() -> Result<String> {
+    use base64::Engine;
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .context("could not read /dev/urandom")?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn urldecode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => {
+                out.push(b' ');
+                at += 1;
+            }
+            b'%' if at + 2 < bytes.len() => {
+                if let Ok(hex) = std::str::from_utf8(&bytes[at + 1..at + 3])
+                    && let Ok(decoded) = u8::from_str_radix(hex, 16)
+                {
+                    out.push(decoded);
+                    at += 3;
+                    continue;
+                }
+                out.push(b'%');
+                at += 1;
+            }
+            other => {
+                out.push(other);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Bind a loopback callback port and build the Google OAuth URL for a
+/// consumer Antigravity login. `agy`'s own Keychain slot is never touched.
+pub async fn begin_login(login_hint: Option<&str>) -> Result<LoginSession> {
+    use base64::Engine;
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(_) => tokio::net::TcpListener::bind("[::1]:0")
+            .await
+            .context("could not bind a localhost port for the OAuth callback")?,
+    };
+    let port = listener
+        .local_addr()
+        .context("OAuth callback listener has no local address")?
+        .port();
+    let redirect_uri = format!("http://localhost:{port}{CALLBACK_PATH}");
+    let verifier = random_b64()?;
+    let state = random_b64()?;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let mut url = format!(
+        "{AUTHORIZE_URL}?client_id={CLIENT_ID}&redirect_uri={redirect}&response_type=code\
+         &scope={scope}&access_type=offline&prompt=consent&code_challenge={challenge}\
+         &code_challenge_method=S256&state={state}",
+        redirect = urlencode(&redirect_uri),
+        scope = urlencode(SCOPES),
+    );
+    if let Some(hint) = login_hint.filter(|hint| hint.contains('@')) {
+        url.push_str(&format!("&login_hint={}", urlencode(hint)));
+    }
+    Ok(LoginSession {
+        url,
+        redirect_uri,
+        verifier,
+        state,
+        listener,
+    })
+}
+
+impl LoginSession {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    pub(crate) fn verifier(&self) -> &str {
+        &self.verifier
+    }
+
+    /// Extract the authorization code from a pasted redirect URL (when the
+    /// browser ran on another machine) or a bare code.
+    pub fn parse_callback_input(&self, input: &str) -> Result<String> {
+        let input = input.trim();
+        if input.is_empty() {
+            bail!("no authorization code pasted");
+        }
+        if let Some((_, query)) = input.split_once('?') {
+            let query = query.split('#').next().unwrap_or(query);
+            return self.extract_query_code(query);
+        }
+        if input.contains("code=") {
+            return self.extract_query_code(input);
+        }
+        if input.chars().any(char::is_whitespace) {
+            bail!("pasted text is neither a callback URL nor an authorization code");
+        }
+        Ok(urldecode(input))
+    }
+
+    fn extract_query_code(&self, query: &str) -> Result<String> {
+        let mut code = None;
+        let mut state = None;
+        let mut oauth_error = None;
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "code" if !value.is_empty() => code = Some(urldecode(value)),
+                "state" if !value.is_empty() => state = Some(urldecode(value)),
+                "error" if !value.is_empty() => oauth_error = Some(urldecode(value)),
+                _ => {}
+            }
+        }
+        if let Some(error) = oauth_error {
+            bail!("Google refused the sign-in: {error}");
+        }
+        if state.as_deref() != Some(self.state.as_str()) {
+            bail!("OAuth callback state did not match this login session");
+        }
+        code.context("OAuth callback carried no authorization code")
+    }
+
+    /// Wait up to `timeout` for Google's browser redirect on the loopback
+    /// listener, and return the authorization code.
+    pub async fn wait_for_callback(&self, timeout: Duration) -> Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(timeout, async {
+            loop {
+                let (mut stream, _) = self
+                    .listener
+                    .accept()
+                    .await
+                    .context("OAuth callback listener closed")?;
+                let mut buf = vec![0u8; CALLBACK_MAX_BYTES];
+                let Ok(Ok(read)) =
+                    tokio::time::timeout(CALLBACK_READ_TIMEOUT, stream.read(&mut buf)).await
+                else {
+                    continue;
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let Some(target) = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                else {
+                    continue;
+                };
+                let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                if path != CALLBACK_PATH {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                match self.extract_query_code(query) {
+                    Ok(code) => {
+                        let body = "<!doctype html><meta charset=utf-8><title>tokeman</title>\
+                            <p>Signed in to Antigravity for tokeman. You can close this tab.</p>";
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        return Ok(code);
+                    }
+                    Err(error) => {
+                        let body = "<!doctype html><meta charset=utf-8><title>tokeman</title>\
+                            <p>Sign-in did not complete. Return to the terminal for details.</p>";
+                        let reply = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        return Err(error);
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {}s waiting for the Google sign-in callback",
+                timeout.as_secs()
+            )
+        })?
+    }
+}
+
+/// Trade an authorization code from [`LoginSession`] for a [`ServiceAccount`].
+pub async fn exchange_code(
+    client: &Client,
+    session: &LoginSession,
+    code: &str,
+    now_ms: i64,
+) -> Result<ServiceAccount> {
+    exchange_code_at(client, TOKEN_URL, session, code, now_ms).await
+}
+
+async fn exchange_code_at(
+    client: &Client,
+    token_url: &str,
+    session: &LoginSession,
+    code: &str,
+    now_ms: i64,
+) -> Result<ServiceAccount> {
+    let response = client
+        .post(token_url)
+        .timeout(REQUEST_TIMEOUT)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", CLIENT_ID),
+            ("client_secret", CLIENT_SECRET),
+            ("redirect_uri", session.redirect_uri()),
+            ("code_verifier", session.verifier()),
+        ])
+        .send()
+        .await
+        .context("token exchange request failed")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("token exchange response could not be read")?;
+    if !status.is_success() {
+        bail!(
+            "Google refused the authorization code (HTTP {}): {}",
+            status.as_u16(),
+            error_message(&text)
+        );
+    }
+    let received: CodeGrant =
+        serde_json::from_str(&text).context("token exchange answer was not JSON")?;
+    let refresh_token = received
+        .refresh_token
+        .filter(|token| !token.is_empty())
+        .context("Google returned no refresh token; try again and approve offline access")?;
+    let grant = Grant {
+        access_token: received.access_token,
+        expires_in: received.expires_in,
+        id_token: received.id_token,
+    };
+    let email = grant
+        .email()
+        .context("Google's token response did not name an account email")?;
+    let expires_at = now_ms + grant.expires_in.unwrap_or(3599) * 1000;
+    Ok(account(
+        email,
+        refresh_token,
+        Some((grant.access_token, expires_at)),
+    ))
 }
 
 // ---- discovery ----
@@ -490,5 +832,117 @@ mod tests {
             .to_string();
         assert!(error.contains("names no account"), "{error}");
         assert!(parse_cli_grant("go-keyring-base64:%%%").is_err());
+    }
+
+    #[tokio::test]
+    async fn browser_login_catches_the_loopback_callback_checks_state_and_exchanges_pkce() {
+        use axum::routing::post;
+        use axum::{Form, Json, Router};
+        use base64::Engine;
+
+        let session = begin_login(Some("new@example.com")).await.unwrap();
+        assert!(session.url().starts_with(AUTHORIZE_URL));
+        assert!(session.url().contains("login_hint=new%40example.com"));
+        assert!(session.url().contains("access_type=offline"));
+        assert!(session.url().contains("code_challenge_method=S256"));
+        // Formatting a session never leaks its PKCE verifier.
+        let shown = format!("{session:?}");
+        assert!(!shown.contains(session.verifier()), "{shown}");
+
+        // Pasted callback URLs validate state and extract the code.
+        let good_url = format!(
+            "{}?code=pasted%2Fcode&state={}&scope=openid",
+            session.redirect_uri(),
+            session.state
+        );
+        assert_eq!(
+            session.parse_callback_input(&good_url).unwrap(),
+            "pasted/code"
+        );
+        assert!(
+            session
+                .parse_callback_input(&format!("{}?code=x&state=wrong", session.redirect_uri()))
+                .is_err()
+        );
+        assert!(
+            session
+                .parse_callback_input(&format!(
+                    "{}?error=access_denied&state={}",
+                    session.redirect_uri(),
+                    session.state
+                ))
+                .is_err()
+        );
+
+        // Live loopback redirect: unrelated paths (favicon) are ignored first.
+        let redirect = session.redirect_uri().to_owned();
+        let base = redirect.strip_suffix(CALLBACK_PATH).unwrap().to_owned();
+        let state = session.state.clone();
+        let browser = tokio::spawn(async move {
+            let client = Client::new();
+            let _ = client.get(format!("{base}/favicon.ico")).send().await;
+            let resp = client
+                .get(format!("{redirect}?code=loopback-code&state={state}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success());
+        });
+        let code = session
+            .wait_for_callback(Duration::from_secs(5))
+            .await
+            .unwrap();
+        browser.await.unwrap();
+        assert_eq!(code, "loopback-code");
+
+        // Exchange against a fake Google token server verifying PKCE fields.
+        let expected_verifier = session.verifier().to_owned();
+        let expected_redirect = session.redirect_uri().to_owned();
+        let app = Router::new().route(
+            "/token",
+            post(move |Form(form): Form<Vec<(String, String)>>| {
+                let get = |k: &str| {
+                    form.iter()
+                        .find(|(key, _)| key == k)
+                        .map(|(_, v)| v.clone())
+                };
+                assert_eq!(get("grant_type").as_deref(), Some("authorization_code"));
+                assert_eq!(get("client_id").as_deref(), Some(CLIENT_ID));
+                assert_eq!(get("client_secret").as_deref(), Some(CLIENT_SECRET));
+                assert_eq!(get("code").as_deref(), Some("loopback-code"));
+                assert_eq!(
+                    get("redirect_uri").as_deref(),
+                    Some(expected_redirect.as_str())
+                );
+                assert_eq!(
+                    get("code_verifier").as_deref(),
+                    Some(expected_verifier.as_str())
+                );
+                let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(r#"{"email":"new@example.com"}"#);
+                async move {
+                    Json(serde_json::json!({
+                        "access_token": "ya29.new",
+                        "refresh_token": "1//new",
+                        "expires_in": 3599,
+                        "id_token": format!("h.{claims}.s"),
+                    }))
+                }
+            }),
+        );
+        let token_base = crate::testing::serve(app).await;
+        let stored = exchange_code_at(
+            &Client::new(),
+            &format!("{token_base}/token"),
+            &session,
+            &code,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.name, "new@example.com");
+        assert_eq!(stored.refresh_token.as_deref(), Some("1//new"));
+        assert_eq!(stored.access_token.as_deref(), Some("ya29.new"));
+        assert_eq!(stored.expires_at, Some(1_000_000 + 3_599_000));
     }
 }

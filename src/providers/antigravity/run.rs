@@ -45,10 +45,21 @@ use crate::quota::Service;
 const NOT_LINKED: &[&str] = &[".gemini", "Library"];
 /// What agy only reads under `~/.gemini`, linked into each per-account home
 /// when it exists.
-pub const SHARED: &[&str] = &["GEMINI.md", "skills", "config/mcp_config.json"];
-/// What agy writes under `~/.gemini` (the model, trusted folders), copied
-/// into a per-account home once, when the home has none.
-pub const SEEDED: &[&str] = &["antigravity-cli/settings.json"];
+pub const SHARED: &[&str] = &[
+    "GEMINI.md",
+    "skills",
+    "antigravity-cli/keybindings.json",
+    "config/mcp_config.json",
+    "config/hooks.json",
+    "config/plugins",
+];
+/// What agy writes under `~/.gemini` (the model, trusted folders, onboarding,
+/// user settings), copied into a per-account home once, when the home has none.
+pub const SEEDED: &[&str] = &[
+    "antigravity-cli/settings.json",
+    "antigravity-cli/cache/onboarding.json",
+    "config/config.json",
+];
 const TOKEN_FILE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 
 /// The directory name of `account`'s home under [`paths::agy_homes`].
@@ -143,10 +154,11 @@ impl Place {
             bail!("no home directory");
         }
         let homes = paths::agy_homes();
-        if real_home.starts_with(&homes) {
+        let shell_home = dirs::home_dir().unwrap_or_else(|| real_home.clone());
+        if real_home.starts_with(&homes) || shell_home.starts_with(&homes) {
             bail!(
                 "this shell already runs on a per-account agy home ({}); run `tokeman agy run` from a shell on your own home",
-                real_home.display()
+                shell_home.display()
             );
         }
         Ok(Self {
@@ -242,7 +254,14 @@ async fn prepare_at(
         login: Login::Own { home: home.clone() },
         program: place.agy.clone(),
         args,
-        env: vec![("HOME", home.into_os_string()), ("SSH_TTY", ssh_tty)],
+        env: vec![
+            ("HOME", home.into_os_string()),
+            ("SSH_TTY", ssh_tty),
+            (
+                "TOKEMAN_REAL_HOME",
+                place.real_home.clone().into_os_string(),
+            ),
+        ],
     })
 }
 
@@ -421,7 +440,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         for sub in [
-            ".gemini/antigravity-cli",
+            ".gemini/antigravity-cli/cache",
+            ".gemini/config/plugins",
             ".gemini/skills",
             "Library/Keychains",
             ".ssh",
@@ -431,6 +451,22 @@ mod tests {
         std::fs::write(real.join(".gitconfig"), "[user]\n").unwrap();
         std::fs::write(real.join(".gemini/GEMINI.md"), "rules").unwrap();
         std::fs::write(real.join(".gemini/antigravity-cli/settings.json"), "{}").unwrap();
+        std::fs::write(
+            real.join(".gemini/antigravity-cli/keybindings.json"),
+            r#"{"cli.clear_screen":["ctrl+l"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            real.join(".gemini/antigravity-cli/cache/onboarding.json"),
+            r#"{"completed":true}"#,
+        )
+        .unwrap();
+        std::fs::write(real.join(".gemini/config/hooks.json"), "{}").unwrap();
+        std::fs::write(
+            real.join(".gemini/config/config.json"),
+            r#"{"userSettings":{"useAiCredits":false}}"#,
+        )
+        .unwrap();
         std::fs::write(
             real.join(".gemini/antigravity-cli/antigravity-oauth-token"),
             "the normal login",
@@ -478,7 +514,8 @@ mod tests {
             env(&launch),
             vec![
                 ("HOME", home.display().to_string()),
-                ("SSH_TTY", "/dev/tty".into())
+                ("SSH_TTY", "/dev/tty".into()),
+                ("TOKEMAN_REAL_HOME", f.place.real_home.display().to_string()),
             ]
         );
         assert_eq!(launch.args(), ["models"]);
@@ -526,6 +563,30 @@ mod tests {
             std::fs::read_link(home.join(".gemini/skills")).unwrap(),
             real.join(".gemini/skills")
         );
+        for linked in [
+            ".gemini/antigravity-cli/keybindings.json",
+            ".gemini/config/hooks.json",
+            ".gemini/config/plugins",
+        ] {
+            assert_eq!(
+                std::fs::read_link(home.join(linked)).unwrap(),
+                real.join(linked),
+                "{linked}"
+            );
+        }
+        for seeded in [
+            ".gemini/antigravity-cli/cache/onboarding.json",
+            ".gemini/config/config.json",
+        ] {
+            let copy = home.join(seeded);
+            assert!(std::fs::read_link(&copy).is_err(), "{seeded}");
+            assert_eq!(
+                std::fs::read_to_string(&copy).unwrap(),
+                std::fs::read_to_string(real.join(seeded)).unwrap(),
+                "{seeded}"
+            );
+            assert_eq!(mode(&copy), 0o600, "{seeded}");
+        }
         // Absent in the real home, so not linked.
         assert!(!present(&home.join(".gemini/config/mcp_config.json")).unwrap());
         // The normal login is not touched.

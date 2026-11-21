@@ -290,11 +290,13 @@ time.
 ## Antigravity
 
 ```sh
+tokeman agy login [<name>]         # sign in through the browser without touching agy's login
 tokeman agy import                 # register the accounts agy and the Antigravity app are signed in to
 tokeman agy remove <name>
 tokeman agy list                   # read every account now
 tokeman agy best [--group claude]  # rank them by room left (on one model group, or on all)
-tokeman agy use <account>          # sign the agy CLI in as that account (macOS)
+tokeman agy use [<account>]        # sign the agy CLI in as that account, or the best one (macOS)
+tokeman agy use --group gemini     # sign in as the account with the most room in one model group
 tokeman agy use --previous         # put back the login the last `use` replaced
 tokeman agy run <account> [-- …]   # start agy as that account beside your normal login (macOS)
 tokeman agy launch [--group claude] [-- …]   # `agy run` on the account with the most room
@@ -303,7 +305,9 @@ tokeman agy launch [--group claude] [-- …]   # `agy run` on the account with t
 Antigravity meters each model group apart, each with a weekly and a five-hour
 window. The service reads the accounts; it never switches agy. `agy`, the
 Antigravity app and an editor's `agy acp` server share one login in the
-Keychain, and `agy use` looks at what is running before it writes:
+Keychain, and `agy use` (which probes and picks the roomiest account when none
+is named, falling back to the group of `agy`'s configured model if another
+group is exhausted) looks at what is running before it writes:
 
 - The Antigravity app is told to re-read the login and switches live.
 - An `agy acp` server cannot be told from outside; if it holds the old
@@ -311,20 +315,24 @@ Keychain, and `agy use` looks at what is running before it writes:
   back when it next refreshes its token.
 - An interactive `agy` cannot be told either, so the switch is refused while
   one runs, with each process's PID, directory and the command that resumes
-  its conversation. Quit it, run the command again, resume. `--force`
-  switches anyway; it lasts until that process refreshes, within the hour.
+  its conversation. Quit it, run `tokeman agy use`, then resume (when this
+  directory has a recorded conversation, `agy use` prints its
+  `agy --conversation=<id>` command). `--force` switches anyway; it lasts
+  until that process refreshes, within the hour.
 
 `tokeman agy run <account>` avoids switching: it starts agy with a login of
 its own, so two accounts can work side by side. The session gets a home under
 `~/.local/share/tokeman/agy-homes/<account>` that links to everything in your
 real home except `.gemini` and `Library`, a token file written from tokeman's
-grant, and `SSH_TTY`, which makes agy keep its login in that file and leave
-the shared Keychain item alone. It has its own conversations (`agy -c` there
-resumes that account's last one) and shares your `GEMINI.md`, skills, CLI
-settings and MCP config. Commands agy runs in it cannot reach the macOS
-keychain (git's https credential helper, for example). The account agy
-already holds runs plain `agy`. `agy list` shows these sessions, and `agy use`
-does not count them as a reason to refuse.
+grant, `SSH_TTY` (which makes agy keep its login in that file and leave the
+shared Keychain item alone), and `TOKEMAN_REAL_HOME` so tokeman commands run
+inside it still find your real home. It has its own conversations (`agy -c`
+there resumes that account's last one), shares your `GEMINI.md`, skills,
+keybindings, hooks, plugins and MCP config, and seeds your CLI settings,
+onboarding state and user config once. Commands agy runs in it cannot reach
+the macOS keychain (git's https credential helper, for example). The account
+agy already holds runs plain `agy`. `agy list` shows these sessions, and
+`agy use` does not count them as a reason to refuse.
 
 `--dry-run` says what is running and what would happen, and writes nothing.
 
@@ -403,7 +411,7 @@ service answered, the state of the credential and the unrecognised items
 (also those of the reset programs and the Codex credit list, and what the
 service has logged). It then states the installed Claude Code, codex, agy
 and Antigravity app against the versions this build was verified with
-(2.1.322, 0.167.0, 1.5.6, 2.31.2), the SessionStart hook, whether the
+(2.1.322, 0.167.0, 1.5.13, 2.31.2), the SessionStart hook, whether the
 background service runs, the modes of the config directory and tokens.toml,
 whether agy's Keychain login reads, and reset claims without an answer. It
 exits 0 when nothing is wrong and 1 otherwise, and every problem comes with

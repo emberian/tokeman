@@ -332,6 +332,7 @@ async fn codex_command(action: CodexAction) -> Result<()> {
 
 async fn agy_command(action: AgyAction) -> Result<()> {
     match action {
+        AgyAction::Login { name } => prompt::agy_login(name.as_deref()).await?,
         AgyAction::Import => text::print_agy_imported(&services::import_antigravity().await?),
         AgyAction::Remove { name } => {
             services::remove(Service::Antigravity, &name)?;
@@ -345,13 +346,22 @@ async fn agy_command(action: AgyAction) -> Result<()> {
         }
         AgyAction::Use {
             name,
+            group,
             previous,
             force,
             dry_run,
         } => {
-            let name = name.filter(|_| !previous);
+            let pick = if previous {
+                services::AgyPick::Previous
+            } else if let Some(name) = name.as_deref() {
+                services::AgyPick::Named(name)
+            } else {
+                services::AgyPick::Best {
+                    group: group.as_deref(),
+                }
+            };
             let options = tokeman::providers::antigravity::seat::UseOptions { force, dry_run };
-            let report = services::agy_use(&Fleet::load()?, name.as_deref(), options).await?;
+            let report = services::agy_use(&Fleet::load()?, pick, options).await?;
             text::print_agy_use(&report);
             if report.refused() {
                 bail!("agy's login was not changed");

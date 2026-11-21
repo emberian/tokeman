@@ -68,6 +68,50 @@ pub async fn login(name: Option<&str>, more: bool) -> Result<()> {
     Ok(())
 }
 
+const AGY_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Sign in to a Google Antigravity account through the browser and register
+/// it without touching `agy`'s Keychain slot. Completes as soon as Google
+/// hits the localhost callback, or when the user pastes the redirect URL (if
+/// the browser ran on another machine) or types `q` to stop.
+pub async fn agy_login(name: Option<&str>) -> Result<()> {
+    let session = crate::commands::services::begin_agy_login(name).await?;
+    text::print_agy_login_step(name, session.url());
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<Option<String>>>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map(|bytes| (bytes > 0).then_some(line))
+            .map_err(anyhow::Error::from);
+        let _ = tx.send(read);
+    });
+    let code = loop {
+        tokio::select! {
+            callback = session.wait_for_callback(AGY_LOGIN_TIMEOUT) => break callback?,
+            pasted = &mut rx => match pasted {
+                Ok(Ok(Some(line))) => {
+                    let trimmed = line.trim();
+                    if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
+                        text::print_agy_login_cancelled();
+                        return Ok(());
+                    }
+                    if trimmed.is_empty() {
+                        rx = tokio::sync::oneshot::channel().1;
+                        continue;
+                    }
+                    break session.parse_callback_input(trimmed)?;
+                }
+                _ => break session.wait_for_callback(AGY_LOGIN_TIMEOUT).await?,
+            },
+        }
+    };
+    let logged_in = crate::commands::services::finish_agy_login(name, &session, &code).await?;
+    text::print_agy_logged_in(&logged_in);
+    Ok(())
+}
+
 /// Interactive prompts need both a keyboard and a terminal for their output.
 pub fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()

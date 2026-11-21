@@ -14,10 +14,24 @@ use std::path::PathBuf;
 pub(crate) const TEST_HOME: &str = "/nonexistent/tokeman-test-home";
 
 /// The user's home directory. Every module asks here, so a unit test never
-/// learns the real one.
+/// learns the real one. Inside a `tokeman agy run` session, `HOME` is that
+/// account's directory under [`agy_homes`] and `TOKEMAN_REAL_HOME` carries
+/// the user's own.
 #[cfg(not(test))]
 pub fn home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    resolve_home(
+        std::env::var_os("TOKEMAN_REAL_HOME").as_deref(),
+        dirs::home_dir(),
+    )
+}
+
+fn resolve_home(real_home: Option<&std::ffi::OsStr>, detected: Option<PathBuf>) -> PathBuf {
+    real_home
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or(detected)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -276,5 +290,22 @@ mod tests {
             );
         }
         assert_eq!(tilde(&home.join(".codex")), "~/.codex");
+    }
+
+    #[test]
+    fn real_home_overrides_a_per_account_home_only_when_absolute() {
+        use std::ffi::OsStr;
+        let detected = || Some(PathBuf::from("/local/agy-homes/b@example.com"));
+        assert_eq!(
+            resolve_home(Some(OsStr::new("/Users/real")), detected()),
+            PathBuf::from("/Users/real")
+        );
+        for ignored in [None, Some(OsStr::new("")), Some(OsStr::new("relative/dir"))] {
+            assert_eq!(
+                resolve_home(ignored, detected()),
+                PathBuf::from("/local/agy-homes/b@example.com")
+            );
+        }
+        assert_eq!(resolve_home(None, None), PathBuf::from("."));
     }
 }
