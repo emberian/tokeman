@@ -626,7 +626,14 @@ async fn reset_reads(fleet: &Fleet, accounts: &mut [AccountCheck], at: i64) {
                 let cache = &cache;
                 async move {
                     let client = anthropic::Client::shared();
-                    let status = anthropic::resets::status(client, cache, account, false, at).await;
+                    let status = anthropic::resets::status(
+                        client,
+                        cache,
+                        account,
+                        anthropic::profile::ReadPolicy::Cached,
+                        at,
+                    )
+                    .await;
                     (Service::Claude, account.name.clone(), status)
                 }
             }),

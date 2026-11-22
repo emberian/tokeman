@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use super::now;
 use crate::account::{Account, Fleet};
-use crate::anthropic::profile::Cache;
+use crate::anthropic::profile::{Cache, Endpoint, ReadPolicy};
 use crate::anthropic::{Client, oauth, resets};
 use crate::claims::{Journal, Pending};
 use crate::daemon;
@@ -122,16 +122,21 @@ pub struct ResetListing {
 }
 
 /// Every logged-in account's reset offers, from the shared profile cache.
-pub async fn reset_offers(fleet: &Fleet) -> Vec<ResetListing> {
+pub async fn reset_offers(fleet: &Fleet, named: bool) -> Vec<ResetListing> {
     let at = now();
     let cache = Cache::default();
     let journal = Journal::default();
+    let policy = if named {
+        ReadPolicy::Cached
+    } else {
+        ReadPolicy::Stored
+    };
     let mut listings = Vec::new();
     for account in &fleet.accounts {
         let status = match account.profile_token(at * 1000) {
             None => None,
             Some(_) => Some(
-                resets::status(Client::shared(), &cache, account, false, at)
+                resets::status(Client::shared(), &cache, account, policy, at)
                     .await
                     .map_err(|error| format!("{error:#}")),
             ),
@@ -178,7 +183,20 @@ pub async fn reset_plan(
         .account(name)
         .with_context(|| format!("no configured account named {name}"))?;
     let at = now();
-    let status = resets::status(Client::shared(), &Cache::default(), account, true, at).await?;
+    let endpoint = if session {
+        Endpoint::AtWall
+    } else {
+        Endpoint::CedarEmber
+    };
+    let status = resets::program(
+        Client::shared(),
+        &Cache::default(),
+        account,
+        endpoint,
+        ReadPolicy::Plan,
+        at,
+    )
+    .await?;
     let choice = if session {
         let session = status
             .juniper_tide
@@ -254,6 +272,7 @@ pub async fn reset_claim(plan: &ResetPlan) -> Result<resets::ClaimResponse> {
         &plan.account,
         grant_id,
         &Journal::default(),
+        &Cache::default(),
         now(),
     )
     .await

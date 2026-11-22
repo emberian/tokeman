@@ -187,7 +187,7 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
                         }
                         fleet.accounts.retain(|account| &account.name == name);
                     }
-                    let listings = claude::reset_offers(&fleet).await;
+                    let listings = claude::reset_offers(&fleet, name.is_some()).await;
                     if !pick {
                         text::print_reset_offers(&listings);
                         return Ok(());

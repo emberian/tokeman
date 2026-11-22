@@ -1369,7 +1369,15 @@ pub fn print_reset_offers(listings: &[crate::commands::claude::ResetListing]) {
         let Some(status) = &listing.status else {
             continue;
         };
-        println!("{}", listing.account);
+        if let Some(at) = status.as_ref().ok().and_then(|status| status.checked_at) {
+            println!(
+                "{} (oldest offer check {})",
+                listing.account,
+                format_age(at, now)
+            );
+        } else {
+            println!("{}", listing.account);
+        }
         match status {
             Ok(status) => {
                 print_reset_status(status, listing.pending.as_ref(), &listing.account, now)

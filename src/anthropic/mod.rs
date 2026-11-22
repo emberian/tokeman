@@ -220,12 +220,25 @@ pub fn http_error(status: reqwest::StatusCode, body: String) -> ReadError {
     }
 }
 
-/// `Retry-After` in seconds, when the server sent one.
+/// The delay requested by Retry-After, in seconds or as an HTTP date.
 pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<i64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
+    use reqwest::header::{DATE, RETRY_AFTER};
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds.max(0));
+    }
+    let timestamp = |value| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|at| at.timestamp())
+    };
+    let until = timestamp(value)?;
+    let now = headers
+        .get(DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(timestamp)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    Some((until - now).max(0))
 }
 
 #[cfg(test)]
@@ -250,7 +263,7 @@ pub(crate) mod testing {
     /// A profile cache in a fresh directory; keep the guard for its lifetime.
     pub fn temp_cache() -> (tempfile::TempDir, profile::Cache) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = profile::Cache::at(dir.path().join("reads.json"));
+        let cache = profile::Cache::at(dir.path().join("reads.json")).without_spacing();
         (dir, cache)
     }
 }
@@ -258,6 +271,18 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_http_date_retry_after_uses_the_servers_clock() {
+        use reqwest::header::{DATE, HeaderMap, RETRY_AFTER};
+        let mut headers = HeaderMap::new();
+        headers.insert(DATE, "Sun, 22 Nov 2026 12:00:00 GMT".parse().unwrap());
+        headers.insert(
+            RETRY_AFTER,
+            "Sun, 22 Nov 2026 12:55:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_secs(&headers), Some(3300));
+    }
 
     #[test]
     fn the_user_agent_carries_the_installed_version_or_the_fallback() {

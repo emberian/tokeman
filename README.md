@@ -194,7 +194,10 @@ account has one and has used it, the Fable limit, and each window's own
 status. The profile endpoint (which needs a login) lists every limit: the
 windows, a weekly limit per model, and how large each is as a share of the
 weekly. An account whose list has no five-hour row has no five-hour limit,
-and every surface says so. Profile answers are cached and backed off on 429.
+and every surface says so. Routine profile reads reuse an answer for 15 minutes.
+The daemon and CLI share a cache and space usage requests at least three seconds
+apart across accounts. A 429 holds the affected account until its retry time.
+Overlapping cooldowns on two accounts hold the fleet.
 
 Only limits on the startup model (read from `~/.claude/settings.json`) take
 part in rotation; they are marked `*`. An exhausted Opus 4.8 limit does not
@@ -216,7 +219,11 @@ rejection tokeman did not see itself.
 
 Anthropic offers some accounts resets that refill their limits on request.
 `tokeman claude reset` opens a picker of available resets; add `<name>` to
-limit it to one account. Use arrow keys to browse the offers and their effects,
+check one account. Browsing the fleet reads the offers already on disk and
+makes no usage requests. The daemon populates these offers as it reads quota.
+Use `tokeman claude reset <name> --list` to check an account on demand.
+When preparing a claim, tokeman requires a successful read of the selected program
+within the last minute and honors any active cooldown. Use arrow keys to browse the offers and their effects,
 Enter to review and confirm, or Esc to cancel. `--list` prints offers without
 opening the picker; bare `reset` also lists when piped. `--grant <id>` or
 `--session` selects directly, and `--yes` skips confirmation. A grant spends

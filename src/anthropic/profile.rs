@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -18,13 +19,26 @@ use serde::{Deserialize, Serialize};
 use super::{Client, describe, retry_after_secs};
 use crate::account::Account;
 use crate::drift::Unrecognized;
-use crate::fs::write_atomic;
+use crate::fs::{FileLock, write_atomic};
 use crate::paths;
 use crate::quota::{Limit, ModelKey, Reading, Scope, SessionLimit, Source, Span, Window};
 use crate::util::{one_line, parse_reset};
 
 /// How long an answer is reused before the endpoint is asked again.
-pub const MAX_AGE_SECS: i64 = 300;
+pub const MAX_AGE_SECS: i64 = 900;
+/// A plan may reuse the offer just shown in the picker.
+const PLAN_MAX_AGE_SECS: i64 = 60;
+const REQUEST_SPACING: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadPolicy {
+    /// Read the last known answer without contacting Anthropic.
+    Stored,
+    /// Reuse a recent answer, falling back to older data during backoff.
+    Cached,
+    /// Require a recent success and respect every active backoff.
+    Plan,
+}
 const FIRST_BACKOFF_SECS: i64 = 600;
 const MAX_BACKOFF_SECS: i64 = 3600;
 /// After an error that is not a rate limit (network, 5xx).
@@ -49,6 +63,20 @@ impl Endpoint {
             Self::AtWall => "/api/oauth/usage?at_wall=1&skip_spend=1",
             Self::CedarEmber => "/api/oauth/usage?cedar_ember=1&skip_spend=1",
         }
+    }
+
+    fn serves(self, wanted: Self, body: &serde_json::Value) -> bool {
+        self == wanted
+            || match wanted {
+                Self::Usage => true,
+                Self::CedarEmber => body
+                    .get("cedar_ember")
+                    .and_then(|v| {
+                        serde_json::from_value::<super::resets::GrantProgram>(v.clone()).ok()
+                    })
+                    .is_some_and(|p| p.standing() != super::resets::Standing::Unknown),
+                Self::AtWall => false,
+            }
     }
 
     fn key(self, account: &str) -> String {
@@ -113,15 +141,15 @@ impl Backoff {
             self.accounts.push(account.to_owned());
         }
         self.rate_limited = self.rate_limited.saturating_add(1);
-        self.retry_after = self
-            .retry_after
-            .max(now + retry_delay_secs(true, self.rate_limited, retry_after));
+        self.retry_after = self.retry_after.max(now.saturating_add(retry_delay_secs(
+            true,
+            self.rate_limited,
+            retry_after,
+        )));
         self.last_error = Some(message.to_owned());
     }
 
-    /// A read succeeded. Reads run concurrently, so a success that was in
-    /// flight when another account drew a 429 must not lift that backoff:
-    /// only an expired one is cleared.
+    /// A different account can succeed during a per-account cooldown.
     fn succeeded(&mut self, now: i64) {
         if now >= self.retry_after {
             *self = Self::default();
@@ -132,15 +160,34 @@ impl Backoff {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct CacheFile {
     #[serde(default)]
+    last_request_ms: i64,
+    #[serde(default)]
     backoff: Backoff,
     #[serde(default, deserialize_with = "crate::fs::lenient_map")]
     entries: BTreeMap<String, Entry>,
+}
+
+impl CacheFile {
+    fn answer(&self, account: &str, wanted: Endpoint) -> Option<(i64, &serde_json::Value)> {
+        [Endpoint::Usage, Endpoint::AtWall, Endpoint::CedarEmber]
+            .into_iter()
+            .filter_map(|source| {
+                let entry = self.entries.get(&source.key(account))?;
+                let body = entry.body.as_ref()?;
+                source
+                    .serves(wanted, body)
+                    .then_some((entry.fetched_at, source == wanted, body))
+            })
+            .max_by_key(|(at, exact, _)| (*at, *exact))
+            .map(|(at, _, body)| (at, body))
+    }
 }
 
 /// The cache file, shared by the daemon and every CLI command.
 #[derive(Debug, Clone)]
 pub struct Cache {
     path: PathBuf,
+    spacing: Duration,
 }
 
 impl Default for Cache {
@@ -151,7 +198,10 @@ impl Default for Cache {
 
 impl Cache {
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            spacing: REQUEST_SPACING,
+        }
     }
 
     /// The file as stored; a file in an older shape reads as empty.
@@ -162,45 +212,72 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    /// Best-effort read-modify-write: a lost update costs one extra read
-    /// later. The file holds usage figures, never credentials.
-    fn update(&self, change: impl FnOnce(&mut CacheFile)) {
+    #[cfg(test)]
+    pub(super) fn without_spacing(mut self) -> Self {
+        self.spacing = Duration::ZERO;
+        self
+    }
+
+    async fn lock(&self) -> Result<FileLock> {
+        let path = self.path.with_extension("lock");
+        tokio::task::spawn_blocking(move || FileLock::acquire(&path)).await?
+    }
+
+    fn save(&self, file: &CacheFile) -> Result<()> {
+        write_atomic(&self.path, &serde_json::to_vec(file)?, 0o600)
+    }
+
+    /// Discard pre-claim answers while preserving any server backoff.
+    pub(super) async fn begin_claim(&self, account: &str) -> Result<FileLock> {
+        let lock = self.lock().await?;
         let mut file = self.load();
-        change(&mut file);
-        if let Ok(bytes) = serde_json::to_vec_pretty(&file) {
-            let _ = write_atomic(&self.path, &bytes, 0o600);
+        for endpoint in [Endpoint::Usage, Endpoint::AtWall, Endpoint::CedarEmber] {
+            if let Some(entry) = file.entries.get_mut(&endpoint.key(account)) {
+                entry.body = None;
+            }
         }
+        self.save(&file)?;
+        Ok(lock)
     }
 
-    /// What the cache holds for `account`, however old, and when it was
-    /// fetched (epoch seconds). No request is made.
     pub fn stored(&self, account: &str, endpoint: Endpoint) -> Option<(i64, serde_json::Value)> {
-        let entry = self.load().entries.remove(&endpoint.key(account))?;
-        Some((entry.fetched_at, entry.body?))
+        let file = self.load();
+        let (at, body) = file.answer(account, endpoint)?;
+        Some((at, body.clone()))
     }
 
-    /// The endpoint's JSON for `account`: from the cache when younger than
-    /// [`MAX_AGE_SECS`] (unless `fresh`), or while this account or the fleet
-    /// is backed off; otherwise fetched with `bearer`. `now` is epoch seconds.
     pub async fn read(
         &self,
         client: &Client,
         account: &str,
         bearer: &str,
         endpoint: Endpoint,
-        fresh: bool,
+        policy: ReadPolicy,
         now: i64,
-    ) -> Result<serde_json::Value> {
-        let key = endpoint.key(account);
-        let file = self.load();
-        let entry = file.entries.get(&key).cloned().unwrap_or_default();
-        let young = now - entry.fetched_at < MAX_AGE_SECS;
-        if let Some(body) = &entry.body
-            && young
-            && !fresh
-        {
-            return Ok(body.clone());
+    ) -> Result<(i64, serde_json::Value)> {
+        if policy == ReadPolicy::Stored {
+            return self.stored(account, endpoint).ok_or_else(|| {
+                anyhow::anyhow!("no cached offer; run `tokeman claude reset {account} --list`")
+            });
         }
+        let started = Instant::now();
+        // All variants draw on one endpoint budget. Hold the same lock from
+        // the cache check through the HTTP response and its persisted backoff.
+        let _lock = self.lock().await?;
+        let mut file = self.load();
+        let requested_at = now;
+        let now = requested_at + started.elapsed().as_secs() as i64;
+        // The at-wall variant reports quota plus both reset programs on
+        // current accounts. One routine quota poll can populate the picker.
+        let source = if endpoint == Endpoint::Usage {
+            Endpoint::AtWall
+        } else {
+            endpoint
+        };
+        let key = source.key(account);
+        let entry = file.entries.get(&key);
+        let answer = file.answer(account, endpoint);
+        let fresh = policy == ReadPolicy::Plan;
         let fleet_held = file.backoff.holds(account, now);
         let scope = if file.backoff.accounts.len() >= FLEET_429_ACCOUNTS {
             " for every account"
@@ -208,7 +285,11 @@ impl Cache {
             ""
         };
         let held = [
-            (entry.retry_after, entry.last_error.as_deref(), ""),
+            (
+                entry.map_or(0, |e| e.retry_after),
+                entry.and_then(|e| e.last_error.as_deref()),
+                "",
+            ),
             (
                 if fleet_held {
                     file.backoff.retry_after
@@ -223,8 +304,8 @@ impl Cache {
         .filter(|(until, _, _)| now < *until)
         .max_by_key(|(until, _, _)| *until);
         if let Some((until, error, scope)) = held {
-            return match &entry.body {
-                Some(body) if !fresh => Ok(body.clone()),
+            return match answer {
+                Some((at, body)) if !fresh => Ok((at, body.clone())),
                 _ => bail!(
                     "{} (backing off{scope} for {}s)",
                     error.unwrap_or("recently refused"),
@@ -232,39 +313,67 @@ impl Cache {
                 ),
             };
         }
-        match fetch(client, bearer, endpoint).await {
+        let max_age = if fresh {
+            PLAN_MAX_AGE_SECS
+        } else {
+            MAX_AGE_SECS
+        };
+        if let Some((at, body)) = answer
+            && now.saturating_sub(at) < max_age
+        {
+            return Ok((at, body.clone()));
+        }
+
+        let elapsed_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(file.last_request_ms)
+            .max(0);
+        let delay = self
+            .spacing
+            .saturating_sub(Duration::from_millis(elapsed_ms as u64));
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        // Reserve the slot before sending: cancellation or a failed cache
+        // write must not let a retry immediately send another request.
+        file.last_request_ms = chrono::Utc::now().timestamp_millis();
+        self.save(&file)?;
+        let response = fetch(client, bearer, source).await;
+        let finished = requested_at + started.elapsed().as_secs() as i64;
+        file.last_request_ms = chrono::Utc::now().timestamp_millis();
+        match response {
             Ok(body) => {
-                self.update(|file| {
-                    file.entries.insert(
-                        key,
-                        Entry {
-                            fetched_at: now,
-                            body: Some(body.clone()),
-                            ..Entry::default()
-                        },
-                    );
-                    file.backoff.succeeded(now);
-                });
-                Ok(body)
+                file.entries.insert(
+                    key,
+                    Entry {
+                        fetched_at: finished,
+                        body: Some(body.clone()),
+                        ..Entry::default()
+                    },
+                );
+                file.backoff.succeeded(finished);
+                self.save(&file)?;
+                Ok((finished, body))
             }
             Err(failure) => {
-                self.update(|file| {
-                    let entry = file.entries.entry(key).or_default();
-                    entry.last_error = Some(failure.message.clone());
-                    if failure.rate_limited {
-                        file.backoff.rate_limited(
-                            account,
-                            now,
-                            failure.retry_after,
-                            &failure.message,
-                        );
-                    } else {
-                        entry.retry_after = now + retry_delay_secs(false, 0, None);
-                    }
-                });
-                match entry.body {
-                    Some(body) if !fresh => Ok(body),
-                    _ => bail!("{}", failure.message),
+                let entry = file.entries.entry(key).or_default();
+                entry.last_error = Some(failure.message.clone());
+                let delay = if failure.rate_limited {
+                    file.backoff.rate_limited(
+                        account,
+                        finished,
+                        failure.retry_after,
+                        &failure.message,
+                    );
+                    file.backoff.retry_after - finished
+                } else {
+                    entry.retry_after = finished + ERROR_RETRY_SECS;
+                    ERROR_RETRY_SECS
+                };
+                self.save(&file)?;
+                match file.answer(account, endpoint) {
+                    Some((at, body)) if !fresh => Ok((at, body.clone())),
+                    _ => bail!("{} (backing off for {delay}s)", failure.message),
                 }
             }
         }
@@ -634,10 +743,19 @@ pub async fn usage(
 ) -> Option<std::result::Result<ProfileUsage, String>> {
     let bearer = account.profile_token(now * 1000)?;
     let outcome = match cache
-        .read(client, &account.name, bearer, Endpoint::Usage, false, now)
+        .read(
+            client,
+            &account.name,
+            bearer,
+            Endpoint::Usage,
+            ReadPolicy::Cached,
+            now,
+        )
         .await
     {
-        Ok(body) => parse(&body).map_err(|error| format!("usage response parse failed: {error}")),
+        Ok((_, body)) => {
+            parse(&body).map_err(|error| format!("usage response parse failed: {error}"))
+        }
         Err(error) => Err(format!("usage {error:#}")),
     };
     Some(outcome)
@@ -1042,8 +1160,20 @@ mod tests {
             let client = client.clone();
             async move {
                 cache
-                    .read(&client, account, "tok", Endpoint::Usage, fresh, now)
+                    .read(
+                        &client,
+                        account,
+                        "tok",
+                        Endpoint::Usage,
+                        if fresh {
+                            ReadPolicy::Plan
+                        } else {
+                            ReadPolicy::Cached
+                        },
+                        now,
+                    )
                     .await
+                    .map(|(_, body)| body)
             }
         };
 
@@ -1078,8 +1208,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(cache.load().backoff.accounts, ["acct"]);
 
-        // A second account's 429 holds back every account, even a new one.
-        assert!(read("third", refused_at + 400, false).await.is_err());
+        // A second account's 429 holds back every account, including a
+        // claim with an otherwise recent successful read.
+        assert!(read("third", refused_at + 20, false).await.is_err());
+        assert!(read("second", refused_at + 21, true).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         let other = read("fourth", refused_at + 410, false).await.unwrap_err();
         assert!(other.to_string().contains("for every account"), "{other}");
@@ -1091,9 +1223,56 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert_eq!(cache.load().backoff, Backoff::default());
 
-        // A fresh read asks even when the stored answer is young.
-        assert_eq!(read("fourth", after + 1, true).await.unwrap(), good);
+        // A claim needs a more recent answer than an ordinary read.
+        assert_eq!(
+            read("fourth", after + PLAN_MAX_AGE_SECS, true)
+                .await
+                .unwrap(),
+            good
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn concurrent_accounts_space_their_requests_and_observe_the_same_429s() {
+        use std::sync::{Arc, Mutex};
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let observed = hits.clone();
+        let client = serve(Router::new().route(
+            "/api/oauth/usage",
+            get(move || {
+                observed.lock().unwrap().push(Instant::now());
+                async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "3300")],
+                        "{}",
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (dir, mut cache) = temp_cache();
+        cache.spacing = Duration::from_millis(150);
+        let outcomes = futures::future::join_all(["a", "b", "c", "d"].map(|name| {
+            cache.read(
+                &client,
+                name,
+                "tok",
+                Endpoint::CedarEmber,
+                ReadPolicy::Plan,
+                1000,
+            )
+        }))
+        .await;
+        assert!(outcomes.iter().all(Result::is_err));
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 2);
+        // Allow loopback transit and timer resolution.
+        assert!(hits[1].duration_since(hits[0]) >= Duration::from_millis(100));
+        let reopened = Cache::at(dir.path().join("reads.json")).load();
+        assert_eq!(reopened.backoff.accounts.len(), 2);
+        assert!(reopened.backoff.retry_after >= 4300);
     }
 
     #[test]
@@ -1114,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_success_in_flight_during_another_accounts_429_keeps_the_backoff() {
+    fn a_success_during_another_accounts_429_keeps_the_backoff() {
         let mut backoff = Backoff {
             retry_after: 1600,
             rate_limited: 2,
@@ -1146,7 +1325,14 @@ mod tests {
             let client = client.clone();
             async move {
                 cache
-                    .read(&client, account, "tok", Endpoint::Usage, false, now)
+                    .read(
+                        &client,
+                        account,
+                        "tok",
+                        Endpoint::Usage,
+                        ReadPolicy::Cached,
+                        now,
+                    )
                     .await
             }
         };
@@ -1154,7 +1340,7 @@ mod tests {
         assert!(error.to_string().contains("HTTP 500"), "{error}");
         let file = cache.load();
         assert_eq!(
-            file.entries["acct|usage"].retry_after,
+            file.entries["acct|at_wall"].retry_after,
             100 + ERROR_RETRY_SECS
         );
         assert_eq!(file.backoff, Backoff::default());
@@ -1165,7 +1351,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // After it: fetched, and the entry's backoff state is cleared.
         read("acct", 161).await.unwrap();
-        let entry = cache.load().entries.remove("acct|usage").unwrap();
+        let entry = cache.load().entries.remove("acct|at_wall").unwrap();
         assert_eq!(entry.retry_after, 0);
         assert!(entry.last_error.is_none());
         #[cfg(unix)]

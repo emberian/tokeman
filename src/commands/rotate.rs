@@ -5,8 +5,7 @@ use anyhow::{Result, bail};
 use std::path::PathBuf;
 
 use crate::account::Fleet;
-use crate::anthropic::profile::Cache;
-use crate::anthropic::{Client, probe, resets};
+use crate::anthropic::probe;
 use crate::claude::{sessions, settings as claude_settings};
 use crate::daemon::cadence::Cadence;
 use crate::daemon::lock::RotationLock;
@@ -14,7 +13,7 @@ use crate::daemon::{self, cycle};
 use crate::observe::{self, Family, LimitWindow};
 use crate::policy::{self, Mode};
 use crate::quota::{ModelKey, Source};
-use crate::ui::overview::{Facts, Overview, ResetOffer};
+use crate::ui::overview::{Facts, Overview};
 
 /// Probe and apply the policy once.
 pub async fn run(fleet: &Fleet, options: cycle::Options) -> Result<cycle::Outcome> {
@@ -87,7 +86,6 @@ pub async fn status(fleet: &Fleet) -> Result<Overview> {
         target_model.as_deref(),
         now,
     ));
-    facts.offers = resets_on_offer(fleet, at, model.as_ref()).await;
     facts.live_sessions = live_sessions;
     Ok(Overview::build(
         fleet,
@@ -134,37 +132,6 @@ fn describe_sampling(
         interval / 60,
         eligible.len()
     )
-}
-
-/// The usable reset grants of every logged-in account, read now.
-async fn resets_on_offer(fleet: &Fleet, now: i64, model: Option<&ModelKey>) -> Vec<ResetOffer> {
-    let cache = Cache::default();
-    let client = Client::shared();
-    let accounts: Vec<_> = fleet
-        .accounts
-        .iter()
-        .filter(|account| account.profile_token(now * 1000).is_some())
-        .collect();
-    let statuses = futures::future::join_all(
-        accounts
-            .iter()
-            .map(|account| resets::status(client, &cache, account, false, now)),
-    )
-    .await;
-    let mut offers = Vec::new();
-    for (account, status) in accounts.iter().zip(statuses) {
-        let Some(program) = status.ok().and_then(|status| status.cedar_ember) else {
-            continue;
-        };
-        offers.extend(
-            program
-                .grants()
-                .iter()
-                .filter(|grant| grant.is_usable(now))
-                .map(|grant| ResetOffer::of(&account.name, grant, now, now, model)),
-        );
-    }
-    offers
 }
 
 pub fn pause() -> Result<()> {

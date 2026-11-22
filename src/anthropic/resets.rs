@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::profile::{Cache, Endpoint};
+use super::profile::{Cache, Endpoint, ReadPolicy};
 use super::{Client, describe};
 use crate::account::Account;
 use crate::claims::{Conflict, Journal};
@@ -239,6 +239,9 @@ impl SessionProgram {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResetStatus {
+    /// Oldest read contributing to this status.
+    #[serde(skip)]
+    pub checked_at: Option<i64>,
     #[serde(default)]
     pub cedar_ember: Option<GrantProgram>,
     #[serde(default)]
@@ -469,47 +472,64 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&body).with_context(|| format!("unreadable {path} response"))
 }
 
-/// Reset offers, from the shared profile-read cache unless `fresh`: the
-/// granted resets from the cedar_ember read, the session reset from the
-/// at-wall read. A failed read leaves its program unknown and says why.
-/// `now` is epoch seconds.
+/// Read just the selected program. The other program can be absent or malformed.
+pub async fn program(
+    client: &Client,
+    cache: &Cache,
+    account: &Account,
+    endpoint: Endpoint,
+    policy: ReadPolicy,
+    now: i64,
+) -> Result<ResetStatus> {
+    let bearer = profile_token(account, now)?;
+    let (at, body) = cache
+        .read(client, &account.name, bearer, endpoint, policy, now)
+        .await?;
+    let mut status = ResetStatus {
+        checked_at: Some(at),
+        unrecognized: super::profile::unrecognized(&body),
+        ..ResetStatus::default()
+    };
+    crate::drift::merge(&mut status.unrecognized, unrecognized(&body));
+    match endpoint {
+        Endpoint::CedarEmber => {
+            status.cedar_ember = serde_json::from_value(body["cedar_ember"].clone())?
+        }
+        Endpoint::AtWall => {
+            status.juniper_tide = serde_json::from_value(body["juniper_tide"].clone())?
+        }
+        Endpoint::Usage => bail!("expected a reset program"),
+    }
+    Ok(status)
+}
+
+/// Read the at-wall form first. When it evaluates both programs the grant
+/// lookup reuses that response.
 pub async fn status(
     client: &Client,
     cache: &Cache,
     account: &Account,
-    fresh: bool,
+    policy: ReadPolicy,
     now: i64,
 ) -> Result<ResetStatus> {
-    let bearer = profile_token(account, now)?;
     let mut status = ResetStatus::default();
-    for endpoint in [Endpoint::CedarEmber, Endpoint::AtWall] {
-        let body = match cache
-            .read(client, &account.name, bearer, endpoint, fresh, now)
-            .await
-        {
-            Ok(body) => body,
-            Err(error) => {
-                status.errors.push(format!("{error:#}"));
-                continue;
+    for endpoint in [Endpoint::AtWall, Endpoint::CedarEmber] {
+        match program(client, cache, account, endpoint, policy, now).await {
+            Ok(read) => {
+                status.checked_at = status.checked_at.into_iter().chain(read.checked_at).min();
+                crate::drift::merge(&mut status.unrecognized, read.unrecognized);
+                if endpoint == Endpoint::AtWall {
+                    status.juniper_tide = read.juniper_tide;
+                } else {
+                    status.cedar_ember = read.cedar_ember;
+                }
             }
-        };
-        crate::drift::merge(
-            &mut status.unrecognized,
-            super::profile::unrecognized(&body),
-        );
-        crate::drift::merge(&mut status.unrecognized, unrecognized(&body));
-        let read: ResetStatus = match serde_json::from_value(body) {
-            Ok(read) => read,
             Err(error) => {
-                status
-                    .errors
-                    .push(format!("unreadable reset status: {error}"));
-                continue;
+                let message = format!("{error:#}");
+                if !status.errors.contains(&message) {
+                    status.errors.push(message);
+                }
             }
-        };
-        match endpoint {
-            Endpoint::CedarEmber => status.cedar_ember = read.cedar_ember,
-            _ => status.juniper_tide = read.juniper_tide,
         }
     }
     if status.cedar_ember.is_none() && status.juniper_tide.is_none() && !status.errors.is_empty() {
@@ -523,9 +543,8 @@ pub async fn status(
 /// was never read.
 pub fn stored_grants(cache: &Cache, account: &str, now: i64) -> Option<(i64, Vec<ResetGrant>)> {
     let (fetched_at, body) = cache.stored(account, Endpoint::CedarEmber)?;
-    let status: ResetStatus = serde_json::from_value(body).ok()?;
-    let grants = status
-        .cedar_ember
+    let program: Option<GrantProgram> = serde_json::from_value(body["cedar_ember"].clone()).ok()?;
+    let grants = program
         .map(|program| program.grants())
         .unwrap_or_default()
         .into_iter()
@@ -559,6 +578,7 @@ pub async fn claim(
     account: &Account,
     grant_id: Option<&str>,
     journal: &Journal,
+    cache: &Cache,
     now: i64,
 ) -> Result<ClaimResponse> {
     let bearer = profile_token(account, now)?;
@@ -593,6 +613,7 @@ pub async fn claim(
         }),
         None => serde_json::json!({ "program": "juniper_tide" }),
     };
+    let _cache_lock = cache.begin_claim(&account.name).await?;
     let path = format!("/api/organizations/{organization}/reset_rate_limits");
     let response = client
         .oauth_post(&path, bearer)
@@ -959,7 +980,7 @@ mod tests {
         let client = serve(router).await;
         let (_dir, cache) = temp_cache();
         let setup_only = setup_account("acct");
-        let error = status(&client, &cache, &setup_only, false, 1)
+        let error = status(&client, &cache, &setup_only, ReadPolicy::Cached, 1)
             .await
             .unwrap_err();
         assert!(
@@ -968,7 +989,9 @@ mod tests {
         );
 
         let account = profile_only_account("acct", "profile");
-        let status = status(&client, &cache, &account, false, 1).await.unwrap();
+        let status = status(&client, &cache, &account, ReadPolicy::Cached, 1)
+            .await
+            .unwrap();
         assert_eq!(status.cedar_ember.unwrap().grants().len(), 1);
         assert_eq!(
             status.juniper_tide.unwrap().ineligible_reason.as_deref(),
@@ -994,7 +1017,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fleet_browsing_and_repeated_plans_share_the_daemons_one_read() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let observed = queries.clone();
+        let router = Router::new().route(
+            "/api/oauth/usage",
+            get(move |query: axum::extract::RawQuery| {
+                observed.lock().unwrap().push(query.0.unwrap());
+                async {
+                    let mut body: serde_json::Value = serde_json::from_str(CEDAR_STATUS).unwrap();
+                    let wall: serde_json::Value = serde_json::from_str(AT_WALL_STATUS).unwrap();
+                    body["juniper_tide"] = wall["juniper_tide"].clone();
+                    body["limits"] = serde_json::json!([]);
+                    axum::Json(body)
+                }
+            }),
+        );
+        let client = serve(router).await;
+        let (_dir, cache) = temp_cache();
+        let account = profile_only_account("acct", "profile");
+        let browse = |now| status(&client, &cache, &account, ReadPolicy::Stored, now);
+        let plan =
+            |endpoint, now| program(&client, &cache, &account, endpoint, ReadPolicy::Plan, now);
+        assert!(browse(1).await.is_err());
+        assert!(queries.lock().unwrap().is_empty());
+
+        // Simulate three independent callers on a cold cache.
+        let worker = cache.clone();
+        let (daemon, picker, another) = tokio::join!(
+            super::super::profile::usage(&client, &cache, &account, 10),
+            status(&client, &worker, &account, ReadPolicy::Cached, 10),
+            status(&client, &cache, &account, ReadPolicy::Cached, 10)
+        );
+        daemon.unwrap().unwrap();
+        assert!(picker.unwrap().cedar_ember.is_some());
+        assert!(another.unwrap().juniper_tide.is_some());
+        plan(Endpoint::AtWall, 20).await.unwrap();
+        plan(Endpoint::CedarEmber, 30).await.unwrap();
+        assert_eq!(browse(9000).await.unwrap().checked_at, Some(10));
+        assert_eq!(*queries.lock().unwrap(), ["at_wall=1&skip_spend=1"]);
+
+        plan(Endpoint::CedarEmber, 100).await.unwrap();
+        plan(Endpoint::CedarEmber, 101).await.unwrap();
+        plan(Endpoint::AtWall, 110).await.unwrap();
+        assert_eq!(
+            *queries.lock().unwrap(),
+            [
+                "at_wall=1&skip_spend=1",
+                "cedar_ember=1&skip_spend=1",
+                "at_wall=1&skip_spend=1"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn an_uncertain_claim_is_resent_as_itself_and_blocks_any_other_grant() {
+        let (_cache_dir, cache) = temp_cache();
         let (router, sent) = fake_api(vec![
             (StatusCode::BAD_GATEWAY, "upstream timeout"),
             (
@@ -1008,10 +1086,16 @@ mod tests {
         let journal = Journal::at(dir.path());
         let account = profile_only_account("acct", "profile");
 
-        let error = claim(&client, &account, Some("g1"), &journal, 100)
+        status(&client, &cache, &account, ReadPolicy::Cached, 90)
+            .await
+            .unwrap();
+        assert!(cache.stored("acct", Endpoint::CedarEmber).is_some());
+        let error = claim(&client, &account, Some("g1"), &journal, &cache, 100)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("HTTP 502"), "{error}");
+        assert!(cache.stored("acct", Endpoint::CedarEmber).is_none());
+        assert!(cache.stored("acct", Endpoint::AtWall).is_none());
         let pending = journal
             .pending(Service::Claude, "acct")
             .unwrap()
@@ -1020,7 +1104,7 @@ mod tests {
         assert_eq!(pending.sent_at, 100);
 
         // Another grant is refused before any request.
-        let refused = claim(&client, &account, Some("g2"), &journal, 200)
+        let refused = claim(&client, &account, Some("g2"), &journal, &cache, 200)
             .await
             .unwrap_err();
         let refused = refused.to_string();
@@ -1033,7 +1117,7 @@ mod tests {
         assert_eq!(sent.lock().unwrap().len(), 1);
 
         // The same grant is resent with the same request id; an answer clears it.
-        let claimed = claim(&client, &account, Some("g1"), &journal, 300)
+        let claimed = claim(&client, &account, Some("g1"), &journal, &cache, 300)
             .await
             .unwrap();
         assert_eq!(claimed.result, ClaimResult::Reset);
@@ -1046,7 +1130,9 @@ mod tests {
         assert_eq!(journal.pending(Service::Claude, "acct").unwrap(), None);
 
         // The session reset carries no grant and no journal entry.
-        let session = claim(&client, &account, None, &journal, 400).await.unwrap();
+        let session = claim(&client, &account, None, &journal, &cache, 400)
+            .await
+            .unwrap();
         assert_eq!(session.result, ClaimResult::NotLimited);
         assert_eq!(
             sent.lock().unwrap()[2],
@@ -1057,6 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_claim_left_pending_by_an_earlier_build_is_honoured() {
+        let (_cache_dir, cache) = temp_cache();
         let (router, sent) = fake_api(vec![
             (StatusCode::OK, r#"{"result": "something_new"}"#),
             (StatusCode::OK, r#"{"result": "already_used"}"#),
@@ -1073,9 +1160,16 @@ mod tests {
         let account = profile_only_account("acct", "profile");
 
         // Another grant is refused without a request, and nothing is written.
-        let refused = claim(&client, &account, Some("other-grant"), &journal, 200)
-            .await
-            .unwrap_err();
+        let refused = claim(
+            &client,
+            &account,
+            Some("other-grant"),
+            &journal,
+            &cache,
+            200,
+        )
+        .await
+        .unwrap_err();
         assert!(
             refused
                 .to_string()
@@ -1087,14 +1181,28 @@ mod tests {
 
         // The same grant goes out with the request id the old file held. An
         // answer this build cannot name leaves the claim pending.
-        let unknown = claim(&client, &account, Some("fable52-launch"), &journal, 300)
-            .await
-            .unwrap();
+        let unknown = claim(
+            &client,
+            &account,
+            Some("fable52-launch"),
+            &journal,
+            &cache,
+            300,
+        )
+        .await
+        .unwrap();
         assert_eq!(unknown.result, ClaimResult::Unknown);
         assert!(journal.pending(Service::Claude, "acct").unwrap().is_some());
-        let answered = claim(&client, &account, Some("fable52-launch"), &journal, 400)
-            .await
-            .unwrap();
+        let answered = claim(
+            &client,
+            &account,
+            Some("fable52-launch"),
+            &journal,
+            &cache,
+            400,
+        )
+        .await
+        .unwrap();
         assert_eq!(answered.result, ClaimResult::AlreadyUsed);
         let bodies = sent.lock().unwrap().clone();
         assert_eq!(bodies.len(), 2);
@@ -1110,12 +1218,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_organization_lookup_journals_nothing() {
+        let (_cache_dir, cache) = temp_cache();
         let client = serve(Router::new()).await;
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::at(dir.path());
         let account = profile_only_account("acct", "profile");
         assert!(
-            claim(&client, &account, Some("g1"), &journal, 1)
+            claim(&client, &account, Some("g1"), &journal, &cache, 1)
                 .await
                 .is_err()
         );

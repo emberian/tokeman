@@ -132,6 +132,7 @@ fn reset_options(listings: &[claude::ResetListing], now: i64) -> Vec<ResetOption
         let Some(Ok(status)) = &listing.status else {
             continue;
         };
+        let first = options.len();
         if let Some(program) = &status.cedar_ember
             && program.standing() == resets::Standing::Eligible
         {
@@ -185,6 +186,14 @@ fn reset_options(listings: &[claude::ResetListing], now: i64) -> Vec<ResetOption
                         .into(),
             });
         }
+        if let Some(at) = status.checked_at {
+            for option in &mut options[first..] {
+                option.details.push_str(&format!(
+                    "\nOldest offer check {}",
+                    text::format_age(at, now)
+                ));
+            }
+        }
     }
     options
 }
@@ -197,7 +206,9 @@ pub fn choose_reset(listings: &[claude::ResetListing]) -> Result<Option<ResetOpt
     let mut options = reset_options(listings, chrono::Utc::now().timestamp());
     if options.is_empty() {
         crate::ui::text::print_reset_offers(listings);
-        println!("No resets available to use now.");
+        println!(
+            "No available resets in these readings. Check one account with `tokeman claude reset <name> --list`."
+        );
         return Ok(None);
     }
     let _session = super::tui::TerminalSession::enter()?;

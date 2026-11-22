@@ -213,7 +213,8 @@ pub enum ClaudeAction {
     ///
     /// Interactively choose an available reset, optionally for NAME, then review
     /// its effect and confirm. Use --list for plain output; without NAME,
-    /// piped output also lists offers.
+    /// piped output also lists offers. Fleet browsing uses cached offers.
+    /// Use NAME --list to check one account on demand.
     /// Explicit --grant or --session skips the picker. Requires a login.
     /// Weekly reset dates stay unchanged.
     Reset {
