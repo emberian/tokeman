@@ -136,6 +136,7 @@ impl Backoff {
     fn rate_limited(&mut self, account: &str, now: i64, retry_after: Option<i64>, message: &str) {
         if now >= self.retry_after {
             self.accounts.clear();
+            self.rate_limited = 0;
         }
         if !self.accounts.iter().any(|held| held == account) {
             self.accounts.push(account.to_owned());
@@ -188,6 +189,7 @@ impl CacheFile {
 pub struct Cache {
     path: PathBuf,
     spacing: Duration,
+    read_only: bool,
 }
 
 impl Default for Cache {
@@ -201,7 +203,14 @@ impl Cache {
         Self {
             path,
             spacing: REQUEST_SPACING,
+            read_only: false,
         }
+    }
+
+    /// Never lock or write the cache file (for `--dry-run`).
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// The file as stored; a file in an older shape reads as empty.
@@ -218,9 +227,20 @@ impl Cache {
         self
     }
 
+    fn lock_path(&self) -> PathBuf {
+        if self.path == paths::profile_cache() {
+            paths::profile_cache_lock()
+        } else {
+            self.path.with_extension("lock")
+        }
+    }
+
     async fn lock(&self) -> Result<FileLock> {
-        let path = self.path.with_extension("lock");
-        tokio::task::spawn_blocking(move || FileLock::acquire(&path)).await?
+        let path = self.lock_path();
+        tokio::task::spawn_blocking(move || {
+            FileLock::acquire_announced(&path, "the Claude usage cache")
+        })
+        .await?
     }
 
     fn save(&self, file: &CacheFile) -> Result<()> {
@@ -255,7 +275,7 @@ impl Cache {
         policy: ReadPolicy,
         now: i64,
     ) -> Result<(i64, serde_json::Value)> {
-        if policy == ReadPolicy::Stored {
+        if policy == ReadPolicy::Stored || self.read_only {
             return self.stored(account, endpoint).ok_or_else(|| {
                 anyhow::anyhow!("no cached offer; run `tokeman claude reset {account} --list`")
             });
@@ -319,6 +339,7 @@ impl Cache {
             MAX_AGE_SECS
         };
         if let Some((at, body)) = answer
+            && at <= now
             && now.saturating_sub(at) < max_age
         {
             return Ok((at, body.clone()));
@@ -623,6 +644,7 @@ pub fn unrecognized(body: &serde_json::Value) -> Vec<String> {
         &body["weekly_scoped_shares"],
         KNOWN_SHARE_KEYS,
     );
+    seen.extend(super::resets::unrecognized(body));
     seen.into_vec()
 }
 
@@ -719,7 +741,11 @@ pub fn usage_of(usage: &UsageResponse) -> ProfileUsage {
         .iter()
         .filter_map(|(index, row)| scoped_model_limit(row, shares.get(index).copied()))
         .collect();
-    models.sort_by(|a, b| a.key().cmp(&b.key()));
+    models.sort_by(|a, b| {
+        a.key()
+            .cmp(&b.key())
+            .then_with(|| b.window.used.total_cmp(&a.window.used))
+    });
     models.dedup_by(|a, b| a.key() == b.key());
     models.sort_by(|a, b| a.label.cmp(&b.label));
     profile.models = models;
@@ -769,11 +795,15 @@ pub fn merge(reading: &mut Reading, outcome: Option<std::result::Result<ProfileU
     match outcome {
         Some(Ok(profile)) => {
             crate::drift::merge(&mut reading.unrecognized, profile.unrecognized);
-            for limit in profile.models {
-                reading.set_limit(limit);
-            }
             // A cached answer can outlive its window; one past its reset says nothing.
             let at = reading.at;
+            for limit in profile
+                .models
+                .into_iter()
+                .filter(|limit| limit.window.resets_at == 0 || limit.window.resets_at > at)
+            {
+                reading.set_limit(limit);
+            }
             for (span, window) in [
                 (Span::FiveHour, profile.session),
                 (Span::Weekly, profile.weekly),

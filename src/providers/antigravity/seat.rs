@@ -162,12 +162,21 @@ pub(super) fn read_slot() -> Result<Option<String>> {
     read_raw(&security_bin())
 }
 
-/// The account `agy` is signed in as.
+/// The account `agy` is signed in as (Keychain on macOS, else fallback token file).
 pub fn slot() -> Result<Option<Slot>> {
-    match read_slot()? {
-        Some(raw) => Slot::parse(&raw),
-        None => Ok(None),
+    if let Ok(Some(raw)) = read_slot()
+        && let Some(slot) = Slot::parse(&raw)?
+    {
+        return Ok(Some(slot));
     }
+    let use_token_file = !cfg!(target_os = "macos")
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some();
+    if use_token_file && let Some(raw) = read_if_present(&token_file())? {
+        return Slot::parse(&raw);
+    }
+    Ok(None)
 }
 
 /// The name of the account in `accounts` that `agy` holds.
@@ -212,15 +221,22 @@ fn write_raw(security: &Path, value: &str) -> Result<()> {
 /// non-zero.
 fn run(security: &Path, args: &[&str], stdin: Option<&str>) -> Result<Option<String>> {
     use std::io::Read;
-    let mut child = Command::new(security)
-        .args(args)
+    let mut cmd = Command::new(security);
+    cmd.args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if !cfg!(test) {
+        let real_home = paths::home();
+        if real_home.is_absolute() {
+            cmd.env("HOME", real_home);
+        }
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("could not run {}", security.display()))?;
     if let Some(input) = stdin {
@@ -279,14 +295,14 @@ pub(super) fn slot_values(
     email: &str,
     now: DateTime<Local>,
 ) -> Result<(String, String)> {
-    let expires_in = grant.expires_in.unwrap_or(3599);
+    let expires_in = grant.expires_in.unwrap_or(3599).clamp(0, 365 * 86_400);
+    let delta = chrono::TimeDelta::try_seconds(expires_in).unwrap_or_default();
     let json = serde_json::to_string(&SlotDocument {
         token: SlotToken {
             access_token: &grant.access_token,
             token_type: "Bearer",
             refresh_token,
-            expiry: (now + chrono::Duration::seconds(expires_in))
-                .to_rfc3339_opts(SecondsFormat::Micros, false),
+            expiry: (now + delta).to_rfc3339_opts(SecondsFormat::Micros, false),
             expires_in,
         },
         auth_method: "consumer",
@@ -407,6 +423,7 @@ pub struct ClientReport {
     pub pid: u32,
     pub cwd: Option<PathBuf>,
     /// The account it held before the switch, when it could be asked.
+    #[serde(rename = "previous_account")]
     pub account: Option<String>,
     /// An interactive `agy`: the conversation its history last recorded for
     /// its working directory, which `agy --conversation=<id>` resumes.
@@ -794,7 +811,7 @@ fn install(place: &Place, prepared: &Prepared) -> Result<Seated> {
             rewritten: false,
         });
     }
-    if let Some(raw) = &current {
+    if let (Some(raw), Some(_)) = (&current, &previous) {
         Backup {
             saved_at: chrono::Utc::now().timestamp(),
             account: previous_email.clone(),
@@ -1550,7 +1567,7 @@ esac
         assert_eq!(
             serde_json::to_value(&report.clients[0]).unwrap(),
             serde_json::json!({
-                "kind": "hub", "pid": 10, "cwd": null, "account": "a@example.com",
+                "kind": "hub", "pid": 10, "cwd": null, "previous_account": "a@example.com",
                 "conversation": null, "result": "told", "account": "b@example.com",
             })
         );

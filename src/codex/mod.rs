@@ -17,7 +17,49 @@ pub mod resets;
 pub mod seats;
 
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Cookie jar restricted to Cloudflare edge-mitigation cookies (`__cf_bm`,
+/// `cf_clearance`, `_cfuvid`, ...) so account-identifying or session cookies
+/// (`oai-did`, `oai-sc`, ...) never leak from one account probe to the next.
+#[derive(Debug, Default)]
+struct EdgeCookieJar {
+    inner: reqwest::cookie::Jar,
+}
+
+impl EdgeCookieJar {
+    fn is_edge_cookie(header: &reqwest::header::HeaderValue) -> bool {
+        let Ok(raw) = header.to_str() else {
+            return false;
+        };
+        let Some((name, _)) = raw.split_once('=') else {
+            return false;
+        };
+        let lower = name.trim().to_ascii_lowercase();
+        lower.starts_with("__cf") || lower.starts_with("_cf") || lower.starts_with("cf_")
+    }
+}
+
+impl reqwest::cookie::CookieStore for EdgeCookieJar {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>,
+        url: &reqwest::Url,
+    ) {
+        let kept: Vec<&reqwest::header::HeaderValue> = cookie_headers
+            .filter(|header| Self::is_edge_cookie(header))
+            .collect();
+        if !kept.is_empty() {
+            let mut iter = kept.into_iter();
+            self.inner.set_cookies(&mut iter, url);
+        }
+    }
+
+    fn cookies(&self, url: &reqwest::Url) -> Option<reqwest::header::HeaderValue> {
+        self.inner.cookies(url)
+    }
+}
 
 /// `GET` here answers the usage probe.
 pub const USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
@@ -77,7 +119,7 @@ impl Client {
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .http1_only()
-            .cookie_store(true)
+            .cookie_provider(Arc::new(EdgeCookieJar::default()))
             .timeout(TIMEOUT)
             .build()?;
         Ok(Self {

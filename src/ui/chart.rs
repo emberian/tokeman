@@ -2,7 +2,7 @@
 //! axis logic the TUI chart draws with.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::io::{Cursor, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -85,7 +85,7 @@ pub fn resolve(metric: Option<&str>, readings: &[Reading]) -> Result<Series> {
     if let Some(span) = span_named(metric) {
         return Ok(Series::new(span, Scope::All));
     }
-    if metric == "overage" {
+    if metric.eq_ignore_ascii_case("overage") {
         return Ok(Series::new(Span::Unknown, Scope::extra_usage()));
     }
     let (needle, span) = match metric.rsplit_once(char::is_whitespace) {
@@ -242,8 +242,8 @@ pub struct Rendered {
 }
 
 pub fn run(request: &Request) -> Result<Rendered> {
-    if !request.hours.is_finite() || request.hours <= 0.0 {
-        bail!("--hours must be greater than zero");
+    if !request.hours.is_finite() || request.hours <= 0.0 || request.hours > 24.0 * 365.0 * 10.0 {
+        bail!("--hours must be greater than zero and at most 87600");
     }
     if !(640..=3840).contains(&request.width) {
         bail!("--width must be between 640 and 3840");
@@ -270,11 +270,7 @@ pub fn run(request: &Request) -> Result<Rendered> {
     )?;
 
     let output = request.output.clone().unwrap_or_else(paths::default_chart);
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::write(&output, &png)
+    crate::fs::write_atomic(&output, &png, 0o600)
         .with_context(|| format!("failed to write {}", output.display()))?;
 
     let inline = (request.iterm || (is_iterm2() && std::env::var_os("TMUX").is_none()))
@@ -283,8 +279,9 @@ pub fn run(request: &Request) -> Result<Rendered> {
 }
 
 fn is_iterm2() -> bool {
-    std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "iTerm.app")
-        || std::env::var("LC_TERMINAL").is_ok_and(|value| value == "iTerm2")
+    std::io::stdout().is_terminal()
+        && (std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "iTerm.app")
+            || std::env::var("LC_TERMINAL").is_ok_and(|value| value == "iTerm2"))
 }
 
 /// iTerm2's inline-image escape sequence for `png`.
@@ -657,6 +654,11 @@ fn glyph(character: char) -> [u8; 7] {
         '/' => [1, 2, 4, 8, 16, 0, 0],
         '(' => [2, 4, 8, 8, 8, 4, 2],
         ')' => [8, 4, 2, 2, 2, 4, 8],
+        '[' => [14, 8, 8, 8, 8, 8, 14],
+        ']' => [14, 2, 2, 2, 2, 2, 14],
+        '+' => [0, 4, 4, 31, 4, 4, 0],
+        '\'' => [4, 4, 2, 0, 0, 0, 0],
+        '&' => [12, 18, 20, 8, 21, 18, 13],
         '_' => [0, 0, 0, 0, 0, 0, 31],
         '·' => [0, 0, 0, 4, 0, 0, 0],
         '…' => [0, 0, 0, 0, 0, 21, 0],

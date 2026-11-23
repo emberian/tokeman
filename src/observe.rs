@@ -412,17 +412,29 @@ fn configured_model() -> Option<String> {
     settings::target_model(&settings).map(str::to_owned)
 }
 
-/// The last model named in the transcript's first `through` bytes.
+/// The last model named in the transcript's tail up to `through` bytes.
 fn infer_last_model(path: &Path, through: u64) -> Option<String> {
-    let mut reader = BufReader::new(File::open(path).ok()?);
-    let mut line = String::new();
+    const TAIL_BYTES: u64 = 2 * 1024 * 1024;
+    let file = File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    if through > TAIL_BYTES {
+        reader.seek(SeekFrom::Start(through - TAIL_BYTES)).ok()?;
+        // Skip the partial line we landed in.
+        reader.read_until(b'\n', &mut raw).ok()?;
+    }
     let mut last_model = None;
     while reader.stream_position().ok()? < through {
-        line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw).ok()? == 0 {
             break;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+        if let Ok(line) = std::str::from_utf8(&raw)
+            && let Ok(value) = serde_json::from_str::<Value>(line)
+        {
             update_last_model(&value, &mut last_model);
         }
     }
@@ -548,7 +560,13 @@ fn scan_binding(
     let Ok(file) = File::open(&binding.transcript_path) else {
         return Ok((Vec::new(), false));
     };
-    let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let Ok(metadata) = file.metadata() else {
+        return Ok((Vec::new(), false));
+    };
+    if !metadata.is_file() {
+        return Ok((Vec::new(), false));
+    }
+    let len = metadata.len();
     if len < binding.scan_offset {
         // Rewritten (compacted) transcript: skip its history; the next hook
         // sets an exact boundary again.
@@ -561,19 +579,20 @@ fn scan_binding(
 
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(binding.scan_offset))?;
-    let mut line = String::new();
+    let mut raw = Vec::new();
     let mut incoming = Vec::new();
     loop {
         let line_start = reader.stream_position()?;
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
             break;
         }
-        if !line.ends_with('\n') {
+        if !raw.ends_with(b"\n") {
             // A record still being appended is read next time.
             reader.seek(SeekFrom::Start(line_start))?;
             break;
         }
+        let line = String::from_utf8_lossy(&raw);
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -617,12 +636,16 @@ pub fn scan_transcripts(accounts: &[Account]) -> Result<usize> {
     let mut incoming = Vec::new();
     let mut changed = false;
     for binding in state.sessions.values_mut() {
-        if !configured.contains(binding.account.as_str()) {
+        let Ok((limits, scanned)) =
+            scan_binding(binding, now, |at| history::account_at(&timeline, at))
+        else {
             continue;
-        }
-        let (limits, scanned) =
-            scan_binding(binding, now, |at| history::account_at(&timeline, at))?;
-        incoming.extend(limits);
+        };
+        incoming.extend(
+            limits
+                .into_iter()
+                .filter(|limit| configured.contains(limit.account.as_str())),
+        );
         changed |= scanned;
     }
     let mut observed = 0;
@@ -634,6 +657,44 @@ pub fn scan_transcripts(accounts: &[Account]) -> Result<usize> {
         save_state(&state)?;
     }
     Ok(observed)
+}
+
+/// In-memory transcript scan for `--dry-run`: never locks or writes the
+/// admission state file.
+pub fn scan_transcripts_dry_run(accounts: &[Account]) -> (usize, Vec<ObservedLimit>) {
+    let mut state = load_state();
+    let now = Utc::now().timestamp();
+    prune(&mut state, now);
+    let configured: HashSet<&str> = accounts
+        .iter()
+        .map(|account| account.name.as_str())
+        .collect();
+    let timeline = history::load();
+    let mut incoming = Vec::new();
+    for binding in state.sessions.values_mut() {
+        if let Ok((limits, _)) = scan_binding(binding, now, |at| history::account_at(&timeline, at))
+        {
+            incoming.extend(
+                limits
+                    .into_iter()
+                    .filter(|limit| configured.contains(limit.account.as_str())),
+            );
+        }
+    }
+    let mut observed = 0;
+    for limit in incoming {
+        observed += usize::from(merge_limit(&mut state.limits, limit));
+    }
+    (observed, state.limits)
+}
+
+/// Whether `account` has an active observed rejection recorded at or after
+/// `since_epoch`, so a scheduled daemon tick re-evaluates immediately even if
+/// a CLI read advanced the transcript cursor first.
+pub fn has_rejection_since(account: &str, since_epoch: f64) -> bool {
+    active_limits()
+        .iter()
+        .any(|limit| limit.account == account && limit.observed_at as f64 >= since_epoch)
 }
 
 /// Limits whose reset is still ahead, ordered by account, family, model, window.
@@ -657,8 +718,13 @@ pub fn active_limits() -> Vec<ObservedLimit> {
 /// Overlay the active limits on probe readings.
 pub fn apply(readings: &mut [Reading]) {
     let limits = active_limits();
+    apply_limits(readings, &limits);
+}
+
+/// Overlay `limits` on probe readings.
+pub fn apply_limits(readings: &mut [Reading], limits: &[ObservedLimit]) {
     for reading in readings {
-        for limit in &limits {
+        for limit in limits {
             if limit.account == reading.account {
                 apply_limit(reading, limit);
             }
@@ -698,10 +764,17 @@ fn reject_shared(reading: &mut Reading, span: Span, window: Window, claim: &str)
 }
 
 fn reject_bucket(reading: &mut Reading, key: ModelKey, window: Window) {
-    let label = reading
-        .model_limit(&key)
+    let existing = reading.model_limit(&key).cloned();
+    let label = existing
+        .as_ref()
         .map_or_else(|| model_label(&key), |limit| limit.label.clone());
-    reading.set_limit(Limit::model(key, &label, window, Source::Observed));
+    let share = existing.as_ref().and_then(|limit| limit.share);
+    let status = existing.and_then(|limit| limit.status);
+    reading.set_limit(Limit {
+        share,
+        status,
+        ..Limit::model(key, &label, window, Source::Observed)
+    });
 }
 
 // Quarantine.
@@ -833,9 +906,13 @@ fn parse_reset_from_message(message: &str, observed_at: i64) -> Option<i64> {
     if let Some((date_text, time_text)) = reset_text.split_once(" at ") {
         let time = parse_clock(time_text)?;
         for year in [observed.year(), observed.year() + 1] {
-            let date =
-                NaiveDate::parse_from_str(&format!("{year} {date_text}"), "%Y %b %e").ok()?;
-            let local = local_time(date.and_time(time))?;
+            let Ok(date) = NaiveDate::parse_from_str(&format!("{year} {date_text}"), "%Y %b %e")
+            else {
+                continue;
+            };
+            let Some(local) = local_time(date.and_time(time)) else {
+                continue;
+            };
             if local.timestamp() > observed_at {
                 return Some(local.timestamp());
             }
@@ -855,10 +932,10 @@ fn parse_reset_from_message(message: &str, observed_at: i64) -> Option<i64> {
 /// `9am`, `11:30PM`.
 fn parse_clock(value: &str) -> Option<NaiveTime> {
     let normalized = value.trim().to_ascii_uppercase();
-    let (clock, suffix) = normalized.split_at(normalized.len().checked_sub(2)?);
-    if suffix != "AM" && suffix != "PM" {
-        return None;
-    }
+    let (clock, suffix) = normalized
+        .strip_suffix("AM")
+        .map(|clock| (clock, "AM"))
+        .or_else(|| normalized.strip_suffix("PM").map(|clock| (clock, "PM")))?;
     let (hour, minute) = match clock.split_once(':') {
         Some((hour, minute)) => (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?),
         None => (clock.parse::<u32>().ok()?, 0),

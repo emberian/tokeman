@@ -67,6 +67,21 @@ impl Poller {
         lines
     }
 
+    /// Collect an in-flight service poll when the daemon shuts down.
+    pub async fn finish(&mut self) -> Vec<String> {
+        let Some(poll) = self.running.take() else {
+            return Vec::new();
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), poll).await {
+            Ok(Ok(usages)) => {
+                self.record(&usages);
+                self.transitions(&usages)
+            }
+            Ok(Err(error)) => vec![format!("ERROR service poll task failed: {error}")],
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn record(&self, usages: &[Reading]) {
         super::log::log_drift(usages);
         let Ok(store) = Store::open_at(&self.store) else {

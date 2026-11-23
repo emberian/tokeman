@@ -83,7 +83,8 @@ impl MaintenanceState {
 }
 
 /// The daemon's sweep over the fleet's Codex accounts; the events are for
-/// its log.
+/// its log. While rotation is paused, polling continues read-only so stored
+/// views stay fresh without mutating credentials.
 pub async fn maintenance(fleet: &Fleet, state: &mut MaintenanceState) -> Vec<MaintenanceEvent> {
     if fleet.codex.is_empty() {
         return Vec::new();
@@ -103,7 +104,12 @@ pub async fn maintenance(fleet: &Fleet, state: &mut MaintenanceState) -> Vec<Mai
             }
         },
     };
-    let (mut probes, events) = sweep_probed(client, &fleet.codex, needs_login).await;
+    let paused = crate::daemon::lock::is_paused();
+    let (mut probes, events) = if paused {
+        (probe::probe_all(client, &fleet.codex).await, Vec::new())
+    } else {
+        sweep_probed(client, &fleet.codex, needs_login, true).await
+    };
     super::resets::with_expiry(client, &fleet.codex, &mut probes).await;
     crate::daemon::log::log_drift(&probes);
     record(&probes);
@@ -130,33 +136,48 @@ pub async fn sweep(
     accounts: &[CodexAccount],
     needs_login: &mut BTreeSet<String>,
 ) -> Vec<MaintenanceEvent> {
-    sweep_probed(client, accounts, needs_login).await.1
+    sweep_probed(client, accounts, needs_login, false).await.1
 }
 
-/// [`sweep`], with the probes it decided on. They predate any refresh the
-/// sweep then made.
+/// [`sweep`], with the probes it decided on. When `reprobe_refreshed` is set,
+/// any account whose token was rotated is probed once more so the stored
+/// reading reflects the live bundle rather than the pre-refresh 401.
 async fn sweep_probed(
     client: &Client,
     accounts: &[CodexAccount],
     needs_login: &mut BTreeSet<String>,
+    reprobe_refreshed: bool,
 ) -> (Vec<Reading>, Vec<MaintenanceEvent>) {
     let mut events = Vec::new();
     if accounts.is_empty() {
         return (Vec::new(), events);
     }
-    let probes = probe::probe_all(client, accounts).await;
-    let rejected: BTreeSet<&str> = probes
+    let probed_tokens: Vec<Option<crate::history::Fingerprint>> = accounts
+        .iter()
+        .map(|account| {
+            CodexHome::new(account.home())
+                .read()
+                .ok()
+                .and_then(|auth| auth.access_token().map(crate::history::Fingerprint::of))
+        })
+        .collect();
+    let mut probes = probe::probe_all(client, accounts).await;
+    let rejected: BTreeSet<String> = probes
         .iter()
         .filter(|probe| probe.error.as_ref().is_some_and(ReadError::is_unauthorized))
-        .map(|probe| probe.account.as_str())
+        .map(|probe| probe.account.clone())
         .collect();
-    for account in accounts {
+    for (idx, account) in accounts.iter().enumerate() {
         // No refresh material: its eventual 401 is expected, not a fault.
         if account.access_only {
             continue;
         }
         let home = CodexHome::new(account.home());
-        let force = rejected.contains(account.name.as_str());
+        let current_token = home
+            .read()
+            .ok()
+            .and_then(|auth| auth.access_token().map(crate::history::Fingerprint::of));
+        let force = rejected.contains(account.name.as_str()) && current_token == probed_tokens[idx];
         let outcome =
             refresh::refresh(client, &home, force, DEFAULT_MAX_AGE_DAYS, Utc::now()).await;
         let permanent = outcome
@@ -170,9 +191,16 @@ async fn sweep_probed(
             });
         }
         match (outcome, permanent) {
-            (Ok(Some(_)), _) => events.push(MaintenanceEvent::Refreshed {
-                account: account.name.clone(),
-            }),
+            (Ok(Some(_)), _) => {
+                events.push(MaintenanceEvent::Refreshed {
+                    account: account.name.clone(),
+                });
+                if reprobe_refreshed
+                    && let Some(slot) = probes.iter_mut().find(|p| p.account == account.name)
+                {
+                    *slot = probe::probe(client, account).await;
+                }
+            }
             (Ok(None), _) => {}
             (Err(_), Some(failure)) => {
                 if needs_login.insert(account.name.clone()) {
@@ -189,7 +217,6 @@ async fn sweep_probed(
             }),
         }
     }
-    drop(rejected);
     (probes, events)
 }
 

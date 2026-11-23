@@ -100,21 +100,28 @@ pub(super) async fn exchange(
             body: format!("token refresh: {}", error_message(&text)),
         });
     }
-    serde_json::from_str(&text).map_err(|_| ReadError::Decode {
+    let grant: Grant = serde_json::from_str(&text).map_err(|_| ReadError::Decode {
         message: "token refresh answer carried no access_token".into(),
-    })
+    })?;
+    if grant.access_token.is_empty() {
+        return Err(ReadError::Decode {
+            message: "token refresh answer carried an empty access_token".into(),
+        });
+    }
+    Ok(grant)
 }
 
 // ---- browser login ----
 
 /// A browser login in progress: the authorize URL to open, the loopback
-/// listener Google redirects to, and the PKCE verifier that redeems the code.
+/// listener(s) Google redirects to, and the PKCE verifier that redeems the code.
 pub struct LoginSession {
     url: String,
     redirect_uri: String,
     verifier: String,
     state: String,
     listener: tokio::net::TcpListener,
+    listener_v6: Option<tokio::net::TcpListener>,
 }
 
 impl fmt::Debug for LoginSession {
@@ -206,11 +213,23 @@ fn urldecode(value: &str) -> String {
 /// consumer Antigravity login. `agy`'s own Keychain slot is never touched.
 pub async fn begin_login(login_hint: Option<&str>) -> Result<LoginSession> {
     use base64::Engine;
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(listener) => listener,
-        Err(_) => tokio::net::TcpListener::bind("[::1]:0")
-            .await
-            .context("could not bind a localhost port for the OAuth callback")?,
+    let (listener, listener_v6) = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(v4) => {
+            let port = v4
+                .local_addr()
+                .context("OAuth callback listener has no local address")?
+                .port();
+            let v6 = tokio::net::TcpListener::bind(format!("[::1]:{port}"))
+                .await
+                .ok();
+            (v4, v6)
+        }
+        Err(_) => {
+            let v6 = tokio::net::TcpListener::bind("[::1]:0")
+                .await
+                .context("could not bind a localhost port for the OAuth callback")?;
+            (v6, None)
+        }
     };
     let port = listener
         .local_addr()
@@ -237,6 +256,7 @@ pub async fn begin_login(login_hint: Option<&str>) -> Result<LoginSession> {
         verifier,
         state,
         listener,
+        listener_v6,
     })
 }
 
@@ -301,15 +321,35 @@ impl LoginSession {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(timeout, async {
             loop {
-                let (mut stream, _) = self
-                    .listener
-                    .accept()
-                    .await
-                    .context("OAuth callback listener closed")?;
-                let mut buf = vec![0u8; CALLBACK_MAX_BYTES];
-                let Ok(Ok(read)) =
-                    tokio::time::timeout(CALLBACK_READ_TIMEOUT, stream.read(&mut buf)).await
-                else {
+                let accepted = tokio::select! {
+                    res = self.listener.accept() => res,
+                    res = async {
+                        match &self.listener_v6 {
+                            Some(v6) => v6.accept().await,
+                            None => std::future::pending().await,
+                        }
+                    } => res,
+                };
+                let (mut stream, _) = accepted.context("OAuth callback listener closed")?;
+                let mut buf = Vec::with_capacity(1024);
+                let read_headers = tokio::time::timeout(CALLBACK_READ_TIMEOUT, async {
+                    let mut chunk = [0u8; 1024];
+                    while buf.len() < CALLBACK_MAX_BYTES {
+                        let n = stream.read(&mut chunk).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n")
+                            || buf.windows(2).any(|w| w == b"\n\n")
+                        {
+                            break;
+                        }
+                    }
+                    Ok::<usize, std::io::Error>(buf.len())
+                })
+                .await;
+                let Ok(Ok(read)) = read_headers else {
                     continue;
                 };
                 if read == 0 {
@@ -353,7 +393,10 @@ impl LoginSession {
                         );
                         let _ = stream.write_all(reply.as_bytes()).await;
                         let _ = stream.flush().await;
-                        return Err(error);
+                        if error.to_string().starts_with("Google refused the sign-in:") {
+                            return Err(error);
+                        }
+                        continue;
                     }
                 }
             }
@@ -417,6 +460,9 @@ async fn exchange_code_at(
         .refresh_token
         .filter(|token| !token.is_empty())
         .context("Google returned no refresh token; try again and approve offline access")?;
+    if received.access_token.is_empty() {
+        bail!("Google returned an empty access_token");
+    }
     let grant = Grant {
         access_token: received.access_token,
         expires_in: received.expires_in,
@@ -425,7 +471,7 @@ async fn exchange_code_at(
     let email = grant
         .email()
         .context("Google's token response did not name an account email")?;
-    let expires_at = now_ms + grant.expires_in.unwrap_or(3599) * 1000;
+    let expires_at = now_ms.saturating_add(grant.expires_in.unwrap_or(3599).saturating_mul(1000));
     Ok(account(
         email,
         refresh_token,
@@ -569,8 +615,12 @@ fn app_grant() -> Result<Option<ServiceAccount>> {
     let email = item("antigravityUnifiedStateSync.userStatus")?
         .and_then(|status| vscdb::user_email(&status))
         .context("the Antigravity app's userStatus names no account")?;
-    let access = (!token.access_token.is_empty() && token.expiry > 0)
-        .then(|| (token.access_token.clone(), token.expiry * 1000));
+    let access = (!token.access_token.is_empty() && token.expiry > 0).then(|| {
+        (
+            token.access_token.clone(),
+            token.expiry.saturating_mul(1000),
+        )
+    });
     Ok(Some(account(email, token.refresh_token, access)))
 }
 
@@ -689,7 +739,7 @@ mod proto {
     }
 
     pub fn bytes<'a>(fields: &[(u64, Field<'a>)], number: u64) -> Option<&'a [u8]> {
-        fields.iter().find_map(|(n, field)| match field {
+        fields.iter().rev().find_map(|(n, field)| match field {
             Field::Bytes(raw) if *n == number => Some(*raw),
             _ => None,
         })
@@ -700,7 +750,7 @@ mod proto {
     }
 
     pub fn varint(fields: &[(u64, Field<'_>)], number: u64) -> Option<u64> {
-        fields.iter().find_map(|(n, field)| match field {
+        fields.iter().rev().find_map(|(n, field)| match field {
             Field::Varint(value) if *n == number => Some(*value),
             _ => None,
         })

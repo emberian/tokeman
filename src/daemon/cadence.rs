@@ -168,7 +168,7 @@ impl Cadence {
             && self
                 .samples
                 .get(&account.name)
-                .is_none_or(|sample| now - sample.sampled_at >= interval)
+                .is_none_or(|sample| now < sample.sampled_at || now - sample.sampled_at >= interval)
     }
 
     /// Remember a sample; returns the accounts whose sample got no headers
@@ -182,20 +182,23 @@ impl Cadence {
         let mut newly_unanswered = Vec::new();
         for sample in samples {
             let answered = sample.has_quota();
-            if !answered
-                && self
-                    .samples
-                    .get(&sample.account)
-                    .is_none_or(|previous| previous.answered)
-            {
+            let previous = self.samples.get(&sample.account);
+            if !answered && previous.is_none_or(|previous| previous.answered) {
                 newly_unanswered.push(sample.account.clone());
             }
+            let carried_on_failure = (!answered)
+                .then(|| previous.and_then(|prev| prev.window))
+                .flatten()
+                .filter(|window| window.resets_at == 0 || window.resets_at as f64 > now);
             self.samples.insert(
                 sample.account.clone(),
                 Sample {
                     sampled_at: now,
                     answered,
-                    window: sample.model_limit(&fable).map(|limit| limit.window),
+                    window: sample
+                        .model_limit(&fable)
+                        .map(|limit| limit.window)
+                        .or(carried_on_failure),
                 },
             );
         }
@@ -206,15 +209,20 @@ impl Cadence {
     /// has none, until that window resets.
     pub fn apply_samples(&self, readings: &mut [Reading], now: f64) {
         let fable = ModelKey::family_wide(Family::Fable);
+        let max_unreset_age = crate::quota::Span::WEEK_SECS as f64;
         for reading in readings {
-            if reading.model_limit(&fable).is_some() {
+            if reading.error.is_some() || reading.model_limit(&fable).is_some() {
                 continue;
             }
-            let carried = self
-                .samples
-                .get(&reading.account)
-                .and_then(|sample| sample.window)
-                .filter(|window| window.resets_at == 0 || window.resets_at as f64 > now);
+            let carried = self.samples.get(&reading.account).and_then(|sample| {
+                let window = sample.window?;
+                let valid = if window.resets_at > 0 {
+                    window.resets_at as f64 > now
+                } else {
+                    now >= sample.sampled_at && now - sample.sampled_at < max_unreset_age
+                };
+                valid.then_some(window)
+            });
             if let Some(window) = carried {
                 reading.set_limit(Limit::model(
                     fable.clone(),

@@ -21,9 +21,32 @@ pub fn add(name: &str, key: String) -> Result<()> {
 }
 
 pub fn remove(name: &str) -> Result<()> {
-    let (_, removed) = Fleet::update(|fleet| Ok(fleet.remove_account(name)))?;
-    if !removed {
+    let (fleet, removed) = Fleet::update(|fleet| {
+        let existing = fleet.account(name).cloned();
+        fleet.remove_account(name);
+        Ok(existing)
+    })?;
+    let Some(removed) = removed else {
         bail!("Account '{name}' not found");
+    };
+    {
+        let _lock = daemon::lock::RotationLock::acquire()?;
+        if let Ok(mut settings) = crate::claude::settings::load() {
+            let matches_name =
+                crate::claude::settings::env(&settings, crate::claude::settings::ACCOUNT)
+                    == Some(name);
+            let matches_token = crate::claude::settings::configured_token(&settings)
+                .is_some_and(|token| removed.holds(token));
+            if (matches_name || matches_token) && crate::claude::settings::clear(&mut settings) {
+                let _ = crate::claude::settings::commit(
+                    &settings,
+                    Some(crate::history::Event::pause(now())),
+                );
+            }
+        }
+    }
+    if !fleet.accounts.is_empty() {
+        daemon::reconcile_after_login()?;
     }
     Ok(())
 }
@@ -96,14 +119,28 @@ pub struct Refreshed {
 
 /// Renew login grants now instead of waiting for the daemon.
 pub async fn refresh(name: Option<&str>) -> Result<Refreshed> {
-    let count = daemon::refresh::refresh_now(name).await?;
+    let summary = daemon::refresh::refresh_now(name).await?;
+    if summary.renewed == 0
+        && (!summary.permanent_failures.is_empty() || !summary.transient_failures.is_empty())
+    {
+        let details: Vec<String> = summary
+            .permanent_failures
+            .iter()
+            .chain(&summary.transient_failures)
+            .map(|(acct, err)| format!("{acct}: {err}"))
+            .collect();
+        bail!("failed to refresh login grant(s): {}", details.join("; "));
+    }
     let accounts = Fleet::load()?
         .accounts
         .into_iter()
         .filter(|account| name.is_none_or(|name| account.name == name))
         .filter(Account::is_refreshable)
         .collect();
-    Ok(Refreshed { count, accounts })
+    Ok(Refreshed {
+        count: summary.renewed,
+        accounts,
+    })
 }
 
 /// Make `name` the default now.
@@ -126,20 +163,46 @@ pub async fn reset_offers(fleet: &Fleet, named: bool) -> Vec<ResetListing> {
     let at = now();
     let cache = Cache::default();
     let journal = Journal::default();
-    let policy = if named {
-        ReadPolicy::Cached
-    } else {
-        ReadPolicy::Stored
-    };
     let mut listings = Vec::new();
     for account in &fleet.accounts {
         let status = match account.profile_token(at * 1000) {
             None => None,
-            Some(_) => Some(
-                resets::status(Client::shared(), &cache, account, policy, at)
+            Some(_) => {
+                let first_policy = if named {
+                    ReadPolicy::Cached
+                } else {
+                    ReadPolicy::Stored
+                };
+                let mut result =
+                    resets::status(Client::shared(), &cache, account, first_policy, at).await;
+                if !named
+                    && result
+                        .as_ref()
+                        .is_err_and(|_| cache.stored(&account.name, Endpoint::CedarEmber).is_none())
+                {
+                    result =
+                        resets::status(Client::shared(), &cache, account, ReadPolicy::Cached, at)
+                            .await;
+                } else if !named
+                    && let Ok(ref current) = result
+                    && current.cedar_ember.is_none()
+                    && cache.stored(&account.name, Endpoint::CedarEmber).is_none()
+                    && let Ok(cedar) = resets::program(
+                        Client::shared(),
+                        &cache,
+                        account,
+                        Endpoint::CedarEmber,
+                        ReadPolicy::Cached,
+                        at,
+                    )
                     .await
-                    .map_err(|error| format!("{error:#}")),
-            ),
+                    && let Ok(ref mut merged) = result
+                {
+                    merged.cedar_ember = cedar.cedar_ember;
+                    merged.errors.clear();
+                }
+                Some(result.map_err(|error| format!("{error:#}")))
+            }
         };
         listings.push(ResetListing {
             account: account.name.clone(),
@@ -183,6 +246,23 @@ pub async fn reset_plan(
         .account(name)
         .with_context(|| format!("no configured account named {name}"))?;
     let at = now();
+    let pending = Journal::default().pending(Service::Claude, name)?;
+    if let Some(ref pending) = pending {
+        if session {
+            bail!(
+                "a claim of grant {} on {name} has no known outcome; resolve it with `tokeman claude reset {name}` or `tokeman claude reset {name} --clear` before claiming a session reset",
+                pending.item.as_deref().unwrap_or("unknown")
+            );
+        }
+        if let Some(requested) = grant
+            && pending.item.as_deref() != Some(requested)
+        {
+            bail!(
+                "a claim of grant {} on {name} has no known outcome; {requested} cannot be claimed until it is answered or cleared with `tokeman claude reset {name} --clear`",
+                pending.item.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
     let endpoint = if session {
         Endpoint::AtWall
     } else {
@@ -213,44 +293,71 @@ pub async fn reset_plan(
         }
         ResetChoice::Session
     } else {
-        let program = status
-            .cedar_ember
-            .as_ref()
-            .context("limit resets are not offered to this account")?;
-        if !program.eligible {
-            bail!(
-                "not eligible for limit resets ({})",
-                program
-                    .ineligible_reason
-                    .as_deref()
-                    .unwrap_or("no reason given")
-            );
-        }
-        let pending = Journal::default().pending(Service::Claude, name)?;
+        let pending_item = pending.and_then(|pending| pending.item);
+        let program = status.cedar_ember.as_ref();
         let wanted = grant
             .map(str::to_owned)
-            .or_else(|| pending.and_then(|pending| pending.item))
-            .or_else(|| program.next_grant_id.clone());
-        let chosen = program
-            .grants()
-            .into_iter()
-            .find(|candidate| Some(&candidate.id) == wanted.as_ref())
-            .context("no such grant on offer; see `tokeman claude reset`")?;
-        if !chosen.is_usable(at) {
-            bail!(
-                "that grant cannot be used: {}",
-                resets::describe_grant(&chosen, at)
-            );
+            .or_else(|| pending_item.clone())
+            .or_else(|| program.and_then(|p| p.next_grant_id.clone()));
+        let retrying_pending = pending_item.is_some() && pending_item == wanted;
+        if !retrying_pending {
+            let program = program.context("limit resets are not offered to this account")?;
+            if !program.eligible {
+                bail!(
+                    "not eligible for limit resets ({})",
+                    program
+                        .ineligible_reason
+                        .as_deref()
+                        .unwrap_or("no reason given")
+                );
+            }
         }
-        if !chosen.usable_now {
-            bail!(
-                "that grant is not usable right now{}",
-                if chosen.use_requires_limit {
-                    " (it only works at a usage limit)"
-                } else {
-                    ""
+        let chosen = match program.and_then(|program| {
+            program
+                .grants()
+                .into_iter()
+                .find(|candidate| Some(&candidate.id) == wanted.as_ref())
+        }) {
+            Some(chosen) => chosen,
+            None if retrying_pending => {
+                let id = wanted.expect("pending_item was Some");
+                resets::ResetGrant {
+                    id,
+                    label: String::new(),
+                    kind: None,
+                    resets_total: 0,
+                    resets_left: 0,
+                    starts_at: None,
+                    ends_at: None,
+                    clears: Vec::new(),
+                    gives_back_weekly: false,
+                    paused: false,
+                    usable_now: false,
+                    use_requires_limit: true,
+                    unavailable_reason: None,
+                    blocking: Vec::new(),
+                    percent_used: std::collections::BTreeMap::new(),
                 }
-            );
+            }
+            None => bail!("no such grant on offer; see `tokeman claude reset`"),
+        };
+        if !retrying_pending {
+            if !chosen.is_usable(at) {
+                bail!(
+                    "that grant cannot be used: {}",
+                    resets::describe_grant(&chosen, at)
+                );
+            }
+            if !chosen.usable_now {
+                bail!(
+                    "that grant is not usable right now{}",
+                    if chosen.use_requires_limit {
+                        " (it only works at a usage limit)"
+                    } else {
+                        ""
+                    }
+                );
+            }
         }
         ResetChoice::Grant(Box::new(chosen))
     };

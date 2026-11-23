@@ -17,10 +17,10 @@ pub fn confirm(question: &str) -> Result<bool> {
     Ok(answer.trim().eq_ignore_ascii_case("y"))
 }
 
-/// Everything on stdin (the SessionStart hook's JSON).
+/// Everything on stdin (the SessionStart hook's JSON), bounded to 1 MiB.
 pub fn stdin_bytes() -> Result<Vec<u8>> {
     let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
+    std::io::stdin().take(1024 * 1024).read_to_end(&mut input)?;
     Ok(input)
 }
 
@@ -77,33 +77,47 @@ const AGY_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 pub async fn agy_login(name: Option<&str>) -> Result<()> {
     let session = crate::commands::services::begin_agy_login(name).await?;
     text::print_agy_login_step(name, session.url());
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<Option<String>>>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Option<String>>>();
     std::thread::spawn(move || {
-        let mut line = String::new();
-        let read = std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map(|bytes| (bytes > 0).then_some(line))
-            .map_err(anyhow::Error::from);
-        let _ = tx.send(read);
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        loop {
+            let mut line = String::new();
+            match handle.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(None));
+                    break;
+                }
+                Ok(_) => {
+                    if tx.send(Ok(Some(line))).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(anyhow::Error::from(error)));
+                    break;
+                }
+            }
+        }
     });
+    let callback_wait = session.wait_for_callback(AGY_LOGIN_TIMEOUT);
+    tokio::pin!(callback_wait);
     let code = loop {
         tokio::select! {
-            callback = session.wait_for_callback(AGY_LOGIN_TIMEOUT) => break callback?,
-            pasted = &mut rx => match pasted {
-                Ok(Ok(Some(line))) => {
+            callback = &mut callback_wait => break callback?,
+            pasted = rx.recv() => match pasted {
+                Some(Ok(Some(line))) => {
                     let trimmed = line.trim();
                     if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
                         text::print_agy_login_cancelled();
                         return Ok(());
                     }
                     if trimmed.is_empty() {
-                        rx = tokio::sync::oneshot::channel().1;
                         continue;
                     }
                     break session.parse_callback_input(trimmed)?;
                 }
-                _ => break session.wait_for_callback(AGY_LOGIN_TIMEOUT).await?,
+                _ => break (&mut callback_wait).await?,
             },
         }
     };
@@ -133,21 +147,26 @@ fn reset_options(listings: &[claude::ResetListing], now: i64) -> Vec<ResetOption
             continue;
         };
         let first = options.len();
+        let pending_grant_id = listing
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.item.as_deref());
+        let mut matched_pending = false;
         if let Some(program) = &status.cedar_ember
-            && program.standing() == resets::Standing::Eligible
+            && (program.standing() == resets::Standing::Eligible || pending_grant_id.is_some())
         {
             let mut grants = program.grants();
             grants.sort_by_key(|grant| program.next_grant_id.as_deref() != Some(&grant.id));
             for grant in grants {
-                if !grant.is_usable(now) || !grant.usable_now {
+                let is_pending_match = pending_grant_id == Some(grant.id.as_str());
+                if listing.pending.is_some() && !is_pending_match {
                     continue;
                 }
-                if listing
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.item.as_deref() != Some(&grant.id))
-                {
+                if !is_pending_match && (!grant.is_usable(now) || !grant.usable_now) {
                     continue;
+                }
+                if is_pending_match {
+                    matched_pending = true;
                 }
                 let label = if grant.label.is_empty() {
                     &grant.id
@@ -170,6 +189,16 @@ fn reset_options(listings: &[claude::ResetListing], now: i64) -> Vec<ResetOption
                     grant: Some(grant.id),
                 });
             }
+        }
+        if let Some(id) = pending_grant_id
+            && !matched_pending
+        {
+            options.push(ResetOption {
+                account: listing.account.clone(),
+                label: format!("{} · {id}", listing.account),
+                details: format!("{id}\nResends the previous request whose outcome is unknown."),
+                grant: Some(id.to_owned()),
+            });
         }
         if listing.pending.is_none()
             && status
@@ -206,9 +235,7 @@ pub fn choose_reset(listings: &[claude::ResetListing]) -> Result<Option<ResetOpt
     let mut options = reset_options(listings, chrono::Utc::now().timestamp());
     if options.is_empty() {
         crate::ui::text::print_reset_offers(listings);
-        println!(
-            "No available resets in these readings. Check one account with `tokeman claude reset <name> --list`."
-        );
+        crate::ui::text::print_no_available_resets();
         return Ok(None);
     }
     let _session = super::tui::TerminalSession::enter()?;
@@ -308,9 +335,22 @@ mod tests {
             request_id: "request".into(),
             sent_at: 0,
         });
-        let options = reset_options(&[listing], 0);
+        let options = reset_options(&[listing.clone()], 0);
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].grant.as_deref(), Some("other"));
         assert!(options[0].details.contains("previous request"));
+
+        // Even if the first send spent the grant (leaving resets_left == 0 or
+        // eligible == false), the pending grant remains selectable for idempotent resend.
+        listing.pending = Some(crate::claims::Pending {
+            service: crate::quota::Service::Claude,
+            account: "work".into(),
+            item: Some("spent".into()),
+            request_id: "request-2".into(),
+            sent_at: 0,
+        });
+        let options = reset_options(&[listing], 0);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].grant.as_deref(), Some("spent"));
     }
 }

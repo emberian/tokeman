@@ -218,28 +218,40 @@ pub enum AgyPick<'a> {
     Previous,
 }
 
-/// Pick the best Antigravity account from `readings`. With no explicit
-/// `group`, accounts with room in every group rank first; if every account
-/// has at least one exhausted group, fall back to `startup_group` (`agy`'s
-/// configured model group) so an exhausted unused group does not block a swap.
+/// Rank Antigravity accounts from `readings`. With no explicit `group`,
+/// accounts with room in every group rank first; if every account has at least
+/// one exhausted group, fall back to `startup_group` (`agy`'s configured model
+/// group) so an exhausted unused group never blocks `agy use`, `agy best`, or
+/// `agy launch`.
+pub(crate) fn rank_agy<'a>(
+    readings: &'a [Reading],
+    group: Option<&str>,
+    startup_group: &'static str,
+) -> (Vec<(&'a Reading, f64)>, Option<String>) {
+    let rank = |scope: Option<&str>| {
+        view::ranked(readings, view::ANY_ROOM, None, view::RankOn::Limits(scope))
+    };
+    let primary = rank(group);
+    if !primary.is_empty() || group.is_some() {
+        return (primary, group.map(str::to_owned));
+    }
+    let fallback = rank(Some(startup_group));
+    if fallback.is_empty() {
+        (fallback, None)
+    } else {
+        (fallback, Some(startup_group.to_owned()))
+    }
+}
+
+/// Pick the best Antigravity account from `readings`.
 fn pick_best_agy<'a>(
     fleet: &'a Fleet,
     readings: &[Reading],
     group: Option<&str>,
     startup_group: &'static str,
 ) -> Result<(&'a ServiceAccount, f64, Option<String>)> {
-    let rank = |scope: Option<&str>| {
-        view::ranked(readings, view::ANY_ROOM, None, view::RankOn::Limits(scope))
-    };
-    let (winner, chosen_group) = match rank(group).into_iter().next() {
-        Some(winner) => (Some(winner), group.map(str::to_owned)),
-        None if group.is_none() => (
-            rank(Some(startup_group)).into_iter().next(),
-            Some(startup_group.to_owned()),
-        ),
-        None => (None, group.map(str::to_owned)),
-    };
-    if let Some((reading, room)) = winner {
+    let (ranked, chosen_group) = rank_agy(readings, group, startup_group);
+    if let Some((reading, room)) = ranked.into_iter().next() {
         let account = fleet
             .service_account(&reading.account)
             .filter(|account| account.service == Service::Antigravity)
@@ -301,7 +313,13 @@ pub async fn agy_use(
                     "no Antigravity accounts are registered; run `tokeman agy import` or `tokeman agy login`"
                 );
             }
-            let readings = providers::read_all(providers::client(), &accounts, super::now()).await;
+            let readings = providers::read_all_opts(
+                providers::client(),
+                &accounts,
+                super::now(),
+                !options.dry_run,
+            )
+            .await;
             if !options.dry_run {
                 view::record(&readings);
             }
@@ -329,16 +347,23 @@ pub async fn agy_run(fleet: &Fleet, name: &str, args: Vec<String>) -> Result<run
         .service_account(name)
         .filter(|account| account.service == Service::Antigravity)
         .ok_or_else(|| anyhow::anyhow!("no Antigravity account named '{name}'"))?;
-    // Shells out to `security` with its own bound; an unreadable slot is
-    // "not this account", which takes the home of its own.
-    let held = account.clone();
-    let seated = tokio::task::spawn_blocking(move || {
-        seat::slot()
-            .ok()
-            .flatten()
-            .is_some_and(|slot| slot.holds(&held))
-    })
-    .await?;
+    let over_ssh = std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some();
+    let seated = if over_ssh {
+        false
+    } else {
+        // Shells out to `security` with its own bound; an unreadable slot is
+        // "not this account", which takes the home of its own.
+        let held = account.clone();
+        tokio::task::spawn_blocking(move || {
+            seat::slot()
+                .ok()
+                .flatten()
+                .is_some_and(|slot| slot.holds(&held))
+        })
+        .await?
+    };
     run::prepare(providers::client(), account, seated, args).await
 }
 

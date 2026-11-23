@@ -17,7 +17,7 @@
 
 use serde::Serialize;
 
-use crate::quota::{Limit, ModelKey, Reading, Scope, Service, Span};
+use crate::quota::{Limit, ModelKey, Reading, Scope, Service, Span, Window};
 
 /// The rate is taken over this many hours.
 pub const BURN_HOURS: i64 = 6;
@@ -81,23 +81,39 @@ fn governing(reading: &Reading) -> Option<&Limit> {
         .max_by_key(|limit| limit.span.seconds())
 }
 
+fn same_reset_window(a: Window, b: Window) -> bool {
+    if a.resets_at == b.resets_at {
+        return true;
+    }
+    if a.resets_at == 0 && a.used == 0.0 && b.resets_at > 0 {
+        return true;
+    }
+    a.resets_at >= 1_000_000 && b.resets_at >= 1_000_000 && (a.resets_at - b.resets_at).abs() <= 2
+}
+
 /// `(covered seconds, use gained)` of the `span` window over `recent`: the
-/// intervals between consecutive reads of one reset window that did not go
-/// down.
+/// intervals between consecutive valid reads of one reset window that did not
+/// go down.
 fn burn(recent: &[Reading], span: Span) -> (i64, f64) {
-    recent
+    let valid: Vec<(i64, Window)> = recent
+        .iter()
+        .filter(|reading| reading.error.is_none())
+        .filter_map(|reading| Some((reading.at, reading.window(span, &Scope::All)?)))
+        .collect();
+    valid
         .windows(2)
         .filter_map(|pair| {
-            let secs = pair[1].at - pair[0].at;
-            let (a, b) = (
-                pair[0].window(span, &Scope::All)?,
-                pair[1].window(span, &Scope::All)?,
-            );
-            (secs > 0 && a.resets_at == b.resets_at && b.used >= a.used)
-                .then_some((secs, b.used - a.used))
+            let (at_a, a) = pair[0];
+            let (at_b, b) = pair[1];
+            let secs = at_b.saturating_sub(at_a);
+            (secs > 0
+                && same_reset_window(a, b)
+                && b.used >= a.used
+                && (b.used - a.used).is_finite())
+            .then_some((secs, b.used - a.used))
         })
-        .fold((0, 0.0), |(secs, used), (more_secs, more_used)| {
-            (secs + more_secs, used + more_used)
+        .fold((0i64, 0.0), |(secs, used), (more_secs, more_used)| {
+            (secs.saturating_add(more_secs), used + more_used)
         })
 }
 
@@ -133,7 +149,7 @@ fn walk(
     now: i64,
     use_refills: bool,
 ) -> Option<i64> {
-    let end = (now + HORIZON_SECS) as f64;
+    let end = now.saturating_add(HORIZON_SECS) as f64;
     let mut t = now as f64;
     // Each step ends at a reset or empties a pool, so the walk is finite;
     // the bound is for a rate so small that rounding stalls it.
@@ -160,7 +176,7 @@ fn walk(
         // A window that is not running starts with its first use.
         pools[index]
             .reset
-            .get_or_insert(t.round() as i64 + span_secs);
+            .get_or_insert((t.round() as i64).saturating_add(span_secs));
         let next = pools
             .iter()
             .filter_map(|pool| pool.reset)
@@ -210,7 +226,7 @@ pub fn forecast(
         let reading = account.latest;
         // A model's limit that is a share of the weekly caps the room a
         // full window gives it.
-        let (room, full) = if span == Span::Weekly {
+        let (raw_room, full) = if span == Span::Weekly {
             (
                 reading
                     .model_room(model)
@@ -223,8 +239,16 @@ pub fn forecast(
         } else {
             (limit.window.remaining(), 1.0)
         };
+        let rejected = !reading.allows()
+            || limit.is_rejected()
+            || (span == Span::Weekly && reading.limits_for(model).any(Limit::is_rejected));
+        let room = if rejected || !raw_room.is_finite() {
+            0.0
+        } else {
+            (raw_room - floor).max(0.0)
+        };
         pools.push(Pool {
-            room: (room - floor).max(0.0),
+            room,
             full: (full - floor).max(0.0),
             reset: Some(limit.window.resets_at).filter(|reset| *reset > now),
             refills: account.refills,
@@ -238,9 +262,11 @@ pub fn forecast(
     if measured == 0 {
         return None;
     }
-    let refills: u32 = pools.iter().map(|pool| pool.refills).sum();
+    let refills: u32 = pools
+        .iter()
+        .fold(0u32, |sum, pool| sum.saturating_add(pool.refills));
     let outlook = |use_refills: bool| {
-        if rate < IDLE_RATE {
+        if !rate.is_finite() || rate < IDLE_RATE {
             Outlook::Idle
         } else {
             match walk(pools.clone(), rate, span_secs, now, use_refills) {

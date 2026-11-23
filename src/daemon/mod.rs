@@ -13,14 +13,18 @@ pub mod service;
 pub mod services;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use tokio::task::JoinHandle;
 
 use self::lock::{RotationLock, is_paused};
-use self::log::log;
+use self::log::{log, log_drift};
 use crate::account::Fleet;
+use crate::anthropic;
 use crate::claude::{keychain, settings as claude_settings};
+use crate::codex::maintenance::{MaintenanceEvent, MaintenanceState, SWEEP_INTERVAL};
 use crate::history::{Event, EventKind};
 use crate::paths;
 
@@ -32,18 +36,96 @@ pub fn now_epoch() -> f64 {
         .as_secs_f64()
 }
 
-/// Size and modification time of the running executable. A long-lived process
-/// compares it against the value at startup and exits when the binary on disk
-/// has been replaced, so launchd (or the user) restarts into the new code.
-pub fn executable_identity() -> Option<(u64, SystemTime)> {
-    let path = std::env::current_exe().ok()?;
+/// On-disk identity of the running executable's path as recorded at startup.
+/// Checking the startup path (rather than re-reading `/proc/self/exe`, which
+/// turns into `... (deleted)` on Linux after an unlink+replace) detects binary
+/// upgrades on both macOS and Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExeIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+pub fn executable_identity() -> Option<ExeIdentity> {
+    static STARTUP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let path = STARTUP_PATH
+        .get_or_init(|| std::env::current_exe().ok())
+        .as_ref()?;
     let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.len(), metadata.modified().ok()?))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(ExeIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(ExeIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+pub fn executable_replaced(started_as: Option<ExeIdentity>) -> bool {
+    started_as.is_some() && executable_identity() != started_as
 }
 
 const TICK: Duration = Duration::from_secs(20);
 
-/// The loop `tokeman rotate daemon` runs until the binary is replaced.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = async {
+                match &mut term {
+                    Some(sig) => { sig.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// Read Claude accounts without touching credentials, Keychain or cycle state,
+/// so stored views stay fresh while rotation is paused.
+async fn poll_claude_read_only(fleet: &Fleet) {
+    if fleet.accounts.is_empty() {
+        return;
+    }
+    let at = chrono::Utc::now().timestamp();
+    let mut readings = anthropic::probe::probe_all(
+        anthropic::Client::shared(),
+        fleet.accounts.iter(),
+        anthropic::probe::PROBE_MODEL,
+        anthropic::probe::PROBE_TIMEOUT,
+        at,
+    )
+    .await;
+    let _ = crate::observe::scan_transcripts(&fleet.accounts);
+    crate::observe::apply(&mut readings);
+    log_drift(&readings);
+    crate::commands::view::record(&readings);
+}
+
+/// The loop `tokeman rotate daemon` runs until the binary is replaced or
+/// stopped by a signal.
 pub async fn run() -> Result<()> {
     let Some(_alive) = lock::DaemonLock::take()? else {
         anyhow::bail!("another tokeman daemon is already running");
@@ -53,20 +135,29 @@ pub async fn run() -> Result<()> {
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_codex_sweep = Instant::now();
     let mut refresh_backoff = refresh::Backoff::default();
-    let mut codex_state = crate::codex::maintenance::MaintenanceState::default();
+    let mut codex_state = Some(MaintenanceState::default());
+    let mut codex_sweep: Option<JoinHandle<(MaintenanceState, Vec<MaintenanceEvent>)>> = None;
     let mut services_poller = services::Poller::default();
     let mut notifier = notify::Notifier::default();
     let mut codex_mover = codex::Mover::default();
+    let mut last_paused_claude_poll: Option<Instant> = None;
+    let stop = shutdown_signal();
+    tokio::pin!(stop);
+
     loop {
-        wake.tick().await;
-        if started_as.is_some() && executable_identity().is_some_and(|now| Some(now) != started_as)
-        {
-            log("daemon executable was replaced; exiting so launchd loads the new binary");
-            return Ok(());
+        tokio::select! {
+            _ = wake.tick() => {}
+            sig = &mut stop => {
+                log(&format!("received {sig}; shutting down daemon"));
+                break;
+            }
         }
-        if !is_paused()
-            && let Err(error) = refresh::refresh_due(&mut refresh_backoff).await
-        {
+        if executable_replaced(started_as) {
+            log("daemon executable was replaced; exiting so launchd loads the new binary");
+            break;
+        }
+        let paused = is_paused();
+        if !paused && let Err(error) = refresh::refresh_due(&mut refresh_backoff).await {
             log(&format!("ERROR login refresh sweep failed: {error:#}"));
         }
         let fleet = match Fleet::load() {
@@ -89,25 +180,73 @@ pub async fn run() -> Result<()> {
         for line in codex_mover.tick(&fleet).await {
             log(&line);
         }
-        let scheduled = cycle::Options {
-            scheduled: true,
-            ..cycle::Options::default()
-        };
-        match cycle::run(&fleet, scheduled).await {
-            Ok(outcome) if outcome.is_notable() => crate::notice::notice(&outcome.message),
-            Ok(_) => {}
-            Err(error) => {
-                log(&format!("ERROR rotation cycle failed: {error:#}"));
-                crate::notice::notice(&format!("tokeman rotation cycle failed: {error:#}"));
+        if paused {
+            let interval = Duration::from_secs(fleet.policy.normal_probe_interval_secs.max(20));
+            if last_paused_claude_poll.is_none_or(|at| at.elapsed() >= interval) {
+                last_paused_claude_poll = Some(Instant::now());
+                poll_claude_read_only(&fleet).await;
+            }
+        } else {
+            last_paused_claude_poll = None;
+            let scheduled = cycle::Options {
+                scheduled: true,
+                ..cycle::Options::default()
+            };
+            match cycle::run(&fleet, scheduled).await {
+                Ok(outcome) if outcome.is_notable() => crate::notice::notice(&outcome.message),
+                Ok(_) => {}
+                Err(error) => {
+                    log(&format!("ERROR rotation cycle failed: {error:#}"));
+                    crate::notice::notice(&format!("tokeman rotation cycle failed: {error:#}"));
+                }
             }
         }
-        if Instant::now() >= next_codex_sweep {
-            next_codex_sweep = Instant::now() + crate::codex::maintenance::SWEEP_INTERVAL;
-            for event in crate::codex::maintenance::maintenance(&fleet, &mut codex_state).await {
-                log(&event.to_string());
+        if let Some(done) = codex_sweep.take_if(|handle| handle.is_finished()) {
+            match done.await {
+                Ok((state, events)) => {
+                    codex_state = Some(state);
+                    for event in events {
+                        log(&event.to_string());
+                    }
+                }
+                Err(error) => {
+                    codex_state = Some(MaintenanceState::default());
+                    log(&format!("ERROR codex maintenance task failed: {error}"));
+                }
             }
+        }
+        if codex_sweep.is_none() && Instant::now() >= next_codex_sweep {
+            next_codex_sweep = Instant::now() + SWEEP_INTERVAL;
+            let mut state = codex_state.take().unwrap_or_default();
+            let sweep_fleet = fleet.clone();
+            codex_sweep = Some(tokio::spawn(async move {
+                let events = crate::codex::maintenance::maintenance(&sweep_fleet, &mut state).await;
+                (state, events)
+            }));
         }
     }
+
+    for line in services_poller.finish().await {
+        log(&line);
+    }
+    for line in notifier.finish().await {
+        log(&line);
+    }
+    for line in codex_mover.finish().await {
+        log(&line);
+    }
+    if let Some(sweep) = codex_sweep {
+        match tokio::time::timeout(Duration::from_secs(10), sweep).await {
+            Ok(Ok((_, events))) => {
+                for event in events {
+                    log(&event.to_string());
+                }
+            }
+            Ok(Err(error)) => log(&format!("ERROR codex maintenance task failed: {error}")),
+            Err(_) => log("codex maintenance task still in flight at exit; aborting"),
+        }
+    }
+    Ok(())
 }
 
 /// Install the launchd agent, the SessionStart hook, and re-offer the
@@ -143,13 +282,19 @@ pub fn install() -> Result<PathBuf> {
     Ok(plist)
 }
 
-/// Remove the agent and the hook, and put the /login record back.
+/// Remove the agent, the hook and any managed settings credential, and put
+/// the /login record back.
 pub fn uninstall() -> Result<()> {
     let _lock = RotationLock::acquire()?;
     service::uninstall()?;
     let mut settings = claude_settings::load()?;
-    if claude_settings::remove_observer_hook(&mut settings) {
-        claude_settings::save(&settings)?;
+    let cleared = claude_settings::clear(&mut settings);
+    let unhooked = claude_settings::remove_observer_hook(&mut settings);
+    if cleared || unhooked {
+        claude_settings::commit(
+            &settings,
+            cleared.then(|| Event::pause(chrono::Utc::now().timestamp())),
+        )?;
     }
     if keychain::restore()? {
         log("restored saved /login credential during service uninstall");
@@ -186,6 +331,7 @@ pub fn pause() -> Result<()> {
 
 /// Resume managing, then run one cycle; a healthy explicit choice is kept.
 pub async fn resume(fleet: &Fleet) -> Result<cycle::Outcome> {
+    let fresh_fleet;
     {
         let _lock = RotationLock::acquire()?;
         let marker = paths::pause_marker();
@@ -193,15 +339,18 @@ pub async fn resume(fleet: &Fleet) -> Result<cycle::Outcome> {
             std::fs::remove_file(&marker)
                 .with_context(|| format!("failed to remove {}", marker.display()))?;
         }
+        fresh_fleet = Fleet::load().unwrap_or_else(|_| fleet.clone());
         log("rotation resumed");
     }
-    cycle::run(fleet, cycle::Options::default()).await
+    cycle::run(&fresh_fleet, cycle::Options::default()).await
 }
 
 /// `tokeman claude use <name>`: make this account the default now.
 pub fn activate(fleet: &Fleet, name: &str) -> Result<()> {
     let _lock = RotationLock::acquire()?;
-    let account = fleet
+    let fresh = Fleet::load().ok();
+    let active_fleet = fresh.as_ref().unwrap_or(fleet);
+    let account = active_fleet
         .account(name)
         .with_context(|| format!("account '{name}' is not configured"))?;
     if keychain::suppress(false)? {

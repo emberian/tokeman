@@ -96,25 +96,73 @@ impl Family {
 }
 
 /// The canonical spelling of a model: ASCII alphanumerics, lower case, without
-/// a leading `claude`. `claude-opus-4-8`, `Opus 4.8` and `opus48` are all
-/// `opus48`; `claude-fable-5-1[1m]` is `fable51`; a family alone (`fable`)
-/// names its family-wide limit.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// a leading `claude` or trailing release date (`-20260501`). `claude-opus-4-8`,
+/// `claude-opus-4-8-20260501`, `Opus 4.8` and `opus48` are all `opus48`;
+/// `claude-fable-5-1[1m]` is `fable51`; a family alone (`fable`) names its
+/// family-wide limit.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ModelKey(String);
+
+impl<'de> Deserialize<'de> for ModelKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::new(&raw))
+    }
+}
+
+fn strip_release_date(text: &str) -> &str {
+    if text.len() > 9 {
+        let split = text.len() - 9;
+        if let Some(tail) = text.get(split..) {
+            let bytes = tail.as_bytes();
+            if matches!(bytes[0], b'-' | b'_') && is_release_yyyymmdd(&tail[1..]) {
+                return &text[..split];
+            }
+        }
+    }
+    text
+}
+
+fn is_release_yyyymmdd(eight: &str) -> bool {
+    if eight.len() != 8 || !eight.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let year: u16 = eight[0..4].parse().unwrap_or(0);
+    let month: u8 = eight[4..6].parse().unwrap_or(0);
+    let day: u8 = eight[6..8].parse().unwrap_or(0);
+    (2020..=2099).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
 
 impl ModelKey {
     pub fn new(model: &str) -> Self {
         let base = model.split('[').next().unwrap_or(model);
+        let base = strip_release_date(base);
         let key: String = base
             .chars()
             .filter(|ch| ch.is_ascii_alphanumeric())
             .flat_map(char::to_lowercase)
             .collect();
-        Self(match key.strip_prefix("claude") {
+        let mut stripped = match key.strip_prefix("claude") {
             Some(rest) if !rest.is_empty() => rest.to_owned(),
             _ => key,
-        })
+        };
+        // Strip concatenated 8-digit release dates after version digits (`opus4820260501`).
+        if stripped.len() >= 9 && is_release_yyyymmdd(&stripped[stripped.len() - 8..]) {
+            let prefix = &stripped[..stripped.len() - 8];
+            if prefix.bytes().last().is_some_and(|b| b.is_ascii_digit()) {
+                stripped.truncate(stripped.len() - 8);
+            }
+        }
+        // Canonicalize `claude-3-5-sonnet` (`35sonnet`) -> `sonnet35`.
+        let leading_digits = stripped.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if leading_digits > 0 {
+            let rest = &stripped[leading_digits..];
+            if Family::ALL.iter().any(|family| family.name() == rest) {
+                stripped = format!("{rest}{}", &stripped[..leading_digits]);
+            }
+        }
+        Self(stripped)
     }
 
     pub fn family_wide(family: Family) -> Self {
@@ -133,11 +181,9 @@ impl ModelKey {
         Family::of(&self.0)
     }
 
-    /// The version digits after the family name: `48` for Opus 4.8, `5` for
-    /// a major-only name, `None` for a family-wide key. Claude Code's bare
-    /// `opus` alias selects Opus 5, so it reads as version `5` rather than
-    /// as the whole family: an exhausted Opus 4.8 limit must not poison it.
-    pub fn version(&self) -> Option<&str> {
+    /// Explicit version digits after the family name (`None` when none are
+    /// present, as on a family-wide bucket like `opus` or `fable`).
+    fn explicit_version(&self) -> Option<&str> {
         let family = self.family()?;
         let start = self.0.find(family.name())? + family.name().len();
         let digits = &self.0[start..];
@@ -146,22 +192,29 @@ impl ModelKey {
             .split(|c: char| !c.is_ascii_digit())
             .next()
             .unwrap_or("");
-        if digits.is_empty() {
-            (family == Family::Opus && self.0 == "opus").then_some("5")
-        } else {
-            Some(digits)
-        }
+        (!digits.is_empty()).then_some(digits)
+    }
+
+    /// The version digits after the family name: `48` for Opus 4.8, `5` for
+    /// a major-only name, `None` for a family-wide key. Claude Code's bare
+    /// `opus` alias selects Opus 5, so it reads as version `5` rather than
+    /// as the whole family: an exhausted Opus 4.8 limit must not poison it.
+    pub fn version(&self) -> Option<&str> {
+        let family = self.family()?;
+        self.explicit_version()
+            .or_else(|| (family == Family::Opus && self.0 == "opus").then_some("5"))
     }
 
     /// Whether a limit scoped to `bucket` limits sessions on this model.
     ///
-    /// Same family and: the limit is family-wide; or it names a major only
-    /// (`fable5`) and this model is one of its point releases; or both name
-    /// the same version. Keys outside any family match by equality.
+    /// Same family and: the limit is family-wide (`bucket` carries no version
+    /// digits); or it names a major only (`fable5`) and this model is one of
+    /// its point releases; or both name the same version. Keys outside any
+    /// family match by equality.
     pub fn is_limited_by(&self, bucket: &ModelKey) -> bool {
         match (self.family(), bucket.family()) {
             (Some(mine), Some(theirs)) if mine == theirs => {
-                match (self.version(), bucket.version()) {
+                match (self.version(), bucket.explicit_version()) {
                     (_, None) => true,
                     (Some(mine), Some(theirs)) if theirs.len() == 1 => mine.starts_with(theirs),
                     (mine, theirs) => mine == theirs,
@@ -1089,11 +1142,16 @@ impl Reading {
     }
 
     /// Whether a model's limit leaves more than `floor`. One that is a share
-    /// of the weekly is judged on its room in weekly terms.
+    /// of the weekly is judged on its room in weekly terms, compared on the
+    /// used side so floating-point rounding never lifts an exact boundary.
     pub fn limit_above(&self, limit: &Limit, floor: f64) -> bool {
         match limit.share {
             None => limit.window.above(floor),
-            Some(_) => limit.room(self.weekly().as_ref()) > floor,
+            Some(share) if share > 0.0 => {
+                limit.window.above(floor / share)
+                    && self.weekly().is_none_or(|weekly| weekly.above(floor))
+            }
+            Some(_) => floor < 0.0,
         }
     }
 
@@ -1126,7 +1184,7 @@ impl Reading {
                 .all(|limit| !limit.is_rejected() && limit.window.above(floor(limit.span)))
             && self
                 .limits_for(model)
-                .all(|limit| self.limit_above(limit, weekly_floor))
+                .all(|limit| !limit.is_rejected() && self.limit_above(limit, weekly_floor))
     }
 
     /// The limit with the least left: among the account-wide ones when there
@@ -1142,15 +1200,19 @@ impl Reading {
     /// accounts on a part of their quota. With `needle`, the scoped limits
     /// matching it ([`Limit::matches`]) become the account-wide ones and
     /// every other limit is left out: such a limit is metered apart. With
-    /// `None`, every group's limit joins the account-wide ones, since work
-    /// may land in any group. `None` when no limit would be left.
+    /// `None`, every group's limit (apart from overage extra usage) joins the
+    /// account-wide ones, since work may land in any group. `None` when no
+    /// limit would be left.
     pub fn scoped_to(&self, needle: Option<&str>) -> Option<Reading> {
+        if needle.is_some_and(|needle| needle.trim().is_empty()) {
+            return None;
+        }
         let limits: Vec<Limit> = self
             .limits
             .iter()
             .filter(|limit| match needle {
                 Some(needle) => limit.matches(needle),
-                None => limit.key().is_none(),
+                None => limit.key().is_none() && limit.scope != Scope::extra_usage(),
             })
             .map(|limit| Limit {
                 scope: Scope::All,
@@ -1176,12 +1238,19 @@ mod tests {
     #[test]
     fn model_keys_agree_between_ids_and_display_names() {
         assert_eq!(key("claude-opus-4-8"), key("Opus 4.8"));
+        assert_eq!(key("claude-opus-4-8-20260501"), key("Opus 4.8"));
+        assert_eq!(key("claude-sonnet-4-5-20250929"), key("Sonnet 4.5"));
+        assert_eq!(key("claude-3-5-sonnet-20241022"), key("Claude 3.5 Sonnet"));
+        assert_eq!(key("claude-3-5-sonnet-20241022").version(), Some("35"));
         assert_eq!(key("claude-fable-5-1[1m]").as_str(), "fable51");
         assert_eq!(key("Fable 5").as_str(), "fable5");
         assert_eq!(key("claude").as_str(), "claude");
         assert_eq!(key("Sonnet 4.5").version(), Some("45"));
         assert_eq!(key("fable").version(), None);
         assert_eq!(key("opus").version(), Some("5"));
+        assert!(key("claude-opus-4-8").is_limited_by(&ModelKey::family_wide(Family::Opus)));
+        let deser: ModelKey = serde_json::from_str("\"Opus 4.8\"").unwrap();
+        assert_eq!(deser, key("opus48"));
     }
 
     #[test]
@@ -1368,12 +1437,17 @@ mod tests {
         assert!(!r.above(0.05, 0.05, Some(&fable)));
         assert!(r.above(0.05, 0.03, Some(&fable)));
         assert!(r.above(0.05, 0.05, Some(&key("claude-opus-5-5"))));
-        // Exactly the floor is not above it: half of a half is a quarter.
+        // Exactly the floor is not above it, even where (1.0 - 0.70) * 0.5
+        // rounds above 0.15 in IEEE-754.
         let mut half = model_limit("fable", "Fable", 0.5, Source::Profile);
         half.share = Some(0.5);
         r.set_limit(half);
         assert!(!r.above(0.05, 0.25, Some(&fable)));
         assert!(r.above(0.05, 0.24, Some(&fable)));
+        let mut tricky = model_limit("fable", "Fable", 0.70, Source::Profile);
+        tricky.share = Some(0.5);
+        r.set_limit(tricky);
+        assert!(!r.above(0.05, 0.15, Some(&fable)));
     }
 
     #[test]

@@ -37,18 +37,34 @@ pub struct AccountInfo {
 }
 
 impl AccountInfo {
-    /// The first `email` and `planType` anywhere in the response.
+    /// The first non-empty string `email` and `planType` anywhere in the response.
     pub fn from_value(value: &Value) -> Self {
         let first = |key: &str| {
             let mut found = Vec::new();
             json_values(value, key, &mut found);
-            found.first().and_then(|v| v.as_str()).map(str::to_owned)
+            found
+                .into_iter()
+                .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
+                .map(str::to_owned)
         };
         Self {
             email: first("email"),
             plan_type: first("planType"),
         }
     }
+}
+
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::OnceLock;
+    static EUID: OnceLock<Option<u32>> = OnceLock::new();
+    *EUID.get_or_init(|| {
+        std::fs::metadata("/proc/self")
+            .or_else(|_| tempfile::tempfile().and_then(|file| file.metadata()))
+            .ok()
+            .map(|meta| meta.uid())
+    })
 }
 
 impl std::fmt::Display for AccountInfo {
@@ -81,6 +97,16 @@ impl AppServer {
                     socket_path.display()
                 )
             })?;
+        #[cfg(unix)]
+        if let (Ok(peer), Some(euid)) = (stream.peer_cred(), current_euid())
+            && peer.uid() != euid
+        {
+            bail!(
+                "refusing to connect to {}: owned by uid {}, expected {euid}",
+                socket_path.display(),
+                peer.uid()
+            );
+        }
         let (socket, _response) =
             tokio::time::timeout(CONNECT_TIMEOUT, client_async("ws://localhost/", stream))
                 .await
@@ -115,9 +141,10 @@ impl AppServer {
     }
 
     async fn send(&mut self, message: &Value) -> Result<()> {
-        self.socket
-            .send(Message::Text(serde_json::to_string(message)?))
+        let text = serde_json::to_string(message)?;
+        tokio::time::timeout(RESPONSE_TIMEOUT, self.socket.send(Message::Text(text)))
             .await
+            .map_err(|_| anyhow!("timed out writing to control socket"))?
             .context("failed to write to control socket")
     }
 
@@ -136,13 +163,25 @@ impl AppServer {
         }
     }
 
-    /// Read until the response with `id` arrives, discarding notifications.
+    /// Read until the response with `id` arrives, discarding notifications and
+    /// rejecting server-to-client requests so Codex never stalls waiting on us.
     async fn await_response(&mut self, id: i64) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let message = tokio::time::timeout_at(deadline, self.read_message())
                 .await
                 .context("timed out waiting for app-server response")??;
+            if message.get("method").is_some() {
+                if let Some(server_id) = message.get("id").cloned() {
+                    let _ = self
+                        .send(&json!({
+                            "id": server_id,
+                            "error": { "code": -32601, "message": "method not supported" },
+                        }))
+                        .await;
+                }
+                continue;
+            }
             if message.get("id").and_then(Value::as_i64) != Some(id) {
                 continue;
             }
@@ -200,6 +239,17 @@ impl AppServer {
     pub async fn next_notification(&mut self, method: &str) -> Result<Value> {
         loop {
             let message = self.read_message().await?;
+            if message.get("method").is_some()
+                && let Some(server_id) = message.get("id").cloned()
+            {
+                let _ = self
+                    .send(&json!({
+                        "id": server_id,
+                        "error": { "code": -32601, "message": "method not supported" },
+                    }))
+                    .await;
+                continue;
+            }
             if message.get("method").and_then(Value::as_str) == Some(method) {
                 return Ok(message.get("params").cloned().unwrap_or(Value::Null));
             }
@@ -207,7 +257,7 @@ impl AppServer {
     }
 
     pub async fn close(mut self) {
-        let _ = self.socket.close(None).await;
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, self.socket.close(None)).await;
     }
 }
 
@@ -267,11 +317,11 @@ impl ReportedLimits {
                 let used = either(window, "usedPercent", "used_percent")?.as_f64()?;
                 let minutes = either(window, "windowDurationMins", "window_minutes")
                     .and_then(|minutes| minutes.as_i64());
-                let resets_at = either(window, "resetsAt", "resets_at")
-                    .and_then(|at| at.as_i64())
-                    .unwrap_or(0);
+                let resets_at =
+                    super::probe::epoch_of(either(window, "resetsAt", "resets_at").as_ref())
+                        .unwrap_or(0);
                 Some(ReportedWindow {
-                    span: Span::from_seconds(minutes.map(|minutes| minutes * 60)),
+                    span: Span::from_seconds(minutes.and_then(|minutes| minutes.checked_mul(60))),
                     used: used / 100.0,
                     resets_at,
                 })

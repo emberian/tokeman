@@ -241,7 +241,8 @@ pub fn relocate<'a>(
         session: 0.0,
         weekly: 0.0,
     };
-    if above(seat, leave, None) {
+    if above(seat, leave, None) || (seat.accepts_work() && !seat.has_quota() && seat.plan.is_some())
+    {
         return Relocation::Stay;
     }
     let landing = choose_above(others, land, None).or_else(|| {
@@ -267,14 +268,21 @@ fn landing_order(a: &Reading, b: &Reading, floors: Floors, model: Option<&ModelK
 /// a later switch, so it does not justify landing on a tighter account.
 pub const EXPIRING_WITHIN_SECS: i64 = 24 * 3600;
 
-/// When the weekly window resets, epoch seconds, if that is within
-/// [`EXPIRING_WITHIN_SECS`] of the reading; `None` when further out or
-/// unreported.
+/// When the weekly window resets, epoch seconds, if that is still in the
+/// future and within [`EXPIRING_WITHIN_SECS`] of the reading; `None` when
+/// already passed, further out, or unreported.
 fn expiring_reset(reading: &Reading) -> Option<i64> {
     reading
-        .weekly()
-        .map(|window| window.resets_at)
-        .filter(|&reset| reset > 0 && reset - reading.at <= EXPIRING_WITHIN_SECS)
+        .shared()
+        .filter(|limit| limit.span == Span::Weekly)
+        .map(|limit| limit.window.resets_at)
+        .filter(|&reset| {
+            reset > 0
+                && reset
+                    .checked_sub(reading.at)
+                    .is_some_and(|left| (1..=EXPIRING_WITHIN_SECS).contains(&left))
+        })
+        .min()
 }
 
 /// Sooner first; unknown last.
@@ -289,10 +297,15 @@ fn compare_reset(a: Option<i64>, b: Option<i64>) -> Ordering {
 
 /// Use of the shared windows; an unreported window has none.
 fn used(reading: &Reading) -> (f64, f64) {
-    (
-        reading.session().map_or(0.0, |w| w.used),
-        reading.weekly().map_or(0.0, |w| w.used),
-    )
+    let max_used = |span: Span| {
+        reading
+            .shared()
+            .filter(|limit| limit.span == span)
+            .map(|limit| limit.window.used)
+            .reduce(f64::max)
+            .unwrap_or(0.0)
+    };
+    (max_used(Span::FiveHour), max_used(Span::Weekly))
 }
 
 /// Every reported window with its floor: the account-wide ones (the session
@@ -327,7 +340,12 @@ fn margin(window: &Window, floor: f64) -> f64 {
 }
 
 fn room_margin(remaining: f64, floor: f64) -> f64 {
-    (remaining - floor) / (1.0 - floor)
+    let denom = 1.0 - floor;
+    if denom <= 0.0 {
+        remaining - floor
+    } else {
+        (remaining - floor) / denom
+    }
 }
 
 /// The smallest normalized margin across every window that limits `model`.
@@ -360,7 +378,7 @@ fn reset_delay(reading: &Reading, floors: Floors, model: Option<&ModelKey>) -> O
 }
 
 fn compare_f64(a: f64, b: f64) -> Ordering {
-    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+    a.total_cmp(&b)
 }
 
 /// How soon to probe again: fast in sip mode, after a partial probe, when
@@ -372,12 +390,23 @@ pub fn next_interval_secs(
     policy: &PolicySettings,
     model: Option<&ModelKey>,
 ) -> u64 {
+    let near_bound = |floor: f64, cap: f64| (floor * 2.0).min(0.5 * (floor + cap));
     let near_floor = |reading: &Reading| {
-        !reading.above(
-            policy.normal_min_5h_remaining * 2.0,
-            policy.normal_min_7d_remaining * 2.0,
-            model,
-        )
+        let session_near = near_bound(policy.normal_min_5h_remaining, 1.0);
+        let weekly_near = near_bound(policy.normal_min_7d_remaining, 1.0);
+        !reading.allows()
+            || reading.shared().any(|limit| {
+                limit.is_rejected()
+                    || !limit.window.above(match limit.span {
+                        Span::FiveHour => session_near,
+                        _ => weekly_near,
+                    })
+            })
+            || reading.limits_for(model).any(|limit| {
+                let cap = limit.share.unwrap_or(1.0).clamp(0.0, 1.0);
+                let bound = near_bound(policy.normal_min_7d_remaining, cap);
+                limit.is_rejected() || !reading.limit_above(limit, bound)
+            })
     };
     if mode == Mode::Sip
         || !complete
@@ -489,8 +518,8 @@ pub fn decide<'a>(situation: &Situation<'a>, policy: &PolicySettings) -> Decisio
     }
     let trigger = match current_reading {
         None => Trigger::NoDefault,
-        Some(_) if healthy && force => Trigger::Forced,
         Some(reading) if reading.is_refused() => Trigger::Refused,
+        Some(reading) if (staying || !reading.has_quota()) && force => Trigger::Forced,
         Some(reading) if !viable(reading, Mode::Sip, policy, model) => Trigger::SipFloor,
         Some(_) => Trigger::NormalFloor,
     };

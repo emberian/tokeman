@@ -545,6 +545,7 @@ pub fn stored_grants(cache: &Cache, account: &str, now: i64) -> Option<(i64, Vec
     let (fetched_at, body) = cache.stored(account, Endpoint::CedarEmber)?;
     let program: Option<GrantProgram> = serde_json::from_value(body["cedar_ember"].clone()).ok()?;
     let grants = program
+        .filter(|program| program.standing() == Standing::Eligible)
         .map(|program| program.grants())
         .unwrap_or_default()
         .into_iter()
@@ -583,27 +584,27 @@ pub async fn claim(
 ) -> Result<ClaimResponse> {
     let bearer = profile_token(account, now)?;
     // Refused before any request: another grant's claim is still unanswered.
-    if let Some(grant_id) = grant_id
-        && let Some(pending) = journal.pending(Service::Claude, &account.name)?
-        && pending.item.as_deref() != Some(grant_id)
+    if let Some(pending) = journal.pending(Service::Claude, &account.name)?
+        && pending.item.as_deref() != grant_id
     {
         bail!(unanswered(&Conflict {
             pending,
-            requested: grant_id.to_owned(),
+            requested: grant_id.unwrap_or("session reset").to_owned(),
         }));
     }
     let organization = organization_uuid(client, bearer).await?;
-    let pending = match grant_id {
-        Some(grant_id) => Some(
-            journal
+    let _cache_lock = cache.begin_claim(&account.name).await?;
+    let (pending, fresh) = match grant_id {
+        Some(grant_id) => {
+            let (pending, fresh) = journal
                 .begin(Service::Claude, &account.name, Some(grant_id), now)
                 .map_err(|error| match error.downcast::<Conflict>() {
                     Ok(conflict) => anyhow::anyhow!(unanswered(&conflict)),
                     Err(error) => error,
-                })?
-                .0,
-        ),
-        None => None,
+                })?;
+            (Some(pending), fresh)
+        }
+        None => (None, false),
     };
     let body = match &pending {
         Some(pending) => serde_json::json!({
@@ -613,23 +614,48 @@ pub async fn claim(
         }),
         None => serde_json::json!({ "program": "juniper_tide" }),
     };
-    let _cache_lock = cache.begin_claim(&account.name).await?;
     let path = format!("/api/organizations/{organization}/reset_rate_limits");
-    let response = client
-        .oauth_post(&path, bearer)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| anyhow::anyhow!("reset request failed: {}", describe(&error)))?;
+    let response = match client.oauth_post(&path, bearer).json(&body).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let note = if pending.is_some() {
+                " (claim recorded as pending; rerun the same command to check or complete it)"
+            } else {
+                ""
+            };
+            bail!("reset request failed: {}{note}", describe(&error));
+        }
+    };
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("reset answered HTTP {status}: {}", one_line(&text, 200));
+        // A brand-new claim rejected definitively by a 4xx before execution did
+        // not consume a grant; an earlier uncertain claim stays until answered.
+        let definitive_pre_exec =
+            fresh && matches!(status.as_u16(), 400 | 401 | 403 | 404 | 422 | 429);
+        if definitive_pre_exec && let Some(pending) = &pending {
+            let _ = journal.finish(Service::Claude, &account.name, &pending.request_id);
+        }
+        let note = if pending.is_some() && !definitive_pre_exec {
+            " (claim remains pending; rerun the same command to verify its outcome)"
+        } else {
+            ""
+        };
+        bail!(
+            "reset answered HTTP {status}: {}{note}",
+            one_line(&text, 200)
+        );
     }
     let response: ClaimResponse =
         serde_json::from_str(&text).context("unreadable reset response")?;
+    let indeterminate = response.result == ClaimResult::Unknown
+        || (response.result == ClaimResult::Unavailable
+            && matches!(
+                response.reason.as_deref(),
+                Some("stamp_indeterminate" | "reset_unconfirmed")
+            ));
     if let Some(pending) = &pending
-        && response.result != ClaimResult::Unknown
+        && !indeterminate
     {
         journal.finish(Service::Claude, &account.name, &pending.request_id)?;
     }

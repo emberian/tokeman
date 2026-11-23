@@ -100,14 +100,25 @@ pub(crate) async fn probe_fleet(
         Some(_) => due
             .iter()
             .copied()
-            .filter(|account| cadence.due_for_sample(account, &fleet.policy, now))
+            .filter(|account| {
+                (force && account.profile_token((now * 1000.0) as i64).is_none())
+                    || cadence.due_for_sample(account, &fleet.policy, now)
+            })
             .collect(),
         None => Vec::new(),
     };
     let client = Client::shared();
     let at = now as i64;
+    let probe_fut = async {
+        if store {
+            probe::probe_all(client, due.iter().copied(), PROBE_MODEL, PROBE_TIMEOUT, at).await
+        } else {
+            probe::probe_all_read_only(client, due.iter().copied(), PROBE_MODEL, PROBE_TIMEOUT, at)
+                .await
+        }
+    };
     let (mut readings, samples) = futures::join!(
-        probe::probe_all(client, due.iter().copied(), PROBE_MODEL, PROBE_TIMEOUT, at),
+        probe_fut,
         probe::sample_all(
             client,
             to_sample.iter().copied(),
@@ -116,6 +127,34 @@ pub(crate) async fn probe_fleet(
             at
         ),
     );
+    if store {
+        let cache = crate::anthropic::profile::Cache::default();
+        for account in &due {
+            if account.profile_token(at * 1000).is_some() {
+                let fresh_cedar = cache
+                    .stored(
+                        &account.name,
+                        crate::anthropic::profile::Endpoint::CedarEmber,
+                    )
+                    .is_some_and(|(fetched_at, _)| {
+                        fetched_at <= at
+                            && at.saturating_sub(fetched_at)
+                                < crate::anthropic::profile::MAX_AGE_SECS
+                    });
+                if !fresh_cedar {
+                    let _ = crate::anthropic::resets::program(
+                        client,
+                        &cache,
+                        account,
+                        crate::anthropic::profile::Endpoint::CedarEmber,
+                        crate::anthropic::profile::ReadPolicy::Cached,
+                        at,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     for account in cadence.record_samples(&samples, now) {
         log(&format!(
             "target-model sample for {account} got no quota headers; next try in one interval"
@@ -123,8 +162,8 @@ pub(crate) async fn probe_fleet(
     }
     cadence.apply_samples(&mut readings, now);
     fold_sample_drift(&mut readings, samples);
-    observe::apply(&mut readings);
     if store {
+        observe::apply(&mut readings);
         super::log::log_drift(&readings);
     }
     if store && let Ok(store) = Store::open() {
@@ -219,7 +258,21 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
             "No accounts configured. Use `tokeman claude login <name>` or `tokeman claude add <name> <key>` to add one."
         );
     }
-    let _lock = RotationLock::acquire()?;
+    let _lock = (!options.dry_run).then(RotationLock::acquire).transpose()?;
+    // Reload under RotationLock when the account file is on disk so a token
+    // refreshed while waiting on the lock is never missed.
+    let reloaded = if !options.dry_run && crate::paths::accounts_file().exists() {
+        Fleet::load().ok()
+    } else {
+        None
+    };
+    let fleet = reloaded.as_ref().unwrap_or(fleet);
+    fleet.policy.validate()?;
+    if fleet.accounts.is_empty() {
+        bail!(
+            "No accounts configured. Use `tokeman claude login <name>` or `tokeman claude add <name> <key>` to add one."
+        );
+    }
     let mut cadence = Cadence::load();
     cadence.retain(&fleet.accounts);
     let previous_mode = cadence.mode.unwrap_or(Mode::Normal);
@@ -241,13 +294,18 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
     if !options.scheduled && !options.dry_run && keychain::suppress(false)? {
         log("suppressed short-lived /login Keychain auth before managed rotation");
     }
-    let observed = match observe::scan_transcripts(&fleet.accounts) {
-        Ok(observed) => observed,
-        Err(error) => {
-            note(&format!(
-                "ERROR Claude admission feedback scan failed: {error:#}"
-            ));
-            0
+    let (observed, dry_run_limits) = if options.dry_run {
+        let (count, limits) = observe::scan_transcripts_dry_run(&fleet.accounts);
+        (count, Some(limits))
+    } else {
+        match observe::scan_transcripts(&fleet.accounts) {
+            Ok(observed) => (observed, None),
+            Err(error) => {
+                note(&format!(
+                    "ERROR Claude admission feedback scan failed: {error:#}"
+                ));
+                (0, None)
+            }
         }
     };
     if observed > 0 {
@@ -255,13 +313,24 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
             "observed {observed} Claude quota rejection(s); reevaluating default now"
         ));
     }
+    let mut settings = claude_settings::load()?;
+    let model_raw = claude_settings::target_model(&settings).map(str::to_owned);
+    let model = model_raw.as_deref().map(ModelKey::new);
+    let current_value = claude_settings::configured_token(&settings).map(str::to_owned);
+    let current_name = current_value
+        .as_deref()
+        .and_then(|value| fleet.account_holding(value))
+        .map(|account| account.name.clone());
+    let pending_default_rejection = current_name
+        .as_deref()
+        .is_some_and(|name| observe::has_rejection_since(name, cadence.last_probe_epoch));
     let started = now_epoch();
-    if options.scheduled && observed == 0 {
+    if options.scheduled && observed == 0 && !pending_default_rejection {
         let interval = cadence
             .probe_interval_secs
             .unwrap_or_else(|| fleet.policy.interval_secs(previous_mode))
             as f64;
-        if started - cadence.last_probe_epoch < interval {
+        if started >= cadence.last_probe_epoch && started - cadence.last_probe_epoch < interval {
             return Ok(Outcome::held(
                 Action::NotDue,
                 previous_mode,
@@ -275,14 +344,6 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
         }
     }
 
-    let mut settings = claude_settings::load()?;
-    let model_raw = claude_settings::target_model(&settings).map(str::to_owned);
-    let model = model_raw.as_deref().map(ModelKey::new);
-    let current_value = claude_settings::configured_token(&settings).map(str::to_owned);
-    let current_name = current_value
-        .as_deref()
-        .and_then(|value| fleet.account_holding(value))
-        .map(|account| account.name.clone());
     if let Some(name) = current_name.as_deref()
         && !options.dry_run
     {
@@ -312,7 +373,7 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
         .filter(|account| options.force || !cadence.is_parked(account, now))
         .map(|account| account.name.clone())
         .collect();
-    let readings = probe_fleet(
+    let mut readings = probe_fleet(
         fleet,
         &mut cadence,
         model_raw.as_deref(),
@@ -322,6 +383,9 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
         !options.dry_run,
     )
     .await;
+    if let Some(ref limits) = dry_run_limits {
+        observe::apply_limits(&mut readings, limits);
+    }
     let mut backoff = cadence.clone();
     let asked = readings
         .iter()
@@ -502,9 +566,12 @@ pub async fn run(fleet: &Fleet, options: Options) -> Result<Outcome> {
                 .account(&to.account)
                 .context("probe returned an account absent from the fleet")?;
             let now_ms = chrono::Utc::now().timestamp_millis();
+            // Reload settings right before writing so concurrent Claude Code
+            // edits during the network probe are preserved.
+            let mut latest_settings = claude_settings::load()?;
             let event =
-                claude_settings::install(&mut settings, account, now_ms, EventKind::Switch)?;
-            claude_settings::commit(&settings, Some(event))?;
+                claude_settings::install(&mut latest_settings, account, now_ms, EventKind::Switch)?;
+            claude_settings::commit(&latest_settings, Some(event))?;
             log(&message);
             Ok(Outcome {
                 action: Action::Switched,

@@ -23,12 +23,17 @@ pub const BASE: &str = "https://api.kimi.com/coding/v1";
 
 const FIXED_POINT_PER_CENT: f64 = 1e6;
 
-/// The windows Kimi reports, in display order, with their labels and lengths.
-const KNOWN: [(&str, &str, Option<i64>); 4] = [
-    ("limit_5h", "5h", Some(5 * 3600)),
-    ("limit_7d", "weekly", Some(7 * 86_400)),
-    ("limit_month_total", "monthly", None),
-    ("limit_month_code", "monthly (Kimi Code share)", None),
+/// The windows Kimi reports, in display order, with their group, labels and lengths.
+const KNOWN: [(&str, Option<&str>, &str, Option<i64>); 4] = [
+    ("limit_5h", None, "5h", Some(5 * 3600)),
+    ("limit_7d", None, "weekly", Some(7 * 86_400)),
+    ("limit_month_total", None, "monthly", Some(30 * 86_400)),
+    (
+        "limit_month_code",
+        Some("Kimi Code"),
+        "monthly (Kimi Code share)",
+        Some(30 * 86_400),
+    ),
 ];
 
 pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Reading {
@@ -101,8 +106,10 @@ async fn get(client: &reqwest::Client, url: &str, key: &str) -> Result<String, R
 struct UsagesBody {
     #[serde(default)]
     usages: Option<BTreeMap<String, Pool>>,
-    #[serde(default, alias = "boosterWallet")]
+    #[serde(default)]
     booster_wallet: Option<Wallet>,
+    #[serde(default, rename = "boosterWallet")]
+    booster_wallet_camel: Option<Wallet>,
 }
 
 #[derive(Deserialize)]
@@ -154,21 +161,26 @@ fn number(value: Option<&Value>) -> Option<f64> {
 }
 
 fn fixed_point_to_cents(value: f64) -> i64 {
-    let cents = value / FIXED_POINT_PER_CENT;
+    let cents = value.max(0.0) / FIXED_POINT_PER_CENT;
     if cents > 0.0 && cents < 1.0 {
         1
     } else {
-        cents.round() as i64
+        cents.clamp(0.0, i64::MAX as f64).round() as i64
     }
 }
 
-fn meter(label: String, span_secs: Option<i64>, pool: &Pool) -> Option<Limit> {
+fn meter(
+    group: Option<String>,
+    label: String,
+    span_secs: Option<i64>,
+    pool: &Pool,
+) -> Option<Limit> {
     Some(limit(
-        None,
+        group,
         label,
         span_secs,
         Window::new(
-            number(pool.used_ratio.as_ref())?,
+            number(pool.used_ratio.as_ref())?.max(0.0),
             crate::util::parse_reset(pool.reset_time.as_deref()),
         ),
         None,
@@ -249,7 +261,7 @@ const KNOWN_ME_KEYS: &[&str] = &[
 fn unrecognized(body: &Value) -> Vec<String> {
     let mut seen = Unrecognized::new();
     seen.keys("usages", body, KNOWN_KEYS);
-    let windows: Vec<&str> = KNOWN.iter().map(|(key, _, _)| *key).collect();
+    let windows: Vec<&str> = KNOWN.iter().map(|(key, _, _, _)| *key).collect();
     seen.keys("usages.usages", &body["usages"], &windows);
     for pool in body["usages"]
         .as_object()
@@ -309,20 +321,28 @@ fn parse_usages(body: &str) -> Result<Parsed, ReadError> {
     let mut pools = parsed.usages.unwrap_or_default();
     let mut meters: Vec<Limit> = KNOWN
         .iter()
-        .filter_map(|(key, label, span)| meter((*label).into(), *span, &pools.remove(*key)?))
+        .filter_map(|(key, group, label, span)| {
+            meter(
+                group.map(str::to_owned),
+                (*label).into(),
+                *span,
+                &pools.remove(*key)?,
+            )
+        })
         .collect();
     meters.extend(pools.iter().filter_map(|(key, pool)| {
-        meter(key.strip_prefix("limit_").unwrap_or(key).into(), None, pool)
+        meter(
+            None,
+            key.strip_prefix("limit_").unwrap_or(key).into(),
+            None,
+            pool,
+        )
     }));
     if meters.is_empty() {
         return Err(decode("the answer has no usage windows"));
     }
-    let balances = parsed
-        .booster_wallet
-        .as_ref()
-        .and_then(booster)
-        .into_iter()
-        .collect();
+    let wallet = parsed.booster_wallet.or(parsed.booster_wallet_camel);
+    let balances = wallet.as_ref().and_then(booster).into_iter().collect();
     Ok((meters, balances, unrecognized))
 }
 

@@ -156,15 +156,17 @@ struct RawWindow {
     used_percent: Option<f64>,
     limit_window_seconds: Option<i64>,
     reset_after_seconds: Option<i64>,
-    reset_at: Option<i64>,
+    reset_at: Option<Value>,
 }
 
 impl RawWindow {
     fn window(&self, at: DateTime<Utc>) -> Option<(Span, Window)> {
         let used = self.used_percent? / 100.0;
-        let resets_at = self
-            .reset_at
-            .or_else(|| self.reset_after_seconds.map(|after| at.timestamp() + after))
+        let resets_at = epoch_of(self.reset_at.as_ref())
+            .or_else(|| {
+                self.reset_after_seconds
+                    .map(|after| at.timestamp().saturating_add(after))
+            })
             .unwrap_or(0);
         Some((
             Span::from_seconds(self.limit_window_seconds),
@@ -231,7 +233,7 @@ struct RawSpendLimit {
     used: Option<Value>,
     remaining: Option<Value>,
     used_percent: Option<f64>,
-    reset_at: Option<i64>,
+    reset_at: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -403,6 +405,19 @@ pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Read
             message: "usage response is not a JSON object".to_owned(),
         });
     };
+    if !object.keys().any(|key| KNOWN_KEYS.contains(&key.as_str())) {
+        let detail = object
+            .get("detail")
+            .or_else(|| object.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("response contained no usage fields");
+        return Err(ReadError::Decode {
+            message: format!(
+                "unexpected usage response: {}",
+                crate::util::one_line(detail, 160)
+            ),
+        });
+    }
     fn field<T: serde::de::DeserializeOwned>(
         object: &serde_json::Map<String, Value>,
         key: &str,
@@ -418,9 +433,24 @@ pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Read
         )?),
     };
     let credits: Option<RawCredits> = field(object, "credits");
-    let extra: Vec<RawExtraLimit> = field(object, "additional_rate_limits").unwrap_or_default();
-    let models: std::collections::BTreeMap<String, RawModelUsage> =
-        field(object, "model_usage").unwrap_or_default();
+    let extra: Vec<RawExtraLimit> = object
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect();
+    let models: std::collections::BTreeMap<String, RawModelUsage> = object
+        .get("model_usage")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .filter_map(|(slug, item)| {
+            serde_json::from_value(item.clone())
+                .ok()
+                .map(|usage| (slug.clone(), usage))
+        })
+        .collect();
     let spend: Option<RawSpendControl> = field(object, "spend_control");
     let resets: Option<RawResetCredits> = field(object, "rate_limit_reset_credits");
     let reached: Option<RawReachedType> = field(object, "rate_limit_reached_type");
@@ -463,7 +493,7 @@ pub fn decode_usage(account: &str, body: &str, at: DateTime<Utc>) -> Result<Read
                     used: text_of(limit.used),
                     remaining: text_of(limit.remaining),
                     used_percent: limit.used_percent,
-                    reset_at: limit.reset_at,
+                    reset_at: epoch_of(limit.reset_at.as_ref()),
                     source: limit.source,
                 }),
             }),
@@ -594,17 +624,37 @@ pub async fn probe(client: &Client, account: &CodexAccount) -> Reading {
     reading
 }
 
-/// Probe every account through one client. The first request goes alone so
-/// a challenge settles and seeds the cookie jar; the rest run concurrently.
+/// Probe every account through one client. The first account with a local
+/// access token goes alone so a challenge settles and seeds the cookie jar;
+/// the rest run concurrently in input order.
 pub async fn probe_all(client: &Client, accounts: &[CodexAccount]) -> Vec<Reading> {
-    let Some((first, rest)) = accounts.split_first() else {
+    if accounts.is_empty() {
         return Vec::new();
+    }
+    let seed_idx = accounts.iter().position(|account| {
+        CodexHome::new(account.home())
+            .read()
+            .ok()
+            .and_then(|auth| auth.access_token().map(|_| ()))
+            .is_some()
+    });
+    let Some(seed_idx) = seed_idx else {
+        return futures::future::join_all(accounts.iter().map(|account| probe(client, account)))
+            .await;
     };
-    let mut probes = Vec::with_capacity(accounts.len());
-    probes.push(probe(client, first).await);
-    probes
-        .extend(futures::future::join_all(rest.iter().map(|account| probe(client, account))).await);
-    probes
+    let seed_reading = probe(client, &accounts[seed_idx]).await;
+    let rest_futures = accounts
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != seed_idx)
+        .map(|(idx, account)| async move { (idx, probe(client, account).await) });
+    let rest_readings = futures::future::join_all(rest_futures).await;
+    let mut ordered: Vec<Option<Reading>> = vec![None; accounts.len()];
+    ordered[seed_idx] = Some(seed_reading);
+    for (idx, reading) in rest_readings {
+        ordered[idx] = Some(reading);
+    }
+    ordered.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -1338,21 +1388,24 @@ pub(crate) mod tests {
         assert_eq!(over.least_remaining(), Some(0.0));
         assert!(!over.above(0.0, 0.0, None));
 
-        // `rate_limit: null`, a window that says no percentage, and an error
-        // envelope sent with HTTP 200: none has a window, so none is a
-        // landing, and nothing claims the backend allowed the account.
+        // `rate_limit: null` and a window that says no percentage: neither
+        // has a window, so neither is a landing. An HTTP 200 error envelope
+        // carrying no usage schema keys at all is a decode error.
         let mut null = weekly_only_body(10.0);
         null["rate_limit"] = Value::Null;
         let mut blank = weekly_only_body(10.0);
         blank["rate_limit"]["primary_window"] = json!({"limit_window_seconds": 604_800});
-        let envelope = json!({"detail": "Something went wrong"});
-        for (body, allowed) in [(&null, None), (&blank, Some(true)), (&envelope, None)] {
+        for (body, allowed) in [(&null, None), (&blank, Some(true))] {
             let reading = decode(body, 0);
             assert_eq!(reading.limits, [], "{body}");
             assert!(!reading.has_quota() && !reading.above(0.0, 0.0, None));
             assert_eq!(reading.least_remaining(), None);
             assert_eq!(reading.codex().unwrap().allowed, allowed);
         }
-        assert_eq!(decode(&envelope, 0).unrecognized, ["usage.detail"]);
+        let at = DateTime::from_timestamp(0, 0).unwrap();
+        for envelope in [json!({"detail": "Something went wrong"}), json!({})] {
+            let err = decode_usage("a", &envelope.to_string(), at).unwrap_err();
+            assert!(matches!(err, ReadError::Decode { .. }), "{err:?}");
+        }
     }
 }

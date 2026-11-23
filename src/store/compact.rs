@@ -265,7 +265,8 @@ fn take_exclusively(conn: &Connection, wait: Duration) -> Result<()> {
 }
 
 fn room_for(path: &Path) -> Result<()> {
-    let needed = size(path).saturating_mul(ROOM);
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let needed = size(path).saturating_add(size(&wal)).saturating_mul(ROOM);
     let dir = path.parent().unwrap_or(Path::new("."));
     let free = fs2::available_space(dir)
         .with_context(|| format!("failed to read the free space of {}", dir.display()))?;
@@ -347,7 +348,15 @@ fn keep_original(
         );
     }
     let partial = PathBuf::from(format!("{}.partial", original.display()));
-    let mut copy = std::fs::File::create(&partial)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut copy = options
+        .open(&partial)
         .with_context(|| format!("failed to create {}", partial.display()))?;
     crate::fs::set_mode(&partial, 0o600)?;
     std::io::copy(&mut database, &mut copy)

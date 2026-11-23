@@ -24,18 +24,21 @@ wrapper=$(mktemp -d "${TMPDIR:-/tmp}/tokeman-zig-cc.XXXXXX")/cc
 trap 'rm -rf "$(dirname "$wrapper")"' EXIT
 cat > "$wrapper" <<EOF
 #!/bin/sh
-args=""
+n=\$#
+i=0
 skip=0
-for a in "\$@"; do
+while [ "\$i" -lt "\$n" ]; do
+  a=\$1
+  shift
+  i=\$((i + 1))
   if [ "\$skip" = 1 ]; then skip=0; continue; fi
   case "\$a" in
     --target=*) continue ;;
     -target) skip=1; continue ;;
-    *) args="\$args \\"\$a\\"" ;;
+    *) set -- "\$@" "\$a" ;;
   esac
 done
-eval set -- \$args
-exec zig cc -target $zig_target "\$@"
+exec zig cc -target "$zig_target" "\$@"
 EOF
 chmod +x "$wrapper"
 

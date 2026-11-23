@@ -71,8 +71,11 @@ impl Ledger {
 
     /// The items of `standing` not told yet, each now recorded as told at
     /// `now`. Entries whose item has not stood for [`REARM_SECS`] are
-    /// forgotten.
+    /// forgotten first, so a returning episode is told anew even if no check
+    /// ran while it was absent.
     pub fn due<'a>(&mut self, standing: &'a [AttentionView], now: i64) -> Vec<&'a AttentionView> {
+        self.told
+            .retain(|_, told| now.saturating_sub(told.seen_at) < REARM_SECS);
         let mut due = Vec::new();
         for item in standing {
             match self.told.get_mut(&item.key) {
@@ -89,7 +92,6 @@ impl Ledger {
                 }
             }
         }
-        self.told.retain(|_, told| now - told.seen_at < REARM_SECS);
         due
     }
 }
@@ -156,6 +158,7 @@ fn notifier(title: &str, body: &str) -> Option<(Channel, PathBuf, Vec<String>)> 
         program,
         vec![
             "--app-name=tokeman".to_owned(),
+            "--".to_owned(),
             title.to_owned(),
             body.to_owned(),
         ],
@@ -301,6 +304,18 @@ impl Notifier {
         }
         lines
     }
+
+    /// Collect an in-flight notification round when the daemon shuts down.
+    pub async fn finish(&mut self) -> Vec<String> {
+        let Some(round) = self.running.take() else {
+            return Vec::new();
+        };
+        match tokio::time::timeout(DELIVERY_TIMEOUT, round).await {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(error)) => vec![format!("ERROR attention task failed: {error}")],
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +378,8 @@ mod tests {
         assert!(ledger.due(&[], NOW + 3_600 + REARM_SECS).is_empty());
         assert_eq!(ledger, Ledger::default());
         assert_eq!(ledger.due(&floor, NOW + 3_700 + REARM_SECS).len(), 1);
+        // Even with no check in between, standing again past REARM_SECS re-arms.
+        assert_eq!(ledger.due(&floor, NOW + 3_700 + 2 * REARM_SECS).len(), 1);
     }
 
     #[test]

@@ -139,8 +139,15 @@ pub struct ToolCheck {
 }
 
 /// The numbers of a dotted version; `None` when a part is not a number.
+/// Strips a leading `v` and any `-pre` / `+build` suffix.
 fn version_numbers(version: &str) -> Option<Vec<u64>> {
-    version.split('.').map(|part| part.parse().ok()).collect()
+    let core = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    parts.into_iter().map(|part| part.parse().ok()).collect()
 }
 
 /// The first word of `text` that is a dotted number (`codex-cli 0.167.0`,
@@ -191,21 +198,33 @@ pub enum Hook {
     },
 }
 
-/// The binary a hook command runs: its first word, unquoted. `None` for a
-/// command whose first word is not a plain or single-quoted path.
+/// The binary a hook command runs: its first word, unquoted (supporting
+/// `util::shell_quote`'s `'\''` apostrophe escapes). `None` for a command whose
+/// first word uses double quotes, backslashes or shell expansion.
 fn hook_binary(command: &str) -> Option<String> {
     let command = command.trim_start();
-    match command.strip_prefix('\'') {
-        Some(rest) => {
-            let (binary, after) = rest.split_once('\'')?;
-            // `'\''` continues the word; such a path is not judged.
-            (after.is_empty() || after.starts_with(' ')).then(|| binary.to_owned())
+    if command.starts_with('\'') {
+        let mut out = String::new();
+        let mut rest = command;
+        while let Some(inner) = rest.strip_prefix('\'') {
+            let (chunk, after) = inner.split_once('\'')?;
+            out.push_str(chunk);
+            if let Some(escaped) = after.strip_prefix("\\'") {
+                out.push('\'');
+                rest = escaped;
+            } else if after.is_empty() || after.starts_with(char::is_whitespace) {
+                return (!out.is_empty()).then_some(out);
+            } else {
+                return None;
+            }
         }
-        None => command
+        None
+    } else {
+        command
             .split_whitespace()
             .next()
             .filter(|word| !word.contains(['"', '\\', '$']))
-            .map(str::to_owned),
+            .map(str::to_owned)
     }
 }
 
@@ -412,7 +431,9 @@ impl Report {
     pub fn assemble(findings: Findings) -> Self {
         let mut problems = Vec::new();
         for account in &findings.accounts {
-            problems.extend(account_problem(account));
+            if !(account.credential == CredentialState::Missing && account.login_error.is_some()) {
+                problems.extend(account_problem(account));
+            }
             if let Some(error) = &account.login_error {
                 problems.push(Problem {
                     what: format!("{}: the browser login was refused ({error})", account.name),
@@ -593,12 +614,17 @@ async fn tool_version(binary: &str, arg: &str) -> Option<String> {
         .then(|| version_in(&String::from_utf8_lossy(&output.stdout)))?
 }
 
-async fn tools() -> Vec<ToolCheck> {
-    let claude = std::env::var("TOKEMAN_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+async fn tools(fleet: &Fleet) -> Vec<ToolCheck> {
+    let claude = std::env::var("TOKEMAN_CLAUDE_BIN")
+        .ok()
+        .or_else(|| fleet.launch.claude_bin.clone())
+        .unwrap_or_else(|| "claude".into());
+    let codex = std::env::var("TOKEMAN_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let agy = std::env::var("TOKEMAN_AGY_BIN").unwrap_or_else(|_| "agy".into());
     let (claude, codex, agy) = tokio::join!(
         tool_version(&claude, "--version"),
-        tool_version("codex", "--version"),
-        tool_version("agy", "--version"),
+        tool_version(&codex, "--version"),
+        tool_version(&agy, "--version"),
     );
     vec![
         ToolCheck::of("Claude Code", VERIFIED_CLAUDE_CODE, claude),
@@ -737,10 +763,16 @@ fn files() -> Vec<FileCheck> {
     #[cfg(unix)]
     {
         let (dir, tokens) = (paths::config_dir(), paths::accounts_file());
-        vec![
+        let mut checks = vec![
             FileCheck::of(dir.clone(), mode_of(&dir), 0o700),
             FileCheck::of(tokens.clone(), mode_of(&tokens), 0o600),
-        ]
+        ];
+        for backup in [paths::login_backup(), paths::agy_login_backup()] {
+            if let Some(mode) = mode_of(&backup) {
+                checks.push(FileCheck::of(backup, Some(mode), 0o600));
+            }
+        }
+        checks
     }
     #[cfg(not(unix))]
     Vec::new()
@@ -766,7 +798,7 @@ fn pending_claims(fleet: &Fleet) -> Result<Vec<Pending>, String> {
 pub async fn gather(fleet: &Fleet) -> Findings {
     let at = now();
     let (readings, tools, agy_slot) =
-        tokio::join!(view::probe(fleet, None), tools(), agy_slot(fleet));
+        tokio::join!(view::probe(fleet, None), tools(fleet), agy_slot(fleet));
     let mut accounts: Vec<AccountCheck> = readings.iter().map(AccountCheck::of).collect();
     for account in &mut accounts {
         if account.service == Service::Claude {
@@ -978,6 +1010,8 @@ mod tests {
         assert_eq!(state(Some("0.170.1")), VersionState::Newer);
         assert_eq!(state(Some("0.99.12")), VersionState::Older);
         assert_eq!(state(Some("1.0")), VersionState::Newer);
+        assert_eq!(state(Some("v0.167.0")), VersionState::Verified);
+        assert_eq!(state(Some("0.171.0-beta.1")), VersionState::Newer);
         assert_eq!(state(Some("nightly")), VersionState::NotFound);
         assert_eq!(state(None), VersionState::NotFound);
         assert_eq!(
@@ -1023,6 +1057,14 @@ mod tests {
             Hook::Dangling {
                 command: gone.into(),
                 binary: "/old/tokeman".into()
+            }
+        );
+        let apostrophe = "'/Users/Ember'\\''s Mac/tokeman' rotate observe-session --pid \"$PPID\"";
+        assert_eq!(
+            Hook::of(Ok(&settings(apostrophe)), here),
+            Hook::Dangling {
+                command: apostrophe.into(),
+                binary: "/Users/Ember's Mac/tokeman".into()
             }
         );
         // A bare name is resolved on PATH when the hook runs; it is not judged.

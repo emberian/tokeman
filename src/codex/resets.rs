@@ -138,21 +138,29 @@ impl CreditList {
         self.credits.iter().find(|credit| credit.id == id)
     }
 
-    /// Epoch seconds when the first available credit to expire does.
+    /// Epoch seconds when the first plan-supported available credit to expire does.
     pub fn next_expiry(&self) -> Option<i64> {
         self.credits
             .iter()
-            .filter(|credit| credit.status == CreditStatus::Available)
+            .filter(|credit| {
+                credit.status == CreditStatus::Available && credit.supported_by_plan != Some(false)
+            })
             .filter_map(|credit| credit.expires_at)
             .min()
     }
 
-    /// Put [`Self::next_expiry`] beside the count in `probe`.
+    /// Put [`Self::next_expiry`] beside the count in `probe` and merge any
+    /// unrecognized credit-list schema items into `probe.unrecognized`.
     pub fn date(&self, probe: &mut Reading) {
         if let Detail::Codex(codex) = &mut probe.detail
             && let Some(count) = &mut codex.reset_credits
         {
             count.expires_at = self.next_expiry();
+        }
+        if !self.unrecognized.is_empty() {
+            probe.unrecognized.extend(self.unrecognized.iter().cloned());
+            probe.unrecognized.sort();
+            probe.unrecognized.dedup();
         }
     }
 }
@@ -268,6 +276,9 @@ pub enum ConsumeCode {
     NoCredit,
     /// This request id was already redeemed: an earlier attempt went through.
     AlreadyRedeemed,
+    /// A newer backend code this build does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +412,19 @@ pub async fn plan(
     }
     let count = plan.probe.codex().and_then(|codex| codex.reset_credits);
     let applicable = count.and_then(|count| count.applicable);
-    if applicable.is_none_or(|applicable| applicable <= 0) {
+    let has_fallback_credit = count.is_some_and(|count| count.available > 0)
+        || plan.credits.as_ref().is_ok_and(|list| {
+            list.available > 0
+                || list.credits.iter().any(|credit| {
+                    credit.status == CreditStatus::Available
+                        && credit.supported_by_plan != Some(false)
+                })
+        });
+    let allowed_by_count = match applicable {
+        Some(applicable) => applicable > 0,
+        None => has_fallback_credit,
+    };
+    if !allowed_by_count {
         bail!(Refusal::NoApplicableCredit {
             available: count.map(|count| count.available),
             applicable,
@@ -448,6 +471,12 @@ pub async fn claim(
     now: i64,
 ) -> Result<Claim> {
     let account = &plan.account;
+    let auth = CodexHome::new(account.home())
+        .read()
+        .map_err(|error| anyhow::anyhow!("cannot read {}: {error:#}", account.name))?;
+    if auth.access_token().is_none() {
+        bail!("{} auth.json has no access_token", account.name);
+    }
     let (pending, fresh) = journal
         .begin(
             Service::Codex,
@@ -466,25 +495,20 @@ pub async fn claim(
     if let Some(credit_id) = &pending.item {
         body["credit_id"] = json!(credit_id);
     }
-    let answer = match CodexHome::new(account.home()).read() {
-        Err(error) => Err(ReadError::Credential {
-            message: format!("{error:#}"),
-        }),
-        Ok(auth) => probe::call(
-            client,
-            &account.name,
-            &auth,
-            reqwest::Method::POST,
-            &client.consume_url(),
-            Some(&body),
-        )
-        .await
-        .and_then(|text| {
-            serde_json::from_str::<Consumed>(&text).map_err(|error| ReadError::Decode {
-                message: format!("unreadable reset answer: {error}"),
-            })
-        }),
-    };
+    let answer = probe::call(
+        client,
+        &account.name,
+        &auth,
+        reqwest::Method::POST,
+        &client.consume_url(),
+        Some(&body),
+    )
+    .await
+    .and_then(|text| {
+        serde_json::from_str::<Consumed>(&text).map_err(|error| ReadError::Decode {
+            message: format!("unreadable reset answer: {error}"),
+        })
+    });
     match answer {
         Ok(consumed) => {
             journal.finish(Service::Codex, &account.name, &pending.request_id)?;
@@ -493,6 +517,12 @@ pub async fn claim(
                 consumed,
                 retried: !fresh,
             })
+        }
+        Err(ReadError::Http { status, body })
+            if fresh && matches!(status, 400 | 401 | 403 | 404 | 422) =>
+        {
+            let _ = journal.finish(Service::Codex, &account.name, &pending.request_id);
+            bail!("HTTP {status}: {body}");
         }
         Err(error) => Ok(Claim::Uncertain {
             redeem_request_id: pending.request_id,

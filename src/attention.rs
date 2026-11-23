@@ -32,7 +32,7 @@ impl Within {
     /// The threshold `at` falls in, seen from `now`; `None` when it is more
     /// than three days out. A date already passed is within a day.
     pub fn of(at: i64, now: i64) -> Option<Self> {
-        match at - now {
+        match at.saturating_sub(now) {
             left if left <= DAY_SECS => Some(Self::OneDay),
             left if left <= 3 * DAY_SECS => Some(Self::ThreeDays),
             _ => None,
@@ -194,13 +194,15 @@ pub fn find(overview: &Overview, now: i64) -> Vec<Attention> {
         }
     }
     for forecast in &overview.forecasts {
-        if let Outlook::Dry { at } = forecast.forecast.outlook
-            && at - now < DRY_WITHIN_SECS
+        let service = forecast.forecast.service;
+        let already_below = found
+            .iter()
+            .any(|item| matches!(item, Attention::BelowFloor { service: s } if *s == service));
+        if !already_below
+            && let Outlook::Dry { at } = forecast.forecast.outlook
+            && at.saturating_sub(now) < DRY_WITHIN_SECS
         {
-            found.push(Attention::RunsDry {
-                service: forecast.forecast.service,
-                at,
-            });
+            found.push(Attention::RunsDry { service, at });
         }
     }
     for account in &overview.accounts {
@@ -222,13 +224,23 @@ pub fn find(overview: &Overview, now: i64) -> Vec<Attention> {
             found.push(Attention::LoginAgeing { account: name() });
         }
     }
+    let mut soonest_claude_offer: Vec<(&str, i64)> = Vec::new();
     for offer in &overview.resets_on_offer {
-        if let Some(expires_at) = offer.expires_at.filter(|at| *at > now)
-            && let Some(within) = Within::of(expires_at, now)
-        {
+        if let Some(expires_at) = offer.expires_at.filter(|at| *at > now) {
+            match soonest_claude_offer
+                .iter_mut()
+                .find(|(acct, _)| *acct == offer.account.as_str())
+            {
+                Some((_, best)) => *best = (*best).min(expires_at),
+                None => soonest_claude_offer.push((offer.account.as_str(), expires_at)),
+            }
+        }
+    }
+    for (account, expires_at) in soonest_claude_offer {
+        if let Some(within) = Within::of(expires_at, now) {
             found.push(Attention::ResetExpires {
                 service: Service::Claude,
-                account: offer.account.clone(),
+                account: account.to_owned(),
                 expires_at,
                 within,
             });
@@ -256,7 +268,7 @@ pub fn find(overview: &Overview, now: i64) -> Vec<Attention> {
     }
     for view in &overview.codex_seats {
         let seat = &view.seat;
-        let left = seat.expires_at.map(|at| at - now);
+        let left = seat.expires_at.map(|at| at.saturating_sub(now));
         // Long past its end, the session has failed already and the entry
         // only waits for a service to forget it.
         if left.is_some_and(|left| left < -DAY_SECS) {
@@ -559,6 +571,8 @@ mod tests {
             Facts {
                 offers: vec![
                     offer(Some(NOW + 2 * DAY_SECS)),
+                    // A second offer on the same account expiring later is deduplicated.
+                    offer(Some(NOW + 2 * DAY_SECS + HOUR)),
                     offer(Some(NOW + 9 * DAY_SECS)),
                     offer(None),
                     // Already over: nothing is left to use.

@@ -8,12 +8,13 @@
 //! interval through `commands::view`. `r` reads now either way.
 
 use std::collections::BTreeMap;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -46,6 +47,7 @@ const SLOW_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What a finished load hands the screen.
 struct Loaded {
+    fleet: Option<Fleet>,
     overview: Overview,
     /// `Some` when a census was taken with this load; the inner `None` is a
     /// census that failed.
@@ -124,22 +126,31 @@ impl App {
     /// account when nothing else reads them or `force` asks.
     fn spawn_load(&mut self, force: bool) -> JoinHandle<Loaded> {
         self.loading = true;
-        let fleet = self.fleet.clone();
+        let fallback_fleet = self.fleet.clone();
         let force = force || self.always_fresh;
         let census = self
             .census_at
             .is_none_or(|at| at.elapsed() >= SLOW_INTERVAL);
         tokio::spawn(async move {
-            let overview = view::overview(&fleet, force).await;
+            let reloaded = Fleet::load().ok();
+            let active_fleet = reloaded.as_ref().unwrap_or(&fallback_fleet);
+            let overview = view::overview(active_fleet, force).await;
             let sessions = match census {
                 true => Some(sessions::live().await.ok()),
                 false => None,
             };
-            Loaded { overview, sessions }
+            Loaded {
+                fleet: reloaded,
+                overview,
+                sessions,
+            }
         })
     }
 
     fn apply(&mut self, loaded: Loaded) {
+        if let Some(fleet) = loaded.fleet {
+            self.fleet = fleet;
+        }
         if let Some(sessions) = loaded.sessions {
             self.live_sessions = sessions;
             self.census_at = Some(Instant::now());
@@ -226,16 +237,27 @@ impl App {
     }
 }
 
-/// Raw mode and the alternate screen, restored on drop whatever happens.
+/// Raw mode and the alternate screen, restored on drop or panic.
 pub(super) struct TerminalSession;
 
 impl TerminalSession {
     pub(super) fn enter() -> Result<Self> {
+        static PANIC_HOOK: Once = Once::new();
+        PANIC_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = disable_raw_mode();
+                let _ = std::io::stdout().execute(LeaveAlternateScreen);
+                crate::notice::set_muted(false);
+                previous(info);
+            }));
+        });
         enable_raw_mode()?;
         if let Err(error) = std::io::stdout().execute(EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
+        crate::notice::set_muted(true);
         Ok(Self)
     }
 }
@@ -244,6 +266,7 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        crate::notice::set_muted(false);
     }
 }
 
@@ -257,9 +280,7 @@ pub async fn run(fleet: Fleet, always_fresh: bool) -> Result<()> {
     let mut executable_replaced = false;
 
     loop {
-        if started_as.is_some()
-            && daemon::executable_identity().is_some_and(|current| Some(current) != started_as)
-        {
+        if daemon::executable_replaced(started_as) {
             executable_replaced = true;
             break;
         }
@@ -281,6 +302,7 @@ pub async fn run(fleet: Fleet, always_fresh: bool) -> Result<()> {
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char('r') => {
                     if let Some(load) = active.take() {
                         load.abort();
@@ -517,14 +539,17 @@ fn draw_cards(f: &mut Frame, area: Rect, app: &App) {
                     ..row
                 },
             );
+            let spark_width = row.width.saturating_sub(label_width + 2);
+            let tail = &data[data.len().saturating_sub(spark_width as usize)..];
             let sparkline = Sparkline::default()
-                .data(data)
+                .data(tail)
+                .max(100)
                 .style(Style::default().fg(Color::Cyan));
             f.render_widget(
                 sparkline,
                 Rect {
                     x: row.x + label_width.min(row.width),
-                    width: row.width.saturating_sub(label_width + 2),
+                    width: spark_width,
                     ..row
                 },
             );
@@ -920,6 +945,7 @@ mod tests {
         };
         let at = reading().at + 30;
         app.apply(Loaded {
+            fleet: None,
             overview: Overview::build(&fleet, facts(Monitor::Running), None, at),
             sessions: Some(Some(Vec::new())),
         });
@@ -938,6 +964,7 @@ mod tests {
 
         // Without the service it reads on the configured interval.
         app.apply(Loaded {
+            fleet: None,
             overview: Overview::build(
                 &fleet,
                 facts(Monitor::NotInstalled).with_fresh(vec![reading()]),
@@ -964,6 +991,7 @@ mod tests {
         // `--fresh` reads even while the service runs.
         let mut forced = App::new(fleet.clone(), true);
         forced.apply(Loaded {
+            fleet: None,
             overview: Overview::build(&fleet, facts(Monitor::Running), None, at),
             sessions: None,
         });

@@ -94,8 +94,10 @@ pub fn format_reset_compact(ts: i64) -> String {
         reset.with_timezone(&Local).format("%a %-I%p").to_string()
     } else if hours > 0 {
         format!("{hours}h{mins}m")
-    } else {
+    } else if mins > 0 {
         format!("{mins}m")
+    } else {
+        format!("{}s", diff.num_seconds())
     }
 }
 
@@ -175,7 +177,7 @@ fn brief_error(error: &str) -> String {
         let message = body["error"]["message"]
             .as_str()
             .or_else(|| body["error_description"].as_str())?;
-        Some(format!("{}{message}", &error[..start]))
+        Some(one_line(&format!("{}{message}", &error[..start]), 200))
     });
     message.unwrap_or_else(|| one_line(error, 200))
 }
@@ -328,7 +330,7 @@ pub fn limit_name(limit: &Limit) -> String {
         Scope::Model(key) if label.is_empty() => key.to_string(),
         _ => label.to_owned(),
     };
-    if limit.span == Span::Unknown || head.ends_with(&span) {
+    if limit.span == Span::Unknown || head.contains(&span) {
         head
     } else {
         format!("{head} {span}")
@@ -841,9 +843,10 @@ pub fn account_lines(
         .max()
         .unwrap_or(0);
     for limit in limits {
-        let mark = if target
-            .zip(limit.key())
-            .is_some_and(|(target, key)| target.is_limited_by(key))
+        let mark = if account.service == Service::Claude
+            && target
+                .zip(limit.key())
+                .is_some_and(|(target, key)| target.is_limited_by(key))
         {
             "*"
         } else {
@@ -1506,6 +1509,28 @@ pub fn print_reset_plan(plan: &crate::commands::claude::ResetPlan) {
     }
 }
 
+pub fn print_reset_cancelled() {
+    println!("Cancelled; no reset used.");
+}
+
+pub fn print_no_available_resets() {
+    println!(
+        "No available resets in these readings. Check one account with `tokeman claude reset <name> --list`."
+    );
+}
+
+fn claude_claim_result_word(result: &resets::ClaimResult) -> &'static str {
+    match result {
+        resets::ClaimResult::Reset => "reset",
+        resets::ClaimResult::AlreadyUsed => "already used",
+        resets::ClaimResult::NotLimited => "not rate-limited",
+        resets::ClaimResult::Cooldown => "cooling down",
+        resets::ClaimResult::Ineligible => "not eligible",
+        resets::ClaimResult::Unavailable => "not available",
+        resets::ClaimResult::Unknown => "unrecognized response",
+    }
+}
+
 pub fn print_reset_claimed(outcome: &resets::ClaimResponse) {
     let cleared: Vec<&str> = outcome
         .cleared
@@ -1525,8 +1550,16 @@ pub fn print_reset_claimed(outcome: &resets::ClaimResponse) {
                 .map(|left| format!("; resets left: {left}"))
                 .unwrap_or_default()
         ),
+        resets::ClaimResult::AlreadyUsed => println!(
+            "the earlier claim already went through; nothing more was spent{}",
+            outcome
+                .resets_left
+                .map(|left| format!(" (resets left: {left})"))
+                .unwrap_or_default()
+        ),
         other => println!(
-            "not applied: {other:?}{}{}",
+            "not applied: {}{}{}",
+            claude_claim_result_word(other),
             outcome
                 .reason
                 .as_deref()
@@ -1538,6 +1571,17 @@ pub fn print_reset_claimed(outcome: &resets::ClaimResponse) {
                 .map(|at| format!("; cooldown until {at}"))
                 .unwrap_or_default()
         ),
+    }
+}
+
+/// Non-`None` when a Claude reset request completed without applying a reset.
+pub fn claude_reset_failed(outcome: &resets::ClaimResponse) -> Option<String> {
+    match outcome.result {
+        resets::ClaimResult::Reset | resets::ClaimResult::AlreadyUsed => None,
+        ref other => Some(format!(
+            "reset was not applied ({})",
+            claude_claim_result_word(other)
+        )),
     }
 }
 
@@ -1628,6 +1672,7 @@ pub fn print_codex_imported(imported: &[codex::Imported]) {
 /// holds.
 pub fn print_codex_listed(overview: &Overview, listed: &[codex::Listed]) {
     println!("\n {BOLD}tokeman{RESET} — {}\n", view_caption(overview));
+    print_headlines(overview);
     for account in &overview.accounts {
         for line in account_lines(account, None, aged_at(overview)) {
             println!("{line}");
@@ -1672,7 +1717,14 @@ pub fn print_codex_used(used: &codex::Used) {
     match used {
         codex::Used::Seated(seated) => {
             warn(&seated.warnings);
-            println!("seated {} into {}", seated.account, tilde(&seated.into));
+            if seated.dry_run {
+                println!("would link {} into {}", seated.account, tilde(&seated.into));
+            } else {
+                println!("linked {} into {}", seated.account, tilde(&seated.into));
+                if let Some(backup) = &seated.backup {
+                    println!("backed up previous auth.json to {}", tilde(backup));
+                }
+            }
         }
         codex::Used::Reseated(reseat) => {
             warn(&reseat.warnings);
@@ -1774,6 +1826,7 @@ pub fn print_codex_reset_claimed(name: &str, claim: &codex_resets::Claim) {
             AlreadyRedeemed => "already redeemed; nothing more was spent".to_owned(),
             NothingToReset => "nothing to reset; no credit was spent".to_owned(),
             NoCredit => "no credit to spend".to_owned(),
+            Unknown => "unrecognized response code from backend".to_owned(),
         };
         println!("{name}: {text}");
     }
@@ -1792,6 +1845,20 @@ pub fn codex_reset_uncertain(name: &str, claim: &codex_resets::Claim) -> Option<
              which the backend redeems at most once. `tokeman codex reset {name} --clear` \
              forgets the claim once the usage page shows what happened"
         )),
+    }
+}
+
+/// Non-`None` when a Codex reset request answered without applying a reset.
+pub fn codex_reset_failed(name: &str, claim: &codex_resets::Claim) -> Option<String> {
+    use codex_resets::ConsumeCode::*;
+    let codex_resets::Claim::Answered { consumed, .. } = claim else {
+        return None;
+    };
+    match consumed.code {
+        Reset | AlreadyRedeemed => None,
+        NothingToReset => Some(format!("{name}: nothing to reset")),
+        NoCredit => Some(format!("{name}: no reset credit available")),
+        Unknown => Some(format!("{name}: unrecognized reset response code")),
     }
 }
 

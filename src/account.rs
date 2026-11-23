@@ -73,7 +73,7 @@ impl Login {
     /// Whole days since the browser login, when known.
     pub fn age_days(&self, now_ms: i64) -> Option<i64> {
         self.logged_in_at
-            .map(|at| (now_ms - at).max(0) / 86_400_000)
+            .map(|at| now_ms.saturating_sub(at).max(0) / 86_400_000)
     }
 }
 
@@ -89,7 +89,7 @@ impl Login {
     /// reported, [`LOGIN_WARNING_DAYS`] after the browser login.
     pub fn is_ageing(&self, now_ms: i64) -> bool {
         match self.refresh_expires_at {
-            Some(expires_at) => now_ms >= expires_at - REFRESH_WARNING_MS,
+            Some(expires_at) => now_ms >= expires_at.saturating_sub(REFRESH_WARNING_MS),
             None => self
                 .age_days(now_ms)
                 .is_some_and(|days| days >= LOGIN_WARNING_DAYS),
@@ -210,10 +210,10 @@ impl Account {
     /// room left to be adopted by a session.
     fn login_credential(&self, now_ms: i64) -> Option<Credential<'_>> {
         let login = self.login.as_ref().filter(|login| login.is_refreshable())?;
-        let token = login.access_token.as_deref()?;
+        let token = login.access_token.as_deref().filter(|t| !t.is_empty())?;
         if login
             .expires_at
-            .is_some_and(|expires_at| expires_at - now_ms < MIN_INSTALL_LIFETIME_MS)
+            .is_some_and(|expires_at| expires_at.saturating_sub(now_ms) < MIN_INSTALL_LIFETIME_MS)
         {
             return None;
         }
@@ -232,16 +232,23 @@ impl Account {
     }
 
     /// A token for the read-only profile endpoint. A captured access token
-    /// without refresh material still counts until it expires.
+    /// without refresh material still counts until it expires, unless the
+    /// login has failed permanently or lacks `user:profile` scope.
     pub fn profile_token(&self, now_ms: i64) -> Option<&str> {
         let login = self.login.as_ref()?;
+        if login.error.is_some() {
+            return None;
+        }
+        if !login.scopes.is_empty() && !login.scopes.iter().any(|scope| scope == "user:profile") {
+            return None;
+        }
         if login
             .expires_at
             .is_some_and(|expires_at| expires_at <= now_ms)
         {
             return None;
         }
-        login.access_token.as_deref()
+        login.access_token.as_deref().filter(|t| !t.is_empty())
     }
 
     pub fn is_refreshable(&self) -> bool {
@@ -258,8 +265,9 @@ impl Account {
         };
         let old_enough = login
             .obtained_at
-            .is_none_or(|obtained_at| now_ms - obtained_at >= MIN_REFRESH_AGE_MS);
-        expires_at <= now_ms || (expires_at - now_ms <= REFRESH_MARGIN_MS && old_enough)
+            .is_none_or(|obtained_at| now_ms.saturating_sub(obtained_at) >= MIN_REFRESH_AGE_MS);
+        expires_at <= now_ms
+            || (expires_at.saturating_sub(now_ms) <= REFRESH_MARGIN_MS && old_enough)
     }
 
     /// Whether `value` is one of this account's current credentials.
@@ -282,8 +290,8 @@ impl Account {
             (stored, reported) => reported.or(stored),
         };
         login.access_token = Some(grant.access_token);
-        if grant.refresh_token.is_some() {
-            login.refresh_token = grant.refresh_token;
+        if let Some(refresh_token) = grant.refresh_token.filter(|token| !token.is_empty()) {
+            login.refresh_token = Some(refresh_token);
         }
         login.expires_at = grant.expires_at;
         login.obtained_at = Some(now_ms);
@@ -488,26 +496,36 @@ impl Fleet {
     }
 
     fn save_to(&self, path: &Path, _lock: &FleetLock) -> Result<()> {
-        self.policy.validate()?;
+        self.validate()?;
         let existing = read_if_present(path)?.unwrap_or_default();
         write_atomic(path, self.render(&existing)?.as_bytes(), 0o600)
     }
 
+    pub fn validate(&self) -> Result<()> {
+        self.launch.validate()?;
+        self.policy.validate()?;
+        validate_names("tokens", self.accounts.iter().map(|a| a.name.as_str()))?;
+        validate_names("codex_accounts", self.codex.iter().map(|a| a.name.as_str()))?;
+        validate_names("services", self.services.iter().map(|a| a.name.as_str()))?;
+        Ok(())
+    }
+
     pub fn parse(contents: &str) -> Result<Self> {
         let file: File = toml::from_str(contents)?;
-        file.policy.validate()?;
-        Ok(Self {
+        let fleet = Self {
             accounts: file.tokens.into_iter().map(Account::from).collect(),
             codex: file.codex_accounts,
             services: file.services,
             launch: file.settings,
             policy: file.policy,
-        })
+        };
+        fleet.validate()?;
+        Ok(fleet)
     }
 
     /// Render over the existing document so comments and unknown keys stay.
     pub fn render(&self, existing: &str) -> Result<String> {
-        use toml_edit::{DocumentMut, Item, Table, value};
+        use toml_edit::{DocumentMut, value};
         let mut doc: DocumentMut = existing.parse().unwrap_or_default();
         sync_tables(
             &mut doc,
@@ -593,11 +611,7 @@ impl Fleet {
                 set_opt(table, "label", account.label.as_deref().map(value));
             },
         );
-        let settings = doc
-            .entry("settings")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .context("[settings] is not a table")?;
+        let settings = ensure_section_table(&mut doc, "settings")?;
         set(
             settings,
             "launch_args",
@@ -613,12 +627,18 @@ impl Fleet {
         set(
             settings,
             "probe_interval_secs",
-            value(self.launch.probe_interval_secs as i64),
+            value(
+                i64::try_from(self.launch.probe_interval_secs)
+                    .context("probe_interval_secs exceeds TOML integer range")?,
+            ),
         );
         set(
             settings,
             "services_interval_secs",
-            value(self.launch.services_interval_secs as i64),
+            value(
+                i64::try_from(self.launch.services_interval_secs)
+                    .context("services_interval_secs exceeds TOML integer range")?,
+            ),
         );
         set(settings, "notifications", value(self.launch.notifications));
         set_opt(
@@ -631,11 +651,7 @@ impl Fleet {
             "claude_bin",
             self.launch.claude_bin.as_deref().map(value),
         );
-        let rotation = doc
-            .entry("rotation")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .context("[rotation] is not a table")?;
+        let rotation = ensure_section_table(&mut doc, "rotation")?;
         let policy = &self.policy;
         for (key, number) in [
             ("normal_min_5h_remaining", policy.normal_min_5h_remaining),
@@ -661,17 +677,26 @@ impl Fleet {
         set(
             rotation,
             "normal_probe_interval_secs",
-            value(policy.normal_probe_interval_secs as i64),
+            value(
+                i64::try_from(policy.normal_probe_interval_secs)
+                    .context("normal_probe_interval_secs exceeds TOML integer range")?,
+            ),
         );
         set(
             rotation,
             "sip_probe_interval_secs",
-            value(policy.sip_probe_interval_secs as i64),
+            value(
+                i64::try_from(policy.sip_probe_interval_secs)
+                    .context("sip_probe_interval_secs exceeds TOML integer range")?,
+            ),
         );
         set(
             rotation,
             "target_model_sample_secs",
-            value(policy.target_model_sample_secs as i64),
+            value(
+                i64::try_from(policy.target_model_sample_secs)
+                    .context("target_model_sample_secs exceeds TOML integer range")?,
+            ),
         );
         Ok(doc.to_string())
     }
@@ -756,10 +781,47 @@ impl From<Account> for Record {
     }
 }
 
+fn validate_names<'a>(section: &str, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+            anyhow::bail!("[[{section}]] has an invalid account name {name:?}");
+        }
+        if !seen.insert(name) {
+            anyhow::bail!("[[{section}]] has duplicate account name {name:?}");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_section_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    name: &str,
+) -> Result<&'a mut toml_edit::Table> {
+    use toml_edit::{Item, Table, Value};
+    if matches!(doc.get(name), Some(Item::Value(Value::InlineTable(_))))
+        && let Some(Item::Value(Value::InlineTable(inline))) = doc.remove(name)
+    {
+        let mut table = inline.into_table();
+        table.set_implicit(false);
+        doc.insert(name, Item::Table(table));
+    }
+    doc.entry(name)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .with_context(|| format!("[{name}] is not a table"))
+}
+
 fn set(table: &mut toml_edit::Table, key: &str, item: impl Into<toml_edit::Item>) {
-    let item = item.into();
+    let mut item = item.into();
     match table.get_mut(key) {
-        Some(existing) => *existing = item,
+        Some(existing) => {
+            if let (Some(old_val), Some(new_val)) = (existing.as_value(), item.as_value_mut()) {
+                *new_val.decor_mut() = old_val.decor().clone();
+            }
+            *existing = item;
+        }
         None => {
             table.insert(key, item);
         }
@@ -1229,5 +1291,18 @@ mod tests {
         let rendered = fleet.render("").unwrap();
         let reparsed = Fleet::parse(&rendered).unwrap();
         assert_eq!(reparsed, fleet);
+
+        // Inline settings/rotation tables and inline comments survive render.
+        let inline = "settings = { notifications = false }\nrotation = { codex_auto_move = false }\n[[tokens]]\nname = \"acct\" # keep inline comment\nkey = \"sk-ant-oat01-setup\"\n";
+        let parsed = Fleet::parse(inline).unwrap();
+        assert!(!parsed.launch.notifications);
+        assert!(!parsed.policy.codex_auto_move);
+        let rerendered = parsed.render(inline).unwrap();
+        assert!(rerendered.contains("# keep inline comment"), "{rerendered}");
+        assert_eq!(Fleet::parse(&rerendered).unwrap(), parsed);
+
+        // Duplicate or blank names are refused.
+        assert!(Fleet::parse("[[tokens]]\nname = \"  \"\n").is_err());
+        assert!(Fleet::parse("[[tokens]]\nname = \"a\"\n[[tokens]]\nname = \"a\"\n").is_err());
     }
 }

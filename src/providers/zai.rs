@@ -145,25 +145,30 @@ impl RawLimit {
             6 => 7 * DAY,
             _ => return None,
         };
-        Some(number * unit)
+        number.checked_mul(unit)
     }
 
     fn meter(&self, now: i64) -> Option<Limit> {
         let span_secs = self.span_secs();
-        let limit = self.usage.filter(|&limit| limit > 0.0);
-        let used_amount = limit.and_then(|limit| {
-            self.current
-                .or_else(|| self.remaining.map(|remaining| limit - remaining))
-        });
+        let limit = self.usage.filter(|&limit| limit.is_finite() && limit > 0.0);
+        let used_amount = limit
+            .and_then(|limit| {
+                self.current
+                    .or_else(|| self.remaining.map(|remaining| limit - remaining))
+            })
+            .filter(|n| n.is_finite())
+            .map(|used| used.max(0.0));
         let used = match (used_amount, limit) {
-            (Some(used), Some(limit)) => used.max(0.0) / limit,
-            _ => self.percentage? / 100.0,
+            (Some(used), Some(limit)) => used / limit,
+            _ => self.percentage.filter(|p| p.is_finite())?.max(0.0) / 100.0,
         };
         // A reset further away than the window is long is not this window's.
         let resets_at = self
             .next_reset_ms
             .map(|ms| ms / 1000)
-            .filter(|&at| span_secs.is_none_or(|span| at <= now + span + MINUTE))
+            .filter(|&at| {
+                span_secs.is_none_or(|span| at <= now.saturating_add(span).saturating_add(MINUTE))
+            })
             .unwrap_or(0);
         let (group, unit) = match self.kind {
             Kind::Credit => (None, "credits"),

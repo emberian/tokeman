@@ -31,7 +31,7 @@ pub const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's officia
 /// headers; the token endpoint rate-limits other clients.
 pub const TOKEN_USER_AGENT: &str = "axios/1.15.2";
 /// Used when the installed `claude` cannot report its version.
-const FALLBACK_CLI_VERSION: &str = "2.1.282";
+const FALLBACK_CLI_VERSION: &str = "2.1.322";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const VERSION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -135,7 +135,7 @@ impl Client {
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(user_agent())
             .build()
-            .unwrap_or_default();
+            .expect("valid Anthropic HTTP client configuration");
         Self {
             http,
             api: api.trim_end_matches('/').to_owned(),

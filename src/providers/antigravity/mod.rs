@@ -50,6 +50,7 @@ const PINNED_HUB_VERSION: &str = "2.28.0";
 const MIN_GEMINI_HUB_VERSION: (u32, u32, u32) = (2, 8, 0);
 /// The project consumer accounts share, used when `loadCodeAssist` is down.
 const CONSUMER_PROJECT: &str = "aicode-consumers";
+const LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Refresh this long before Google's expiry.
 const EXPIRY_MARGIN_MS: i64 = 60_000;
@@ -65,7 +66,7 @@ const WEEK: i64 = 7 * 86_400;
 struct Endpoints {
     api: String,
     token_url: String,
-    cache: PathBuf,
+    cache: Option<PathBuf>,
     /// The `User-Agent` of every API request.
     agent: String,
 }
@@ -75,8 +76,15 @@ impl Endpoints {
         Self {
             api: API.into(),
             token_url: TOKEN_URL.into(),
-            cache: paths::antigravity_tokens(),
+            cache: Some(paths::antigravity_tokens()),
             agent: user_agent().to_owned(),
+        }
+    }
+
+    fn live_uncached() -> Self {
+        Self {
+            cache: None,
+            ..Self::live()
         }
     }
 }
@@ -85,6 +93,11 @@ impl Endpoints {
 /// the reading's `error`.
 pub async fn read(client: &Client, account: &ServiceAccount, now: i64) -> Reading {
     read_with(client, &Endpoints::live(), account, now).await
+}
+
+/// [`read`], without writing refreshed tokens to `antigravity-tokens.json`.
+pub async fn read_uncached(client: &Client, account: &ServiceAccount, now: i64) -> Reading {
+    read_with(client, &Endpoints::live_uncached(), account, now).await
 }
 
 async fn read_with(
@@ -105,12 +118,15 @@ async fn poll(
     account: &ServiceAccount,
     now: i64,
 ) -> Result<Reading, ReadError> {
-    let now_ms = now * 1000;
+    let now_ms = now.saturating_mul(1000);
     let mut session = Session::start(client, endpoints, account, now_ms).await?;
 
-    // The plan is decoration: a failed loadCodeAssist still reads quota.
+    // The plan is decoration: a failed or slow loadCodeAssist still reads quota.
     let mut seen = Unrecognized::new();
-    let (plan, project) = match session.post("loadCodeAssist", &load_body()).await {
+    let (plan, project) = match session
+        .post_with_timeout("loadCodeAssist", &load_body(), LOAD_TIMEOUT)
+        .await
+    {
         Ok(value) => {
             seen.keys("loadCodeAssist", &value, KNOWN_LOAD_KEYS);
             plan_and_project(&value)
@@ -119,9 +135,10 @@ async fn poll(
     };
     let project = project.unwrap_or_else(|| CONSUMER_PROJECT.into());
     let summary = session
-        .post(
+        .post_with_timeout(
             "retrieveUserQuotaSummary",
             &serde_json::json!({ "project": project }),
+            REQUEST_TIMEOUT,
         )
         .await?;
     seen.extend(unrecognized(&summary));
@@ -313,7 +330,7 @@ fn meter(group: Option<String>, bucket: Bucket, now: i64) -> Option<Limit> {
         group,
         label,
         span_secs,
-        Window::new(1.0 - remaining, resets_at),
+        Window::new((1.0 - remaining).max(0.0), resets_at),
         None,
     ))
 }
@@ -430,7 +447,8 @@ impl<'a> Session<'a> {
             return Some(token);
         }
         let refresh_token = self.account.refresh_token.as_deref()?;
-        let cache = TokenCache::load(&self.endpoints.cache);
+        let cache_path = self.endpoints.cache.as_deref()?;
+        let cache = TokenCache::load(cache_path);
         let cached = cache.tokens.get(&self.account.name)?;
         if cached.refresh_fingerprint != Fingerprint::of(refresh_token) {
             return None;
@@ -449,31 +467,41 @@ impl<'a> Session<'a> {
                     .into(),
             })?;
         let grant = exchange(self.client, &self.endpoints.token_url, refresh_token).await?;
-        let expires_at = self.now_ms + grant.expires_in.unwrap_or(3599) * 1000;
+        let expires_at = self
+            .now_ms
+            .saturating_add(grant.expires_in.unwrap_or(3599).saturating_mul(1000));
         // A cache that cannot be written costs one extra refresh next poll.
-        let _ = TokenCache::store(
-            &self.endpoints.cache,
-            &self.account.name,
-            CachedToken {
+        if let Some(cache_path) = self.endpoints.cache.clone() {
+            let account_name = self.account.name.clone();
+            let entry = CachedToken {
                 access_token: grant.access_token.clone(),
                 expires_at,
                 refresh_fingerprint: Fingerprint::of(refresh_token),
-            },
-        );
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                TokenCache::store(&cache_path, &account_name, entry)
+            })
+            .await;
+        }
         self.access_token = grant.access_token;
         self.fresh = true;
         Ok(())
     }
 
     /// POST `v1internal:<method>`; a 401 on a stored token refreshes once.
-    async fn post(&mut self, method: &str, body: &Value) -> Result<Value, ReadError> {
+    async fn post_with_timeout(
+        &mut self,
+        method: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value, ReadError> {
         loop {
             let response = self
                 .client
                 .post(format!("{}/v1internal:{method}", self.endpoints.api))
                 .bearer_auth(&self.access_token)
                 .header(header::USER_AGENT, &self.endpoints.agent)
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(timeout)
                 .json(body)
                 .send()
                 .await
@@ -538,12 +566,15 @@ impl TokenCache {
             .unwrap_or_default()
     }
 
-    /// Read-modify-write under the cache's lock; skipped when another process
-    /// holds it.
+    /// Read-modify-write under the cache's lock so concurrent account refreshes
+    /// in `read_all` never drop each other's cached tokens.
     fn store(path: &Path, account: &str, token: CachedToken) -> Result<()> {
-        let Some(_lock) = FileLock::try_acquire(&path.with_extension("lock"))? else {
-            return Ok(());
+        let lock_path = if path == paths::antigravity_tokens() {
+            paths::antigravity_tokens_lock()
+        } else {
+            path.with_extension("lock")
         };
+        let _lock = FileLock::acquire(&lock_path)?;
         let mut cache = Self::load(path);
         cache.tokens.insert(account.to_owned(), token);
         let mut bytes = serde_json::to_vec_pretty(&cache)?;
@@ -831,7 +862,7 @@ mod tests {
         let endpoints = Endpoints {
             api: base.clone(),
             token_url: format!("{base}/token"),
-            cache: dir.path().join("antigravity-access-tokens.json"),
+            cache: Some(dir.path().join("antigravity-access-tokens.json")),
             agent: agent_for(None),
         };
         (endpoints, dir)
@@ -888,7 +919,8 @@ mod tests {
         let again = read_with(&client, &endpoints, &grant("a@example.com"), NOW + 60).await;
         assert_eq!(again.error, None);
         assert_eq!(fake.seen.lock().unwrap().refreshes.len(), 1);
-        let cached = TokenCache::load(&endpoints.cache);
+        let cache_path = endpoints.cache.as_ref().unwrap();
+        let cached = TokenCache::load(cache_path);
         assert_eq!(
             cached.tokens["a@example.com"].expires_at,
             NOW * 1000 + 3_599_000
@@ -896,10 +928,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&endpoints.cache)
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = std::fs::metadata(cache_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 
@@ -1012,7 +1041,7 @@ mod tests {
         assert!(!accounts.is_empty());
         let dir = tempfile::tempdir().unwrap();
         let mut endpoints = Endpoints::live();
-        endpoints.cache = dir.path().join("antigravity-access-tokens.json");
+        endpoints.cache = Some(dir.path().join("antigravity-access-tokens.json"));
         let now = chrono::Utc::now().timestamp();
         for account in accounts {
             let usage = read_with(&Client::new(), &endpoints, &account, now).await;

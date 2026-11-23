@@ -300,7 +300,7 @@ class TokemanViewModel: ObservableObject {
     }
 
     /// Whether the background service reads the accounts by itself.
-    var serviceReads: Bool { overview?.monitor == "running" }
+    var serviceReads: Bool { overview?.monitor == "running" || overview?.monitor == "paused" }
 
     /// The stored view is older than the service would leave it.
     var isStale: Bool {
@@ -367,9 +367,22 @@ class TokemanViewModel: ObservableObject {
         }
     }
 
-    private func decode(_ output: String, from command: String) {
-        guard let data = output.data(using: .utf8), !output.isEmpty else {
-            loadError = "Could not run tokeman (looked at \(findTokeman())). Install it with: cargo install --path ."
+    private var cachedBin: String?
+
+    private func decode(_ result: ShellResult, from command: String, bin: String) {
+        if result.status == nil {
+            loadError = "Could not run tokeman (looked at \(bin)). Install it with: cargo install --path ."
+            return
+        }
+        if let code = result.status, code != 0 {
+            let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            loadError = detail.isEmpty
+                ? "`tokeman \(command)` exited with status \(code)"
+                : detail
+            return
+        }
+        guard let data = result.stdout.data(using: .utf8), !result.stdout.isEmpty else {
+            loadError = "`tokeman \(command)` returned empty output"
             return
         }
         do {
@@ -382,9 +395,9 @@ class TokemanViewModel: ObservableObject {
     }
 
     func load() async {
-        let bin = findTokeman()
-        decode(await shell(bin, args: ["list", "--json"]), from: "list --json")
-        settings = LaunchSettings.parse(await shell(bin, args: ["settings", "show"]))
+        let bin = await resolveTokeman()
+        decode(await runTokeman(bin, args: ["list", "--json"]), from: "list --json", bin: bin)
+        settings = LaunchSettings.parse((await runTokeman(bin, args: ["settings", "show"])).stdout)
         await loadHistory(bin)
     }
 
@@ -394,7 +407,7 @@ class TokemanViewModel: ObservableObject {
         lastHistoryLoad = Date()
         var grouped: [String: [Reading]] = [:]
         for service in overview.services {
-            let output = await shell(bin, args: ["history", "--service", service.key, "--json", "--since", "24"])
+            let output = (await runTokeman(bin, args: ["history", "--service", service.key, "--json", "--since", "24"])).stdout
             guard let data = output.data(using: .utf8),
                   let readings = try? JSONDecoder().decode([Reading].self, from: data) else {
                 continue
@@ -425,7 +438,8 @@ class TokemanViewModel: ObservableObject {
         isReading = true
         lastRead = Date()
         Task {
-            decode(await shell(findTokeman(), args: ["--fresh", "--json"]), from: "--fresh --json")
+            let bin = await resolveTokeman()
+            decode(await runTokeman(bin, args: ["--fresh", "--json"]), from: "--fresh --json", bin: bin)
             isReading = false
         }
     }
@@ -453,9 +467,10 @@ class TokemanViewModel: ObservableObject {
     /// Every write to tokens.toml goes through tokeman itself: its writer
     /// takes the config lock and keeps comments and every field.
     private func setSetting(_ key: String, _ value: String) async {
-        let output = await shell(findTokeman(), args: ["settings", "set", key, value])
-        if !output.hasPrefix("set ") {
-            fputs("tokeman tray: could not set \(key): \(output)\n", stderr)
+        let bin = await resolveTokeman()
+        let result = await runTokeman(bin, args: ["settings", "set", key, value])
+        if !result.stdout.hasPrefix("set ") {
+            fputs("tokeman tray: could not set \(key): \(result.stderr.isEmpty ? result.stdout : result.stderr)\n", stderr)
         }
     }
 
@@ -465,7 +480,8 @@ class TokemanViewModel: ObservableObject {
         if settings.dangerousMode && !args.contains("--dangerously-skip-permissions") {
             args.append("--dangerously-skip-permissions")
         }
-        return ([bin] + args).map(shellQuote).joined(separator: " ")
+        let quoted = ([bin] + args).map(shellQuote).joined(separator: " ")
+        return "env -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_SCOPES -u TOKEMAN_ACCOUNT \(quoted)"
     }
 
     /// Make `name` the default, then open Claude in a terminal.
@@ -473,9 +489,11 @@ class TokemanViewModel: ObservableObject {
         guard overview?.accounts.contains(where: { $0.isClaude && $0.name == name }) == true else { return }
         let cmd = claudeCommand
         Task {
-            let result = await shell(findTokeman(), args: ["claude", "use", name])
-            guard !result.isEmpty else {
-                loadError = "Could not activate \(name) through tokeman"
+            let bin = await resolveTokeman()
+            let result = await runTokeman(bin, args: ["claude", "use", name])
+            guard result.status == 0, !result.stdout.isEmpty else {
+                let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                loadError = detail.isEmpty ? "Could not activate \(name) through tokeman" : detail
                 return
             }
             launchTerminal(cmd: cmd, terminal: settings.terminal)
@@ -484,46 +502,23 @@ class TokemanViewModel: ObservableObject {
 
     /// Open Claude on whichever account the rotation policy picks.
     func launchBest() {
-        launchTerminal(cmd: "\(shellQuote(findTokeman())) claude launch", terminal: settings.terminal)
+        Task {
+            let bin = await resolveTokeman()
+            launchTerminal(cmd: "\(shellQuote(bin)) claude launch", terminal: settings.terminal)
+        }
     }
 
     // --- helpers ---
 
-    private func findTokeman() -> String {
-        let candidates = [
-            ProcessInfo.processInfo.environment["TOKEMAN_BIN"],
-            "\(NSHomeDirectory())/.cargo/bin/tokeman",
-            "/usr/local/bin/tokeman",
-            "/opt/homebrew/bin/tokeman",
-        ]
-        for p in candidates.compactMap({ $0 }) {
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
+    private func resolveTokeman() async -> String {
+        if let cachedBin, FileManager.default.isExecutableFile(atPath: cachedBin) {
+            return cachedBin
         }
-        if let resolved = shellWhich("tokeman") { return resolved }
-        return "tokeman"
-    }
-
-    private func shellWhich(_ cmd: String) -> String? {
-        let proc = Process()
-        let pipe = Pipe()
-        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-lc", "which \(cmd)"]
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let path = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !path.isEmpty,
-              FileManager.default.isExecutableFile(atPath: path) else { return nil }
-        return path
-    }
-
-    private func shell(_ path: String, args: [String]) async -> String {
-        await runTokeman(path, args: args)
+        let resolved = await Task.detached(priority: .userInitiated) {
+            findTokemanOnDisk()
+        }.value
+        cachedBin = resolved
+        return resolved
     }
 
     private func shellQuote(_ value: String) -> String {
@@ -566,27 +561,82 @@ class TokemanViewModel: ObservableObject {
     }
 }
 
-/// Run tokeman and return its stdout; empty when it could not run. The
-/// output is drained before the wait, so a large answer cannot fill the pipe
-/// and stall the child.
-func runTokeman(_ path: String, args: [String]) async -> String {
+struct ShellResult: Sendable {
+    let status: Int32?
+    let stdout: String
+    let stderr: String
+}
+
+private func findTokemanOnDisk() -> String {
+    let candidates = [
+        ProcessInfo.processInfo.environment["TOKEMAN_BIN"],
+        "\(NSHomeDirectory())/.cargo/bin/tokeman",
+        "/usr/local/bin/tokeman",
+        "/opt/homebrew/bin/tokeman",
+    ]
+    for p in candidates.compactMap({ $0 }) {
+        if FileManager.default.isExecutableFile(atPath: p) { return p }
+    }
+    let proc = Process()
+    let pipe = Pipe()
+    proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    proc.arguments = ["-lc", "command -v tokeman"]
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        let killTimer = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: killTimer)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        killTimer.cancel()
+        if let path = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !path.isEmpty,
+           FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+    } catch {}
+    return "tokeman"
+}
+
+/// Run tokeman with a 30s timeout and return its exit status, stdout and
+/// stderr. Both pipes are drained concurrently before waiting so a large
+/// answer cannot stall the child.
+func runTokeman(_ path: String, args: [String]) async -> ShellResult {
     await withCheckedContinuation { cont in
         DispatchQueue.global().async {
             let proc = Process()
-            let pipe = Pipe()
+            let outPipe = Pipe()
+            let errPipe = Pipe()
             proc.executableURL = URL(fileURLWithPath: path)
             proc.arguments = args
-            proc.standardOutput = pipe
-            proc.standardError = FileHandle.nullDevice
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
             do {
                 try proc.run()
             } catch {
-                cont.resume(returning: "")
+                cont.resume(returning: ShellResult(status: nil, stdout: "", stderr: ""))
                 return
             }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let killTimer = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: killTimer)
+            var errData = Data()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            group.wait()
             proc.waitUntilExit()
-            cont.resume(returning: String(data: data, encoding: .utf8) ?? "")
+            killTimer.cancel()
+            cont.resume(returning: ShellResult(
+                status: proc.terminationStatus,
+                stdout: String(data: outData, encoding: .utf8) ?? "",
+                stderr: String(data: errData, encoding: .utf8) ?? ""
+            ))
         }
     }
 }
@@ -696,7 +746,7 @@ struct MiniUtilizationChart: View {
 
     var body: some View {
         Chart {
-            ForEach(snapshots) { snap in
+            ForEach(Array(snapshots.enumerated()), id: \.offset) { _, snap in
                 if let rem = snap.remaining(for: series) {
                     AreaMark(x: .value("Time", snap.date), y: .value("Remaining", rem))
                         .foregroundStyle(chartColor.opacity(0.15))
@@ -727,13 +777,15 @@ struct AccountDetailChart: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            Picker("Limit", selection: $series) {
-                ForEach(limits, id: \.series) { limit in
-                    Text(limit.name ?? limit.series).tag(limit.series)
+            if !limits.isEmpty {
+                Picker("Limit", selection: $series) {
+                    ForEach(limits, id: \.series) { limit in
+                        Text(limit.name ?? limit.series).tag(limit.series)
+                    }
                 }
+                .pickerStyle(.menu)
+                .labelsHidden()
             }
-            .pickerStyle(.menu)
-            .labelsHidden()
 
             Chart {
                 RuleMark(y: .value("Warning", 20))
@@ -743,7 +795,7 @@ struct AccountDetailChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                     .foregroundStyle(.red.opacity(0.5))
 
-                ForEach(snapshots) { snap in
+                ForEach(Array(snapshots.enumerated()), id: \.offset) { _, snap in
                     if let rem = snap.remaining(for: series) {
                         LineMark(x: .value("Time", snap.date), y: .value("Remaining %", rem))
                             .foregroundStyle(.blue)
@@ -779,7 +831,7 @@ struct ComparisonChart: View {
     var body: some View {
         Chart {
             ForEach(history, id: \.name) { entry in
-                ForEach(entry.readings) { snap in
+                ForEach(Array(entry.readings.enumerated()), id: \.offset) { _, snap in
                     if let rem = snap.remaining(for: Limit.weekly) {
                         LineMark(
                             x: .value("Time", snap.date),

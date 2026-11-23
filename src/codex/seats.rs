@@ -103,7 +103,7 @@ impl Seats {
     /// Every pushed seat. An entry this build does not read is left out;
     /// no file is no seats.
     pub fn load(&self) -> Vec<Pushed> {
-        read_at(&self.path)
+        read_checked(&self.path).unwrap_or_default()
     }
 
     /// The seat on `home` (`~`-relative), if tokeman pushed one.
@@ -113,11 +113,13 @@ impl Seats {
 
     fn change(&self, change: impl FnOnce(&mut Vec<Pushed>)) -> Result<()> {
         crate::fs::ensure_private_parent(&self.path)?;
-        let _lock = FileLock::acquire_announced(
-            &self.path.with_extension("lock"),
-            "the Codex seat file lock",
-        )?;
-        let mut seats = read_at(&self.path);
+        let lock_path = if self.path == paths::codex_seats() {
+            paths::codex_seats_lock()
+        } else {
+            self.path.with_extension("lock")
+        };
+        let _lock = FileLock::acquire_announced(&lock_path, "the Codex seat file lock")?;
+        let mut seats = read_checked(&self.path)?;
         let before = seats.clone();
         change(&mut seats);
         if seats == before {
@@ -141,6 +143,14 @@ impl Seats {
         self.change(|seats| seats.retain(|known| known.home != home))
     }
 
+    /// Forget the seat on `of.home` only if it still holds `of.token`, so a
+    /// concurrent `codex use` push is never deleted by a racing tend.
+    pub fn forget_if(&self, of: &Pushed) -> Result<()> {
+        self.change(|seats| {
+            seats.retain(|known| !(known.home == of.home && known.token == of.token))
+        })
+    }
+
     /// Set or clear the trouble of the seat on `home`, if it still holds
     /// the token `of` was read with.
     pub fn trouble(&self, of: &Pushed, trouble: Option<Trouble>) -> Result<()> {
@@ -155,15 +165,15 @@ impl Seats {
     }
 }
 
-fn read_at(path: &Path) -> Vec<Pushed> {
-    let Some(text) = read_if_present(path).ok().flatten() else {
-        return Vec::new();
+fn read_checked(path: &Path) -> Result<Vec<Pushed>> {
+    let Some(text) = read_if_present(path)? else {
+        return Ok(Vec::new());
     };
-    serde_json::from_str::<Vec<serde_json::Value>>(&text)
+    Ok(serde_json::from_str::<Vec<serde_json::Value>>(&text)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|entry| serde_json::from_value(entry).ok())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

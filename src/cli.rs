@@ -83,7 +83,7 @@ pub enum Command {
         #[arg(long)]
         account: Option<String>,
         /// Only the last N hours
-        #[arg(long)]
+        #[arg(long, conflicts_with = "last")]
         since: Option<f64>,
         #[arg(long)]
         json: bool,
@@ -305,13 +305,13 @@ pub enum CodexAction {
         dry_run: bool,
     },
     /// Move a running Codex onto an account without restarting it, or (with
-    /// --into) copy the account's credentials into another profile directory
+    /// --into) link the account's auth.json into another profile directory
     Use {
         /// Account to move to (default: the best viable)
         account: Option<String>,
-        /// Copy the credentials into this CODEX_HOME instead of moving a
-        /// running Codex
-        #[arg(long, requires = "account", conflicts_with_all = ["codex_home", "dry_run", "force"])]
+        /// Link the account's auth.json into this CODEX_HOME instead of moving
+        /// a running Codex
+        #[arg(long, requires = "account", conflicts_with_all = ["codex_home", "force"])]
         into: Option<String>,
         /// CODEX_HOME whose app-server to migrate (default: ~/.codex)
         #[arg(long)]
@@ -494,7 +494,7 @@ pub enum RotateAction {
         #[arg(long)]
         json: bool,
     },
-    /// Stop managing the credential; /login gets its precedence back
+    /// Stop changing credentials (/login gets its precedence back); read-only quota polling continues
     Pause,
     /// Resume managing and run one cycle now
     Resume,
@@ -597,8 +597,8 @@ pub enum SettingsAction {
     /// Print every launch setting
     Show,
     /// Set one (launch_args, dangerous_mode, terminal, claude_bin,
-    /// probe_interval_secs, services_interval_secs, codex_auto_move,
-    /// codex_min_5h_remaining, codex_min_7d_remaining,
+    /// probe_interval_secs, services_interval_secs, notifications,
+    /// codex_auto_move, codex_min_5h_remaining, codex_min_7d_remaining,
     /// codex_land_min_5h_remaining, codex_land_min_7d_remaining); an empty
     /// value clears it
     Set {
@@ -740,6 +740,7 @@ mod tests {
             "tokeman codex use",
             "tokeman codex use work --dry-run --force",
             "tokeman codex use work --into ~/.codex-homes/other",
+            "tokeman codex use work --into ~/.codex-homes/other --dry-run",
             "tokeman codex best --limit spark",
             "tokeman codex reset work --credit c1 --yes",
             "tokeman agy login",
@@ -783,6 +784,7 @@ mod tests {
             "tokeman rotate quarantine work --model fable --window weekly --until 1900000000",
             "tokeman rotate clear-quarantine work --model fable",
             "tokeman history --last 5 --json",
+            "tokeman history --since 12",
             "tokeman history compact",
             "tokeman history compact --dry-run",
             "tokeman stats",

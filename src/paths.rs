@@ -34,6 +34,14 @@ fn resolve_home(real_home: Option<&std::ffi::OsStr>, detected: Option<PathBuf>) 
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[cfg(not(test))]
+fn non_empty_abs_env(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 #[cfg(test)]
 pub fn home() -> PathBuf {
     PathBuf::from(TEST_HOME)
@@ -44,6 +52,17 @@ pub fn home() -> PathBuf {
 /// other applications keep their state.
 #[cfg(not(test))]
 pub fn platform_config_dir() -> Option<PathBuf> {
+    if let Some(real_home) = non_empty_abs_env("TOKEMAN_REAL_HOME") {
+        #[cfg(target_os = "macos")]
+        {
+            return Some(real_home.join("Library/Application Support"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return non_empty_abs_env("XDG_CONFIG_HOME")
+                .or_else(|| Some(real_home.join(".config")));
+        }
+    }
     dirs::config_dir()
 }
 
@@ -54,8 +73,7 @@ pub fn platform_config_dir() -> Option<PathBuf> {
 
 #[cfg(not(test))]
 fn xdg(var: &str, default: &str) -> PathBuf {
-    std::env::var_os(var)
-        .map(PathBuf::from)
+    non_empty_abs_env(var)
         .unwrap_or_else(|| home().join(default))
         .join("tokeman")
 }
@@ -75,6 +93,12 @@ pub fn data_dir() -> PathBuf {
 
 pub fn cache_dir() -> PathBuf {
     xdg("XDG_CACHE_HOME", ".cache")
+}
+
+/// Whether `path` lives inside one of tokeman's own private trees (`config`,
+/// `data`, or `cache`), whose directories are always kept `0700`.
+pub fn is_private_dir(path: &std::path::Path) -> bool {
+    path.starts_with(config_dir()) || path.starts_with(data_dir()) || path.starts_with(cache_dir())
 }
 
 /// `tokens.toml`: accounts, launch settings, policy, Codex profiles.
@@ -142,10 +166,18 @@ pub fn profile_cache() -> PathBuf {
     config_dir().join("claude-profile-reads.json")
 }
 
+pub fn profile_cache_lock() -> PathBuf {
+    config_dir().join("claude-profile-reads.lock")
+}
+
 /// Antigravity access tokens tokeman minted from its own refresh tokens;
 /// written only by `providers::antigravity`.
 pub fn antigravity_tokens() -> PathBuf {
     config_dir().join("antigravity-access-tokens.json")
+}
+
+pub fn antigravity_tokens_lock() -> PathBuf {
+    config_dir().join("antigravity-access-tokens.lock")
 }
 
 /// Reset claims (Claude grants, Codex credits) sent without a definite
@@ -157,6 +189,10 @@ pub fn claims_journal() -> PathBuf {
 /// The unrecognised items the daemon has logged; written only by `drift`.
 pub fn drift_ledger() -> PathBuf {
     config_dir().join("drift.json")
+}
+
+pub fn drift_lock() -> PathBuf {
+    config_dir().join("drift.lock")
 }
 
 /// Which attention items the daemon has notified; written only by
@@ -186,10 +222,18 @@ pub fn codex_seats() -> PathBuf {
     config_dir().join("codex-seats.json")
 }
 
+pub fn codex_seats_lock() -> PathBuf {
+    config_dir().join("codex-seats.lock")
+}
+
 /// Every move of a running Codex between accounts (JSONL); written only by
 /// `codex::mover`.
 pub fn codex_moves() -> PathBuf {
     config_dir().join("codex-moves.jsonl")
+}
+
+pub fn codex_moves_lock() -> PathBuf {
+    config_dir().join("codex-moves.lock")
 }
 
 /// The agy Keychain value the last `tokeman agy use` replaced (0600).
@@ -232,9 +276,7 @@ pub fn claude_dir() -> PathBuf {
 /// `~/.claude/settings.json`, or `$CLAUDE_SETTINGS` for tests and odd layouts.
 #[cfg(not(test))]
 pub fn claude_settings() -> PathBuf {
-    std::env::var_os("CLAUDE_SETTINGS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| claude_dir().join("settings.json"))
+    non_empty_abs_env("CLAUDE_SETTINGS").unwrap_or_else(|| claude_dir().join("settings.json"))
 }
 
 #[cfg(test)]
@@ -242,8 +284,11 @@ pub fn claude_settings() -> PathBuf {
     claude_dir().join("settings.json")
 }
 
-/// Expand a leading `~/` to the home directory.
+/// Expand `~` or a leading `~/` to the home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return home();
+    }
     match path.strip_prefix("~/") {
         Some(rest) => home().join(rest),
         None => PathBuf::from(path),
@@ -253,8 +298,16 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// The inverse of [`expand_tilde`], for display and for portable config values.
 pub fn tilde(path: &std::path::Path) -> String {
     let display = path.display().to_string();
-    let home = home().display().to_string();
-    match display.strip_prefix(&home) {
+    let home_raw = home().display().to_string();
+    let home = if home_raw.len() > 1 {
+        home_raw.trim_end_matches('/')
+    } else {
+        home_raw.as_str()
+    };
+    if home == "/" {
+        return display;
+    }
+    match display.strip_prefix(home) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => display,
     }
@@ -290,6 +343,8 @@ mod tests {
             );
         }
         assert_eq!(tilde(&home.join(".codex")), "~/.codex");
+        assert_eq!(tilde(home), "~");
+        assert_eq!(expand_tilde("~"), home);
     }
 
     #[test]

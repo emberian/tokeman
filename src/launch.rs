@@ -14,8 +14,20 @@ use crate::quota::Service;
 
 const TAG: &str = " \x1b[1mtokeman:\x1b[0m";
 
-/// Run one cycle, then exec claude with the configured arguments. With
-/// `auto`, keep cycling on the sip cadence while claude runs.
+/// Variables inherited from the caller's shell that would pin Claude Code to a
+/// single credential instead of reading the managed default from settings.json.
+const CLAUDE_UNSET: [&str; 5] = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "TOKEMAN_ACCOUNT",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+];
+
+/// Run one cycle, then exec claude with the configured arguments. With `auto`
+/// when no background service is running, supervise the child and keep cycling
+/// on the sip cadence; when the background service already runs, delegate
+/// ongoing rotation to it and exec claude directly so it owns the terminal.
 pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<()> {
     if fleet.accounts.is_empty() {
         bail!(
@@ -31,57 +43,140 @@ pub async fn run(fleet: Fleet, auto: bool, claude_args: Vec<String>) -> Result<(
     let (binary, args) = fleet.launch.command(claude_args);
     let shown: Vec<String> = args.iter().map(|arg| format!("{arg:?}")).collect();
     notice(&format!("{TAG} launching {binary} {}", shown.join(" ")));
-    if auto {
-        notice(&format!(
-            "{TAG} default monitor enabled ({}s normal / {}s sip-and-drain)",
-            fleet.policy.normal_probe_interval_secs, fleet.policy.sip_probe_interval_secs
-        ));
+
+    let daemon_running =
+        crate::ui::overview::Monitor::now() == crate::ui::overview::Monitor::Running;
+    if !auto || daemon_running {
+        if auto && daemon_running {
+            notice(&format!(
+                "{TAG} background service is running; delegating auto-rotation to it"
+            ));
+        }
+        notice("");
+        let mut launch = Launch::new(Service::Claude, "", None, &binary, args);
+        for var in CLAUDE_UNSET {
+            launch = launch.unset(var);
+        }
+        return Err(launch.exec());
     }
+
+    notice(&format!(
+        "{TAG} default monitor enabled ({}s normal / {}s sip-and-drain; events logged to claude-rotate.log)",
+        fleet.policy.normal_probe_interval_secs, fleet.policy.sip_probe_interval_secs
+    ));
     notice("");
-    // The child reads its credential from settings.json like every other
-    // session; an inherited token would pin it to the launch-time account.
-    let mut child = tokio::process::Command::new(&binary)
-        .args(&args)
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+
+    let mut command = tokio::process::Command::new(&binary);
+    command.args(&args);
+    for var in CLAUDE_UNSET {
+        command.env_remove(var);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch {binary}"))?;
-    let monitor = auto.then(|| {
-        let fleet = fleet.clone();
-        tokio::spawn(async move {
-            let mut wake = tokio::time::interval(std::time::Duration::from_secs(
-                fleet.policy.sip_probe_interval_secs.max(1),
-            ));
-            wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            wake.tick().await; // the launch itself just ran a cycle
-            loop {
-                wake.tick().await;
-                let scheduled = Options {
-                    scheduled: true,
-                    ..Options::default()
-                };
-                match cycle::run(&fleet, scheduled).await {
-                    Ok(outcome) if outcome.changed() => {
-                        notice(&format!("\n{TAG}\x1b[32m {}\x1b[0m", outcome.message))
-                    }
-                    Ok(outcome) if outcome.action == cycle::Action::NoneViable => {
-                        notice(&format!("\n{TAG}\x1b[33m {}\x1b[0m", outcome.message))
-                    }
-                    Ok(_) => {}
-                    Err(error) => notice(&format!(
-                        "\n{TAG}\x1b[31m rotation probe failed: {error:#}\x1b[0m"
-                    )),
-                }
+    let child_pid = child.id();
+
+    let monitor = tokio::spawn(async move {
+        let mut wake = tokio::time::interval(std::time::Duration::from_secs(
+            fleet.policy.sip_probe_interval_secs.max(1),
+        ));
+        wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        wake.tick().await; // the launch itself just ran a cycle
+        let mut refresh_backoff = crate::daemon::refresh::Backoff::default();
+        loop {
+            wake.tick().await;
+            if !crate::daemon::lock::is_paused()
+                && let Err(error) = crate::daemon::refresh::refresh_due(&mut refresh_backoff).await
+            {
+                crate::daemon::log::log(&format!("ERROR launch monitor refresh failed: {error:#}"));
             }
-        })
+            let current_fleet = Fleet::load().unwrap_or_else(|_| fleet.clone());
+            let scheduled = Options {
+                scheduled: true,
+                ..Options::default()
+            };
+            match cycle::run(&current_fleet, scheduled).await {
+                Ok(outcome) if outcome.is_notable() => {
+                    crate::daemon::log::log(&format!("launch monitor: {}", outcome.message));
+                }
+                Ok(_) => {}
+                Err(error) => crate::daemon::log::log(&format!(
+                    "ERROR launch monitor probe failed: {error:#}"
+                )),
+            }
+        }
     });
-    let status = child.wait().await?;
-    if let Some(monitor) = monitor {
-        monitor.abort();
-    }
+
+    let status = wait_supervising_signals(&mut child, child_pid).await?;
+    monitor.abort();
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_supervising_signals(
+    child: &mut tokio::process::Child,
+    child_pid: Option<u32>,
+) -> Result<std::process::ExitStatus> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt()).ok();
+    let mut sigquit = signal(SignalKind::quit()).ok();
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    let mut sighup = signal(SignalKind::hangup()).ok();
+    let forward = |sig_flag: &str| {
+        if let Some(pid) = child_pid {
+            let _ = Command::new("/bin/kill")
+                .args([sig_flag, &pid.to_string()])
+                .status();
+        }
+    };
+    loop {
+        tokio::select! {
+            status = child.wait() => return Ok(status?),
+            // Terminal Ctrl-C / Ctrl-\ already goes to the foreground process
+            // group (`claude`); absorb it here so the supervisor outlives a
+            // cancelled turn.
+            Some(()) = async {
+                match &mut sigint {
+                    Some(s) => s.recv().await,
+                    None => None,
+                }
+            } => {}
+            Some(()) = async {
+                match &mut sigquit {
+                    Some(s) => s.recv().await,
+                    None => None,
+                }
+            } => {}
+            Some(()) = async {
+                match &mut sigterm {
+                    Some(s) => s.recv().await,
+                    None => None,
+                }
+            } => forward("-TERM"),
+            Some(()) = async {
+                match &mut sighup {
+                    Some(s) => s.recv().await,
+                    None => None,
+                }
+            } => forward("-HUP"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_supervising_signals(
+    child: &mut tokio::process::Child,
+    _child_pid: Option<u32>,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        tokio::select! {
+            status = child.wait() => return Ok(status?),
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
 }
 
 /// One variable of a launch's environment.

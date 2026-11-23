@@ -133,6 +133,9 @@ struct Legacy {
     sources: Vec<PathBuf>,
     /// Old files that do not parse: each still stands for a claim in flight.
     unreadable: Vec<(Entry, PathBuf)>,
+    /// Present when `codex-reset-pending.json` exists and cannot be parsed:
+    /// blocks `Service::Codex` without blocking `Service::Claude`.
+    codex_unreadable: Option<PathBuf>,
 }
 
 /// The journal. This type is the only writer of its file.
@@ -216,8 +219,14 @@ impl Journal {
                 },
                 sanitized: true,
             };
-            let text = std::fs::read(&path).with_context(|| format!("reading {}", path.display()));
-            match serde_json::from_slice::<LegacyClaude>(&text?) {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            };
+            match serde_json::from_slice::<LegacyClaude>(&bytes) {
                 Ok(old) => {
                     legacy
                         .entries
@@ -230,25 +239,26 @@ impl Journal {
             }
         }
         if let Some(text) = read_if_present(&self.legacy_codex)? {
-            let old: LegacyCodexFile = serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "{} is unreadable; fix or remove it by hand once no claim is in flight",
-                    self.legacy_codex.display()
-                )
-            })?;
-            legacy
-                .entries
-                .extend(old.pending.into_iter().map(|(account, claim)| Entry {
-                    pending: Pending {
-                        service: Service::Codex,
-                        account,
-                        item: claim.credit_id,
-                        request_id: claim.redeem_request_id,
-                        sent_at: claim.started_at,
-                    },
-                    sanitized: false,
-                }));
-            legacy.sources.push(self.legacy_codex.clone());
+            match serde_json::from_str::<LegacyCodexFile>(&text) {
+                Ok(old) => {
+                    legacy
+                        .entries
+                        .extend(old.pending.into_iter().map(|(account, claim)| Entry {
+                            pending: Pending {
+                                service: Service::Codex,
+                                account,
+                                item: claim.credit_id,
+                                request_id: claim.redeem_request_id,
+                                sent_at: claim.started_at,
+                            },
+                            sanitized: false,
+                        }));
+                    legacy.sources.push(self.legacy_codex.clone());
+                }
+                Err(_) => {
+                    legacy.codex_unreadable = Some(self.legacy_codex.clone());
+                }
+            }
         }
         Ok(legacy)
     }
@@ -274,6 +284,14 @@ impl Journal {
 
     /// An old file that does not parse still blocks its account.
     fn refuse_unreadable(legacy: &Legacy, service: Service, account: &str) -> Result<()> {
+        if service == Service::Codex
+            && let Some(path) = &legacy.codex_unreadable
+        {
+            bail!(
+                "{} is unreadable; fix or remove it by hand once no claim is in flight",
+                path.display()
+            );
+        }
         match legacy
             .unreadable
             .iter()
@@ -386,11 +404,17 @@ impl Journal {
     }
 }
 
-/// The account's entry, named as the caller named the account.
+/// The account's entry, named as the caller named the account. Exact account
+/// matches win over legacy sanitized stems.
 fn found(file: &File, service: Service, account: &str) -> Option<Pending> {
     file.pending
         .iter()
-        .find(|entry| entry.is_for(service, account))
+        .find(|entry| entry.pending.service == service && entry.pending.account == account)
+        .or_else(|| {
+            file.pending
+                .iter()
+                .find(|entry| entry.is_for(service, account))
+        })
         .map(|entry| Pending {
             account: account.to_owned(),
             ..entry.pending.clone()
@@ -731,9 +755,11 @@ pub(crate) mod tests {
         assert!(claims.join("a_b.pending.imported").exists());
         assert_eq!(journal.pending(Service::Claude, "a/b").unwrap(), None);
 
-        // The old Codex map is one file: unreadable, it is an error.
+        // The old Codex map is one file: unreadable, it blocks Codex without
+        // blocking Claude.
         std::fs::write(dir.path().join("codex-reset-pending.json"), "{oops").unwrap();
         assert!(journal.pending(Service::Codex, "one").is_err());
         assert!(journal.begin(Service::Codex, "one", None, 1).is_err());
+        assert_eq!(journal.pending(Service::Claude, "other").unwrap(), None);
     }
 }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::fs::write_atomic;
+use crate::fs::{FileLock, read_if_present, write_atomic};
 use crate::paths;
 use crate::quota::{Reading, Service};
 
@@ -151,11 +151,15 @@ pub struct Entry {
 #[derive(Debug, Clone)]
 pub struct Ledger {
     path: PathBuf,
+    lock: PathBuf,
 }
 
 impl Default for Ledger {
     fn default() -> Self {
-        Self::at(paths::drift_ledger())
+        Self {
+            path: paths::drift_ledger(),
+            lock: paths::drift_lock(),
+        }
     }
 }
 
@@ -163,20 +167,31 @@ impl Ledger {
     const BUILD: &'static str = env!("CARGO_PKG_VERSION");
 
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        let lock = path.with_extension("lock");
+        Self { path, lock }
     }
 
-    /// The file as this build recorded it; a missing or unreadable file, or
+    /// The file as this build recorded it; a missing or unparseable file, or
     /// another build's, reads as empty.
     fn load(&self) -> LedgerFile {
-        std::fs::read(&self.path)
+        self.load_checked().unwrap_or_else(|_| LedgerFile {
+            build: Self::BUILD.to_owned(),
+            items: BTreeMap::new(),
+        })
+    }
+
+    fn load_checked(&self) -> anyhow::Result<LedgerFile> {
+        let empty = || LedgerFile {
+            build: Self::BUILD.to_owned(),
+            items: BTreeMap::new(),
+        };
+        let Some(text) = read_if_present(&self.path)? else {
+            return Ok(empty());
+        };
+        Ok(serde_json::from_str::<LedgerFile>(&text)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<LedgerFile>(&bytes).ok())
             .filter(|file| file.build == Self::BUILD)
-            .unwrap_or_else(|| LedgerFile {
-                build: Self::BUILD.to_owned(),
-                items: BTreeMap::new(),
-            })
+            .unwrap_or_else(empty))
     }
 
     /// Every item on record, by service and then by name. No write.
@@ -206,7 +221,15 @@ impl Ledger {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let mut file = self.load();
+        // Quick unlocked check so repeat items never acquire a lock or touch disk.
+        if let Ok(snapshot) = self.load_checked()
+            && let Some(known) = snapshot.items.get(&service)
+            && items.iter().all(|item| known.contains_key(item))
+        {
+            return Ok(Vec::new());
+        }
+        let _lock = FileLock::acquire(&self.lock)?;
+        let mut file = self.load_checked()?;
         let known = file.items.entry(service).or_default();
         let new: Vec<String> = items
             .iter()

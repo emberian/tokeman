@@ -33,6 +33,9 @@ pub async fn daemon() -> Result<()> {
 pub async fn status(fleet: &Fleet) -> Result<Overview> {
     fleet.policy.validate()?;
     let _lock = RotationLock::acquire()?;
+    let reloaded = Fleet::load().ok();
+    let fleet = reloaded.as_ref().unwrap_or(fleet);
+    fleet.policy.validate()?;
     let settings = claude_settings::load()?;
     let target_model = claude_settings::target_model(&settings).map(str::to_owned);
     let model = target_model.as_deref().map(ModelKey::new);

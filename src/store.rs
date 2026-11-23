@@ -22,6 +22,15 @@ use crate::quota::{Limit, Reading, Scope, Service, Span, Window};
 /// How long an unchanged reading goes without a row of its own.
 pub const HOLD_SECS: i64 = 600;
 
+fn immutable_uri(path: &std::path::Path) -> Option<String> {
+    let text = path.to_str()?;
+    let escaped = text
+        .replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23");
+    Some(format!("file:{escaped}?immutable=1"))
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -84,8 +93,16 @@ impl Store {
     }
 
     pub fn open_at(path: &std::path::Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        crate::fs::ensure_private_parent(path)?;
+        #[cfg(unix)]
+        if !path.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path);
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
@@ -106,25 +123,16 @@ impl Store {
 
     pub fn open_read_only_at(path: &std::path::Path) -> Result<Self> {
         use rusqlite::OpenFlags;
-        // A reader of a WAL database creates the `-shm` and `-wal` files when
-        // they are missing. With no `-wal` file every row is in the main
-        // file, so it is read as immutable, which creates nothing; with one,
-        // the sidecars exist already and an ordinary read-only open adds none.
-        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        if !path.exists() {
+            anyhow::bail!("no history database at {}", path.display());
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = if wal.exists() {
-            Connection::open_with_flags(path, flags)
-        } else {
-            let escaped = path
-                .display()
-                .to_string()
-                .replace('%', "%25")
-                .replace('?', "%3f")
-                .replace('#', "%23");
-            Connection::open_with_flags(
-                format!("file:{escaped}?immutable=1"),
-                flags | OpenFlags::SQLITE_OPEN_URI,
-            )
+        let has_live_journal = ["wal", "shm", "journal"]
+            .into_iter()
+            .any(|ext| std::path::PathBuf::from(format!("{}-{ext}", path.display())).exists());
+        let conn = match (!has_live_journal).then(|| immutable_uri(path)).flatten() {
+            Some(uri) => Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI),
+            None => Connection::open_with_flags(path, flags),
         }
         .with_context(|| format!("failed to open database at {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -231,6 +239,7 @@ impl Store {
     /// The newest reading of each of `accounts`, as of its last
     /// confirmation.
     pub fn latest(&self, accounts: &[(Service, &str)]) -> Result<Vec<Reading>> {
+        let _tx = self.conn.unchecked_transaction()?;
         let mut latest = Vec::new();
         for (service, account) in accounts {
             let newest = self
@@ -257,7 +266,8 @@ impl Store {
         account: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Reading>> {
-        let count = limit as i64;
+        let _tx = self.conn.unchecked_transaction()?;
+        let count = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut readings = self.held(service, account)?;
         readings.extend(match account {
             Some(name) => self.query(
@@ -282,6 +292,7 @@ impl Store {
         account: Option<&str>,
         since: i64,
     ) -> Result<Vec<Reading>> {
+        let _tx = self.conn.unchecked_transaction()?;
         let mut readings = match account {
             Some(name) => self.query(
                 "WHERE service = ?1 AND account = ?2 AND at >= ?3 ORDER BY at ASC, id ASC",
@@ -377,7 +388,7 @@ fn keep(newest: Option<i64>, same: bool, confirmed: Option<i64>, at: i64) -> Kep
     match newest {
         Some(row) if same => Kept {
             closing: None,
-            row: at - row >= HOLD_SECS,
+            row: at.saturating_sub(row) >= HOLD_SECS,
         },
         Some(row) => Kept {
             closing: confirmed.filter(|seen| *seen > row && *seen < at),
@@ -449,15 +460,31 @@ impl Stats {
     }
 }
 
+fn same_reset_window(a: Window, b: Window) -> bool {
+    if a.resets_at == b.resets_at {
+        return true;
+    }
+    if a.resets_at == 0 && a.used == 0.0 && b.resets_at > 0 {
+        return true;
+    }
+    a.resets_at >= 1_000_000 && b.resets_at >= 1_000_000 && (a.resets_at - b.resets_at).abs() <= 2
+}
+
 fn burn(series: Series, label: String, readings: &[Reading]) -> Burn {
+    let valid: Vec<(i64, Window)> = readings
+        .iter()
+        .filter(|reading| reading.error.is_none())
+        .filter_map(|reading| Some((reading.at, series.window(reading)?)))
+        .collect();
     // (hours, use per hour) of each interval inside one reset window.
-    let intervals: Vec<(f64, f64)> = readings
+    let intervals: Vec<(f64, f64)> = valid
         .windows(2)
         .filter_map(|pair| {
-            let hours = (pair[1].at - pair[0].at) as f64 / 3600.0;
-            let (a, b) = (series.window(&pair[0])?, series.window(&pair[1])?);
+            let (at_a, a) = pair[0];
+            let (at_b, b) = pair[1];
+            let hours = at_b.saturating_sub(at_a) as f64 / 3600.0;
             let rate = (b.used - a.used) / hours;
-            (hours > 0.0 && a.resets_at == b.resets_at && b.used >= a.used && rate.is_finite())
+            (hours > 0.0 && same_reset_window(a, b) && b.used >= a.used && rate.is_finite())
                 .then_some((hours, rate))
         })
         .collect();
@@ -479,8 +506,8 @@ fn burn(series: Series, label: String, readings: &[Reading]) -> Burn {
     });
     let latest = intervals.last().map(|(_, rate)| *rate);
     let hours_left = latest.filter(|rate| *rate > 0.0).and_then(|rate| {
-        let window = readings.iter().rev().find_map(|r| series.window(r))?;
-        Some(window.remaining() / rate)
+        let (_, window) = valid.last()?;
+        Some(window.remaining().max(0.0) / rate)
     });
     Burn {
         series,

@@ -1,14 +1,53 @@
 //! Small pure helpers that more than one domain needs. Nothing here does IO.
 
-/// Collapse whitespace and cap at `max_chars`, marking a cut with `…`.
+/// Collapse whitespace, strip terminal escape/control sequences, and cap at
+/// `max_chars`, marking a cut with `…`.
 pub fn one_line(text: &str, max_chars: usize) -> String {
-    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = strip_escape_and_controls(text);
+    let single = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     if single.chars().count() <= max_chars {
         single
     } else {
         let cut: String = single.chars().take(max_chars).collect();
         format!("{cut}…")
     }
+}
+
+fn strip_escape_and_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if !ch.is_control() || ch.is_whitespace() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// `value` as one word of a POSIX shell command line.
@@ -42,6 +81,7 @@ mod tests {
         assert_eq!(one_line("ééééé", 3), "ééé…");
         assert_eq!(one_line("ééé", 3), "ééé", "three characters, six bytes");
         assert_eq!(one_line("💥💥💥", 2), "💥💥…");
+        assert_eq!(one_line("\x1b[31mred\x1b[0m\x07 bell", 20), "red bell");
     }
 
     #[test]

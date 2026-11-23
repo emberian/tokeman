@@ -231,8 +231,15 @@ struct HubFile {
     csrf_token: Option<String>,
 }
 
-/// The hub daemon files whose process is among `alive`.
-fn hubs(daemon_dir: &Path, alive: &[u32]) -> Vec<Running> {
+fn is_hub_process(command: &str) -> bool {
+    command.contains("language_server")
+        || command.contains("Antigravity")
+        || command.contains("antigravity")
+        || is_agy(command)
+}
+
+/// The hub daemon files whose process is among `alive` and looks like a hub.
+fn hubs(daemon_dir: &Path, alive: &[(u32, &str)]) -> Vec<Running> {
     let Ok(entries) = std::fs::read_dir(daemon_dir) else {
         return Vec::new();
     };
@@ -246,13 +253,16 @@ fn hubs(daemon_dir: &Path, alive: &[u32]) -> Vec<Running> {
         })
         .filter_map(|path| {
             let file: HubFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-            alive.contains(&file.pid).then(|| Running {
-                kind: ClientKind::Hub,
-                pid: file.pid,
-                cwd: None,
-                ports: vec![file.http_port],
-                csrf: file.csrf_token.map(Csrf),
-            })
+            alive
+                .iter()
+                .any(|(pid, comm)| *pid == file.pid && is_hub_process(comm))
+                .then(|| Running {
+                    kind: ClientKind::Hub,
+                    pid: file.pid,
+                    cwd: None,
+                    ports: vec![file.http_port],
+                    csrf: file.csrf_token.map(Csrf),
+                })
         })
         .collect();
     hubs.sort_by_key(|hub| hub.pid);
@@ -366,10 +376,11 @@ pub(super) async fn sessions(lookout: &Lookout) -> Result<Vec<Session>> {
 
 async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
     let everything = output(&lookout.ps, &["-axo", "pid=,comm="], CENSUS_TIMEOUT).await?;
-    let alive: Vec<u32> = pid_lines(&everything).map(|(pid, _)| pid).collect();
-    let agy: Vec<u32> = pid_lines(&everything)
+    let alive: Vec<(u32, &str)> = pid_lines(&everything).collect();
+    let agy: Vec<u32> = alive
+        .iter()
         .filter(|(_, command)| is_agy(command))
-        .map(|(pid, _)| pid)
+        .map(|(pid, _)| *pid)
         .collect();
     let mut clients = hubs(&lookout.daemon_dir, &alive);
     let mut sessions = Vec::new();
@@ -385,7 +396,13 @@ async fn take(lookout: &Lookout) -> Result<(Vec<Running>, Vec<Session>)> {
     };
     let mut args = environment.to_vec();
     args.extend(["-ww", "-o", "pid=,args=", "-p", &pids]);
-    let lines = output(&lookout.ps, &args, CENSUS_TIMEOUT).await?;
+    // Short-lived `agy` processes may all exit between the two `ps` calls, in
+    // which case `ps -p` exits with status 1 and no output.
+    let lines = match output(&lookout.ps, &args, CENSUS_TIMEOUT).await {
+        Ok(lines) => lines,
+        Err(error) if error.to_string().contains("exit status: 1") => String::new(),
+        Err(error) => return Err(error),
+    };
     let mut processes: Vec<(u32, ClientKind, Option<String>)> = pid_lines(&lines)
         .filter(|(pid, _)| agy.contains(pid))
         .filter_map(|(pid, line)| Some((pid, classify(line)?, own_home(line, &lookout.homes))))

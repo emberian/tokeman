@@ -4,9 +4,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+
+const MAX_SYMLINK_HOPS: usize = 40;
 
 #[cfg(unix)]
 pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
@@ -20,41 +22,153 @@ pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Create the parent directory, owner-only.
-pub fn ensure_private_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+/// Follow up to 40 symbolic links at `path` so atomic replacements update
+/// the link's target instead of clobbering the link.
+pub fn resolve_link_chain(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for hop in 0..=MAX_SYMLINK_HOPS {
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stat {}", current.display()));
+            }
+        };
+        if !meta.file_type().is_symlink() {
+            if hop > 0 && meta.permissions().readonly() {
+                bail!(
+                    "refusing to write through symlink {} to read-only file {}",
+                    path.display(),
+                    current.display()
+                );
+            }
+            return Ok(current);
+        }
+        if hop == MAX_SYMLINK_HOPS {
+            bail!("too many symbolic link levels resolving {}", path.display());
+        }
+        let target = std::fs::read_link(&current)
+            .with_context(|| format!("failed to read symlink {}", current.display()))?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join(target),
+                _ => target,
+            }
+        };
+    }
+    unreachable!()
+}
+
+fn ensure_parent_for_mode(path: &Path, file_mode: u32) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let private_file = file_mode & 0o077 == 0;
+    if !existed {
+        set_mode(parent, if private_file { 0o700 } else { 0o755 })?;
+    } else if private_file && crate::paths::is_private_dir(parent) {
         set_mode(parent, 0o700)?;
     }
     Ok(())
 }
 
-/// Replace `path` with `bytes` so a reader never sees a partial file.
-pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    ensure_private_parent(path)?;
-    let parent = path.parent().context("output path has no parent")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    set_mode(temp.path(), mode)?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    set_mode(path, mode)
+/// Create the parent directory, owner-only when newly created or inside
+/// tokeman's own state trees.
+pub fn ensure_private_parent(path: &Path) -> Result<()> {
+    ensure_parent_for_mode(path, 0o600)
 }
 
-/// Append one line to an owner-only file, creating it if needed.
+/// Replace `path` (or its symlink target) with `bytes` so a reader never sees
+/// a partial file and a dotfile symlink is never replaced by a regular file.
+pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let resolved = resolve_link_chain(path)?;
+    ensure_parent_for_mode(&resolved, mode)?;
+    let parent = match resolved.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    set_mode(temp.path(), mode)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(&resolved)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", resolved.display()))?;
+    set_mode(&resolved, mode)
+}
+
+/// Atomically replace `link_path` with a symbolic link pointing to `target`.
+#[cfg(unix)]
+pub fn write_symlink_atomic(link_path: &Path, target: &Path) -> Result<()> {
+    ensure_parent_for_mode(link_path, 0o600)?;
+    let parent = match link_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix(".tokeman-link-")
+        .tempdir_in(parent)
+        .with_context(|| format!("failed to create staging directory in {}", parent.display()))?;
+    let staged = scratch.path().join("link");
+    std::os::unix::fs::symlink(target, &staged).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link_path.display(),
+            target.display()
+        )
+    })?;
+    std::fs::rename(&staged, link_path)
+        .with_context(|| format!("failed to replace {}", link_path.display()))
+}
+
+/// Append one line to an owner-only file in a single write, healing any
+/// missing trailing newline left by an earlier interrupted write.
 pub fn append_line(path: &Path, line: &str) -> Result<()> {
-    ensure_private_parent(path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    set_mode(path, 0o600)?;
-    writeln!(file, "{line}")?;
+    let resolved = resolve_link_chain(path)?;
+    ensure_private_parent(&resolved)?;
+    let mut options = OpenOptions::new();
+    options.read(true).create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&resolved)
+        .with_context(|| format!("failed to open {}", resolved.display()))?;
+    set_mode(&resolved, 0o600)?;
+    let needs_leading_newline = match file.metadata() {
+        Ok(meta) if meta.len() > 0 => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                let mut last = [0u8; 1];
+                file.read_at(&mut last, meta.len() - 1)
+                    .is_ok_and(|n| n == 1 && last[0] != b'\n')
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+        _ => false,
+    };
+    let mut buf = Vec::with_capacity(line.len() + 2);
+    if needs_leading_newline {
+        buf.push(b'\n');
+    }
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    file.write_all(&buf)?;
     Ok(())
 }
 
@@ -117,15 +231,19 @@ impl FileLock {
 }
 
 fn open_lock_file(path: &Path) -> Result<File> {
-    ensure_private_parent(path)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("failed to open lock {}", path.display()))?;
-    set_mode(path, 0o600)?;
+    let resolved = resolve_link_chain(path)?;
+    ensure_private_parent(&resolved)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&resolved)
+        .with_context(|| format!("failed to open lock {}", resolved.display()))?;
+    set_mode(&resolved, 0o600)?;
     Ok(file)
 }
 
@@ -197,5 +315,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
         assert_eq!(mode(&log), 0o600);
         assert_eq!(mode(log.parent().unwrap()), 0o700);
+
+        // Symlinked files keep their symlink and update the target; healing a
+        // truncated tail inserts a newline before the next JSONL record.
+        let target = dir.path().join("real.json");
+        std::fs::write(&target, b"old").unwrap();
+        let link = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, b"new", 0o600).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        let partial_log = dir.path().join("partial.jsonl");
+        std::fs::write(&partial_log, b"{\"partial\":true}").unwrap();
+        append_line(&partial_log, "{\"complete\":true}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&partial_log).unwrap(),
+            "{\"partial\":true}\n{\"complete\":true}\n"
+        );
+
+        let sym = dir.path().join("atomic-link");
+        write_symlink_atomic(&sym, &target).unwrap();
+        assert_eq!(std::fs::read_link(&sym).unwrap(), target);
     }
 }

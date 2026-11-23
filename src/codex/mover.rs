@@ -25,9 +25,20 @@ use super::probe;
 use super::refresh::RefreshError;
 use super::seats::{Pushed, Seats};
 use crate::account::{CodexAccount, Fleet};
-use crate::fs::{append_line, read_if_present, write_atomic};
+use crate::fs::{FileLock, append_line, read_if_present, write_atomic};
 use crate::history::Fingerprint;
 use crate::paths::{self, tilde};
+
+pub(crate) fn home_tilde(path: &Path) -> String {
+    if path.is_absolute() {
+        tilde(path)
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => tilde(&cwd.join(path)),
+            Err(_) => tilde(path),
+        }
+    }
+}
 use crate::policy::{self, Floors, Relocation};
 use crate::quota::{CodexDetail, Detail, Limit, Reading, Scope, Service, Source, Span, Window};
 
@@ -159,7 +170,10 @@ impl Seat {
             (Some(seated), Some(held)) => *seated == held,
             _ => {
                 let email = auth.claims().and_then(|claims| claims.email);
-                email.is_some() && email == self.info.as_ref().and_then(|info| info.email.clone())
+                email
+                    .as_deref()
+                    .zip(self.info.as_ref().and_then(|info| info.email.as_deref()))
+                    .is_some_and(|(held, seated)| held.eq_ignore_ascii_case(seated))
             }
         }
     }
@@ -244,8 +258,19 @@ pub fn record(moved: &Move) -> Result<()> {
 
 /// [`record`], into the history at `path`.
 pub fn record_at(path: &Path, moved: &Move) -> Result<()> {
+    crate::fs::ensure_private_parent(path)?;
+    let lock_path = if path == paths::codex_moves() {
+        paths::codex_moves_lock()
+    } else {
+        path.with_extension("lock")
+    };
+    let _lock = FileLock::acquire_announced(&lock_path, "the Codex move history lock")?;
     if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > COMPACT_ABOVE_BYTES) {
-        let kept = moves_at(path);
+        let kept: Vec<Move> = read_if_present(path)?
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
         let from = kept.len().saturating_sub(KEPT_MOVES);
         let mut text = String::new();
         for kept in &kept[from..] {
@@ -319,17 +344,15 @@ pub async fn announce(
     let sent = server
         .reseat(access_token, &account_id, plan.as_deref())
         .await;
-    let after = match &sent {
-        Ok(_) => server.read_account().await.ok(),
-        Err(_) => None,
-    };
-    server.close().await;
-    sent?;
-    // From here the Codex runs on a token it cannot renew; the seat file is
-    // what gets it renewed.
+    if let Err(error) = sent {
+        server.close().await;
+        return Err(error);
+    }
+    // From here the Codex runs on a token it cannot renew; record the seat
+    // immediately so a slow post-move read or shutdown never strands it.
     let record_error = seats
         .put(Pushed {
-            home: tilde(home.path()),
+            home: home_tilde(home.path()),
             account: account.name.clone(),
             account_id,
             email: claims.and_then(|claims| claims.email),
@@ -341,6 +364,8 @@ pub async fn announce(
         })
         .err()
         .map(|error| format!("{error:#}"));
+    let after = server.read_account().await.ok();
+    server.close().await;
     Ok(Announced {
         refresh_error,
         record_error,
@@ -411,7 +436,7 @@ impl Look {
         };
         Some(Move {
             at,
-            home: tilde(&self.home),
+            home: home_tilde(&self.home),
             from: self.seated.clone(),
             to: to.clone(),
             remaining: self.tightest.map(|(remaining, _)| remaining),
@@ -437,7 +462,7 @@ impl Look {
 
 impl fmt::Display for Look {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let home = tilde(&self.home);
+        let home = home_tilde(&self.home);
         let seat = match (&self.seated, self.tightest) {
             (Some(seated), Some((remaining, span))) => format!(
                 "on {seated}, {:.0}% left in its {} window",

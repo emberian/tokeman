@@ -197,11 +197,33 @@ impl Mover {
         lines
     }
 
+    /// Wait for any in-flight mover round to complete and harvest its results,
+    /// so daemon shutdown or self-restart never aborts a mid-flight refresh.
+    pub async fn finish(&mut self) -> Vec<String> {
+        let Some(look) = self.running.take() else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        match look.await {
+            Ok(Ok((tended, looks))) => {
+                lines = self.tended(&tended);
+                lines.extend(self.take_in(&looks));
+            }
+            Ok(Err(message)) => lines.push(format!("ERROR codex mover: {message}")),
+            Err(error) => lines.push(format!("ERROR codex mover task failed: {error}")),
+        }
+        lines
+    }
+
     /// Keep what the looks read, record the moves, and say what changed.
     fn take_in(&mut self, looks: &[Look]) -> Vec<String> {
         let mut lines = Vec::new();
+        let live_store = self.store == paths::snapshots_db();
         let store = Store::open_at(&self.store).ok();
         for look in looks {
+            if live_store {
+                crate::daemon::log::log_drift(&look.probed);
+            }
             if let Some(store) = &store {
                 for reading in &look.probed {
                     let _ = store.insert(reading);

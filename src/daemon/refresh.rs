@@ -43,13 +43,44 @@ impl Backoff {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct Summary {
+    pub renewed: usize,
+    pub permanent_failures: Vec<(String, String)>,
+    pub transient_failures: Vec<(String, String)>,
+}
+
+impl Summary {
+    pub fn changed(&self) -> usize {
+        self.renewed + self.permanent_failures.len()
+    }
+}
+
 /// Refresh every grant that is due; returns how many accounts changed.
 pub async fn refresh_due(backoff: &mut Backoff) -> Result<usize> {
-    refresh_where(backoff, |account, now_ms| account.needs_refresh(now_ms)).await
+    Ok(
+        refresh_where(backoff, |account, now_ms| account.needs_refresh(now_ms))
+            .await?
+            .changed(),
+    )
 }
 
 /// Refresh one account, or every account with a login, now.
-pub async fn refresh_now(name: Option<&str>) -> Result<usize> {
+pub async fn refresh_now(name: Option<&str>) -> Result<Summary> {
+    let fleet = Fleet::load()?;
+    if let Some(target) = name {
+        let Some(account) = fleet.account(target) else {
+            anyhow::bail!("Account '{target}' not found");
+        };
+        if !account.is_refreshable() {
+            let reason = account
+                .login
+                .as_ref()
+                .and_then(|login| login.error.as_deref())
+                .unwrap_or("has no refreshable login; run `tokeman claude login`");
+            anyhow::bail!("Account '{target}' cannot be refreshed ({reason})");
+        }
+    }
     let mut backoff = Backoff::default();
     refresh_where(&mut backoff, |account, _| {
         account.is_refreshable() && name.is_none_or(|name| account.name == name)
@@ -60,23 +91,26 @@ pub async fn refresh_now(name: Option<&str>) -> Result<usize> {
 async fn refresh_where(
     backoff: &mut Backoff,
     due: impl Fn(&Account, i64) -> bool,
-) -> Result<usize> {
+) -> Result<Summary> {
     let now = now_epoch();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let names: Vec<String> = Fleet::load()?
+    let initial = Fleet::load()?;
+    let names: Vec<String> = initial
         .accounts
         .iter()
         .filter(|account| due(account, now_ms) && backoff.allows(&account.name, now))
         .map(|account| account.name.clone())
         .collect();
     if names.is_empty() {
-        return Ok(0);
+        return Ok(Summary::default());
     }
     let _lock = RotationLock::acquire()?;
-    let mut changed = 0;
+    let mut summary = Summary::default();
     for name in names {
-        let (mut fleet, fleet_lock) = Fleet::load_locked()?;
-        let Some(account) = fleet.account_mut(&name) else {
+        let current_fleet = Fleet::load()?;
+        // Ensure the account file can be rendered before redeeming a single-use token.
+        current_fleet.render("")?;
+        let Some(account) = current_fleet.account(&name) else {
             continue;
         };
         if !due(account, chrono::Utc::now().timestamp_millis()) {
@@ -91,50 +125,88 @@ async fn refresh_where(
         let scopes = login.scopes.clone();
         match oauth::refresh(Client::shared(), &refresh_token, &scopes).await {
             Ok(grant) => {
-                let replaced = login.access_token.clone();
-                account.apply_grant(grant, chrono::Utc::now().timestamp_millis());
-                fleet.save(&fleet_lock)?;
+                let (_, replaced) = Fleet::update(|fleet| {
+                    let Some(account) = fleet.account_mut(&name) else {
+                        return Ok(None);
+                    };
+                    let current_rt = account
+                        .login
+                        .as_ref()
+                        .and_then(|l| l.refresh_token.as_deref());
+                    // If a concurrent browser login wrote a newer refresh token while
+                    // this request was in flight, keep the newer login.
+                    if current_rt != Some(refresh_token.as_str()) {
+                        return Ok(None);
+                    }
+                    let old = account.login.as_ref().and_then(|l| l.access_token.clone());
+                    account.apply_grant(grant, chrono::Utc::now().timestamp_millis());
+                    Ok(Some(old))
+                })?;
                 backoff.clear(&name);
-                changed += 1;
-                if let Some(old) = replaced
-                    && let Err(error) =
-                        history::append(&Event::revoke(chrono::Utc::now().timestamp(), &name, &old))
-                {
-                    log(&format!(
-                        "ERROR could not record credential history: {error:#}"
-                    ));
+                if let Some(replaced) = replaced {
+                    summary.renewed += 1;
+                    if let Some(old) = replaced
+                        && let Err(error) = history::append(&Event::revoke(
+                            chrono::Utc::now().timestamp(),
+                            &name,
+                            &old,
+                        ))
+                    {
+                        log(&format!(
+                            "ERROR could not record credential history: {error:#}"
+                        ));
+                    }
                 }
             }
             Err(error) if oauth::is_permanent(&error) => {
-                let fallback = if account.setup_key.is_some() {
-                    "its setup key"
-                } else {
-                    "nothing"
-                };
                 let reason = one_line(&format!("{error:#}"), 160);
-                if let Some(login) = account.login.as_mut() {
-                    login.error = Some(reason.clone());
+                let (_, fallback) = Fleet::update(|fleet| {
+                    let Some(account) = fleet.account_mut(&name) else {
+                        return Ok(None);
+                    };
+                    let current_rt = account
+                        .login
+                        .as_ref()
+                        .and_then(|l| l.refresh_token.as_deref());
+                    if current_rt != Some(refresh_token.as_str()) {
+                        return Ok(None);
+                    }
+                    let fallback = if account.setup_key.is_some() {
+                        "its setup key"
+                    } else {
+                        "nothing"
+                    };
+                    if let Some(login) = account.login.as_mut() {
+                        login.error = Some(reason.clone());
+                    }
+                    Ok(Some(fallback))
+                })?;
+                if let Some(fallback) = fallback {
+                    summary
+                        .permanent_failures
+                        .push((name.clone(), reason.clone()));
+                    log(&format!(
+                        "ERROR login for {name} was refused permanently ({reason}); it falls back to {fallback} until `tokeman claude login {name}`"
+                    ));
                 }
-                fleet.save(&fleet_lock)?;
-                changed += 1;
-                log(&format!(
-                    "ERROR login for {name} was refused permanently ({reason}); it falls back to {fallback} until `tokeman claude login {name}`"
-                ));
             }
             Err(error) => {
+                let reason = one_line(&format!("{error:#}"), 160);
+                summary
+                    .transient_failures
+                    .push((name.clone(), reason.clone()));
                 if backoff.fail(&name, now) {
                     log(&format!(
-                        "login refresh for {name} failed; retrying with backoff ({})",
-                        one_line(&format!("{error:#}"), 160)
+                        "login refresh for {name} failed; retrying with backoff ({reason})"
                     ));
                 }
             }
         }
     }
-    if changed > 0 {
+    if summary.changed() > 0 {
         reoffer_default(&Fleet::load()?)?;
     }
-    Ok(changed)
+    Ok(summary)
 }
 
 /// After a refresh, make sure the default account's settings entry offers

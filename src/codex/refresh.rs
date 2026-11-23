@@ -10,10 +10,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Client;
 use super::auth::{CodexHome, IdClaims, TokenBundle};
+use crate::fs::{FileLock, resolve_link_chain};
 
 /// Codex refreshes on its own at about this age; tokeman stays ahead of it.
 pub const DEFAULT_MAX_AGE_DAYS: i64 = 7;
@@ -130,7 +134,7 @@ pub async fn exchange(client: &Client, refresh_token: &str) -> Result<TokenBundl
         .await
         .map_err(RefreshError::transient)?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = response.text().await.map_err(RefreshError::transient)?;
     if !status.is_success() {
         return Err(RefreshError {
             failure: classify(status, &body),
@@ -142,25 +146,97 @@ pub async fn exchange(client: &Client, refresh_token: &str) -> Result<TokenBundl
     })?;
     let access_token = parsed
         .access_token
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| RefreshError::transient("refresh response carried no access_token"))?;
     Ok(TokenBundle {
         access_token,
         // Codex keeps the prior refresh token when the response omits one.
         refresh_token: parsed
             .refresh_token
+            .filter(|token| !token.is_empty())
             .unwrap_or_else(|| refresh_token.to_owned()),
-        id_token: parsed.id_token,
+        id_token: parsed.id_token.filter(|token| !token.is_empty()),
         account_id: None,
         last_refresh: Some(Utc::now()),
     })
 }
 
+fn process_refresh_lock(resolved_auth: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut map = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(resolved_auth.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+struct RefreshGuard {
+    _task_guard: tokio::sync::OwnedMutexGuard<()>,
+    _file_lock: FileLock,
+}
+
+async fn acquire_refresh_guard(home: &CodexHome) -> Result<RefreshGuard, RefreshError> {
+    let resolved = resolve_link_chain(&home.auth_path())
+        .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
+    let resolved = if resolved.is_absolute() {
+        resolved
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&resolved))
+            .unwrap_or(resolved)
+    };
+    let task_mutex = process_refresh_lock(&resolved);
+    let task_guard = task_mutex.lock_owned().await;
+    let lock_path = resolved.with_extension("refresh.lock");
+    let file_lock = tokio::task::spawn_blocking(move || {
+        FileLock::acquire_announced(
+            &lock_path,
+            &format!("Codex refresh lock {}", lock_path.display()),
+        )
+    })
+    .await
+    .map_err(|err| RefreshError::transient(format!("refresh lock task failed: {err}")))?
+    .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
+    Ok(RefreshGuard {
+        _task_guard: task_guard,
+        _file_lock: file_lock,
+    })
+}
+
 /// Refresh the profile at `home` in place. The rotated bundle is on disk
-/// before this returns anything that could fail afterwards.
+/// before this returns anything that could fail afterwards, and concurrent
+/// refreshers of the same resolved `auth.json` are serialized so a single-use
+/// `refresh_token` is never redeemed twice.
 pub async fn refresh_home(client: &Client, home: &CodexHome) -> Result<TokenBundle, RefreshError> {
+    let before = home.read().ok().map(|auth| {
+        (
+            auth.access_token().map(str::to_owned),
+            auth.refresh_token().map(str::to_owned),
+        )
+    });
+    let _guard = acquire_refresh_guard(home).await?;
     let auth = home
         .read()
         .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
+    if let Some((before_access, before_refresh)) = &before {
+        let after_access = auth.access_token().map(str::to_owned);
+        let after_refresh = auth.refresh_token().map(str::to_owned);
+        if (&after_access, &after_refresh) != (before_access, before_refresh)
+            && let Some(bundle) = auth.bundle()
+        {
+            return Ok(bundle);
+        }
+    }
+    refresh_home_locked(client, home, &auth).await
+}
+
+async fn refresh_home_locked(
+    client: &Client,
+    home: &CodexHome,
+    auth: &super::auth::AuthFile,
+) -> Result<TokenBundle, RefreshError> {
     let Some(refresh_token) = auth.refresh_token() else {
         return Err(RefreshError {
             failure: Failure::NoRefreshToken,
@@ -192,15 +268,31 @@ pub async fn refresh(
     max_age_days: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<TokenBundle>, RefreshError> {
-    if !force {
-        let auth = home
-            .read()
-            .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
-        if !auth.is_stale(max_age_days, now) {
-            return Ok(None);
-        }
+    let before = home
+        .read()
+        .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
+    if !force && !before.is_stale(max_age_days, now) {
+        return Ok(None);
     }
-    refresh_home(client, home).await.map(Some)
+    let before_tokens = (
+        before.access_token().map(str::to_owned),
+        before.refresh_token().map(str::to_owned),
+    );
+    let _guard = acquire_refresh_guard(home).await?;
+    let auth = home
+        .read()
+        .map_err(|err| RefreshError::transient(format!("{err:#}")))?;
+    let after_tokens = (
+        auth.access_token().map(str::to_owned),
+        auth.refresh_token().map(str::to_owned),
+    );
+    if after_tokens != before_tokens {
+        return Ok(auth.bundle());
+    }
+    if !force && !auth.is_stale(max_age_days, Utc::now()) {
+        return Ok(None);
+    }
+    refresh_home_locked(client, home, &auth).await.map(Some)
 }
 
 #[cfg(test)]

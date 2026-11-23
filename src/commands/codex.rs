@@ -103,15 +103,19 @@ pub fn profile_name(path: &Path) -> String {
 pub fn survey(roots: &[PathBuf], fleet: &Fleet) -> Vec<Discovered> {
     roots
         .iter()
-        .map(|root| Discovered {
-            name: profile_name(root),
-            path: root.clone(),
-            registered: fleet.codex.iter().any(|account| account.home() == *root),
+        .map(|root| {
+            let existing = fleet.codex.iter().find(|account| account.home() == *root);
+            Discovered {
+                name: existing.map_or_else(|| profile_name(root), |account| account.name.clone()),
+                path: root.clone(),
+                registered: existing.is_some(),
+            }
         })
         .collect()
 }
 
-/// Find profiles on disk; with `adopt`, register the unknown ones.
+/// Find profiles on disk; with `adopt`, register the unknown ones without
+/// overwriting any existing profile that shares the same base directory name.
 pub fn discover(adopt: bool) -> Result<Discovery> {
     let roots = discovery_roots();
     let profiles = survey(&roots, &Fleet::load()?);
@@ -127,8 +131,18 @@ pub fn discover(adopt: bool) -> Result<Discovery> {
             .filter(|profile| !profile.registered)
             .collect();
         for profile in &unknown {
+            let mut name = profile.name.clone();
+            let mut suffix = 2usize;
+            while fleet
+                .codex
+                .iter()
+                .any(|existing| existing.name == name && existing.home() != profile.path)
+            {
+                name = format!("{}-{suffix}", profile.name);
+                suffix += 1;
+            }
             fleet.upsert_codex(CodexAccount {
-                name: profile.name.clone(),
+                name,
                 codex_home: tilde(&profile.path),
                 ..CodexAccount::default()
             });
@@ -171,15 +185,34 @@ pub fn parse_import(text: &str) -> Result<Vec<(String, String)>> {
 /// Seed one access-only profile per line of `text` under `root`, registering
 /// each as an `access_only` account when `register` is set.
 pub fn import_into(text: &str, root: &Path, register: bool) -> Result<Vec<Imported>> {
-    let mut imported = Vec::new();
-    let mut accounts = Vec::new();
-    for (name, token) in parse_import(text)? {
+    let entries = parse_import(text)?;
+    if entries.is_empty() {
+        bail!("no tokens found");
+    }
+    let mut seen_names = std::collections::BTreeSet::new();
+    let mut seen_dirs = std::collections::BTreeSet::new();
+    let mut prepared = Vec::with_capacity(entries.len());
+    for (name, token) in entries {
+        if name.is_empty() || name == "." || name == ".." {
+            bail!("invalid account name '{name}'");
+        }
+        if !seen_names.insert(name.clone()) {
+            bail!("duplicate account name '{name}' in import");
+        }
+        let slug = auth::slugify(&name);
+        if !seen_dirs.insert(slug.clone()) {
+            bail!("account '{name}' collides on profile directory '{slug}'");
+        }
         let claims = IdClaims::decode(&token)
             .with_context(|| format!("{name}: token is not a decodable JWT"))?;
         let Some(account_id) = claims.chatgpt_account_id.clone() else {
             bail!("{name}: token carries no chatgpt_account_id");
         };
-        let dir = root.join(auth::slugify(&name));
+        prepared.push((name, token, claims, account_id, root.join(slug)));
+    }
+    let mut imported = Vec::with_capacity(prepared.len());
+    let mut accounts = Vec::with_capacity(prepared.len());
+    for (name, token, claims, account_id, dir) in prepared {
         auth::seat_access_only(&token, &account_id, &CodexHome::new(&dir))?;
         let plan = claims.chatgpt_plan_type.clone();
         let expiry = match claims.expires_at {
@@ -203,9 +236,6 @@ pub fn import_into(text: &str, root: &Path, register: bool) -> Result<Vec<Import
             expires_at: claims.expires_at,
             registered: register,
         });
-    }
-    if imported.is_empty() {
-        bail!("no tokens found");
     }
     if register {
         Fleet::update(|fleet| {
@@ -392,24 +422,41 @@ impl fmt::Display for Warning {
 pub struct Seated {
     pub account: String,
     pub into: PathBuf,
+    pub backup: Option<PathBuf>,
+    pub dry_run: bool,
     pub warnings: Vec<Warning>,
 }
 
-/// Copy an account's bundle into another profile, refreshing it first so the
-/// target never starts on a token about to 401.
+/// Link `into/auth.json` to an account's resolved `auth.json` (refreshing it
+/// first when not a dry run) so both share one single-use refresh token and
+/// `.json.lock` advisory lock instead of splitting refresh state.
 pub async fn seat(
     client: &Client,
     fleet: &Fleet,
     account_name: &str,
     into: &str,
+    dry_run: bool,
 ) -> Result<Seated> {
     let account = fleet
         .codex_account(account_name)
         .with_context(|| format!("no codex account named {account_name}"))?;
     let source = CodexHome::new(account.home());
-    let target = CodexHome::new(expand_tilde(into));
+    let target = target_home(Some(into))?;
     if source == target {
         bail!("source and target are the same profile");
+    }
+    let _ = source
+        .read()?
+        .bundle()
+        .with_context(|| format!("{} has no usable OAuth bundle", source.path().display()))?;
+    if dry_run {
+        return Ok(Seated {
+            account: account_name.to_owned(),
+            into: target.path().to_path_buf(),
+            backup: None,
+            dry_run: true,
+            warnings: Vec::new(),
+        });
     }
     let mut warnings = Vec::new();
     if let Err(error) =
@@ -420,22 +467,30 @@ pub async fn seat(
             error,
         });
     }
-    let bundle = source
-        .read()?
-        .bundle()
-        .with_context(|| format!("{} has no usable OAuth bundle", source.path().display()))?;
-    auth::seat(&bundle, &target)?;
+    let backup = auth::link_profile(&source, &target)?;
     Ok(Seated {
         account: account_name.to_owned(),
         into: target.path().to_path_buf(),
+        backup,
+        dry_run: false,
         warnings,
     })
 }
 
-/// `codex_home` if given, else `~/.codex`.
+/// `codex_home` if given (absolutized against cwd when relative), else `~/.codex`.
 fn target_home(codex_home: Option<&str>) -> Result<CodexHome> {
     match codex_home {
-        Some(path) => Ok(CodexHome::new(expand_tilde(path))),
+        Some(path) => {
+            let expanded = expand_tilde(path);
+            let absolute = if expanded.is_absolute() {
+                expanded
+            } else {
+                std::env::current_dir()
+                    .context("failed to determine current directory")?
+                    .join(expanded)
+            };
+            Ok(CodexHome::new(absolute))
+        }
         None => CodexHome::default_home(),
     }
 }
@@ -710,8 +765,10 @@ pub async fn use_account(
     let client = Client::new()?;
     match &options.into {
         Some(into) => {
-            let account = account.context("name the account to copy into the profile")?;
-            Ok(Used::Seated(seat(&client, fleet, account, into).await?))
+            let account = account.context("name the account to link into the profile")?;
+            Ok(Used::Seated(
+                seat(&client, fleet, account, into, options.dry_run).await?,
+            ))
         }
         None => {
             let reseat = reseat(

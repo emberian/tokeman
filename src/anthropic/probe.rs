@@ -64,8 +64,10 @@ const KNOWN_HEADERS: &[&str] = &[
     "slow-retry-after",
     "slow-max-wait",
 ];
-/// `status`, each window's `-status` and `overage-status`.
+/// `status` and each window's `-status`.
 const KNOWN_VERDICTS: &[&str] = &["allowed", "allowed_warning", "rejected"];
+/// `overage-status` may also be `disabled` when extra usage is turned off.
+const KNOWN_OVERAGE_STATUSES: &[&str] = &["allowed", "allowed_warning", "rejected", "disabled"];
 /// `representative-claim` and `claim`: Claude Code's `rateLimitType`.
 const KNOWN_CLAIMS: &[&str] = &[
     "five_hour",
@@ -109,7 +111,8 @@ const KNOWN_SLOW_OFFERS: &[&str] = &["treatment", "control"];
 /// comma list) of a fixed set. `rest` is the name after the prefix.
 fn known_words(rest: &str) -> Option<&'static [&'static str]> {
     Some(match rest {
-        "status" | "overage-status" => KNOWN_VERDICTS,
+        "status" => KNOWN_VERDICTS,
+        "overage-status" => KNOWN_OVERAGE_STATUSES,
         "representative-claim" | "claim" => KNOWN_CLAIMS,
         "overage-disabled-reason" => KNOWN_OVERAGE_DISABLED_REASONS,
         "overage-scope" => KNOWN_OVERAGE_SCOPES,
@@ -435,6 +438,25 @@ pub async fn probe_all<'a>(
     probe_all_with(
         client,
         &profile::Cache::default(),
+        accounts,
+        model,
+        timeout,
+        now,
+    )
+    .await
+}
+
+/// [`probe_all`], never locking or writing the on-disk profile cache (for `--dry-run`).
+pub async fn probe_all_read_only<'a>(
+    client: &Client,
+    accounts: impl IntoIterator<Item = &'a Account>,
+    model: &str,
+    timeout: Duration,
+    now: i64,
+) -> Vec<Reading> {
+    probe_all_with(
+        client,
+        &profile::Cache::default().read_only(),
         accounts,
         model,
         timeout,

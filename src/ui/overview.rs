@@ -30,7 +30,7 @@ use crate::ui::text;
 #[serde(rename_all = "kebab-case")]
 pub enum Monitor {
     Running,
-    /// The service is installed and rotation is paused: Claude is not read.
+    /// The service runs with credential changes paused; read-only quota polling continues.
     Paused,
     /// The service is installed and no daemon is running: nothing reads.
     Stopped,
@@ -61,7 +61,7 @@ impl Monitor {
     /// Whether the background service reads every account by itself, so a
     /// surface only has to show what is stored.
     pub fn keeps_fresh(self) -> bool {
-        self == Self::Running
+        matches!(self, Self::Running | Self::Paused)
     }
 }
 
@@ -474,23 +474,25 @@ impl Overview {
         let forecasts = services
             .into_iter()
             .filter_map(|service| {
-                let inputs: Vec<forecast::Input<'_>> = accounts
+                let active: Vec<(&AccountView, &Reading, Vec<Reading>)> = accounts
                     .iter()
                     .filter(|account| account.service == service && !account.parked)
                     .filter_map(|account| {
                         let latest = account.reading.as_ref()?;
-                        let first = facts.recent.iter().position(|reading| {
-                            reading.service == service && reading.account == account.name
-                        });
-                        let recent = first.map_or(&[][..], |first| {
-                            let len = facts.recent[first..]
-                                .iter()
-                                .take_while(|reading| {
-                                    reading.service == service && reading.account == account.name
-                                })
-                                .count();
-                            &facts.recent[first..first + len]
-                        });
+                        let recent: Vec<Reading> = facts
+                            .recent
+                            .iter()
+                            .filter(|reading| {
+                                reading.service == service && reading.account == account.name
+                            })
+                            .cloned()
+                            .collect();
+                        Some((account, latest, recent))
+                    })
+                    .collect();
+                let inputs: Vec<forecast::Input<'_>> = active
+                    .iter()
+                    .map(|(account, latest, recent)| {
                         let refills = match service {
                             Service::Claude => facts
                                 .offers
@@ -503,11 +505,11 @@ impl Overview {
                                 .and_then(|codex| codex.reset_credits)
                                 .map_or(0, |credits| credits.available.max(0) as u32),
                         };
-                        Some(forecast::Input {
+                        forecast::Input {
                             latest,
                             recent,
                             refills,
-                        })
+                        }
                     })
                     .collect();
                 // Claude's last accounts drain in place to the sip floor;
@@ -726,8 +728,8 @@ mod tests {
         assert_eq!(Monitor::of(false, false, true), Monitor::Stopped);
         assert_eq!(Monitor::of(false, false, false), Monitor::NotInstalled);
         assert!(Monitor::Running.keeps_fresh());
+        assert!(Monitor::Paused.keeps_fresh());
         assert!(!Monitor::Stopped.keeps_fresh());
-        assert!(!Monitor::Paused.keeps_fresh());
     }
 
     #[test]

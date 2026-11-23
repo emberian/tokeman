@@ -88,13 +88,13 @@ src/
     keychain.rs  macOS: capture, suppress and restore the /login Keychain record
     sessions.rs  live Claude processes (bounded census) and which account each spends
   codex/
-    mod.rs       client (HTTP/1.1 + cookie jar), edge-challenge detection
-    auth.rs      auth.json read/write, seating
-    appserver.rs JSON-RPC over the app-server Unix socket
+    mod.rs       client (HTTP/1.1 + edge-only cookie jar), edge-challenge detection
+    auth.rs      auth.json read/write, `.json.lock` flock, atomic symlink seating (`--into`)
+    appserver.rs JSON-RPC over the app-server Unix socket (UID-verified, bounded)
     probe.rs     the usage probe -> Reading; State (ok / limited / error, as words)
-    refresh.rs   token refresh
+    refresh.rs   token refresh (serialized per resolved auth.json via `.refresh.lock`)
     resets.rs    reset credits: list, plan, claim (through the claim journal)
-    maintenance.rs  the service's half-hour sweep: probe, record, refresh what is due or rejected
+    maintenance.rs  the service's half-hour sweep: probe, record, refresh what is due or rejected (read-only when paused)
     mover.rs     moving a running Codex: Seat (what its app-server reports), consider (leave below the Codex
                  floors for the best profile above the landing floors, via policy::relocate), announce, Look;
                  the only writer of codex-moves.jsonl. Shared by the daemon and `codex watch`
@@ -156,8 +156,8 @@ src/
     tui.rs       --watch: a card per account, a chart of any limit
   cli.rs         clap definitions, and REMOVED: the 0.3 spellings and what replaced each
   main.rs        dispatch: parse, call commands/, hand the result to ui/text
-  launch.rs      `claude launch` (one cycle, then claude); Launch: a program, its arguments and the
-                 environment that seats an account, exec'd by main
+  launch.rs      `claude launch` (one cycle, then exec claude; supervises only with `--auto` when no service runs);
+                 Launch: a program, its arguments and the environment that seats an account, exec'd by main
 macos/tray/      the Swift menu-bar app: a viewer of `tokeman list --json`
 ```
 
@@ -284,7 +284,7 @@ impl Journal { fn pending(service, account) ; fn begin(service, account, item, n
                fn finish(..) ; fn clear(..) }
 
 // ui/overview.rs: the one fleet view. `tokeman list --json` is its serialization.
-pub enum Monitor { Running, Paused, NotInstalled }       // keeps_fresh(): the service reads every account
+pub enum Monitor { Running, Paused, Stopped, NotInstalled }   // keeps_fresh(): Running | Paused (paused polls read-only)
 pub enum Origin { Stored, Fresh }
 pub struct Overview {
     at, origin, read_at: Option<i64> /* the newest reading */, monitor,
@@ -531,8 +531,14 @@ owner-only.
 - A Fable grant (`gives_back_weekly`) gives back only Fable's use of the
   weekly.
 - The ChatGPT edge challenges h2 requests with Codex's headers and replays
-  its cookie only across a shared cookie jar, so the Codex client is
-  HTTP/1.1 with one jar.
+  its clearance cookie across requests, so the Codex client is HTTP/1.1 with
+  an edge-only cookie jar (`__cf*`/`_cf*`/`cf_*`) that never carries session
+  cookies across accounts.
+- `tokeman codex use <account> --into <dir>` symlinks `<dir>/auth.json` to the
+  source profile's resolved `auth.json` (backing up an existing regular file
+  once to `auth.json.bak` `0600`) rather than cloning single-use refresh tokens,
+  and coordinates writes via `<resolved>.json.lock` (`flock`, matching upstream
+  `openai/codex`).
 - Codex's 401 recovery refuses an `auth.json` whose account id changed; the
   app-server `reload` path does not.
 - A Codex app-server answers `account/rateLimits/read` with the account-wide

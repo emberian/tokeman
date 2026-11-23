@@ -59,10 +59,16 @@ pub struct Session {
     pub source: Attribution,
 }
 
-/// Run `/bin/ps` with a bounded wait; the child is killed if the wait ends.
+/// Run `ps` with a bounded wait; the child is killed if the wait ends.
 pub(crate) async fn ps(args: &[&str], timeout: Duration) -> Result<String> {
-    let run = tokio::process::Command::new("/bin/ps")
+    let bin = if std::path::Path::new("/bin/ps").exists() {
+        "/bin/ps"
+    } else {
+        "ps"
+    };
+    let run = tokio::process::Command::new(bin)
         .args(args)
+        .env("LC_ALL", "C")
         .kill_on_drop(true)
         .output();
     let output = tokio::time::timeout(timeout, run)
@@ -110,11 +116,15 @@ pub(crate) fn parse_lstart(text: &str) -> Option<DateTime<Local>> {
 /// One row of `ps -axo pid=,tty=,lstart=,comm=`, when it is a `claude`.
 pub fn parse_ps_session(line: &str) -> Option<(u32, Option<String>, DateTime<Utc>)> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 8 || fields[7].rsplit('/').next()? != "claude" {
+    if fields.len() < 8 {
+        return None;
+    }
+    let comm = fields[7..].join(" ");
+    if comm.rsplit('/').next()? != "claude" {
         return None;
     }
     let pid = fields[0].parse().ok()?;
-    let tty = (fields[1] != "??").then(|| fields[1].to_owned());
+    let tty = (!matches!(fields[1], "??" | "?")).then(|| fields[1].to_owned());
     let started_at = parse_lstart(&fields[2..7].join(" "))?.with_timezone(&Utc);
     Some((pid, tty, started_at))
 }

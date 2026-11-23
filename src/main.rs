@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         None if cli.watch => tokeman::ui::tui::run(Fleet::load()?, cli.fresh).await,
         None => {
             let fleet = Fleet::load()?;
-            if fleet.account_keys().is_empty() {
+            if fleet.account_keys().is_empty() && !cli.json {
                 bail!("{}", text::NO_ACCOUNTS);
             }
             let overview = view::overview(&fleet, cli.fresh).await;
@@ -202,10 +202,14 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
             let plan = claude::reset_plan(&fleet, &name, grant.as_deref(), session).await?;
             text::print_reset_plan(&plan);
             if !yes && !prompt::confirm("Use one reset now?")? {
-                println!("Cancelled; no reset used.");
+                text::print_reset_cancelled();
                 return Ok(());
             }
-            text::print_reset_claimed(&claude::reset_claim(&plan).await?);
+            let outcome = claude::reset_claim(&plan).await?;
+            text::print_reset_claimed(&outcome);
+            if let Some(failed) = text::claude_reset_failed(&outcome) {
+                bail!("{failed}");
+            }
         }
     }
     Ok(())
@@ -235,7 +239,11 @@ async fn codex_command(action: CodexAction) -> Result<()> {
         CodexAction::List { json } => {
             let fleet = Fleet::load()?;
             if fleet.codex.is_empty() {
-                text::print_no_accounts(Service::Codex);
+                if json {
+                    text::print_json(&Vec::<codex::Listed>::new())?;
+                } else {
+                    text::print_no_accounts(Service::Codex);
+                }
                 return Ok(());
             }
             let listed = codex::list(&fleet).await?;
@@ -323,6 +331,9 @@ async fn codex_command(action: CodexAction) -> Result<()> {
             text::print_codex_reset_claimed(&account, &claim);
             if let Some(uncertain) = text::codex_reset_uncertain(&account, &claim) {
                 bail!("{uncertain}");
+            }
+            if let Some(failed) = text::codex_reset_failed(&account, &claim) {
+                bail!("{failed}");
             }
         }
         CodexAction::Best { limit } => best(Service::Codex, limit.as_deref()).await?,

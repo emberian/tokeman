@@ -4,7 +4,20 @@ set -eu
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cargo install --locked --path "$repo_dir" --force "$@"
 
-binary="${CARGO_HOME:-$HOME/.cargo}/bin/tokeman"
+install_root=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}
+prev_root=0
+for arg in "$@"; do
+  if [ "$prev_root" = 1 ]; then
+    install_root=$arg
+    prev_root=0
+    continue
+  fi
+  case "$arg" in
+    --root) prev_root=1 ;;
+    --root=*) install_root=${arg#--root=} ;;
+  esac
+done
+binary="$install_root/bin/tokeman"
 if [ "$(uname -s)" = "Darwin" ]; then
   identity=${TOKEMAN_CODESIGN_IDENTITY:-}
   if [ -n "$identity" ]; then

@@ -55,11 +55,18 @@ pub enum Refusal {
     Transient,
 }
 
-/// 401, or an `invalid_grant` error code in the body.
+/// 401, or an `invalid_grant` error code in the body (either flat OAuth
+/// `{"error":"invalid_grant"}` or nested `{"error":{"type":"invalid_grant"}}`).
 pub fn refusal(status: u16, body: &str) -> Refusal {
     let code = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|body| body.get("error")?.as_str().map(str::to_owned));
+        .and_then(|body| {
+            let error = body.get("error")?;
+            error
+                .as_str()
+                .or_else(|| error.get("type").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        });
     if status == 401 || code.as_deref() == Some("invalid_grant") {
         Refusal::Permanent
     } else {
@@ -197,11 +204,15 @@ impl fmt::Debug for TokenResponse {
 
 /// `expires_at` in epoch milliseconds, as Claude's own Keychain record keeps it.
 pub fn grant_of(response: TokenResponse, now_ms: i64) -> Grant {
+    let to_ms = |seconds: i64| {
+        seconds
+            .max(0)
+            .checked_mul(1000)
+            .and_then(|delta| now_ms.checked_add(delta))
+    };
     Grant {
-        expires_at: response.expires_in.map(|seconds| now_ms + seconds * 1000),
-        refresh_expires_at: response
-            .refresh_token_expires_in
-            .map(|seconds| now_ms + seconds * 1000),
+        expires_at: response.expires_in.and_then(to_ms),
+        refresh_expires_at: response.refresh_token_expires_in.and_then(to_ms),
         scopes: response
             .scope
             .unwrap_or_default()
@@ -209,12 +220,40 @@ pub fn grant_of(response: TokenResponse, now_ms: i64) -> Grant {
             .map(str::to_owned)
             .collect(),
         access_token: response.access_token,
-        refresh_token: response.refresh_token,
+        refresh_token: response.refresh_token.filter(|token| !token.is_empty()),
     }
 }
 
-/// Redeem a pasted `code` or `code#state`. The state is checked before any
-/// network call, so a code from a different run cannot be redeemed here.
+fn parse_pasted_code(pasted: &str) -> (&str, Option<&str>) {
+    let pasted = pasted.trim();
+    if let Some((_, query_and_frag)) = pasted.split_once('?') {
+        let (query, frag) = match query_and_frag.split_once('#') {
+            Some((q, f)) => (q, Some(f.trim())),
+            None => (query_and_frag, None),
+        };
+        let mut code = None;
+        let mut state = frag.filter(|f| !f.is_empty());
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "code" if !v.is_empty() => code = Some(v.trim()),
+                    "state" if !v.is_empty() => state = Some(v.trim()),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(code) = code {
+            return (code, state);
+        }
+    }
+    match pasted.split_once('#') {
+        Some((code, state)) => (code.trim(), Some(state.trim())),
+        None => (pasted, None),
+    }
+}
+
+/// Redeem a pasted `code`, `code#state`, or callback URL. The state is checked
+/// before any network call, so a code from a different run cannot be redeemed here.
 pub async fn exchange(client: &Client, pasted: &str, pkce: &Pkce) -> Result<Grant, Error> {
     exchange_waiting(client, pasted, pkce, &EXCHANGE_RETRY_SECS).await
 }
@@ -225,11 +264,7 @@ async fn exchange_waiting(
     pkce: &Pkce,
     retry_secs: &[u64],
 ) -> Result<Grant, Error> {
-    let pasted = pasted.trim();
-    let (code, state) = match pasted.split_once('#') {
-        Some((code, state)) => (code.trim(), Some(state.trim())),
-        None => (pasted, None),
-    };
+    let (code, state) = parse_pasted_code(pasted);
     if code.is_empty() {
         return Err(Error::Paste("no authorization code was pasted"));
     }
@@ -293,14 +328,20 @@ async fn post_token(client: &Client, body: &serde_json::Value) -> Result<Grant, 
         .await
         .map_err(Error::Network)?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
         return Err(Error::Refused {
             status: status.as_u16(),
             body: text,
         });
     }
+    let text = response.text().await.map_err(Error::Network)?;
     let parsed: TokenResponse = serde_json::from_str(&text).map_err(Error::Unreadable)?;
+    if parsed.access_token.trim().is_empty() {
+        return Err(Error::Unreadable(serde::de::Error::custom(
+            "token response contained an empty access_token",
+        )));
+    }
     Ok(grant_of(parsed, chrono::Utc::now().timestamp_millis()))
 }
 

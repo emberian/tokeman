@@ -44,6 +44,9 @@ fn default_services_interval() -> u64 {
 
 /// Service usage endpoints are polled no faster than this.
 pub const MIN_SERVICES_INTERVAL_SECS: u64 = 60;
+/// Upper bound on configured intervals so conversions to `i64` / `Duration`
+/// never wrap or panic.
+pub const MAX_INTERVAL_SECS: u64 = 365 * 86_400;
 
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -108,19 +111,37 @@ impl LaunchSettings {
             "claude_bin" => self.claude_bin = (!value.is_empty()).then(|| value.to_owned()),
             "probe_interval_secs" => {
                 self.probe_interval_secs = match value.parse() {
-                    Ok(secs) if secs >= 1 => secs,
-                    _ => bail!("probe_interval_secs takes a whole number of seconds, at least 1"),
+                    Ok(secs) if (1..=MAX_INTERVAL_SECS).contains(&secs) => secs,
+                    _ => bail!(
+                        "probe_interval_secs takes a whole number of seconds between 1 and {MAX_INTERVAL_SECS}"
+                    ),
                 }
             }
             "services_interval_secs" => {
                 self.services_interval_secs = match value.parse() {
-                    Ok(secs) if secs >= MIN_SERVICES_INTERVAL_SECS => secs,
+                    Ok(secs)
+                        if (MIN_SERVICES_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&secs) =>
+                    {
+                        secs
+                    }
                     _ => bail!(
-                        "services_interval_secs takes a whole number of seconds, at least {MIN_SERVICES_INTERVAL_SECS}"
+                        "services_interval_secs takes a whole number of seconds between {MIN_SERVICES_INTERVAL_SECS} and {MAX_INTERVAL_SECS}"
                     ),
                 }
             }
             _ => bail!("unknown setting {key:?}; one of {}", Self::KEYS.join(", ")),
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.probe_interval_secs == 0 || self.probe_interval_secs > MAX_INTERVAL_SECS {
+            bail!("settings.probe_interval_secs must be between 1 and {MAX_INTERVAL_SECS} seconds");
+        }
+        if self.services_interval_secs == 0 || self.services_interval_secs > MAX_INTERVAL_SECS {
+            bail!(
+                "settings.services_interval_secs must be between 1 and {MAX_INTERVAL_SECS} seconds"
+            );
         }
         Ok(())
     }
@@ -366,6 +387,12 @@ impl PolicySettings {
         }
         if self.normal_probe_interval_secs == 0 || self.sip_probe_interval_secs == 0 {
             bail!("rotation probe intervals must be at least one second");
+        }
+        if self.normal_probe_interval_secs > MAX_INTERVAL_SECS
+            || self.sip_probe_interval_secs > MAX_INTERVAL_SECS
+            || self.target_model_sample_secs > MAX_INTERVAL_SECS
+        {
+            bail!("rotation intervals must not exceed {MAX_INTERVAL_SECS} seconds");
         }
         Ok(())
     }

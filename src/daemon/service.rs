@@ -14,7 +14,39 @@ use crate::paths;
 #[cfg(target_os = "macos")]
 use anyhow::{Context, anyhow, bail};
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+const CMD_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "macos")]
+const MAX_LAUNCHD_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn run_bounded(program: &str, args: &[&str]) -> Result<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))?;
+    let deadline = Instant::now() + CMD_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect output from {program}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{program} timed out after {}s", CMD_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
 
 pub const LAUNCHER: &str = r#"#!/bin/sh
 set -eu
@@ -88,9 +120,10 @@ pub fn stop() {
     if plist.exists()
         && let Ok(domain) = domain()
     {
-        let _ = Command::new("/bin/launchctl")
-            .args(["bootout", &domain, &plist.to_string_lossy()])
-            .status();
+        let _ = run_bounded(
+            "/bin/launchctl",
+            &["bootout", &domain, &plist.to_string_lossy()],
+        );
     }
 }
 
@@ -102,16 +135,19 @@ pub fn install(binary: &Path) -> Result<PathBuf> {
     let plist_path = paths::launch_agent_plist();
     let log = paths::launchd_log();
     crate::fs::ensure_private_parent(&log)?;
+    if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > MAX_LAUNCHD_LOG_BYTES) {
+        let old = log.with_extension("log.old");
+        let _ = std::fs::rename(&log, &old);
+        let _ = crate::fs::set_mode(&old, 0o600);
+    }
     crate::fs::write_atomic(&launcher, LAUNCHER.as_bytes(), 0o700)?;
     crate::fs::write_atomic(
         &plist_path,
         plist(binary, &launcher, &home, &log).as_bytes(),
         0o644,
     )?;
-    let lint = Command::new("/usr/bin/plutil")
-        .args(["-lint", &plist_path.to_string_lossy()])
-        .status()?;
-    if !lint.success() {
+    let lint = run_bounded("/usr/bin/plutil", &["-lint", &plist_path.to_string_lossy()])?;
+    if !lint.status.success() {
         bail!("generated LaunchAgent plist failed validation");
     }
     let domain = domain()?;
@@ -140,7 +176,7 @@ pub fn uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn domain() -> Result<String> {
-    let output = Command::new("/usr/bin/id").arg("-u").output()?;
+    let output = run_bounded("/usr/bin/id", &["-u"])?;
     if !output.status.success() {
         bail!("failed to determine user id for launchctl");
     }
@@ -149,11 +185,11 @@ fn domain() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn launchctl<const N: usize>(args: [&str; N]) -> Result<()> {
-    let status = Command::new("/bin/launchctl").args(args).status()?;
-    if status.success() {
+    let output = run_bounded("/bin/launchctl", &args)?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(anyhow!("launchctl exited with {status}"))
+        Err(anyhow!("launchctl exited with {}", output.status))
     }
 }
 

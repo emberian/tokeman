@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.5.0 - 2026-11-23
+
+### Rotation, launches, and ranking
+
+- `tokeman rotate pause` now pauses credential mutations only: it clears
+  `~/.claude/settings.json`, restores `/login` Keychain precedence, and stops
+  token refreshes and Codex moves/seat tending while keeping the daemon's
+  read-only quota polling active (`Monitor::Paused.keeps_fresh() == true`) so
+  `tokeman`, `--watch`, and the macOS tray continue to show fresh stored views.
+- `tokeman claude launch` now `exec`s `claude` directly so Claude Code owns the
+  terminal and signals; with `--auto`, it delegates ongoing rotation to the
+  running background service when present, and otherwise supervises the child
+  (absorbing `SIGINT`/`SIGQUIT`, forwarding `SIGTERM`/`SIGHUP`, refreshing due
+  grants, reloading `tokens.toml`, and logging to `claude-rotate.log` instead
+  of writing over Claude's TUI).
+- `tokeman codex use <account> --into <dir>` now atomically symlinks
+  `<dir>/auth.json` to the source profile's resolved `auth.json` (backing up an
+  existing regular file once to `auth.json.bak` mode `0600`) instead of copying
+  single-use refresh tokens, and coordinates writes via `<resolved>.json.lock`
+  (`flock`, matching upstream `openai/codex`). Supports `--dry-run`.
+- `tokeman glm|kimi best` and `glm|kimi launch` now rank on account-wide coding
+  windows by default (scoping to a bucket only when `--group` is passed), so an
+  exhausted auxiliary bucket such as `MCP tools` or the `Kimi Code` monthly
+  share no longer blocks coding launches. `glm|kimi launch` also strips
+  Claude-specific `--model` flags from `launch_args`.
+- `tokeman agy best` and `agy launch` now share `agy use`'s fallback to `agy`'s
+  configured startup model group when another model group is at 0%.
+- `tokeman codex best` rejects HTTP-200 error envelopes lacking usage fields as
+  decode errors instead of windowless accounts, and reports `0%` measured room
+  (rather than `100%`) for genuine windowless last-resort accounts.
+
+### Credentials, claims, and safety
+
+- Resending an uncertain Claude grant claim (`claims.json`) in both
+  `tokeman claude reset` and the interactive reset picker now bypasses
+  pre-claim eligibility/`resets_left` checks when the pending grant matches,
+  allowing idempotent replay of `(grant_id, request_id)` to clear the journal.
+- Codex HTTP requests use an edge-only cookie jar (`__cf*`, `_cf*`, `cf_*`) so
+  session cookies never cross accounts, serialize refreshes per resolved
+  `auth.json` via `<resolved>.refresh.lock` (re-reading tokens after waiting to
+  avoid double-redeeming rotated grants), and verify peer UID + bound writes on
+  app-server Unix sockets.
+- Anthropic PKCE login verifies OAuth `state`, strips pasted URL fragments, and
+  avoids aborting on transient errors; Antigravity login binds IPv4 and IPv6
+  loopback listeners, ignores stray callback hits, serializes access-token cache
+  writes under a file lock, and avoids duplicate JSON keys in `agy use` reports.
+- `tokeman rotate daemon` handles `SIGTERM`/`SIGINT` cleanly, runs Codex
+  maintenance sweeps in a non-blocking task so 20-second Claude rotation ticks
+  never stall, detects binary replacement reliably on both Linux and macOS, and
+  clears managed settings credentials on `rotate uninstall`.
+- Hardened atomic writes, symlink-refusal, and `0600`/`0700` permissions across
+  `fs.rs`, `tokens.toml`, Keychain backups, chart outputs, and `check-linux.sh`
+  (removing `eval`), plus TUI `Ctrl-C`/panic terminal restoration and non-blocking
+  subprocess execution in the macOS tray app.
+
 ## 0.4.2 - 2026-11-14
 
 - `tokeman claude reset` now opens an interactive picker of available resets,

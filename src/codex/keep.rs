@@ -53,7 +53,7 @@ pub fn expiry(access_token: &str) -> Option<i64> {
 
 /// Whether a token expiring at `expires_at` is due for renewal at `now`.
 pub fn due(expires_at: Option<i64>, now: i64) -> bool {
-    expires_at.is_some_and(|at| at - now <= RENEW_WITHIN_SECS)
+    expires_at.is_some_and(|at| at.saturating_sub(now) <= RENEW_WITHIN_SECS)
 }
 
 /// Make the bundle in `home` one worth pushing: renewed when its access
@@ -169,7 +169,7 @@ pub async fn tend(client: &Client, fleet: &Fleet, seats: &Seats, seat: &Pushed, 
             Tended::Fine
         }
         Ok(Step::Ended) => {
-            let _ = seats.forget(&seat.home);
+            let _ = seats.forget_if(seat);
             Tended::Ended
         }
         Ok(Step::Pushed(renewed)) => {
@@ -240,17 +240,21 @@ async fn tend_connected(
         .map_err(|error| (Cause::Unanswered, format!("{error:#}")))?;
     let limits = server.rate_limits().await;
     // On another account, the token tokeman pushed is no longer in use.
-    let moved_by_id = limits
+    // Prefer the authoritative accountId when `rate_limits` answered so an
+    // email rename or case change never falsely drops a live seat.
+    let moved_away = match limits
         .as_ref()
         .ok()
-        .and_then(|limits| limits.account_id.as_ref())
-        .is_some_and(|id| *id != seat.account_id);
-    let moved_by_email = info
-        .email
-        .as_ref()
-        .zip(seat.email.as_ref())
-        .is_some_and(|(now_on, pushed)| now_on != pushed);
-    if moved_by_id || moved_by_email {
+        .and_then(|limits| limits.account_id.as_deref())
+    {
+        Some(id) => id != seat.account_id,
+        None => info
+            .email
+            .as_deref()
+            .zip(seat.email.as_deref())
+            .is_some_and(|(now_on, pushed)| !now_on.eq_ignore_ascii_case(pushed)),
+    };
+    if moved_away {
         return Ok(Step::Ended);
     }
     let account: &CodexAccount = fleet.codex_account(&seat.account).ok_or_else(|| {
@@ -291,9 +295,18 @@ async fn tend_connected(
             format!("{} holds no token to push", seat.account),
         ));
     };
+    if account_id != seat.account_id {
+        return Err((
+            Cause::ProfileGone,
+            format!(
+                "{} now holds account {}, not {}",
+                seat.account, account_id, seat.account_id
+            ),
+        ));
+    }
     let token = Fingerprint::of(access_token);
     if token == seat.token {
-        return match due(seat.expires_at, now) {
+        return match due(seat.expires_at, now) || dead {
             // Renewal left the same token in place: nothing newer exists.
             true => Err((
                 Cause::RefreshFailed,

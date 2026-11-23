@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::fs::write_atomic;
+use crate::fs::{FileLock, resolve_link_chain, write_atomic};
 
 /// A Codex profile directory: whatever `CODEX_HOME` would point at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,14 +56,32 @@ impl CodexHome {
         Ok(AuthFile { raw })
     }
 
+    /// Acquire the advisory lock for this profile's resolved `auth.json`
+    /// (`<resolved>.json.lock`), matching upstream `openai/codex` so tokeman
+    /// and Codex serialize read-modify-write updates to a shared auth file.
+    pub fn lock(&self) -> Result<FileLock> {
+        let resolved = resolve_link_chain(&self.auth_path())?;
+        let lock_path = resolved.with_extension("json.lock");
+        FileLock::acquire_announced(
+            &lock_path,
+            &format!("Codex auth lock {}", lock_path.display()),
+        )
+    }
+
     /// Replace the OAuth bundle, keeping every other key. Atomic: a torn
     /// auth.json loses the only copy of the refresh token.
     pub fn write_tokens(&self, tokens: &TokenBundle) -> Result<()> {
-        let mut raw = if self.exists() {
-            self.read()?.raw
+        let _lock = self.lock()?;
+        let existing = if self.exists() {
+            Some(self.read()?)
         } else {
-            json!({})
+            None
         };
+        let same_account = existing
+            .as_ref()
+            .and_then(AuthFile::effective_account_id)
+            .is_some_and(|prior| tokens.account_id.as_deref() == Some(prior.as_str()));
+        let mut raw = existing.map_or_else(|| json!({}), |file| file.raw);
         let object = raw
             .as_object_mut()
             .context("auth.json is not a JSON object")?;
@@ -76,11 +94,23 @@ impl CodexHome {
         };
         slot.insert("access_token".into(), json!(tokens.access_token));
         slot.insert("refresh_token".into(), json!(tokens.refresh_token));
-        if let Some(id_token) = &tokens.id_token {
-            slot.insert("id_token".into(), json!(id_token));
+        match &tokens.id_token {
+            Some(id_token) => {
+                slot.insert("id_token".into(), json!(id_token));
+            }
+            None if !same_account => {
+                slot.remove("id_token");
+            }
+            None => {}
         }
-        if let Some(account_id) = &tokens.account_id {
-            slot.insert("account_id".into(), json!(account_id));
+        match &tokens.account_id {
+            Some(account_id) => {
+                slot.insert("account_id".into(), json!(account_id));
+            }
+            None if !same_account => {
+                slot.remove("account_id");
+            }
+            None => {}
         }
         object.insert("tokens".into(), Value::Object(slot));
         object.insert(
@@ -208,19 +238,72 @@ pub struct IdClaims {
 
 impl IdClaims {
     pub fn decode(jwt: &str) -> Option<Self> {
-        let payload = jwt.split('.').nth(1)?;
+        let payload = jwt.split('.').nth(1)?.trim_end_matches('=');
         let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
         // Codex's own claims live under this URI.
         let auth = value.get("https://api.openai.com/auth");
+        let profile = value.get("https://api.openai.com/profile");
         let text = |v: Option<&Value>, key: &str| v?.get(key)?.as_str().map(str::to_owned);
+        let expires_at = value.get("exp").and_then(|exp| {
+            exp.as_i64().or_else(|| {
+                exp.as_f64()
+                    .filter(|f| f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64)
+                    .map(|f| f as i64)
+            })
+        });
         Some(Self {
-            email: text(Some(&value), "email"),
+            email: text(Some(&value), "email").or_else(|| text(profile, "email")),
             chatgpt_account_id: text(auth, "chatgpt_account_id"),
             chatgpt_plan_type: text(auth, "chatgpt_plan_type"),
-            expires_at: value.get("exp").and_then(Value::as_i64),
+            expires_at,
         })
     }
+}
+
+/// Link `target/auth.json` to `source`'s resolved `auth.json` so both share one
+/// single-use `refresh_token` and one `.json.lock` advisory lock instead of
+/// splitting refresh state across two files. If `target/auth.json` is an
+/// existing regular file and `auth.json.bak` does not exist yet, backs it up
+/// once (`0600`) and returns the backup path.
+pub fn link_profile(source: &CodexHome, target: &CodexHome) -> Result<Option<PathBuf>> {
+    let source_bundle = source
+        .read()?
+        .bundle()
+        .with_context(|| format!("{} has no usable OAuth bundle", source.path().display()))?;
+    if source_bundle.access_token.is_empty() || source_bundle.refresh_token.is_empty() {
+        bail!("refusing to link an incomplete token bundle");
+    }
+    let resolved_source = resolve_link_chain(&source.auth_path())?;
+    let resolved_source = if resolved_source.is_absolute() {
+        resolved_source
+    } else {
+        std::env::current_dir()
+            .context("failed to determine current directory")?
+            .join(resolved_source)
+    };
+    let target_auth = target.auth_path();
+    let mut backup = None;
+    if let Ok(meta) = std::fs::symlink_metadata(&target_auth)
+        && !meta.file_type().is_symlink()
+    {
+        let backup_path = target.path().join("auth.json.bak");
+        if std::fs::symlink_metadata(&backup_path).is_err() {
+            let bytes = std::fs::read(&target_auth)
+                .with_context(|| format!("failed to read {}", target_auth.display()))?;
+            write_atomic(&backup_path, &bytes, 0o600)?;
+            backup = Some(backup_path);
+        }
+    }
+    #[cfg(unix)]
+    {
+        crate::fs::write_symlink_atomic(&target_auth, &resolved_source)?;
+    }
+    #[cfg(not(unix))]
+    {
+        seat(&source_bundle, target)?;
+    }
+    Ok(backup)
 }
 
 /// Copy a bundle into another profile.
@@ -256,9 +339,20 @@ pub fn slugify(name: &str) -> String {
     } else {
         format!("{local}-{domain_head}")
     };
-    raw.chars()
+    let mapped: String = raw
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+        .collect();
+    let collapsed = mapped
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "account".to_owned()
+    } else {
+        collapsed
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +512,60 @@ pub(crate) mod tests {
         assert_eq!(slugify("ops@example.com"), "ops-example");
         assert_eq!(slugify("plain name"), "plain-name");
         assert_eq!(slugify("a.b@c"), "a-b-c");
+        assert_eq!(slugify("@@@"), "account");
+        assert_eq!(slugify("..foo..@bar"), "foo-bar");
+    }
+
+    #[test]
+    fn switching_accounts_clears_prior_id_token_and_link_profile_backs_up_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = CodexHome::new(dir.path().join("source"));
+        source
+            .write_tokens(&TokenBundle {
+                id_token: Some(id_token("a@b.c", "acct-a", "plus")),
+                account_id: Some("acct-a".into()),
+                ..bundle("access-a", "refresh-a")
+            })
+            .unwrap();
+
+        // Writing a different account with no id_token clears acct-a's id_token.
+        let other = CodexHome::new(dir.path().join("other"));
+        other
+            .write_tokens(&TokenBundle {
+                id_token: Some(id_token("a@b.c", "acct-a", "plus")),
+                account_id: Some("acct-a".into()),
+                ..bundle("access-a", "refresh-a")
+            })
+            .unwrap();
+        other
+            .write_tokens(&TokenBundle {
+                account_id: Some("acct-b".into()),
+                ..bundle("access-b", "refresh-b")
+            })
+            .unwrap();
+        assert_eq!(other.read().unwrap().id_token(), None);
+        assert_eq!(other.read().unwrap().account_id(), Some("acct-b"));
+
+        // Linking into a profile with an existing regular auth.json backs it up
+        // once and makes auth.json a symlink sharing source's refresh state.
+        let backup = link_profile(&source, &other).unwrap();
+        assert_eq!(backup, Some(other.path().join("auth.json.bak")));
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(other.auth_path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(other.read().unwrap().access_token(), Some("access-a"));
+        source
+            .write_tokens(&TokenBundle {
+                account_id: Some("acct-a".into()),
+                ..bundle("access-a2", "refresh-a2")
+            })
+            .unwrap();
+        assert_eq!(other.read().unwrap().access_token(), Some("access-a2"));
+        assert_eq!(link_profile(&source, &other).unwrap(), None);
     }
 
     #[test]

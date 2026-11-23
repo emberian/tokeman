@@ -111,25 +111,39 @@ pub fn settled(existing: Option<LoginBackup>) -> LoginBackup {
     )
 }
 
-/// Move the /login record from the Keychain to the backup. `force_check`
-/// looks even when the backup already says suppressed. Returns whether the
-/// Keychain changed.
+/// Move the /login record from the Keychain to the backup. Looks even when a
+/// backup already exists so a newer manual `/login` in Claude Code cannot
+/// silently shadow tokeman's managed `settings.json` credential. Returns
+/// whether the Keychain changed.
 #[cfg(target_os = "macos")]
-pub fn suppress(force_check: bool) -> Result<bool> {
+pub fn suppress(_force_check: bool) -> Result<bool> {
     let existing = load_backup()?;
-    if !force_check
-        && existing
+    let document = match read_document() {
+        Ok(document) => document,
+        Err(error) if is_locked_keychain(&error) => {
+            crate::notice::notice(
+                "macOS Keychain is locked; skipping Claude /login Keychain check",
+            );
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(mut document) = document else {
+        if existing
             .as_ref()
-            .is_some_and(|backup| backup.state == BackupState::Suppressed)
-    {
-        return Ok(false);
-    }
-    let Some(mut document) = read_document()? else {
-        save_backup(&settled(existing))?;
+            .is_none_or(|b| b.state != BackupState::Suppressed)
+        {
+            save_backup(&settled(existing))?;
+        }
         return Ok(false);
     };
     let Some(login) = split_login(&mut document)? else {
-        save_backup(&settled(existing))?;
+        if existing
+            .as_ref()
+            .is_none_or(|b| b.state != BackupState::Suppressed)
+        {
+            save_backup(&settled(existing))?;
+        }
         return Ok(false);
     };
     let mut backup = LoginBackup::new(BackupState::Captured, Some(login));
@@ -143,6 +157,32 @@ pub fn suppress(force_check: bool) -> Result<bool> {
 #[cfg(not(target_os = "macos"))]
 pub fn suppress(_force_check: bool) -> Result<bool> {
     Ok(false)
+}
+
+/// Whether Claude's Keychain item currently holds an unsuppressed `/login`
+/// record (which overrides `settings.json` in Claude Code).
+#[cfg(target_os = "macos")]
+pub fn has_unsuppressed_login() -> Result<bool> {
+    if cfg!(test) {
+        return Ok(false);
+    }
+    match read_document() {
+        Ok(Some(document)) => Ok(document.get(LOGIN_KEY).is_some()),
+        Ok(None) => Ok(false),
+        Err(error) if is_locked_keychain(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn has_unsuppressed_login() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn is_locked_keychain(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("-25308") || text.contains("User interaction is not allowed")
 }
 
 /// Put the backed-up login back and remove the backup. Returns whether the

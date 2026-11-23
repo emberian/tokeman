@@ -78,14 +78,35 @@ const MODEL_VARS: [&str; 5] = [
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 const SMALL_MODEL_VAR: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
-/// Credentials and an older model variable that would compete with the
+/// Credentials, routing flags and model variables that would compete with the
 /// vendor's if the child inherited them.
-const COMPETING: [&str; 4] = [
+const COMPETING: [&str; 9] = [
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "TOKEMAN_ACCOUNT",
+    "TOKEMAN_SESSION_SPENDS",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
 ];
+
+fn strip_model_flags(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--model" || arg == "-m" {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.starts_with("--model=") {
+            continue;
+        }
+        kept.push(arg.clone());
+    }
+    kept
+}
 
 /// The endpoint of a service whose plan serves Claude Code.
 pub fn endpoint(service: Service) -> Option<Endpoint> {
@@ -114,7 +135,9 @@ pub fn vendor(
         .filter(|account| account.service == best.service)
         .with_context(|| format!("no {} account named '{name}'", best.service.label()))?;
     let key = account.api_key()?;
-    let (binary, args) = fleet.launch.command(args);
+    let mut cleaned_launch = fleet.launch.clone();
+    cleaned_launch.launch_args = strip_model_flags(&cleaned_launch.launch_args);
+    let (binary, args) = cleaned_launch.command(args);
     let mut launch = Launch::new(best.service, name, Some(room), binary, args);
     for name in COMPETING {
         launch = launch.unset(name);
@@ -198,7 +221,7 @@ mod tests {
             ..Fleet::default()
         };
         fleet.launch.claude_bin = Some("/opt/claude".into());
-        fleet.launch.launch_args = vec!["--verbose".into()];
+        fleet.launch.launch_args = vec!["--model".into(), "opus".into(), "--verbose".into()];
 
         let glm = vendor(
             &fleet,

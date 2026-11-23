@@ -154,7 +154,10 @@ impl Place {
             bail!("no home directory");
         }
         let homes = paths::agy_homes();
-        let shell_home = dirs::home_dir().unwrap_or_else(|| real_home.clone());
+        let shell_home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| real_home.clone());
         if real_home.starts_with(&homes) || shell_home.starts_with(&homes) {
             bail!(
                 "this shell already runs on a per-account agy home ({}); run `tokeman agy run` from a shell on your own home",
@@ -346,12 +349,20 @@ fn link_real_home(real: &Path, home: &Path) -> Result<()> {
 }
 
 /// Link each [`SHARED`] entry of `real_gemini` that exists into `gemini`,
-/// where nothing is in its place yet.
+/// where nothing is in its place yet, and remove broken links left when a
+/// shared entry was removed from `real_gemini`.
 fn link_shared(real_gemini: &Path, gemini: &Path) -> Result<()> {
     for relative in SHARED {
         let target = real_gemini.join(relative);
         let link = gemini.join(relative);
-        if !present(&target)? || present(&link)? {
+        if !present(&target)? {
+            if std::fs::read_link(&link).is_ok_and(|existing| existing == target) {
+                std::fs::remove_file(&link)
+                    .with_context(|| format!("failed to remove {}", link.display()))?;
+            }
+            continue;
+        }
+        if present(&link)? {
             continue;
         }
         if let Some(parent) = link.parent() {

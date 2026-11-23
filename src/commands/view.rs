@@ -229,7 +229,10 @@ impl Best {
 /// Read `service`'s accounts now and rank them: `tokeman <service> best`.
 /// Claude is ranked as the rotation would land (the landing floors, the
 /// selection model); Codex on its account-wide windows or on `scope`'s limit,
-/// parked profiles left out; the others on `scope`'s group or on every group.
+/// parked profiles left out; Antigravity on `scope`'s group or every group
+/// (falling back to `agy`'s configured startup group when another group is at
+/// 0%); GLM and Kimi on their account-wide coding windows unless `scope`
+/// explicitly names a group.
 pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Result<Best> {
     let configured = match service {
         Service::Claude => fleet.accounts.len(),
@@ -244,6 +247,7 @@ pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Resul
         bail!("no {} accounts are registered", service.label());
     }
     let readings = probe(fleet, Some(service)).await;
+    let mut effective_scope = scope.map(str::to_owned);
     let (ranked, current, home) = match service {
         Service::Claude => {
             let model = target_model();
@@ -264,10 +268,25 @@ pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Resul
                 .map(|account| account.home());
             (ranked, None, home)
         }
-        _ => {
-            let ranked = names(ranked(&readings, ANY_ROOM, None, RankOn::Limits(scope)));
+        Service::Antigravity => {
+            let (agy_ranked, chosen_group) = super::services::rank_agy(
+                &readings,
+                scope,
+                crate::providers::antigravity::seat::startup_group(),
+            );
+            if let Some(group) = chosen_group {
+                effective_scope = Some(group);
+            }
             let current = super::services::seated(&fleet.services).await;
-            (ranked, current, None)
+            (names(agy_ranked), current, None)
+        }
+        Service::Zai | Service::Kimi => {
+            let on = match scope {
+                Some(group) => RankOn::Limits(Some(group)),
+                None => RankOn::Account,
+            };
+            let ranked = names(ranked(&readings, ANY_ROOM, None, on));
+            (ranked, None, None)
         }
     };
     Ok(Best {
@@ -276,7 +295,7 @@ pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Resul
         ranked,
         current,
         home,
-        scope: scope.map(str::to_owned),
+        scope: effective_scope,
     })
 }
 
@@ -319,7 +338,7 @@ pub fn codex_ranked<'a>(
             candidates
                 .iter()
                 .filter(|reading| reading.accepts_work() && reading.limits.is_empty())
-                .map(|reading| (reading.account.clone(), 1.0)),
+                .map(|reading| (reading.account.clone(), 0.0)),
         );
     }
     order
@@ -345,11 +364,19 @@ pub fn history(
     last: usize,
     since_hours: Option<f64>,
 ) -> Result<Vec<Reading>> {
+    if let Some(hours) = since_hours
+        && (!hours.is_finite() || hours <= 0.0)
+    {
+        bail!("--since must be greater than zero");
+    }
     let Ok(store) = Store::open_read_only() else {
         return Ok(Vec::new());
     };
     match since_hours {
-        Some(hours) => store.since(service, account, now() - (hours * 3_600.0) as i64),
+        Some(hours) => {
+            let secs = (hours * 3_600.0).min((i64::MAX / 2) as f64) as i64;
+            store.since(service, account, now().saturating_sub(secs))
+        }
         None => store.recent(service, account, last),
     }
 }
@@ -514,16 +541,15 @@ mod tests {
         // Ties fall to the policy's last tie-break, the name.
         let tied = vec![probe_with("b", 0.5, None), probe_with("a", 0.5, None)];
         assert_eq!(winner(&tied, &fleet, None).unwrap(), "a");
-        // An accepted account that reports no window is the last resort.
+        // An accepted account that reports no window is the last resort (0% measured room).
         let bare = probe_from(&json!({"email": "bare@x.y"}), "bare", DateTime::UNIX_EPOCH);
         assert_eq!(
             winner(&[bare.clone(), tied[0].clone()], &fleet, None).unwrap(),
             "b"
         );
-        assert_eq!(
-            winner(std::slice::from_ref(&bare), &fleet, None).unwrap(),
-            "bare"
-        );
+        let bare_ranked = codex_ranked(std::slice::from_ref(&bare), &fleet, None);
+        assert_eq!(bare_ranked[0].0.account, "bare");
+        assert_eq!(bare_ranked[0].1, 0.0);
         assert_eq!(winner(&[bare], &fleet, Some("spark")), None);
         // A refused account reports no window either, and is no resort at all.
         assert_eq!(winner(&probes[3..], &fleet, None), None);
@@ -561,10 +587,12 @@ mod tests {
             )],
             ..Fleet::default()
         };
-        let viewed = overview_under(&fleet, false, Monitor::Running).await;
-        assert_eq!(viewed.origin, Origin::Stored);
-        assert_eq!(viewed.accounts[0].reading, None, "nothing was read");
-        for monitor in [Monitor::Paused, Monitor::Stopped, Monitor::NotInstalled] {
+        for monitor in [Monitor::Running, Monitor::Paused] {
+            let viewed = overview_under(&fleet, false, monitor).await;
+            assert_eq!(viewed.origin, Origin::Stored, "{monitor:?}");
+            assert_eq!(viewed.accounts[0].reading, None, "nothing was read");
+        }
+        for monitor in [Monitor::Stopped, Monitor::NotInstalled] {
             let read = overview_under(&fleet, false, monitor).await;
             assert_eq!(read.origin, Origin::Fresh, "{monitor:?}");
             let reading = read.accounts[0].reading.as_ref().expect("read now");
@@ -639,5 +667,31 @@ mod tests {
         assert!(order(RankOn::Limits(Some("nothing-like-it"))).is_empty());
         // A group limit does not gate the account itself.
         assert!(order(RankOn::Account).is_empty());
+
+        // GLM / Kimi: an exhausted scoped bucket (e.g. MCP tools) does not block
+        // coding launches ranked on `RankOn::Account`, while `--group` ranks on it.
+        let mut glm = Reading::empty(Service::Zai, "glm-main", 0);
+        glm.limits = vec![
+            providers::limit(
+                None,
+                "5h",
+                Some(5 * 3_600),
+                crate::quota::Window::new(0.2, 0),
+                None,
+            ),
+            providers::limit(
+                Some("MCP tools".to_owned()),
+                "monthly",
+                Some(30 * 86_400),
+                crate::quota::Window::new(1.0, 0),
+                None,
+            ),
+        ];
+        let glm_list = [glm];
+        assert_eq!(
+            names(ranked(&glm_list, ANY_ROOM, None, RankOn::Account)),
+            [("glm-main".to_owned(), 0.8)]
+        );
+        assert!(ranked(&glm_list, ANY_ROOM, None, RankOn::Limits(Some("mcp"))).is_empty());
     }
 }

@@ -141,15 +141,19 @@ pub fn load() -> Vec<Event> {
 }
 
 fn load_from(path: &Path) -> Vec<Event> {
-    let Ok(Some(contents)) = read_if_present(path) else {
-        return Vec::new();
+    load_from_checked(path).unwrap_or_default()
+}
+
+fn load_from_checked(path: &Path) -> Result<Vec<Event>> {
+    let Some(contents) = read_if_present(path)? else {
+        return Ok(Vec::new());
     };
     let mut events: Vec<Event> = contents
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
     events.sort_by_key(|event| event.at);
-    events
+    Ok(events)
 }
 
 /// Append one event. Callers hold the rotation lock, so appends never
@@ -166,14 +170,16 @@ fn append_to(path: &Path, event: &Event, compact_above: u64) -> Result<()> {
     Ok(())
 }
 
-/// Keep everything inside the retention window plus the newest older entry,
+/// Keep everything inside the retention window plus the newest older offer,
 /// which is the state in effect at the window's start.
 fn compact(path: &Path, now: i64) -> Result<()> {
-    let cutoff = now - RETENTION_SECS;
-    let events = load_from(path);
+    let cutoff = now.saturating_sub(RETENTION_SECS);
+    let events = load_from_checked(path)?;
     let first_kept = events
         .iter()
-        .rposition(|event| event.at <= cutoff)
+        .rposition(|event| {
+            !matches!(event.kind, EventKind::Revoke | EventKind::Unknown) && event.at <= cutoff
+        })
         .unwrap_or(0);
     let mut contents = String::new();
     for event in &events[first_kept..] {
@@ -190,7 +196,9 @@ fn compact(path: &Path, now: i64) -> Result<()> {
 pub fn account_at(events: &[Event], at: i64) -> Option<Option<String>> {
     events
         .iter()
-        .rfind(|event| event.kind != EventKind::Revoke && event.at <= at)
+        .rfind(|event| {
+            !matches!(event.kind, EventKind::Revoke | EventKind::Unknown) && event.at <= at
+        })
         .map(|event| event.account.clone())
 }
 
@@ -258,6 +266,28 @@ mod tests {
         assert_eq!(account_at(&kept, now - 30 * DAY), Some(Some("b".into())));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+
+        // A revocation between the pre-cutoff offer and cutoff never causes
+        // compaction to forget the active offer.
+        let revoke_path = dir.path().join("revoke-history.jsonl");
+        append_to(
+            &revoke_path,
+            &event(now - 35 * DAY, "offered", "fp1", None),
+            u64::MAX,
+        )
+        .unwrap();
+        append_to(
+            &revoke_path,
+            &Event::revoke(now - 32 * DAY, "other", "secret"),
+            u64::MAX,
+        )
+        .unwrap();
+        append_to(&revoke_path, &event(now, "later", "fp2", None), 0).unwrap();
+        let kept_after_revoke = load_from(&revoke_path);
+        assert_eq!(
+            account_at(&kept_after_revoke, now - 30 * DAY),
+            Some(Some("offered".into()))
+        );
     }
 
     #[test]

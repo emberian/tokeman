@@ -79,13 +79,15 @@ tokeman settings [set <key> <value>]      # launch settings and the Codex mover'
 **Who reads the accounts.** While the background service runs
 (`tokeman rotate install`), it is the only reader: bare `tokeman`,
 `tokeman --watch` and the tray show the stored view and send no request.
-Every view says that it is stored and how old it is, and says STALE when the
-service has not read for ten minutes. The service counts as running while its
-daemon holds `daemon.lock`, however it was started; an installed service whose
-daemon has died shows as not running. Without a running service (or while
-rotation is paused) those surfaces read every account themselves. `--fresh`, `r` in
-`--watch` and the tray's reload button read now either way. `tokeman list`
-never sends a request; `tokeman <service> list` always reads that service.
+While rotation is paused (`tokeman rotate pause`), credential changes stop
+while the service continues read-only quota polling so stored views stay
+fresh. Every view says that it is stored and how old it is, and says STALE
+when the service has not read for ten minutes. The service counts as running
+while its daemon holds `daemon.lock`, however it was started; an installed
+service whose daemon has died shows as not running. Without a running service
+those surfaces read every account themselves. `--fresh`, `r` in `--watch` and
+the tray's reload button read now either way. `tokeman list` never sends a
+request; `tokeman <service> list` always reads that service.
 
 **What needs you.** `tokeman`, `tokeman list` and the macOS tray open with a
 "needs attention" section, each item with the command that deals with it: a
@@ -248,7 +250,7 @@ tokeman codex list                      # read every profile now, with its reset
 tokeman codex refresh                   # renew OAuth tokens before they rot into a 401
 tokeman codex best [--limit spark]      # the CODEX_HOME with the most headroom
 tokeman codex use [<account>]           # move a running Codex onto an account (default: the best)
-tokeman codex use <account> --into <dir>   # copy its credentials into another profile instead
+tokeman codex use <account> --into <dir>   # link its auth.json into another profile directory instead
 tokeman codex watch [--dry-run]         # follow a running Codex and move it in time
 tokeman codex launch [--limit spark] [-- codex args]   # start codex on the profile with the most headroom
 tokeman codex reset <account> [--credit <id>] [--yes]   # spend one reset credit at a limit
@@ -375,7 +377,7 @@ tokeman rotate install           # install and start it (macOS LaunchAgent)
 tokeman rotate uninstall
 tokeman rotate status            # read Claude now: the default, live sessions, every account's room
 tokeman rotate run [--dry-run]   # one cycle now; --dry-run writes nothing and says what it would do
-tokeman rotate pause             # stop managing; /login gets its precedence back
+tokeman rotate pause             # stop changing credentials (/login gets precedence back); read-only polling continues
 tokeman rotate resume            # manage again and run one cycle
 tokeman rotate quarantine <name> --model fable --window weekly --until 2026-12-01T09:00:00-04:00
 tokeman rotate clear-quarantine <name>
@@ -397,9 +399,11 @@ six hours away; `notified.json` remembers what was sent. `tokeman notify
 --test` sends one now. `tokeman settings set notifications false` keeps the
 items to the rotation log.
 
-`tokeman claude launch` runs one rotation cycle, then starts claude with the
-configured arguments and without a token in its environment or command line.
-`--auto` keeps rotating on the fast cadence while claude runs.
+`tokeman claude launch` runs one rotation cycle, then `exec`s claude directly
+with the configured arguments and without competing credentials in its
+environment, so claude owns the terminal and its signals. `--auto` delegates
+ongoing rotation to the background service when it is running, or supervises
+the child on the fast cadence (logging to `claude-rotate.log`) when it is not.
 
 ## When a service changes
 
@@ -508,8 +512,8 @@ x86_64). Bump `version` in `Cargo.toml`, add the section to `CHANGELOG.md`
 (the release notes come from it), then:
 
 ```sh
-git tag v0.4.2
-git push origin v0.4.2
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 ## License

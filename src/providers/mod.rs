@@ -34,16 +34,31 @@ pub fn client() -> &'static reqwest::Client {
             .timeout(READ_TIMEOUT)
             .user_agent(concat!("tokeman/", env!("CARGO_PKG_VERSION")))
             .build()
-            .unwrap_or_default()
+            .expect("failed to build providers HTTP client")
     })
 }
 
 /// Read one account on its service's endpoint.
 pub async fn read(client: &reqwest::Client, account: &ServiceAccount, now: i64) -> Reading {
+    read_opts(client, account, now, true).await
+}
+
+async fn read_opts(
+    client: &reqwest::Client,
+    account: &ServiceAccount,
+    now: i64,
+    cache_tokens: bool,
+) -> Reading {
     match account.service {
         Service::Zai => zai::read(client, account, now).await,
         Service::Kimi => kimi::read(client, account, now).await,
-        Service::Antigravity => antigravity::read(client, account, now).await,
+        Service::Antigravity => {
+            if cache_tokens {
+                antigravity::read(client, account, now).await
+            } else {
+                antigravity::read_uncached(client, account, now).await
+            }
+        }
         Service::Claude | Service::Codex => failed(
             account.service,
             &account.name,
@@ -64,9 +79,19 @@ pub async fn read_all(
     accounts: &[ServiceAccount],
     now: i64,
 ) -> Vec<Reading> {
+    read_all_opts(client, accounts, now, true).await
+}
+
+/// [`read_all`], optionally skipping on-disk token-cache writes (for dry runs).
+pub async fn read_all_opts(
+    client: &reqwest::Client,
+    accounts: &[ServiceAccount],
+    now: i64,
+    cache_tokens: bool,
+) -> Vec<Reading> {
     let bound = READ_TIMEOUT * 2;
     futures::future::join_all(accounts.iter().map(|account| async move {
-        match tokio::time::timeout(bound, read(client, account, now)).await {
+        match tokio::time::timeout(bound, read_opts(client, account, now, cache_tokens)).await {
             Ok(usage) => usage,
             Err(_) => Reading::failed(
                 account.service,
@@ -152,6 +177,9 @@ impl ServiceAccount {
             .map(str::trim)
             .filter(|key| !key.is_empty())
         {
+            if key.chars().any(char::is_control) {
+                bail!("API key for '{}' contains control characters", self.name);
+            }
             return Ok(key.to_owned());
         }
         let Some(file) = self.key_file.as_deref() else {
@@ -163,6 +191,12 @@ impl ServiceAccount {
         let key = contents.trim();
         if key.is_empty() {
             bail!("the key file {} is empty", path.display());
+        }
+        if key.chars().any(char::is_control) {
+            bail!(
+                "the key file {} contains control characters (expected a single API key)",
+                path.display()
+            );
         }
         Ok(key.to_owned())
     }
