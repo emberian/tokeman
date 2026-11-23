@@ -253,6 +253,13 @@ pub fn agy_homes() -> PathBuf {
     data_dir().join("agy-homes")
 }
 
+/// `tokeman claude run`'s per-account config directories (0700), one directory
+/// per account: its own `settings.json` carrying that account's credential, and
+/// links to shared entries in `~/.claude`. Written only by `claude::run`.
+pub fn claude_homes() -> PathBuf {
+    data_dir().join("claude-homes")
+}
+
 pub fn snapshots_db() -> PathBuf {
     data_dir().join("snapshots.db")
 }

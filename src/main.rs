@@ -163,6 +163,9 @@ async fn claude_command(action: ClaudeAction) -> Result<()> {
         ClaudeAction::Launch { auto, args } => {
             tokeman::launch::run(Fleet::load()?, auto, args).await?
         }
+        ClaudeAction::Run { name, args } => {
+            return Err(tokeman::claude::run::prepare(&name, args).await?.exec());
+        }
         ClaudeAction::Reset {
             name: Some(name),
             clear: true,

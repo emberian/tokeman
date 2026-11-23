@@ -209,6 +209,14 @@ pub enum ClaudeAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Start claude pinned to one account without changing the global default
+    Run {
+        /// Account to spend (e.g. tobb@ember.software)
+        name: String,
+        /// Arguments passed through to claude
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Spend a limited reset to restore Claude usage allowance (asks first)
     ///
     /// Interactively choose an available reset, optionally for NAME, then review

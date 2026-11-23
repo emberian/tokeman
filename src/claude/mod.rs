@@ -2,5 +2,6 @@
 //! record, and its live processes.
 
 pub mod keychain;
+pub mod run;
 pub mod sessions;
 pub mod settings;

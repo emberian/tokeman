@@ -37,7 +37,7 @@ pub fn load() -> Result<Settings> {
     load_from(&paths::claude_settings())
 }
 
-fn load_from(path: &Path) -> Result<Settings> {
+pub(crate) fn load_from(path: &Path) -> Result<Settings> {
     let Some(contents) = read_if_present(path)? else {
         return Ok(Settings::new());
     };
@@ -54,7 +54,7 @@ pub fn save(settings: &Settings) -> Result<()> {
     save_to(&paths::claude_settings(), settings)
 }
 
-fn save_to(path: &Path, settings: &Settings) -> Result<()> {
+pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(settings)?;
     bytes.push(b'\n');
     write_atomic(path, &bytes, 0o600)
