@@ -131,8 +131,9 @@ tokeman claude reset [<name>]            # choose a usage-limit reset, review, t
 tokeman claude launch [--auto] [-- claude args]   # pick the default, then start claude
 ```
 
-Each login round prints a claude.com URL; sign in as that account and paste
-the code the page shows. This grants the scopes Claude Code's own `/login`
+Each login round prints a claude.com URL. Sign in as that account, entering
+any verification code in the browser. Approve access, then paste the authorization
+code from the final page into tokeman. This grants the scopes Claude Code's own `/login`
 grants, including `user:profile`, with a refresh token the service renews in
 the background. `tokeman list` says when a login ends and asks for a new one
 from three days before.

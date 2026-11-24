@@ -6,6 +6,7 @@ use std::io::{BufRead, IsTerminal, Read};
 use anyhow::Result;
 
 use crate::account::Fleet;
+use crate::anthropic::oauth;
 use crate::commands::claude;
 use crate::ui::text;
 
@@ -39,7 +40,7 @@ pub async fn login(name: Option<&str>, more: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let mut done = 0usize;
-    for (index, account) in targets.iter().enumerate() {
+    'accounts: for (index, account) in targets.iter().enumerate() {
         let pkce = claude::begin_login(account)?;
         text::print_login_step(
             index,
@@ -48,21 +49,33 @@ pub async fn login(name: Option<&str>, more: bool) -> Result<()> {
             fleet.account(account).is_some(),
             &pkce.url,
         );
-        let Some(line) = lines.next() else { break };
-        let line = line?;
-        let answer = line.trim();
-        if answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit") {
+        loop {
+            text::print_question("  authorization code (or `skip` / `q`): ");
+            let Some(line) = lines.next() else {
+                break 'accounts;
+            };
+            let line = line?;
+            let answer = line.trim();
+            if answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit") {
+                break 'accounts;
+            }
+            if answer.is_empty() || answer.eq_ignore_ascii_case("skip") {
+                text::print_login_skipped(account);
+                break;
+            }
+            let outcome = claude::finish_login(account, answer, &pkce).await;
+            text::print_login_outcome(account, &outcome);
+            match outcome {
+                Ok(claude::LoginOutcome::Stored { .. }) => done += 1,
+                Err(error) if stdin.is_terminal() => {
+                    if matches!(error.downcast_ref(), Some(oauth::Error::Paste(_))) {
+                        continue;
+                    }
+                }
+                _ => {}
+            }
             break;
         }
-        if answer.is_empty() || answer.eq_ignore_ascii_case("skip") {
-            text::print_login_skipped(account);
-            continue;
-        }
-        let outcome = claude::finish_login(account, answer, &pkce).await;
-        if matches!(outcome, Ok(claude::LoginOutcome::Stored { .. })) {
-            done += 1;
-        }
-        text::print_login_outcome(account, &outcome);
     }
     text::print_login_summary(done, total);
     Ok(())

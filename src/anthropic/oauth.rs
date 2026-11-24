@@ -273,6 +273,16 @@ async fn exchange_waiting(
             "state mismatch: that code came from a different login attempt",
         ));
     }
+    // A browser sign-in PIN can be pasted once or accidentally doubled.
+    // Only recognize bare PINs: an explicit OAuth callback carries its own code.
+    if pasted.trim() == code
+        && code.bytes().all(|b| b.is_ascii_digit())
+        && (code.len() == 6 || (code.len() == 12 && code[..6] == code[6..]))
+    {
+        return Err(Error::Paste(
+            "that looks like a verification code. Enter it in the browser, approve access, then copy the authorization code from the final page.",
+        ));
+    }
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
@@ -384,6 +394,26 @@ mod tests {
             exchange(&dead_client(), "   ", &pkce).await,
             Err(Error::Paste(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_browser_pin_is_not_exchanged_and_the_same_login_can_finish() {
+        let pkce = begin(None).unwrap();
+        let (router, calls, bodies) = scripted(vec![(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "a"}),
+        )]);
+        let client = serve(router).await;
+        for pin in ["012345", "012345012345"] {
+            assert!(matches!(
+                exchange(&client, pin, &pkce).await,
+                Err(Error::Paste(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let callback = format!("{REDIRECT_URI}?code=012345&state={}", pkce.state);
+        exchange(&client, &callback, &pkce).await.unwrap();
+        assert_eq!(bodies.lock().unwrap()[0]["code"], "012345");
     }
 
     #[test]

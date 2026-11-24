@@ -1325,8 +1325,10 @@ pub fn print_login_step(index: usize, total: usize, account: &str, configured: b
     if !configured {
         println!("  (not configured yet: it will be added as a login-only account)");
     }
-    println!("  sign in as this account, then paste what the page shows:\n\n  {url}\n");
-    print_question("  code (or `skip` / `q`): ");
+    println!(
+        "  Open this link and sign in as {account}. Enter any verification code in the browser.\n\n  {url}\n"
+    );
+    println!("  Approve access, then copy the authorization code from the final page.");
 }
 
 pub fn print_login_skipped(account: &str) {
