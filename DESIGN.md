@@ -8,8 +8,8 @@ this says where.
 
 ## The problem
 
-- **Five services, one thing reported.** Claude, Codex, Antigravity, GLM and
-  Kimi each report a list of limits: a window of some length over the whole
+- **Seven services, one thing reported.** Claude, Codex, Antigravity, GLM,
+  Kimi, Devin and Grok Build each report a list of limits: a window of some length over the whole
   account, one model, or a named group of models. tokeman has one model of a
   limit and one of a read, and every reader produces it.
 - **Claude Code has one slot.** It reads `CLAUDE_CODE_OAUTH_TOKEN` from
@@ -106,6 +106,11 @@ src/
     mod.rs       ServiceAccount; read (dispatch by service) -> Reading, read_all (concurrent, each read bounded)
     zai.rs       GLM Coding Plan
     kimi.rs      Kimi Code: Limits and the booster Balance
+    devin.rs     Devin: GetUserStatus with the key in the Devin CLI's credentials.toml -> the weekly (and shown
+                 daily) Limit, the plan, the extra-usage Balance
+    grok.rs      Grok Build: the CLI proxy's billing answer with the access token in grok's auth.json, only while
+                 that login is live -> the period's Limit, the prepaid and on-demand Balances; the plan from the
+                 settings grok caches. Never redeems grok's refresh token
     antigravity/
       mod.rs     the quota read -> Limits scoped to their model group; its own access-token cache
       grant.rs   browser PKCE login (`agy login`), the Google OAuth refresh exchange; discover() from agy's Keychain item
@@ -141,8 +146,8 @@ src/
                  pending claims -> Findings; Report::assemble (pure) decides what is a problem and names its fix
     launch.rs    `<service> launch`: codex on the best profile's CODEX_HOME, agy run on the best account, claude on
                  a GLM or Kimi plan (Endpoint: base URL, key variable, models)
-    services.rs  agy / glm / kimi: add, remove, agy login, import, the account agy holds, agy use (named, best or
-                 previous), agy run
+    services.rs  agy / glm / kimi / devin / grok: add, remove, agy login, import (agy's accounts; the login the
+                 Devin or grok CLI keeps), the account agy holds, agy use (named, best or previous), agy run
     rotate.rs    run, status (the fleet view of Claude read as a cycle reads it), pause, resume, install, uninstall,
                  quarantine, clear-quarantine, the hook's record
     view.rs      probe (read now, record), stored / fresh / overview (the fleet view), ranked and best, history,
@@ -165,7 +170,7 @@ macos/tray/      the Swift menu-bar app: a viewer of `tokeman list --json`
 
 ```rust
 // quota.rs: one model for every service.
-pub enum Service { Claude, Codex, Antigravity, Zai, Kimi }      // serde: lowercase
+pub enum Service { Claude, Codex, Antigravity, Zai, Kimi, Devin, Grok }      // serde: lowercase
 pub struct Window { pub used: f64 /* fraction, may exceed 1.0 */, pub resets_at: i64 /* epoch s, 0 = none pending */ }
 pub enum Span { FiveHour, Weekly, Monthly /* 28-31 d */, Other(i64 /* s */), Unknown }   // from_seconds, label
 pub struct ModelKey(String);                 // "opus48", "fable51", "fable" (family-wide)
@@ -359,7 +364,8 @@ pub async fn best(&Fleet, Service, scope) -> Result<Best>                  // ev
   (which also reads the reset programs and the Codex credit list), and the
   surfaces when no service reads; `tokeman rotate status` and `rotate run`, which read Claude the way
   a cycle does; and the commands that act on one account (`codex use`,
-  `codex watch`, the two `reset`s, `glm|kimi add`, `agy import`). Nothing in
+  `codex watch`, the two `reset`s, `glm|kimi add`, `agy import`,
+  `devin|grok import`). Nothing in
   `ui/` sends a request: a surface calls `commands::view::overview`, which
   is the stored view while `Monitor::keeps_fresh()`.
 - **A view says what it is.** Every `Overview` carries its origin and the
@@ -431,8 +437,11 @@ owner-only.
   settings, `services_interval_secs` and `notifications`), `[rotation]` (the floors and
   intervals; `codex_auto_move` and the Codex leaving and landing floors
   `codex_min_*` / `codex_land_min_*`), `[[codex_accounts]]`, `[[services]]` (`name`, `service`, `key`
-  or `key_file`, Antigravity's grant, `label`). Comments survive every
-  write; keys added later are optional.
+  or `key_file`, Antigravity's grant, `label`; for Devin and Grok `key_file`
+  is the login file of the service's own CLI). Comments survive every
+  write; keys added later are optional. A `service` a build does not know
+  fails the whole file, so an account of a new service is registered only
+  after every tokeman that reads the file is that build.
 - `~/.claude/settings.json` (or `$CLAUDE_SETTINGS`): the env keys
   `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`,
   `CLAUDE_CODE_OAUTH_401_WAIT_MS`, `TOKEMAN_ACCOUNT`, and the SessionStart
@@ -561,6 +570,13 @@ owner-only.
   (bearer token and API key respectively), and Claude Code 2.1.322 sends a
   key from its environment in preference to a `CLAUDE_CODE_OAUTH_TOKEN` in
   settings.json.
+- Devin's `GetUserStatus` and Grok's billing answer are proto3 JSON: a zero
+  is left out. A Devin window with a reset and no percentage is spent, and a
+  Grok period with no `creditUsagePercent` has used nothing. A Devin plan
+  with `hideDailyQuota` has no daily limit that matters.
+- Grok's refresh token is single-use and its CLI keeps the only copy, so a
+  second redeemer would sign the CLI out. tokeman uses the access token
+  while it lives (six hours) and nothing else.
 - The Codex usage body puts whichever window exists first in
   `primary_window`, so windows are named by `limit_window_seconds`.
 - A running agy does not pick up a swapped Keychain login and writes its own

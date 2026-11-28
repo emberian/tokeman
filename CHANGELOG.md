@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Devin and Grok Build
+
+- Two more services are read beside GLM and Kimi: `tokeman devin` and
+  `tokeman grok`, each with `import`, `remove`, `list` and `best`, and
+  `--service devin|grok` on `history`, `stats` and `chart`. `import`
+  registers the login the service's own CLI keeps on this machine by the path
+  of its file (`~/.local/share/devin/credentials.toml`, `~/.grok/auth.json`);
+  the file is read on every poll and never written.
+- Devin: the weekly quota, the daily one on plans that show it, the plan name
+  and the extra-usage balance, from `GetUserStatus`.
+- Grok Build: the plan's usage period, bought credits and the on-demand cap,
+  from the CLI proxy's billing answer; the plan name from the settings grok
+  caches. tokeman never redeems grok's single-use refresh token, so a login
+  that has expired is reported as one and renewed by starting `grok`.
+- A balance that is owed (negative) is no longer said to be "left".
+- An older tokeman refuses a tokens.toml that names a service it does not
+  know: install this build and restart the background service before the
+  first `tokeman devin import` or `tokeman grok import`.
+
 ## 0.5.0 - 2026-11-23
 
 ### Rotation, launches, and ranking

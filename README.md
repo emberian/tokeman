@@ -5,7 +5,7 @@ left, and shows the rest. It rotates the one credential slot Claude Code
 reads across a fleet of Anthropic accounts, keeps Codex (OpenAI) profiles
 alive and moves a running Codex between them, signs the `agy` CLI in as the
 Antigravity account you choose, and reads the quota of GLM and Kimi coding
-plans beside them.
+plans, Devin and Grok Build beside them.
 
 Every service reports the same thing, a list of limits, and tokeman shows
 them the same way: one gauge per limit, named by what it covers and how long
@@ -26,8 +26,8 @@ its window is.
    read 12m ago
 ```
 
-Commands are service first: `tokeman claude|codex|agy|glm|kimi <verb>`, with
-the same verbs (`add`, `remove`, `list`, `use`, `best`, `launch`, `reset`)
+Commands are service first: `tokeman claude|codex|agy|glm|kimi|devin|grok <verb>`,
+with the same verbs (`add`, `import`, `remove`, `list`, `use`, `best`, `launch`, `reset`)
 wherever they apply. `tokeman <service> launch` starts the tool that spends
 that service's quota on its best account. The shape of the code is written down in [DESIGN.md](DESIGN.md).
 
@@ -371,6 +371,34 @@ send it: Claude Code prefers the key in its environment over the settings
 token. A model set in the `env` block of settings.json would override the
 vendor's.
 
+## Devin and Grok
+
+```sh
+tokeman devin import [--name <name>] [--file <credentials.toml>]   # the login `devin` keeps
+tokeman grok import [--name <name>] [--file <auth.json>]           # the login `grok` keeps
+tokeman devin|grok remove <name>
+tokeman devin|grok list                          # read now
+tokeman devin|grok best                          # rank by room left
+```
+
+These are read, not rotated, through the login each service's own CLI keeps
+on this machine (`~/.local/share/devin/credentials.toml`, `~/.grok/auth.json`).
+`import` stores the path of that file, names the account by the email it
+signs in as, and reads it once; the file is read on every poll and never
+written, so nothing of the login enters tokens.toml.
+
+- **Devin** reports the weekly quota, the daily one on plans that show it,
+  the plan name, and the extra-usage balance (negative when extra usage is
+  owed). Its key does not expire.
+- **Grok Build** reports the one usage period of the plan (weekly on
+  SuperGrok), the plan name, bought credits and the on-demand cap. Its access
+  token lasts six hours and only `grok` can renew it, so tokeman reads while
+  the login is live and otherwise says the login expired: starting `grok`
+  renews it, and `grok login` signs in again when grok asks.
+
+A tokeman from before these services refuses a tokens.toml that names them:
+install this build (and restart the background service) before `import`.
+
 ## The background service
 
 ```sh
@@ -385,7 +413,7 @@ tokeman rotate clear-quarantine <name>
 ```
 
 One process (`tokeman rotate daemon`) does all the reading: Claude on the
-rotation's cadence, the Antigravity, GLM and Kimi accounts every
+rotation's cadence, the Antigravity, GLM, Kimi, Devin and Grok accounts every
 `services_interval_secs` (default 300, in `[settings]`), Codex on a half-hour
 sweep that also refreshes tokens. It renews Claude logins before they expire
 and keeps every read in the history. It exits when its binary is replaced, so
