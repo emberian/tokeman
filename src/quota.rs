@@ -241,15 +241,19 @@ pub enum Service {
     Antigravity,
     Zai,
     Kimi,
+    Devin,
+    Grok,
 }
 
 impl Service {
-    pub const ALL: [Service; 5] = [
+    pub const ALL: [Service; 7] = [
         Service::Claude,
         Service::Codex,
         Service::Antigravity,
         Service::Zai,
         Service::Kimi,
+        Service::Devin,
+        Service::Grok,
     ];
 
     pub fn name(self) -> &'static str {
@@ -259,6 +263,8 @@ impl Service {
             Self::Antigravity => "antigravity",
             Self::Zai => "zai",
             Self::Kimi => "kimi",
+            Self::Devin => "devin",
+            Self::Grok => "grok",
         }
     }
 
@@ -269,6 +275,8 @@ impl Service {
             Self::Antigravity => "Antigravity",
             Self::Zai => "GLM (z.ai)",
             Self::Kimi => "Kimi Code",
+            Self::Devin => "Devin",
+            Self::Grok => "Grok Build",
         }
     }
 }
@@ -407,7 +415,8 @@ pub struct Amount {
     pub unit: String,
 }
 
-/// A money balance beside the limits (Kimi's booster wallet).
+/// A money balance beside the limits (Kimi's booster wallet, Devin's extra
+/// usage, Grok's prepaid credits). Negative when the account owes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Balance {
     pub label: String,
@@ -944,7 +953,11 @@ impl Reading {
             detail: match service {
                 Service::Claude => Detail::Claude(ClaudeDetail::default()),
                 Service::Codex => Detail::Codex(CodexDetail::default()),
-                Service::Antigravity | Service::Zai | Service::Kimi => Detail::None,
+                Service::Antigravity
+                | Service::Zai
+                | Service::Kimi
+                | Service::Devin
+                | Service::Grok => Detail::None,
             },
             unrecognized: Vec::new(),
         }

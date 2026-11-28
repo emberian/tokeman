@@ -368,6 +368,11 @@ fn credential_fix(service: Service, name: &str) -> String {
         }
         Service::Zai => format!("tokeman glm add {name} --key-file <file with a working key>"),
         Service::Kimi => format!("tokeman kimi add {name} --key-file <file with a working key>"),
+        Service::Devin => "devin auth login (tokeman reads the login the Devin CLI keeps)".to_owned(),
+        Service::Grok => {
+            "start grok, which renews its own login, or run `grok login` (tokeman reads the login the grok CLI keeps)"
+                .to_owned()
+        }
     }
 }
 

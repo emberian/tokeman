@@ -4,7 +4,7 @@ use clap::Parser;
 use tokeman::account::Fleet;
 use tokeman::cli::{
     self, AgyAction, ClaudeAction, Cli, CodexAction, Command, HistoryAction, KeyAction,
-    RotateAction, SettingsAction,
+    LoginAction, RotateAction, SettingsAction,
 };
 use tokeman::commands::{claude, codex, doctor, launch, rotate, services, view};
 use tokeman::daemon::cycle;
@@ -55,6 +55,8 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Agy { action } => agy_command(action).await?,
         Command::Glm { action } => key_command(Service::Zai, action).await?,
         Command::Kimi { action } => key_command(Service::Kimi, action).await?,
+        Command::Devin { action } => login_command(Service::Devin, action).await?,
+        Command::Grok { action } => login_command(Service::Grok, action).await?,
         Command::Rotate { action } => rotate_command(action).await?,
         Command::History {
             action: Some(HistoryAction::Compact { dry_run }),
@@ -419,6 +421,23 @@ async fn key_command(service: Service, action: KeyAction) -> Result<()> {
             text::print_launch(&launch);
             return Err(launch.exec());
         }
+    }
+    Ok(())
+}
+
+async fn login_command(service: Service, action: LoginAction) -> Result<()> {
+    match action {
+        LoginAction::Import { name, file, label } => {
+            let (registered, reading) =
+                services::import_login(service, name.as_deref(), file.as_deref(), label).await?;
+            text::print_login_imported(&registered, &reading);
+        }
+        LoginAction::Remove { name } => {
+            services::remove(service, &name)?;
+            text::print_removed(&name);
+        }
+        LoginAction::List { json } => service_list(service, json).await?,
+        LoginAction::Best => best(service, None).await?,
     }
     Ok(())
 }

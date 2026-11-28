@@ -113,7 +113,11 @@ pub fn endpoint(service: Service) -> Option<Endpoint> {
     match service {
         Service::Zai => Some(ZAI),
         Service::Kimi => Some(KIMI),
-        Service::Claude | Service::Codex | Service::Antigravity => None,
+        Service::Claude
+        | Service::Codex
+        | Service::Antigravity
+        | Service::Devin
+        | Service::Grok => None,
     }
 }
 

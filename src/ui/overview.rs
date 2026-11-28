@@ -1196,4 +1196,77 @@ mod tests {
         let kimi = Overview::build(&fleet(), facts, Some(Service::Kimi), NOW);
         assert!(kimi.forecasts.is_empty());
     }
+
+    #[test]
+    fn devin_and_grok_accounts_get_the_forecast_and_the_attention_of_any_service() {
+        let fleet = Fleet {
+            services: vec![
+                ServiceAccount::with_key_file(Service::Devin, "devin", "~/unused"),
+                ServiceAccount::with_key_file(Service::Grok, "grok", "~/unused"),
+            ],
+            ..Fleet::default()
+        };
+        let weekly = |service: Service, name: &str, at: i64, used: f64| Reading {
+            plan: Some("Max".into()),
+            limits: vec![crate::providers::limit(
+                None,
+                "weekly",
+                Some(7 * 86_400),
+                Window::new(used, NOW + 5 * 86_400),
+                None,
+            )],
+            ..Reading::empty(service, name, at)
+        };
+        // Devin burns 5% of its week an hour; Grok's week is spent.
+        let recent: Vec<Reading> = (0..=6)
+            .map(|hour| {
+                let used = 0.30 + 0.05 * hour as f64;
+                weekly(Service::Devin, "devin", NOW - (6 - hour) * 3_600, used)
+            })
+            .collect();
+        let spent = weekly(Service::Grok, "grok", NOW, 1.0);
+        let facts = Facts {
+            readings: vec![recent.last().unwrap().clone(), spent.clone()],
+            recent: recent.into_iter().chain([spent]).collect(),
+            ..Facts::default()
+        };
+        let view = Overview::build(&fleet, facts, None, NOW);
+        let labels: Vec<_> = view
+            .accounts
+            .iter()
+            .map(|account| (account.service_label, account.viable))
+            .collect();
+        assert_eq!(labels, [("Devin", Some(true)), ("Grok Build", Some(false))]);
+        let devin: Vec<_> = view
+            .forecasts
+            .iter()
+            .filter(|shown| shown.forecast.service == Service::Devin)
+            .collect();
+        assert_eq!(devin.len(), 1, "{:?}", view.forecasts);
+        // 40% left at 5% an hour.
+        assert!(
+            devin[0].text.starts_with("Devin runs dry in 8h"),
+            "{}",
+            devin[0].text
+        );
+        let keys: Vec<_> = view
+            .attention
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect();
+        assert!(keys.contains(&"below-floor:grok"), "{keys:?}");
+        assert!(
+            keys.iter().any(|key| key.starts_with("runs-dry:devin")),
+            "{keys:?}"
+        );
+        let said: Vec<_> = view
+            .attention
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        assert!(
+            said.contains(&"Grok Build: no account has room"),
+            "{said:?}"
+        );
+    }
 }

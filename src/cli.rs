@@ -64,6 +64,16 @@ pub enum Command {
         #[command(subcommand)]
         action: KeyAction,
     },
+    /// Devin accounts: the quota of the login the Devin CLI keeps
+    Devin {
+        #[command(subcommand)]
+        action: LoginAction,
+    },
+    /// Grok Build accounts: the quota of the login the grok CLI keeps
+    Grok {
+        #[command(subcommand)]
+        action: LoginAction,
+    },
     /// The rotation of Claude Code's default account, and its background service
     Rotate {
         #[command(subcommand)]
@@ -480,6 +490,34 @@ pub enum KeyAction {
     },
 }
 
+/// A service read through the login its own CLI keeps on this machine.
+#[derive(Subcommand)]
+pub enum LoginAction {
+    /// Register the login the service's CLI holds on this machine
+    ///
+    /// Stores the path of the CLI's login file, not what is in it; the file
+    /// is read on every poll and never written.
+    Import {
+        /// What to call the account (default: the email it signs in as)
+        #[arg(long)]
+        name: Option<String>,
+        /// The CLI's login file, when it is not in the default place
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Unregister an account
+    Remove { name: String },
+    /// Read every account now and print the gauges
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read every account now and rank them by room left
+    Best,
+}
+
 #[derive(Subcommand)]
 pub enum RotateAction {
     /// Probe and apply the policy once
@@ -552,6 +590,8 @@ pub enum ServiceArg {
     #[value(alias = "zai")]
     Glm,
     Kimi,
+    Devin,
+    Grok,
 }
 
 impl From<ServiceArg> for Service {
@@ -562,6 +602,8 @@ impl From<ServiceArg> for Service {
             ServiceArg::Agy => Self::Antigravity,
             ServiceArg::Glm => Self::Zai,
             ServiceArg::Kimi => Self::Kimi,
+            ServiceArg::Devin => Self::Devin,
+            ServiceArg::Grok => Self::Grok,
         }
     }
 }
@@ -771,6 +813,17 @@ mod tests {
             "tokeman kimi add kimi --key-file ~/.kimi-key",
             "tokeman kimi list --json",
             "tokeman kimi best",
+            "tokeman devin import",
+            "tokeman devin import --name work --file ~/.local/share/devin/credentials.toml",
+            "tokeman devin list --json",
+            "tokeman devin best",
+            "tokeman devin remove work",
+            "tokeman grok import --label personal",
+            "tokeman grok list",
+            "tokeman grok best",
+            "tokeman grok remove a@example.com",
+            "tokeman history --service devin --last 3",
+            "tokeman stats --service grok",
             "tokeman claude launch",
             "tokeman claude launch --auto -- --model fable",
             "tokeman codex launch",

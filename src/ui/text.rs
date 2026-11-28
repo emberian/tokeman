@@ -310,6 +310,8 @@ fn balance_text(balance: &Balance) -> String {
             balance.label,
             format_money(total, &balance.currency)
         ),
+        // What is owed is not what is left.
+        None if balance.left_minor < 0 => format!("{} {left}", balance.label),
         None => format!("{} {left} left", balance.label),
     }
 }
@@ -1889,6 +1891,16 @@ pub fn print_service_added(registered: &crate::commands::services::Registered, r
     print_reading(reading, false);
 }
 
+pub fn print_login_imported(registered: &crate::commands::services::Registered, reading: &Reading) {
+    println!(
+        "{} reading the login its CLI keeps in {}",
+        registration_line(registered),
+        registered.account.key_file.as_deref().unwrap_or_default()
+    );
+    println!();
+    print_reading(reading, false);
+}
+
 pub fn print_agy_imported(imported: &crate::commands::services::Imported) {
     if imported.registered.is_empty() {
         println!("no signed-in accounts found");
@@ -2048,6 +2060,10 @@ pub fn print_no_accounts(service: Service) {
             Service::Claude => "tokeman claude login <name>".to_owned(),
             Service::Codex => "tokeman codex discover --adopt".to_owned(),
             Service::Antigravity => "tokeman agy import".to_owned(),
+            Service::Devin | Service::Grok => format!(
+                "tokeman {} import",
+                crate::commands::services::command_word(service)
+            ),
             other => format!(
                 "tokeman {} add <name> --key-file <path>",
                 crate::commands::services::command_word(other)
@@ -2390,6 +2406,36 @@ mod tests {
     #[test]
     fn truncation_counts_characters_not_bytes() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
+    }
+
+    #[test]
+    fn devin_balance_that_is_owed_is_not_called_left() {
+        use crate::providers::limit;
+        use crate::quota::{Service, Window};
+        let reading = Reading {
+            plan: Some("Max".into()),
+            limits: vec![limit(
+                None,
+                "weekly",
+                Some(7 * 86_400),
+                Window::new(0.02, 0),
+                None,
+            )],
+            balances: vec![Balance {
+                label: "extra usage balance".into(),
+                left_minor: -526,
+                total_minor: None,
+                currency: "USD".into(),
+            }],
+            ..Reading::empty(Service::Devin, "devin", 0)
+        };
+        assert_eq!(summary(&reading), "weekly 98% · extra usage balance -$5.26");
+        let mut credit = reading.clone();
+        credit.balances[0].left_minor = 1250;
+        assert_eq!(
+            summary(&credit),
+            "weekly 98% · extra usage balance $12.50 left"
+        );
     }
 
     #[test]

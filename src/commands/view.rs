@@ -231,8 +231,8 @@ impl Best {
 /// selection model); Codex on its account-wide windows or on `scope`'s limit,
 /// parked profiles left out; Antigravity on `scope`'s group or every group
 /// (falling back to `agy`'s configured startup group when another group is at
-/// 0%); GLM and Kimi on their account-wide coding windows unless `scope`
-/// explicitly names a group.
+/// 0%); GLM, Kimi, Devin and Grok on their account-wide windows unless
+/// `scope` explicitly names a group.
 pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Result<Best> {
     let configured = match service {
         Service::Claude => fleet.accounts.len(),
@@ -280,7 +280,7 @@ pub async fn best(fleet: &Fleet, service: Service, scope: Option<&str>) -> Resul
             let current = super::services::seated(&fleet.services).await;
             (names(agy_ranked), current, None)
         }
-        Service::Zai | Service::Kimi => {
+        Service::Zai | Service::Kimi | Service::Devin | Service::Grok => {
             let on = match scope {
                 Some(group) => RankOn::Limits(Some(group)),
                 None => RankOn::Account,

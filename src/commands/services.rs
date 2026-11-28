@@ -1,5 +1,5 @@
-//! `tokeman agy|glm|kimi ...`: register, import, read and (agy) seat the
-//! accounts of the services tokeman does not rotate.
+//! `tokeman agy|glm|kimi|devin|grok ...`: register, import, read and (agy)
+//! seat the accounts of the services tokeman does not rotate.
 
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -68,7 +68,65 @@ pub fn command_word(service: Service) -> &'static str {
         Service::Antigravity => "agy",
         Service::Zai => "glm",
         Service::Kimi => "kimi",
+        Service::Devin => "devin",
+        Service::Grok => "grok",
     }
+}
+
+/// Register the login the Devin or grok CLI keeps on this machine
+/// (`tokeman devin|grok import`), and read it once. The account holds the
+/// path of the CLI's own login file, never a copy of what is in it. It is
+/// named `name`, else by the email the login signs in as; a name that is not
+/// that email keeps the email as its label.
+pub async fn import_login(
+    service: Service,
+    name: Option<&str>,
+    file: Option<&Path>,
+    label: Option<String>,
+) -> Result<(Registered, Reading)> {
+    let file = match (file, service) {
+        (Some(file), _) => std::path::absolute(file)?,
+        (None, Service::Devin) => providers::devin::credentials_file(),
+        (None, Service::Grok) => providers::grok::auth_file(),
+        (None, other) => bail!("{} has no login file to import", other.label()),
+    };
+    if !file.is_file() {
+        bail!(
+            "no {} login at {} (sign in with `{}` first, or name the file with --file)",
+            service.label(),
+            file.display(),
+            match service {
+                Service::Devin => "devin auth login",
+                _ => "grok login",
+            }
+        );
+    }
+    let located = ServiceAccount::with_key_file(service, service.name(), &tilde(&file));
+    let email = match service {
+        Service::Devin => Some(
+            providers::devin::email(providers::client(), &located)
+                .await
+                .map_err(|error| anyhow::anyhow!("could not read the Devin login: {error}"))?,
+        ),
+        _ => providers::grok::email(&file)?,
+    };
+    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    let account = ServiceAccount {
+        name: name
+            .or(email.as_deref())
+            .unwrap_or(service.name())
+            .to_owned(),
+        // An alias keeps the email it stands for, which is also how Grok
+        // finds its login in a file that holds several.
+        label: label.or_else(|| email.filter(|email| name.is_some_and(|name| name != email))),
+        ..located
+    };
+    let replaced = register(account.clone())?;
+    let mut readings = read(std::slice::from_ref(&account)).await;
+    let reading = readings
+        .pop()
+        .unwrap_or_else(|| Reading::empty(service, &account.name, super::now()));
+    Ok((Registered { account, replaced }, reading))
 }
 
 /// What `tokeman agy import` found and read.

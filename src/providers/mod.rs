@@ -1,5 +1,5 @@
 //! Read-only quota for subscriptions tokeman does not rotate: Antigravity,
-//! the z.ai GLM Coding Plan, and Kimi Code. Each service is polled on its own
+//! the z.ai GLM Coding Plan, Kimi Code, Devin and Grok Build. Each service is polled on its own
 //! usage endpoint and its answer becomes a [`Reading`]; nothing here
 //! installs a credential anywhere.
 //!
@@ -8,6 +8,8 @@
 //! returns `Err`: a failure is a `Reading` with `error` set.
 
 pub mod antigravity;
+pub mod devin;
+pub mod grok;
 pub mod kimi;
 pub mod zai;
 
@@ -52,6 +54,8 @@ async fn read_opts(
     match account.service {
         Service::Zai => zai::read(client, account, now).await,
         Service::Kimi => kimi::read(client, account, now).await,
+        Service::Devin => devin::read(client, account, now).await,
+        Service::Grok => grok::read(client, account, now).await,
         Service::Antigravity => {
             if cache_tokens {
                 antigravity::read(client, account, now).await
@@ -118,7 +122,9 @@ pub struct ServiceAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// A file holding the API key; may start with `~/`. Read on every poll,
-    /// so rotating the file needs no tokeman change.
+    /// so rotating the file needs no tokeman change. For Devin and Grok, the
+    /// file their own CLI keeps its login in (`credentials.toml`,
+    /// `auth.json`), which only that CLI writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<String>,
     /// OAuth (Antigravity): Google refresh tokens do not rotate, so tokeman
@@ -155,7 +161,7 @@ impl std::fmt::Debug for ServiceAccount {
 }
 
 impl ServiceAccount {
-    /// An API-key account reading its key from `key_file`.
+    /// An account reading its key or its CLI's login from `key_file`.
     pub fn with_key_file(service: Service, name: &str, key_file: &str) -> Self {
         Self {
             name: name.to_owned(),
