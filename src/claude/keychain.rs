@@ -18,7 +18,9 @@ use crate::paths;
 const VERSION: u32 = 1;
 const LOGIN_KEY: &str = "claudeAiOauth";
 #[cfg(target_os = "macos")]
-const SERVICE: &str = "Claude Code-credentials";
+mod security;
+#[cfg(target_os = "macos")]
+use security::Item;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -118,25 +120,21 @@ pub fn settled(existing: Option<LoginBackup>) -> LoginBackup {
 #[cfg(target_os = "macos")]
 pub fn suppress(_force_check: bool) -> Result<bool> {
     let existing = load_backup()?;
-    let document = match read_document() {
-        Ok(document) => document,
-        Err(error) if is_locked_keychain(&error) => {
+    let account = keychain_account()?;
+    let mut document = match security::read(&account)? {
+        Item::Document(document) => document,
+        Item::Missing => serde_json::json!({}),
+        Item::NeedsInteraction => {
             crate::notice::notice(
-                "macOS Keychain is locked; skipping Claude /login Keychain check",
+                "macOS Keychain access needs interaction; skipping Claude /login Keychain check",
             );
             return Ok(false);
         }
-        Err(error) => return Err(error),
     };
-    let Some(mut document) = document else {
-        if existing
-            .as_ref()
-            .is_none_or(|b| b.state != BackupState::Suppressed)
-        {
-            save_backup(&settled(existing))?;
-        }
-        return Ok(false);
-    };
+    // Only set a login aside if the same transport can put it back on pause.
+    if document.get(LOGIN_KEY).is_some() {
+        security::write_command(&account, &document)?;
+    }
     let Some(login) = split_login(&mut document)? else {
         if existing
             .as_ref()
@@ -148,7 +146,7 @@ pub fn suppress(_force_check: bool) -> Result<bool> {
     };
     let mut backup = LoginBackup::new(BackupState::Captured, Some(login));
     save_backup(&backup)?;
-    write_document(&document)?;
+    security::write(&account, &document)?;
     backup.state = BackupState::Suppressed;
     save_backup(&backup)?;
     Ok(true)
@@ -166,23 +164,14 @@ pub fn has_unsuppressed_login() -> Result<bool> {
     if cfg!(test) {
         return Ok(false);
     }
-    match read_document() {
-        Ok(Some(document)) => Ok(document.get(LOGIN_KEY).is_some()),
-        Ok(None) => Ok(false),
-        Err(error) if is_locked_keychain(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+    Ok(
+        matches!(security::read(&keychain_account()?)?, Item::Document(doc) if doc.get(LOGIN_KEY).is_some()),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn has_unsuppressed_login() -> Result<bool> {
     Ok(false)
-}
-
-#[cfg(target_os = "macos")]
-fn is_locked_keychain(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
-    text.contains("-25308") || text.contains("User interaction is not allowed")
 }
 
 /// Put the backed-up login back and remove the backup. Returns whether the
@@ -194,9 +183,16 @@ pub fn restore() -> Result<bool> {
     };
     let changed = match backup.login {
         Some(login) => {
-            let mut document = read_document()?.unwrap_or_else(|| serde_json::json!({}));
+            let account = keychain_account()?;
+            let mut document = match security::read(&account)? {
+                Item::Document(document) => document,
+                Item::Missing => serde_json::json!({}),
+                Item::NeedsInteraction => {
+                    bail!("unlock the macOS Keychain to restore the saved Claude /login")
+                }
+            };
             if restore_login(&mut document, login)? {
-                write_document(&document)?;
+                security::write(&account, &document)?;
                 true
             } else {
                 false
@@ -236,31 +232,6 @@ fn keychain_account() -> Result<String> {
                 .map(|value| value.to_string_lossy().into_owned())
         })
         .context("could not determine macOS Keychain account")
-}
-
-#[cfg(target_os = "macos")]
-fn read_document() -> Result<Option<Value>> {
-    use security_framework::passwords::get_generic_password;
-    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
-
-    let account = keychain_account()?;
-    let bytes = match get_generic_password(SERVICE, &account) {
-        Ok(bytes) => bytes,
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(None),
-        Err(error) => return Err(error).context("could not read Claude's Keychain credential"),
-    };
-    let value =
-        serde_json::from_slice(&bytes).context("Claude Keychain credential is not valid JSON")?;
-    Ok(Some(value))
-}
-
-#[cfg(target_os = "macos")]
-fn write_document(document: &Value) -> Result<()> {
-    use security_framework::passwords::set_generic_password;
-
-    let account = keychain_account()?;
-    set_generic_password(SERVICE, &account, &serde_json::to_vec(document)?)
-        .context("could not update Claude's Keychain credential")
 }
 
 #[cfg(test)]

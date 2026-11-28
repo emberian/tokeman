@@ -143,6 +143,14 @@ A setup token is inference-only: a session running on one cannot send
 both, the login is used and the setup token is kept for the day the login is
 refused.
 
+On macOS, tokeman sets aside Claude Code's saved `/login` while managing the
+default and restores it on pause or uninstall. Both tools use
+`/usr/bin/security` to access `Claude Code-credentials`, so rebuilding
+tokeman keeps the same Keychain reader. If an older install caused repeated
+password prompts, choose **Always Allow** for `security` on that item when
+you next start Claude Code. Tokeman sends updates on standard input and
+reports an error if the credential exceeds the tool's 4 KiB command buffer.
+
 ### How the default is chosen
 
 The service writes the default account's credential into the `env` block of
